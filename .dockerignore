@@ -1,0 +1,8 @@
+target/
+.git/
+docs/
+tests/
+*.md
+docker-compose.yml
+.github/
+*:Zone.Identifier

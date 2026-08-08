@@ -1,0 +1,4 @@
+/target
+
+# Windows/WSL copy artefacts.
+*:Zone.Identifier

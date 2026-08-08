@@ -1,0 +1,76 @@
+[package]
+name = "simmer"
+version = "0.1.0"
+edition = "2021"
+# Never goes to crates.io. Also what tells cargo-deny this crate's missing
+# `license` field is deliberate rather than an oversight.
+publish = false
+
+# A library plus a thin binary, so the logic-heavy parts (config validation,
+# sender matching, and later the rewrite engine and reply mapping) are reachable
+# from integration tests in tests/ without spawning a process.
+[lib]
+name = "simmer"
+path = "src/lib.rs"
+
+# Binary is `server` to match every other hikari-systems Rust service, so the
+# Dockerfile, the HEALTHCHECK subcommand and the compose healthcheck are the
+# same shape here as everywhere else.
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+# Runtime. `rt-multi-thread` + `net` + `signal` because main owns a set of peer
+# tasks (SMTP listener, admin server, sweepers) joined under one shutdown.
+tokio = { version = "1", features = ["full"] }
+
+# Storage. `runtime-tokio-rustls` is deliberate and matches the house pattern:
+# it keeps openssl/pkg-config out of the build entirely, so the bookworm-slim
+# runtime image needs nothing beyond libc.
+sqlx = { version = "0.8", features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "uuid",
+    "chrono",
+    "migrate",
+] }
+
+# Config. SPEC.md §4 mandates YAML with ${ENV_VAR} interpolation, so we do NOT
+# use hs_utils::config's JSON layering here — see DECISIONS.md D-004.
+# serde_yaml is unmaintained (it is literally published as "0.9.34+deprecated");
+# serde_yaml_ng is the maintained continuation.
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+
+# Admin listener (§9). SPEC.md §12.1 suggests axum and nothing in the house
+# storage pattern reaches the HTTP layer — see DECISIONS.md D-003.
+axum = "0.8"
+serde_json = "1"
+
+# §9.5 structured JSON logging.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+anyhow = "1"
+thiserror = "2"
+
+# §5.1 allowed_cidrs.
+ipnet = "2"
+# §4.2 "a body_rewrites.pattern fails to compile" is a startup validation rule,
+# so the regex engine is needed in phase 1 even though §6.4 lands in phase 5.
+regex = "1"
+
+chrono = { version = "0.4", features = ["serde"] }
+
+# Only for healthcheck::check_subcommand, which makes
+# `HEALTHCHECK CMD ["/app/server","healthcheck"]` work in a runtime image with
+# no curl. No features: the db/web features pull in the actix + JSON-config
+# machinery this service deliberately does not use.
+hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.31.2", default-features = false }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "s"
