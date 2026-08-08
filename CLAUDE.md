@@ -39,6 +39,9 @@ through would emit under the wrong identity and corrupt the ramp.
 ## Build and run
 
 ```sh
+docker compose up -d simmer-db   # tests/quota*.rs need a real Postgres
+export DATABASE_URL=postgres://simmer:simmer@127.0.0.1:5433/simmer
+
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo deny check
@@ -54,8 +57,19 @@ src/config/mod.rs        the §4.1 schema; every struct is deny_unknown_fields
 src/config/validate.rs   §4.2 — accumulates ALL violations, never short-circuits
 src/config/interpolate.rs  ${ENV_VAR}, over the parsed tree not the raw text
 src/routing/sender_match.rs  §5.4 — wildcard precedence, first match wins
+src/smtp/session.rs      §5.2 state machine; PIPELINING means never drop buffered input
+src/smtp/reply.rs        EVERY reply Simmer can emit. Adding a 5xx here is a decision
+src/smtp/buffer.rs       §8.1 — transient, tmpfs above 1 MiB. Not a spool
+src/downstream/outcome.rs  §10.1 + D-008, as data. The §14.1 test lives in its tests
+src/downstream/client.rs   the outbound conversation; §10.2's ambiguity is in `deliver`
+src/relay.rs             decide → reserve → relay → commit/release (§7.4)
+src/quota/postgres.rs    the §7.4 protocol. The row lock is what makes it correct
+src/quota/day.rs         §7.2 elapsed-duration day index; NEVER calendar arithmetic
+src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve are ONE op
+src/metrics.rs           §9.1 counters; no exporter until phase 7
 src/db.rs                pool + migrations
 src/admin/               §9 control plane (phase 1: GET /health only)
+tests/support/mod.rs     the scripted fake downstream (§12.3)
 ```
 
 ## House pattern

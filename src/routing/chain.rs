@@ -1,0 +1,314 @@
+//! §3.2 step 3 — walk the chain, and take the reservation.
+//!
+//! ```text
+//! For each route:
+//!   a. If the route is paused (admin API, §9.3), skip.
+//!   b. If the route has a `recipient_frequency` constraint and this recipient is
+//!      at or over threshold within the window, skip. Evaluated **first**.
+//!   c. If the route is warming and has no remaining headroom for this domain
+//!      group today, skip.
+//!   d. Otherwise, attempt reservation (§7.4).
+//!   e. First route to reserve successfully is selected.
+//! ```
+//!
+//! Steps (c) and (d) are one operation here, not two. Checking headroom and then
+//! reserving would reintroduce the race §7.4 exists to close — the check has to
+//! happen *inside* the transaction that holds the row lock, so `reserve` returns
+//! either a reservation or [`SkipReason::Quota`].
+//!
+//! §3.3 governs what happens after: **no failover**. A route that reserves
+//! successfully and then fails downstream releases and reports; it does not fall
+//! through. Falling through "would silently emit a message under the wrong
+//! identity and corrupt both the ramp accounting and the reputation being built".
+
+use std::sync::Arc;
+
+use chrono::Utc;
+
+use crate::config::{Config, Route};
+use crate::metrics;
+use crate::quota::{
+    self,
+    store::{QuotaError, QuotaStore, ReserveRequest, Reserved},
+    Allowance, Reservation,
+};
+
+/// Why a route was passed over. §9.1's `simmer_route_skipped_total{route,reason}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// §3.2 3a — `POST /routes/{name}/pause`.
+    Paused,
+    /// §7.2 — `warmup.started` is in the future.
+    ///
+    /// Not one of §9.1's four enumerated reasons. Folding it into `quota` would
+    /// be a lie an operator would waste an afternoon on: "out of quota" and "has
+    /// not begun" call for opposite responses.
+    NotStarted,
+    /// §3.2 3c — no headroom for this domain group today.
+    Quota,
+    /// §3.2 3b — phase 6.
+    Frequency,
+    /// §6.7 with `preflight.strict: true` — phase 8.
+    Preflight,
+    /// The chain names a route that does not exist. §4.2 rejects this at
+    /// startup, so it is unreachable; skipping rather than panicking keeps a
+    /// configuration mistake from taking the process down.
+    Unknown,
+}
+
+impl SkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkipReason::Paused => "paused",
+            SkipReason::NotStarted => "not_started",
+            SkipReason::Quota => "quota",
+            SkipReason::Frequency => "frequency",
+            SkipReason::Preflight => "preflight",
+            SkipReason::Unknown => "unknown_route",
+        }
+    }
+}
+
+/// One route's verdict, for §9.5's "chain evaluation with skip reasons".
+#[derive(Debug, Clone)]
+pub struct Step {
+    pub route: String,
+    pub outcome: Result<(), SkipReason>,
+}
+
+/// A route selected and its quota reserved.
+///
+/// Holding one is an obligation: exactly one of [`commit`] or [`release`] must
+/// be called. §7.4 has no third outcome.
+pub struct Selected<'a> {
+    pub route: &'a Route,
+    pub domain_group: String,
+    pub day_index: i64,
+    pub reservation: Reservation,
+}
+
+/// The result of walking a chain.
+pub enum Walk<'a> {
+    Selected(Box<Selected<'a>>),
+    /// §3.2 step 4 — nothing was eligible. §10.3 decides the reply, and its
+    /// default is `451`.
+    Exhausted,
+}
+
+/// §3.2 step 3, for real: walk and reserve.
+pub async fn walk_and_reserve<'a>(
+    cfg: &'a Config,
+    store: &Arc<dyn QuotaStore>,
+    chain: &[String],
+    recipients: &[String],
+    correlation_id: &str,
+    evaluation: &mut Vec<Step>,
+) -> Result<Walk<'a>, QuotaError> {
+    let now = Utc::now();
+    let states = store.route_states().await?;
+
+    // §3.2: "Quota is decremented per message, by the recipient count, not per
+    // recipient" — one reservation of this magnitude (O-7).
+    let count = recipients.len().max(1) as i64;
+
+    // §3.2 step 2. Every recipient of one transaction shares a domain group
+    // while `single_recipient_only` holds; phase 9 splits when it does not.
+    let group = recipients
+        .first()
+        .and_then(|r| super::domain_group::resolve(cfg, r))
+        .or_else(|| cfg.catchall_group())
+        .map(|g| g.name.clone())
+        .unwrap_or_else(|| "catchall".to_string());
+
+    for name in chain {
+        let Some(route) = cfg.route(name) else {
+            record(evaluation, name, Err(SkipReason::Unknown));
+            continue;
+        };
+        let state = states.get(name).copied().unwrap_or_default();
+
+        // (a) paused.
+        if state.paused {
+            record(evaluation, name, Err(SkipReason::Paused));
+            continue;
+        }
+
+        // (b) recipient frequency — phase 6. Evaluated first among the
+        // *eligibility* checks per §3.2 3b, hence its position above the quota
+        // check rather than below it.
+
+        let day_index = quota::day::for_route(route, now);
+        let allowance = quota::allowance_for(route, &group, day_index, state);
+
+        if allowance == Allowance::NotStarted {
+            record(evaluation, name, Err(SkipReason::NotStarted));
+            continue;
+        }
+
+        // (c) + (d) together, under one row lock.
+        let request = ReserveRequest {
+            route: name.clone(),
+            domain_group: group.clone(),
+            day_index,
+            allowance: allowance.as_column(),
+            count,
+            correlation_id: correlation_id.to_string(),
+            expires_at: now
+                + chrono::Duration::from_std(quota::reservation_expiry(route, recipients.len()))
+                    .unwrap_or_else(|_| chrono::Duration::seconds(600)),
+        };
+
+        match store.reserve(&request).await? {
+            Reserved::Taken(reservation) => {
+                record(evaluation, name, Ok(()));
+                metrics::warmup_day(name, day_index);
+                if let Allowance::Limited(a) = allowance {
+                    metrics::quota_allowance(name, &group, a as f64);
+                } else {
+                    metrics::quota_allowance(name, &group, f64::INFINITY);
+                }
+                return Ok(Walk::Selected(Box::new(Selected {
+                    route,
+                    domain_group: group,
+                    day_index,
+                    reservation,
+                })));
+            }
+            Reserved::NoHeadroom { usage } => {
+                tracing::debug!(
+                    route = %name,
+                    domain_group = %group,
+                    day_index,
+                    allowance = ?usage.effective_allowance(),
+                    committed = usage.committed,
+                    reserved = usage.reserved,
+                    "route has no headroom today"
+                );
+                record(evaluation, name, Err(SkipReason::Quota));
+            }
+        }
+    }
+
+    Ok(Walk::Exhausted)
+}
+
+/// The §5.4 early check: is anything in this chain plausibly eligible?
+///
+/// Read-only and takes no reservation, so it is safe to run at `RCPT TO` where
+/// the recipient count is not yet final. §5.4: "When all rules use `envelope`,
+/// Simmer should decide early and reject at `RCPT TO` to avoid a wasted body
+/// transfer."
+///
+/// It can be wrong in one direction only — it may say "eligible" for a chain
+/// that is exhausted by the time the body arrives, because another session took
+/// the last slot in between. That is harmless: the authoritative check is the
+/// reservation, and the message is refused at the final dot instead. It must
+/// never be wrong the other way, which is why it asks for headroom of 1 rather
+/// than for a guess at the eventual recipient count.
+pub async fn any_eligible(
+    cfg: &Config,
+    store: &Arc<dyn QuotaStore>,
+    chain: &[String],
+    recipient: &str,
+) -> Result<bool, QuotaError> {
+    let now = Utc::now();
+    let states = store.route_states().await?;
+    let group = super::domain_group::resolve(cfg, recipient)
+        .map(|g| g.name.clone())
+        .unwrap_or_else(|| "catchall".to_string());
+
+    for name in chain {
+        let Some(route) = cfg.route(name) else {
+            continue;
+        };
+        let state = states.get(name).copied().unwrap_or_default();
+        if state.paused {
+            continue;
+        }
+
+        let day_index = quota::day::for_route(route, now);
+        match quota::allowance_for(route, &group, day_index, state) {
+            Allowance::NotStarted => continue,
+            Allowance::Unlimited => return Ok(true),
+            Allowance::Limited(a) => {
+                let usage = store.usage(name, &group, day_index).await?;
+                // A row that does not exist yet reads as all-zero, so a fresh
+                // day is eligible without a write.
+                let effective = usage.effective_allowance().unwrap_or(a);
+                if effective - usage.committed - usage.reserved >= 1 {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn record(evaluation: &mut Vec<Step>, route: &str, outcome: Result<(), SkipReason>) {
+    if let Err(reason) = outcome {
+        metrics::route_skipped(route, reason.as_str());
+    }
+    evaluation.push(Step {
+        route: route.to_string(),
+        outcome,
+    });
+}
+
+/// Render a chain evaluation for §9.5's log line.
+pub fn render(evaluation: &[Step]) -> String {
+    evaluation
+        .iter()
+        .map(|s| match s.outcome {
+            Ok(()) => format!("{}=selected", s.route),
+            Err(r) => format!("{}={}", s.route, r.as_str()),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_reasons_have_stable_metric_labels() {
+        // These are Prometheus label values (§9.1). Renaming one silently splits
+        // a time series, so they are pinned here rather than left to the enum.
+        assert_eq!(SkipReason::Paused.as_str(), "paused");
+        assert_eq!(SkipReason::Quota.as_str(), "quota");
+        assert_eq!(SkipReason::Frequency.as_str(), "frequency");
+        assert_eq!(SkipReason::Preflight.as_str(), "preflight");
+        assert_eq!(SkipReason::NotStarted.as_str(), "not_started");
+    }
+
+    #[test]
+    fn renders_a_chain_evaluation_for_the_log() {
+        let steps = vec![
+            Step {
+                route: "warming".into(),
+                outcome: Err(SkipReason::Quota),
+            },
+            Step {
+                route: "overflow".into(),
+                outcome: Ok(()),
+            },
+        ];
+        assert_eq!(render(&steps), "warming=quota,overflow=selected");
+    }
+
+    #[test]
+    fn renders_an_exhausted_chain() {
+        let steps = vec![
+            Step {
+                route: "a".into(),
+                outcome: Err(SkipReason::Paused),
+            },
+            Step {
+                route: "b".into(),
+                outcome: Err(SkipReason::NotStarted),
+            },
+        ];
+        assert_eq!(render(&steps), "a=paused,b=not_started");
+    }
+}

@@ -13,5 +13,11 @@
 pub mod admin;
 pub mod config;
 pub mod db;
+pub mod downstream;
 pub mod logging;
+pub mod metrics;
+pub mod models;
+pub mod quota;
+pub mod relay;
 pub mod routing;
+pub mod smtp;

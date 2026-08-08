@@ -314,6 +314,18 @@ pub struct Downstream {
     pub pool: PoolConfig,
     #[serde(default)]
     pub timeouts: Option<DownstreamTimeouts>,
+
+    /// Does this downstream support `SMTPUTF8` (RFC 6531)?
+    ///
+    /// §5.2 says `EHLO` advertises `SMTPUTF8` unconditionally, but Simmer cannot
+    /// honour that promise for a downstream that does not implement it, and it
+    /// cannot discover which downstream it will use until after the client has
+    /// committed to an address — with `match_on: from_header` the route is not
+    /// known until the final dot. Declaring it here is the only way to answer at
+    /// `EHLO` time. Default `false`, so the capability is never claimed by
+    /// accident. See `DECISIONS.md` D-018.
+    #[serde(default)]
+    pub smtputf8: bool,
 }
 
 /// §8.2.
@@ -674,6 +686,42 @@ impl Config {
 
     pub fn catchall_group(&self) -> Option<&DomainGroup> {
         self.domain_groups.iter().find(|g| g.is_catchall())
+    }
+
+    /// Every route a message could actually be sent through: the union of all
+    /// sender-rule chains and `default_chain`.
+    ///
+    /// A route defined in `routes` but named by no chain is dead configuration
+    /// (there is no hot reload, §2.2, so nothing can bring it to life), and it
+    /// must not get a vote in [`advertise_smtputf8`](Self::advertise_smtputf8).
+    pub fn reachable_routes(&self) -> impl Iterator<Item = &Route> {
+        let names: std::collections::BTreeSet<&str> = self
+            .senders
+            .iter()
+            .flat_map(|s| s.chain.iter())
+            .chain(self.default_chain.iter().flatten())
+            .map(String::as_str)
+            .collect();
+        self.routes
+            .iter()
+            .filter(move |r| names.contains(r.name.as_str()))
+    }
+
+    /// Whether `EHLO` may advertise `SMTPUTF8` (§5.2, D-018).
+    ///
+    /// Only when **every** reachable route can carry it. Anything less would let
+    /// the quota ramp steer a UTF-8 message onto a route that cannot deliver it,
+    /// which is the mid-relay discovery O-10 exists to prevent — and which route
+    /// a message takes is not knowable at `EHLO` time.
+    pub fn advertise_smtputf8(&self) -> bool {
+        let mut any = false;
+        for route in self.reachable_routes() {
+            any = true;
+            if !route.downstream.smtputf8 {
+                return false;
+            }
+        }
+        any
     }
 }
 

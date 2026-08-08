@@ -1,4 +1,6 @@
-//! §3.2 route selection. Phase 1 provides sender matching only (§5.4);
-//! domain-group resolution and the chain walk land in phase 3.
+//! §3.2 route selection: match a sender rule (§5.4), resolve the recipient's
+//! domain group (step 2), then walk the chain reserving quota (step 3).
 
+pub mod chain;
+pub mod domain_group;
 pub mod sender_match;

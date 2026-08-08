@@ -1,0 +1,482 @@
+//! Where a buffered message becomes a downstream conversation.
+//!
+//! The three steps O-1 asked to be kept apart:
+//!
+//! 1. **Decide** — resolve the incoming identity and match a sender rule (§3.2
+//!    steps 1–2).
+//! 2. **Reserve** — §7.4 phase 1, walking the chain (§3.2 step 3). This happens
+//!    **immediately before** the downstream conversation, never before `DATA`, so
+//!    a reservation cannot outlive §7.4's expiry while a body transfers.
+//! 3. **Relay, then commit or release** — §7.4 phases 2 and 3, with the §10.1
+//!    mapping deciding which.
+//!
+//! §3.3 governs the seam between 2 and 3: **no failover**. A route that reserved
+//! and then failed downstream releases and reports. It does not fall through to
+//! the next link, because that would emit under the wrong identity and corrupt
+//! both the ramp accounting and the reputation being built.
+
+use std::sync::Arc;
+
+use crate::config::Config;
+use crate::downstream::{self, TlsConfigs};
+use crate::metrics;
+use crate::quota::{self, QuotaStore, ReservationRegistry};
+use crate::routing::chain::{self, Walk};
+use crate::routing::sender_match::{self, Senders};
+use crate::smtp::reply::{self, Reply};
+
+/// Everything a session needs to relay, assembled once at startup.
+#[derive(Clone)]
+pub struct Engine {
+    pub config: Arc<Config>,
+    pub tls: Arc<TlsConfigs>,
+    /// §11 — the storage layer behind its trait.
+    pub quota: Arc<dyn QuotaStore>,
+    /// §10.4 — reservations this process is holding.
+    pub registry: ReservationRegistry,
+}
+
+/// Why no route could be selected. Each maps to a specific reply, and the
+/// mapping is §14.1-sensitive, so it is spelled out rather than inferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectError {
+    /// §3.2 step 1 with `strict_senders: true`.
+    StrictSenderRejected { domain: String },
+    /// §5.4 — `From:` absent or unparseable when `match_on` requires it.
+    MalformedFromHeader,
+    /// §3.2 step 4 / §10.3.
+    ChainExhausted,
+    /// §7.5 — the quota store is unreachable and `fail_closed` is set. "A quota
+    /// enforcer that stops enforcing under failure provides no guarantee at
+    /// all."
+    QuotaUnavailable,
+}
+
+impl SelectError {
+    pub fn to_reply(&self, cfg: &Config) -> Reply {
+        match self {
+            SelectError::StrictSenderRejected { .. } => reply::sender_not_configured(),
+            SelectError::MalformedFromHeader => reply::malformed_from_header(),
+            SelectError::ChainExhausted => reply::no_eligible_route(matches!(
+                cfg.exhausted_chain_reply,
+                crate::config::ExhaustedChainReply::Permanent
+            )),
+            // §7.5's own wording. Temporary, necessarily: the recipient is fine,
+            // Simmer is not.
+            SelectError::QuotaUnavailable => Reply::new(451, "4.3.0 quota service unavailable"),
+        }
+    }
+}
+
+/// §3.2 steps 1–2: match a sender rule and produce the chain to walk.
+///
+/// Pure and synchronous. Splitting it out from the chain walk is what lets the
+/// §5.4 early check and the final-dot path share exactly one implementation of
+/// the sender policy.
+pub fn resolve_chain<'a>(cfg: &'a Config, senders: &Senders) -> Result<&'a [String], SelectError> {
+    // §5.4: a rule that tests the From: header needs one to exist.
+    //
+    // The check is "does *any* rule need it", not "does the rule that would have
+    // matched need it" — a rule cannot be known to match until the header it
+    // tests has been parsed, so the narrower reading is unimplementable
+    // (D-028).
+    let needs_from_header = cfg
+        .senders
+        .iter()
+        .any(|r| !matches!(r.match_on, crate::config::MatchOn::Envelope));
+    if needs_from_header && senders.from_header.is_none() {
+        return Err(SelectError::MalformedFromHeader);
+    }
+
+    if senders.disagree() {
+        // §5.4: log both values and count it. Often the first sign that an
+        // application is half-migrated.
+        tracing::warn!(
+            envelope = senders.envelope.as_deref().unwrap_or("<>"),
+            from_header = senders.from_header.as_deref().unwrap_or(""),
+            "envelope and header senders disagree"
+        );
+        metrics::sender_mismatch();
+    }
+
+    match sender_match::match_sender(cfg, senders) {
+        sender_match::Match::Rule { rule, .. } => Ok(&rule.chain),
+        sender_match::Match::Unmatched => {
+            let domain = senders
+                .from_header
+                .as_deref()
+                .or(senders.envelope.as_deref())
+                .and_then(|a| a.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase()))
+                .unwrap_or_default();
+
+            if cfg.strict_senders {
+                return Err(SelectError::StrictSenderRejected { domain });
+            }
+
+            // §14.2: "a typo in a sender rule sends unwarmed traffic at full
+            // volume via the established identity. The WARN and counter must
+            // actually be alerted on."
+            tracing::warn!(
+                domain = %domain,
+                "sender matched no rule; falling back to default_chain"
+            );
+            metrics::unmatched_sender(&domain);
+
+            // O-6: walk it normally, like any other chain.
+            Ok(cfg
+                .default_chain
+                .as_deref()
+                // §4.2 guarantees this exists whenever strict_senders is false.
+                .unwrap_or(&[]))
+        }
+    }
+}
+
+/// The §5.4 early check, run at `RCPT TO` when every rule is envelope-only.
+///
+/// Takes no reservation (O-1). Returns the sender-policy verdict immediately and
+/// only then asks the store whether anything in the chain has headroom.
+pub async fn check_early(
+    engine: &Engine,
+    senders: &Senders,
+    recipient: &str,
+) -> Result<(), SelectError> {
+    let chain = resolve_chain(&engine.config, senders)?;
+
+    match chain::any_eligible(&engine.config, &engine.quota, chain, recipient).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SelectError::ChainExhausted),
+        Err(e) => Err(quota_failure(&engine.config, e, "early eligibility check")),
+    }
+}
+
+/// §7.5 — turn a storage failure into the configured posture.
+fn quota_failure(cfg: &Config, e: quota::QuotaError, during: &str) -> SelectError {
+    if cfg.database.fail_closed {
+        tracing::error!(error = %e, during, "quota store unavailable; failing closed");
+        metrics::quota_unavailable("-");
+        SelectError::QuotaUnavailable
+    } else {
+        // Explicitly opted out of §7.5's default. Loud, because it means the
+        // ramp is not being enforced right now.
+        tracing::error!(
+            error = %e,
+            during,
+            "quota store unavailable and fail_closed is false; proceeding WITHOUT \
+             quota enforcement. The warm-up ramp is not being applied."
+        );
+        SelectError::ChainExhausted
+    }
+}
+
+/// The whole of step 2 and step 3: reserve, relay, then commit or release.
+///
+/// Returns the reply for the client. Every path through this function resolves
+/// the reservation exactly once — that is the invariant §7.4 rests on, and it is
+/// why commit and release are not exposed separately to the session.
+pub async fn reserve_relay_commit(
+    engine: &Engine,
+    senders: &Senders,
+    message: Message<'_>,
+    correlation_id: &str,
+) -> Reply {
+    let cfg = &engine.config;
+
+    let chain = match resolve_chain(cfg, senders) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!(correlation_id, reason = ?e, "no route selected");
+            return e.to_reply(cfg);
+        }
+    };
+
+    // -- §7.4 phase 1 -------------------------------------------------
+    let mut evaluation = Vec::new();
+    let selected = match chain::walk_and_reserve(
+        cfg,
+        &engine.quota,
+        chain,
+        message.recipients,
+        correlation_id,
+        &mut evaluation,
+    )
+    .await
+    {
+        Ok(Walk::Selected(s)) => s,
+        Ok(Walk::Exhausted) => {
+            // §10.3, and the whole of §14.1: `451` by default, because a `550`
+            // here would permanently suppress a deliverable recipient in systems
+            // that outlive Simmer by years.
+            tracing::info!(
+                correlation_id,
+                chain = %chain::render(&evaluation),
+                "no eligible route in chain"
+            );
+            return SelectError::ChainExhausted.to_reply(cfg);
+        }
+        Err(e) => {
+            let err = quota_failure(cfg, e, "reservation");
+            return err.to_reply(cfg);
+        }
+    };
+
+    engine.registry.insert(&selected.reservation);
+
+    tracing::info!(
+        correlation_id,
+        route = %selected.route.name,
+        domain_group = %selected.domain_group,
+        day_index = selected.day_index,
+        reservation = %selected.reservation.id,
+        chain = %chain::render(&evaluation),
+        envelope_from = message.mail_from.unwrap_or("<>"),
+        recipients = message.recipients.len(),
+        bytes = message.body.len(),
+        "relaying"
+    );
+
+    // -- §7.4 phase 2 -------------------------------------------------
+    let started = std::time::Instant::now();
+    let result = downstream::relay(
+        selected.route,
+        &engine.tls,
+        &cfg.server.hostname,
+        &downstream::Message {
+            mail_from: message.mail_from,
+            recipients: message.recipients,
+            body: message.body,
+            smtputf8: message.smtputf8,
+            body_8bitmime: message.body_8bitmime,
+        },
+    )
+    .await;
+    let elapsed = started.elapsed();
+    metrics::downstream_latency(&selected.route.name, elapsed.as_secs_f64());
+
+    let outcome = match &result {
+        Ok(d) => {
+            tracing::info!(
+                correlation_id,
+                route = %selected.route.name,
+                code = d.code,
+                latency_ms = elapsed.as_millis() as u64,
+                "downstream accepted the message"
+            );
+            downstream::outcome::delivered(&selected.route.name, d)
+        }
+        Err(e) => downstream::outcome::failed(&selected.route.name, e),
+    };
+
+    // -- §7.4 phase 3 -------------------------------------------------
+    //
+    // "On downstream 2xx, move the count from reserved to committed... On any
+    // failure, decrement reserved and delete the reservation." `outcome.commit`
+    // is the §10.1 table's answer, carried since phase 2.
+    let store = Arc::clone(&engine.quota);
+    let resolution = if outcome.commit {
+        store.commit(&selected.reservation).await
+    } else {
+        store.release(&selected.reservation).await
+    };
+    engine.registry.remove(selected.reservation.id);
+
+    if let Err(e) = resolution {
+        // The message's fate is already decided and already correct; only the
+        // accounting failed. Log loudly — a committed send that did not increment
+        // the counter means the ramp is under-counting, and the sweeper will
+        // eventually release the reservation as if the send had failed.
+        tracing::error!(
+            correlation_id,
+            route = %selected.route.name,
+            reservation = %selected.reservation.id,
+            committed = outcome.commit,
+            error = %e,
+            "failed to resolve the quota reservation; ramp accounting may be short"
+        );
+    } else if outcome.commit {
+        // §9.1 gauges, from the row we just moved.
+        if let Ok(usage) = store
+            .usage(
+                &selected.reservation.route,
+                &selected.reservation.domain_group,
+                selected.reservation.day_index,
+            )
+            .await
+        {
+            metrics::quota_committed(
+                &selected.route.name,
+                &selected.domain_group,
+                usage.committed as f64,
+            );
+            metrics::quota_reserved(
+                &selected.route.name,
+                &selected.domain_group,
+                usage.reserved as f64,
+            );
+        }
+    }
+
+    metrics::message(&selected.route.name, outcome.result);
+    outcome.reply
+}
+
+/// What to relay. Distinct from [`downstream::Message`] so the session does not
+/// have to know the outbound leg's types.
+pub struct Message<'a> {
+    pub mail_from: Option<&'a str>,
+    pub recipients: &'a [String],
+    pub body: &'a [u8],
+    pub smtputf8: bool,
+    pub body_8bitmime: bool,
+}
+
+/// §10.4 — release whatever this process is still holding.
+pub async fn release_outstanding(engine: &Engine) {
+    let outstanding = engine.registry.drain();
+    if outstanding.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        count = outstanding.len(),
+        "releasing reservations held by in-flight sessions"
+    );
+
+    for reservation in &outstanding {
+        if let Err(e) = engine.quota.release(reservation).await {
+            // The sweeper is the backstop; it will pick this up at `expires_at`.
+            tracing::error!(
+                reservation = %reservation.id,
+                error = %e,
+                "failed to release a reservation at shutdown; the sweeper will collect it"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CFG: &str = r#"
+server:
+  listen: "127.0.0.1:25"
+  hostname: simmer.test
+  max_message_bytes: 1024
+  max_recipients: 10
+  max_concurrent_sessions: 4
+  allowed_cidrs: ["10.0.0.0/8"]
+  timeouts: { command: 30s, data: 300s, session: 600s }
+  auth: { required: false, allow_insecure_auth: true }
+database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
+admin: { listen: "127.0.0.1:8080", auth_token: "t" }
+domain_groups:
+  - { name: catchall, domains: ["*"] }
+senders:
+  - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
+default_chain: [overflow]
+routes:
+  - name: warming
+    downstream:
+      host: warm.example
+      port: 587
+      pool: { max_connections: 1, idle_ttl: 60s, max_messages_per_connection: 10 }
+    identity: { envelope_from: "b@newbrand.com" }
+    warmup:
+      started: "2026-01-01T00:00:00Z"
+      schedule: { default: [10] }
+  - name: overflow
+    overflow: true
+    downstream:
+      host: over.example
+      port: 587
+      pool: { max_connections: 1, idle_ttl: 60s, max_messages_per_connection: 10 }
+    identity: { envelope_from: "b@established.com" }
+"#;
+
+    fn config(extra: &[(&str, &str)]) -> Config {
+        let mut yaml = CFG.to_string();
+        for (k, v) in extra {
+            yaml.push_str(&format!("{k}: {v}\n"));
+        }
+        crate::config::from_str(&yaml, "test").expect("fixture is valid")
+    }
+
+    #[test]
+    fn a_matched_sender_yields_its_own_chain() {
+        let cfg = config(&[]);
+        let chain = resolve_chain(&cfg, &Senders::new(Some("a@oldbrand.com"), None)).unwrap();
+        assert_eq!(chain, ["warming".to_string(), "overflow".to_string()]);
+    }
+
+    #[test]
+    fn an_unmatched_sender_falls_to_the_default_chain() {
+        let cfg = config(&[]);
+        let chain = resolve_chain(&cfg, &Senders::new(Some("a@elsewhere.com"), None)).unwrap();
+        assert_eq!(chain, ["overflow".to_string()]);
+    }
+
+    #[test]
+    fn strict_senders_rejects_an_unmatched_sender() {
+        let cfg = config(&[("strict_senders", "true")]);
+        assert_eq!(
+            resolve_chain(&cfg, &Senders::new(Some("a@elsewhere.com"), None)).err(),
+            Some(SelectError::StrictSenderRejected {
+                domain: "elsewhere.com".into()
+            })
+        );
+    }
+
+    #[test]
+    fn the_strict_sender_rejection_is_the_one_permitted_550() {
+        // §10.3: "a policy statement about the *sender*, will not trigger
+        // recipient suppression, and should be loud".
+        let cfg = config(&[("strict_senders", "true")]);
+        let err = SelectError::StrictSenderRejected {
+            domain: "x.com".into(),
+        };
+        assert_eq!(err.to_reply(&cfg).code, 550);
+    }
+
+    #[test]
+    fn chain_exhaustion_defaults_to_451_not_550() {
+        let cfg = config(&[]);
+        assert_eq!(SelectError::ChainExhausted.to_reply(&cfg).code, 451);
+    }
+
+    #[test]
+    fn chain_exhaustion_honours_an_explicit_550_policy() {
+        let cfg = config(&[("exhausted_chain_reply", "\"550\"")]);
+        assert_eq!(SelectError::ChainExhausted.to_reply(&cfg).code, 550);
+    }
+
+    #[test]
+    fn quota_unavailability_is_451_never_550() {
+        // §7.5's reply, and §14.1's reasoning: Simmer's database being down says
+        // nothing permanent about the recipient.
+        let cfg = config(&[]);
+        let r = SelectError::QuotaUnavailable.to_reply(&cfg);
+        assert_eq!(r.code, 451);
+        assert!(r.to_wire().contains("4.3.0"));
+    }
+
+    #[test]
+    fn a_missing_from_header_is_only_fatal_when_a_rule_needs_it() {
+        let cfg = config(&[]);
+        assert!(resolve_chain(&cfg, &Senders::new(Some("a@oldbrand.com"), None)).is_ok());
+
+        let mut cfg = config(&[]);
+        cfg.senders[0].match_on = crate::config::MatchOn::FromHeader;
+        assert_eq!(
+            resolve_chain(&cfg, &Senders::new(Some("a@oldbrand.com"), None)).err(),
+            Some(SelectError::MalformedFromHeader)
+        );
+    }
+
+    #[test]
+    fn a_null_envelope_sender_still_routes() {
+        let cfg = config(&[]);
+        let chain = resolve_chain(&cfg, &Senders::new(None, None)).unwrap();
+        assert_eq!(chain, ["overflow".to_string()]);
+    }
+}

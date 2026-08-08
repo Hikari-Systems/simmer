@@ -115,6 +115,12 @@ routes:
         connect: 10s
         command: 30s
         data: 120s
+      # Does this provider implement RFC 6531? EHLO advertises SMTPUTF8 only
+      # when EVERY reachable route says true, because the ramp decides which
+      # route a message takes long after EHLO. Left false so the capability is
+      # never claimed by accident — a UTF-8 address is then refused at MAIL FROM
+      # rather than discovered mid-relay. See DECISIONS.md D-018.
+      smtputf8: false
     identity:
       envelope_from: "bounce+{{original.envelope_from.local}}@newbrand.com"
       set_headers:
@@ -168,6 +174,7 @@ routes:
         username: "apikey"
         password: "${SENDGRID_KEY}"
       pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
+      smtputf8: false           # see the warming route above and D-018
     identity:
       # §14.4: rewriting From: to an established domain spends that domain's
       # reputation on new-brand traffic. A dedicated subdomain contains the blast

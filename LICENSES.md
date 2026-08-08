@@ -135,6 +135,52 @@ one-line change that would benefit every service in the estate, and would let th
 
 ---
 
+## 4. Phase 2 additions
+
+Checked **across every published version**, not just the pinned one, before
+adoption. Verified 2026-08-07 against the crates.io API.
+
+| Crate | Pinned | Licence | Versions checked | For |
+|---|---|---|---|---|
+| `mail-parser` | 0.11.5 | `Apache-2.0 OR MIT` | all 36 | `From:` extraction (D-022) |
+| `argon2` | 0.5.3 | `MIT OR Apache-2.0` | all | §5.3 |
+| `base64` | 0.22.1 | `MIT OR Apache-2.0` | all | AUTH PLAIN/LOGIN payloads |
+| `tempfile` | 3.27.0 | `MIT OR Apache-2.0` | all with metadata | §8.1 spill |
+| `uuid` | 1.24.0 | `Apache-2.0 OR MIT` | all with metadata | §9.5 correlation_id |
+| `rustls` | 0.23.43 | `Apache-2.0 OR ISC OR MIT` | all | §8.2 |
+| `tokio-rustls` | 0.26.4 | `MIT OR Apache-2.0` | all | §8.2 |
+| `rustls-native-certs` | 0.8.4 | `Apache-2.0 OR ISC OR MIT` | all | §8.2 platform root store |
+| `metrics` | 0.24.6 | `MIT` | all | §9.1 (D-021) |
+
+No copyleft, so §1's "stop and ask before taking the dependency" clause was not
+reached. The oldest `tempfile` and `uuid` releases predate crates.io licence
+metadata and report none; every version this century declares a permissive
+licence, and the pinned ones are in the table.
+
+`mail-parser` is the one the prompt's warning was aimed at, and §1 already
+recorded the finding: the AGPL association in this ecosystem is with
+`stalwart-mail`, the mail *server*, which Simmer does not depend on.
+
+**`rustls` uses the `ring` provider, not the default `aws-lc-rs`.** Not a licence
+decision: `aws-lc-rs` needs cmake and a C toolchain in the builder image, and
+sqlx already pulls rustls with `ring` through `runtime-tokio-rustls`, so this
+keeps one crypto provider in the graph instead of two.
+
+Still not adopted: `mail-send` and `lettre`, for the reasons in §1 — §10.2's
+final-dot ambiguity requires distinguishing "no reply was read" from "an error
+occurred", which client crates normalise into one error type.
+
+### Phase 3
+
+| Crate | Pinned | Licence | Versions checked | For |
+|---|---|---|---|---|
+| `async-trait` | 0.1.91 | `MIT OR Apache-2.0` | all | §11's storage trait, held as `Arc<dyn QuotaStore>` |
+
+Taken because §11 asks the storage layer to sit behind a trait and `async fn` in
+a trait is not yet dyn-compatible. Droppable the moment it is.
+
+---
+
 ## 3. Direct dependencies, as resolved
 
 | Crate | Version | Licence |

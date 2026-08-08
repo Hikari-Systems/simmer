@@ -63,6 +63,62 @@ regex = "1"
 
 chrono = { version = "0.4", features = ["serde"] }
 
+# --- phase 2 -------------------------------------------------------------
+# Licences verified across every published version before adoption, per the
+# kickoff prompt. See LICENSES.md §4.
+
+# §5.4 routing on `match_on: from_header` needs the first From: address before a
+# route can be picked, and §5.4 also owes a `550 5.6.0 malformed From header`.
+# Hand-rolling an RFC 5322 address parser for that is where subtle bugs live.
+# Header extraction only in phase 2; the rewrite engine (phase 4) is what this
+# crate is really here for. `Apache-2.0 OR MIT` for all 36 published versions.
+mail-parser = "0.11"
+
+# §5.3 — credentials are argon2id hashes, compared in constant time.
+argon2 = "0.5"
+
+# AUTH PLAIN / LOGIN payloads (§5.3).
+base64 = "0.22"
+
+# §8.1 — the DATA buffer spills above 1 MiB. `tempfile()` hands back an already
+# unlinked file, so §8.1's "deleted when the session ends" is the OS's job and
+# survives a panic between here and the end of the session.
+tempfile = "3"
+
+# §9.5 correlation_id.
+uuid = { version = "1", features = ["v4"] }
+
+# §8.2 outbound TLS. `ring` rather than the default `aws-lc-rs`: aws-lc-rs wants
+# cmake and a C toolchain in the builder image, and sqlx already pulls rustls
+# with ring through `runtime-tokio-rustls`, so this keeps one provider in the
+# graph instead of two.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+# §8.2: "rustls with the platform root store". The runtime image installs
+# ca-certificates for exactly this.
+rustls-native-certs = "0.8"
+
+# §9.1 counters. With no recorder installed these compile to no-ops; phase 7
+# adds `metrics-exporter-prometheus` and nothing here moves. See DECISIONS.md
+# D-021.
+metrics = "0.24"
+
+# --- phase 3 -------------------------------------------------------------
+
+# §11: "The storage layer sits behind a trait so the concrete backend can be
+# substituted." That trait is held as `Arc<dyn QuotaStore>`, and `async fn` in a
+# trait is not yet dyn-compatible. `MIT OR Apache-2.0`, every published version.
+async-trait = "0.1"
+
 # Only for healthcheck::check_subcommand, which makes
 # `HEALTHCHECK CMD ["/app/server","healthcheck"]` work in a runtime image with
 # no curl. No features: the db/web features pull in the actix + JSON-config

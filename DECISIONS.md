@@ -294,6 +294,294 @@ by name in `deny.toml` until then.*
 
 ---
 
+## Phase 2
+
+### D-018 — `SMTPUTF8` is advertised only when every reachable route declares it (settles O-10)
+
+**Spec:** §5.2 — "`EHLO` advertises exactly: `PIPELINING`, `8BITMIME`,
+`SMTPUTF8`, `SIZE <max_message_bytes>`, and `AUTH PLAIN LOGIN` when auth is
+enabled."
+
+**Problem:** Simmer cannot honour that promise for a downstream that does not
+implement RFC 6531, and it cannot know which downstream a message will use at
+`EHLO` time — with `match_on: from_header` the route is not chosen until the
+final dot. O-1's working assumption ("reject `550 5.6.7` at `MAIL FROM` if the
+selected route's downstream does not advertise it") therefore has nothing to
+decide against at the moment it needs to decide.
+
+**Decision:** a new per-route key `downstream.smtputf8: bool`, default `false`.
+`EHLO` advertises `SMTPUTF8` only when **every reachable route** — the union of
+all sender-rule chains and `default_chain` — declares `true`. A route defined in
+`routes` but named by no chain does not get a vote, because §2.2 rules out hot
+reload so nothing can bring it into service.
+
+Three failure points follow, and each is answered where it can be answered
+cheaply:
+
+| Condition | Reply | Where |
+|---|---|---|
+| UTF-8 address or `SMTPUTF8` parameter, capability not advertised | `550 5.6.7` | `MAIL FROM` / `RCPT TO` |
+| Configuration claims `smtputf8: true`, downstream's `EHLO` disagrees | `451 4.3.5` + `ERROR` + `simmer_downstream_config_error_total{route,stage="capability"}` | before the downstream envelope |
+| Same, for `8BITMIME` | as above | as above |
+
+**Why `550` is right for the first row, despite §14.1.** Apply §10.3's own test:
+were Simmer removed, the client would talk to the same downstream, which does not
+implement RFC 6531 either, and would get the same permanent refusal. The reply is
+not an artefact of Simmer's presence, so it does not distort the client's view of
+the world. The second row is the opposite case — a configuration fault of ours —
+and takes `451` and the D-008 counter accordingly.
+
+**Why not advertise unconditionally and `451` on shortfall.** That is purer
+against §14.1 but converts a permanent misconfiguration into a message that
+retries forever and never lands. Being honest at `EHLO` costs one config key.
+
+`8BITMIME` gets only the second half of this treatment: advertised
+unconditionally per §5.2, because it is near-universal and does not justify a
+second key.
+
+*Divergence from §5.2's "advertises exactly" is confined to making one entry
+conditional. Nothing is added to the list.*
+
+### D-019 — Route selection and reservation are separated; no connection pool in phase 2 (settles O-1)
+
+**Spec:** §6.1 orders reservation after `DATA`; §5.4 says decide at `RCPT TO`
+when all rules are envelope-only. §7.4's reservation expiry does not budget for a
+body transfer.
+
+**Decision:** confirmed as proposed. `src/relay.rs` has three steps —
+**decide**, *(phase 3)* **reserve**, **relay** — and the reservation goes
+immediately before the downstream conversation, so it never spans `DATA`.
+Eligibility is evaluated at `RCPT TO` when `can_decide_at_rcpt()` holds, and at
+the final dot otherwise.
+
+Phase 2 has no quota, so "first eligible route in the chain" degenerates to
+`chain[0]`; phase 3 replaces that one expression with the §3.2 step 3 walk and
+inserts `reserve()` at the marked seam. Both decision points are already wired
+and tested.
+
+**Also decided:** §8.3's connection pool is **not** in phase 2. One connection
+per message: connect, `EHLO`, `STARTTLS`, `AUTH`, envelope, `DATA`, `QUIT`.
+§13.10 calls pooling a *refinement*, and the conversation is written against an
+owned `Stream` so the pool wraps `client::relay` in phase 10 without changing it.
+
+### D-020 — Line-length limits, and closing the connection on an oversized body
+
+**Spec:** silent on line length. §5.5 gives `552 5.3.4` for exceeding
+`max_message_bytes` but not what to do with the rest of the transfer.
+
+**Decision:**
+
+- Command lines are capped at 4096 octets (RFC 5321 §4.5.3.1 requires 512), and
+  `DATA` lines at 65536 (RFC 5321 requires 1000). Exceeding the command cap is
+  `500 5.5.2 line too long` and the session continues.
+- Bare `LF` is normalised to `CRLF`, and the buffer stores the **unstuffed**
+  canonical message. Re-stuffing happens on transmit.
+- `MAIL FROM ... SIZE=n` is honoured against `max_message_bytes` and refused
+  `552` before the body is transferred.
+- A body that exceeds `max_message_bytes` mid-transfer gets `552` and the
+  connection is **closed**.
+
+**Why close.** Staying in step would mean reading and discarding an unbounded
+remainder — the exact denial of service the limit exists to prevent. RFC 5321
+permits termination, and it is what a real MTA does. This is the one place phase
+2 does not honour RFC 2920's "keep answering".
+
+**Why the caps at all** (same grounds as D-015): `max_message_bytes` governs only
+`DATA`, so without a command-line cap a client can exhaust memory before `SIZE`
+has anything to say.
+
+### D-021 — Counters land now, the Prometheus exporter lands in phase 7
+
+**Spec:** §9.1 lists the metrics; §13.7 puts the admin API and metrics in phase 7.
+
+**Decision:** take the `metrics` facade crate now and call it from the code that
+creates the conditions §9.1 counts — §10.2's ambiguous delivery, D-008's config
+errors, §14.2's unmatched senders. With no recorder installed every call compiles
+to a branch on a null pointer. Phase 7 adds `metrics-exporter-prometheus` and no
+call site moves.
+
+**Why not log-only now.** The alternative is a sweep through the relay path in
+phase 7 to add counters to code written months earlier, which is where a missing
+series comes from. `src/metrics.rs` also gives each metric exactly one spelling,
+so a typo cannot silently create a second time series.
+
+### D-022 — `mail-parser` arrives in phase 2, for header extraction only
+
+**Spec:** §13.4 puts the rewriting engine in phase 4, and `LICENSES.md` §1
+planned `mail-parser` for it.
+
+**Decision:** adopt it in phase 2, used only to pull the first `From:` address
+out of the buffered header block.
+
+**Why:** the shipped configuration matches on `from_header`, so phase 2 cannot
+relay end to end without parsing `From:`, and §5.4 owes a `550 5.6.0 malformed
+From header` for the cases where it cannot be parsed. Hand-rolling an RFC 5322
+address parser for a few weeks — one that has to survive folding, display names,
+group syntax and a comma-separated list — is where subtle bugs live. Licence was
+already cleared (`Apache-2.0 OR MIT`, all 36 published versions).
+
+Only the header block is parsed, capped at 256 KiB and read from the head of the
+buffer, so a spilled 25 MiB message is never read back into memory to answer a
+routing question.
+
+### D-023 — A downstream `5xx` at `EHLO` or `AUTH` joins D-008's config-error class
+
+**Spec:** D-008 splits §10.1's `5xx` mapping by stage, naming `MAIL FROM`,
+`DATA` and the final dot as config errors and `RCPT TO` as the recipient case.
+
+**Decision:** `EHLO` and `AUTH` are added to the config-error class — `451`, an
+`ERROR` log, and `simmer_downstream_config_error_total`.
+
+**Why:** a downstream refusing *our* credentials, or refusing to talk to us at
+all, is as much a statement about Simmer's configuration as a rejected envelope
+sender is, and as little a statement about the recipient. D-008 did not enumerate
+them because phase 1 had no downstream conversation to reach them from.
+
+---
+
+## Phase 3
+
+### D-024 — Overflow routes account fully, and measure their day from the epoch (settles O-2)
+
+**Spec:** §3.1 — an overflow route "carries no warm-up schedule and is never
+quota-limited". §1.1 — "A route that happens to emit the identity it received
+still counts against quota."
+
+**These do not conflict.** §1.1 is about a *warming* route whose output identity
+happens to equal its input: do not skip accounting merely because no bytes
+changed. It says nothing about overflow routes.
+
+**Decision:** an overflow route runs the full §7.4 reserve/commit protocol with
+`allowance IS NULL`. "Never quota-limited" is honoured by the headroom check
+never failing.
+
+**Why account at all:** *how much traffic is spilling to overflow* is the single
+most important number during a warm-up, and this is what makes it answerable.
+The alternative — a special case that skips the protocol — also means §9.2's
+`/routes` and every §9.1 series need a branch. `simmer_quota_allowance` reports
+`+Inf` for these routes, which is honest and plots alongside the warming ones.
+
+**Consequence:** an overflow route has no `warmup.started`, so no day boundary.
+It is given a synthetic start of the **Unix epoch**, so `day_index = floor((now −
+started) / 24h)` is one formula for every route and overflow buckets on UTC
+midnight. Warming routes bucket on their own anniversary. The two clocks differ
+and are never compared — they only key rows — but a reader of `quota_usage` needs
+to know which is which, and a test that reads the wrong one finds an empty row.
+
+### D-025 — The allowance override is a column on `quota_usage`, not a `route_state` field (settles O-3)
+
+**Spec:** §11 lists `route_state(route, paused, graduated, allowance_override,
+override_expires_at, …)`. §9.3's override is **per domain group**, which a table
+keyed on route alone cannot represent.
+
+**Decision:** `quota_usage` gains `allowance_override`, alongside the scheduled
+`allowance`. `route_state` keeps only `paused` and `graduated`. No
+`route_group_override` table — O-3's working assumption is dropped as unnecessary.
+
+**Why:** the row is already keyed `(route, domain_group, day_index)`, which is
+exactly the scope §9.3 describes, so **the override expires at the day boundary
+by construction** — tomorrow is a different row. That removes
+`override_expires_at`, removes an expiry sweeper, and removes the question O-3
+raised about what "the next day boundary" means for a route with no warm-up.
+Keeping both columns rather than overwriting `allowance` leaves the mutation
+auditable, which §9.3 wants when it logs who did it.
+
+### D-026 — `quota_usage.allowance` is authoritative once written (settles O-4)
+
+**Decision:** the ceiling is written when the row is created and never updated
+from configuration thereafter. A schedule edit plus a restart applies from the
+**next** day boundary, not retroactively. Mid-day changes go through §9.3's
+admin endpoint, which writes `allowance_override`.
+
+**Why:** the alternative lets a restart authorise a burst on a day that was
+already half spent — which is the one thing this component exists to prevent.
+`INSERT … ON CONFLICT DO UPDATE` deliberately does not use `EXCLUDED.allowance`.
+
+*Phase 7 should log at startup where a stored allowance differs from what the
+config would now compute, so the deferral is visible rather than mysterious.*
+
+### D-027 — §3.2 step 3d's retry is dropped (settles O-5)
+
+**Spec:** "If reservation fails due to a concurrent claim, re-evaluate this route
+once, then skip."
+
+**Decision:** no retry. `INSERT … ON CONFLICT DO UPDATE` takes a row lock, so
+contenders for one `(route, domain_group, day_index)` are serialised: by the time
+a session reads the row it is reading the truth, and there is no lost claim to
+re-evaluate. A lock-wait timeout is a database failure per §7.5.
+
+`DO UPDATE` rather than `DO NOTHING` is load-bearing — `DO NOTHING` returns no row
+on conflict and takes no lock, which would leave contenders unserialised and
+reintroduce the exact race §7.4 exists to close.
+
+### D-028 — `550 5.6.0` fires when *any* rule needs the `From:` header
+
+*Implemented in phase 2, recorded here — it only became load-bearing once the
+chain walk gave `resolve_chain` a second caller.*
+
+**Spec:** §5.4 — a malformed `From:` "causes `550 5.6.0` **when `match_on`
+requires it**".
+
+**Decision:** the check is "does any configured rule use `from_header` or
+`either`", not "does the rule that would have matched".
+
+**Why:** a rule cannot be known to match until the header it tests has been
+parsed, so the narrower reading is unimplementable. Consequence worth stating:
+with a mixed rule set, a message with no `From:` is rejected even if an
+envelope-only rule further down the list would have matched it. That is the
+conservative reading; the other silently changes which rule applies based on a
+header being malformed.
+
+### D-029 — `recipient_event` is deferred to phase 6
+
+**Spec:** §11 lists it; D-014 said the quota tables land in phase 3.
+
+**Decision:** phase 3 creates `quota_usage`, `quota_reservation` and
+`route_state` only. `recipient_event` lands in phase 6, where §7.3's hashing,
+normalisation and sweeper are designed.
+
+**Why:** the same reasoning D-014 used to defer these tables out of phase 1 — its
+row shape depends on decisions that have not been made, and creating it now would
+bake in an answer.
+
+### D-030 — A fifth skip reason, `not_started`
+
+**Spec:** §9.1 enumerates `simmer_route_skipped_total{route,reason}` with reason
+`quota`, `frequency`, `paused`, `preflight`.
+
+**Decision:** add `not_started`, for §7.2's "`warmup.started` in the future makes
+the route ineligible". (`unknown_route` also exists, for a chain naming a route
+§4.2 should already have rejected.)
+
+**Why:** folding it into `quota` would be a lie an operator wastes an afternoon
+on. "Out of quota" and "has not begun" call for opposite responses — wait, versus
+check the configured start date.
+
+### D-031 — Database tests use `#[sqlx::test]`, so `cargo test` needs a Postgres
+
+**Decision:** the phase 3 storage tests run against real Postgres via
+`#[sqlx::test]`, which creates a fresh database per test and applies
+`migrations/`. `docker compose up -d simmer-db` plus `DATABASE_URL` is now part of
+the documented development loop, and the compose file publishes the database on a
+fixed `127.0.0.1:5433`.
+
+**Why:** §12.3's concurrency requirement — "N concurrent sessions against a route
+with N−1 remaining allowance; assert exactly N−1 delivered and no overshoot" — is
+the test the whole three-phase protocol exists for, and it is a claim about what
+two transactions do to one row simultaneously. Against a fake it proves nothing.
+A post-hoc increment passes every other test in the suite and fails this one.
+
+**Cost:** `cargo test` is no longer dependency-free. The ingress and reply-mapping
+suites are unaffected: they use an in-memory `QuotaStore` (§11's trait), which is
+test scaffolding rather than the "alternative backend" §11 says is not implemented
+in v1.
+
+*This uses `sqlx::test`'s runtime database creation, not `query_as!`'s
+compile-time verification. `CLAUDE.md`'s ban is on the latter, which would need
+`DATABASE_URL` during the Docker build; nothing here affects the image.*
+
+---
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -301,15 +589,174 @@ the phase that depends on each.
 
 | # | Question | Working assumption | Needed by |
 |---|---|---|---|
-| O-1 | §6.1 orders reservation after `DATA`; §5.4 says decide at `RCPT TO` when all rules are envelope-only. A reservation held across the whole `DATA` transfer can outlive §7.4's expiry, which does not budget for body transfer. | Split eligibility evaluation from reservation: evaluate (and reject) early, reserve immediately before the downstream conversation. | Phase 3 |
-| O-2 | Do overflow routes participate in quota accounting? §3.1 "never quota-limited" vs §1.1 "still counts against quota". | Run the full reserve/commit protocol with a sentinel "unlimited" allowance, so metrics are uniform and the code path has no special case. | Phase 3 |
-| O-3 | §9.3's allowance override is per domain group; §11's `route_state` is keyed on route alone and cannot represent it. "Expires at the next day boundary" is also undefined for an overflow route, which has no `warmup` and so no boundary. | A `route_group_override(route, domain_group, allowance, expires_at)` table; expiry from the route's own day boundary, 24h for overflow routes. | Phase 3 |
-| O-4 | Is `quota_usage.allowance` authoritative or a cache of the config schedule? | Written once when the row is created for a `(route, group, day_index)` and authoritative thereafter; the admin override is the only mid-day change. | Phase 3 |
-| O-5 | §3.2 step 3d's "re-evaluate once on a concurrent claim" has no meaning under §7.4's row lock, which serialises contenders. | Drop the retry; treat a lock-wait timeout as a database failure per §7.5. | Phase 3 |
-| O-6 | §3.2 step 1 says an unmatched sender goes "directly to the overflow route" of the default chain, but §4.2 permits that chain to contain warming routes first. | Walk it normally, like any other chain. | Phase 3 |
-| O-7 | §3.2: "decremented per message, by the recipient count, not per recipient" reads two ways. | One reservation of magnitude `recipient_count`. Moot while `single_recipient_only` defaults true. | Phase 3 |
+| ~~O-1~~ | *Settled in phase 2 — see **D-019**.* | | |
+| ~~O-2~~ | *Settled in phase 3 — see **D-024**.* | | |
+| ~~O-3~~ | *Settled in phase 3 — see **D-025**. The proposed extra table proved unnecessary: the override is a column on the day's own row, so it expires by construction.* | | |
+| ~~O-4~~ | *Settled in phase 3 — see **D-026**.* | | |
+| ~~O-5~~ | *Settled in phase 3 — see **D-027**.* | | |
+| ~~O-6~~ | *Settled in phase 3: the default chain is walked normally, like any other. Implemented in `relay::resolve_chain`.* | | |
+| ~~O-7~~ | *Settled in phase 3: one reservation of magnitude `recipient_count`, tested directly.* | | |
 | O-8 | §5.6's collapse table returns `550` when *any* split failed permanently, which records permanent state about recipients that did not fail — the §14.1 problem again. | `550` only when *all* failures are permanent; `451` otherwise. | Phase 9 |
 | O-9 | §5.6 splits by route; §6.3 implies per-recipient splitting when a template references `recipient.*`. | If a selected route's templates reference `recipient.*`, split that route's recipients one per transaction; otherwise group by route. | Phase 9 |
-| O-10 | §5.2 advertises `SMTPUTF8`, but a downstream may not support it. | Reject with `550 5.6.7` at `MAIL FROM` if a UTF-8 address is presented and the selected route's downstream does not advertise it, rather than discovering it mid-relay. | Phase 2 |
+| ~~O-10~~ | *Settled in phase 2 — see **D-018**. The working assumption did not survive: the route is not known at `MAIL FROM`. Replaced by a config-declared capability.* | | |
 | O-11 | §9.3 logs mutations "with the acting token's identifier", but `admin.auth_token` is a single scalar with no identity. | Either named admin tokens, or drop the wording. Currently one token, logged as `admin`. | Phase 7 |
-| O-12 | §12.3 asks for day-index tests "across DST boundaries and leap seconds". Unix time cannot represent a leap second, so §7.2's elapsed-duration arithmetic is unaffected. | Test DST transitions and a future `warmup.started` (negative day index → route ineligible per §7.2). The leap-second case reduces to a no-op. | Phase 3 |
+| ~~O-12~~ | *Settled in phase 3: DST transitions both directions, a start inside a DST gap, and a future start are all tested; the leap-second case is asserted to be a no-op rather than merely argued.* | | |
+
+
+---
+
+## Phase 2 summary
+
+### What changed
+
+| Module | §  | What |
+|---|---|---|
+| `src/smtp/command.rs` | 5.2 | Command grammar as a pure function; `MAIL FROM` parameters |
+| `src/smtp/reply.rs` | 5.2, 10.1 | The whole reply vocabulary in one file; downstream-text sanitising |
+| `src/smtp/auth.rs` | 5.3 | `AUTH PLAIN`/`LOGIN`, argon2id, three-strike lockout |
+| `src/smtp/buffer.rs` | 8.1 | Memory → tmpfs spill at 1 MiB, dot transparency |
+| `src/smtp/session.rs` | 5.2–5.6 | The state machine, PIPELINING-aware |
+| `src/smtp/mod.rs` | 5.1, 10.4 | Listener, `allowed_cidrs`, session cap, two-phase shutdown |
+| `src/downstream/stream.rs` | 8.2 | All four TLS modes over rustls |
+| `src/downstream/client.rs` | 8.2–8.4 | The outbound conversation, per-stage timeouts |
+| `src/downstream/outcome.rs` | 10.1, 10.2 | The reply mapping as data, with D-008's split |
+| `src/relay.rs` | 3.2, 5.4 | decide → *(reserve)* → relay, the O-1 seam |
+| `src/metrics.rs` | 9.1 | Named counters, no exporter yet |
+
+241 tests (was 74): 146 unit, 43 config validation, 21 reply mapping, 26
+validation integration, 5 shipped config.
+
+### What is tested
+
+Command grammar including quoted local parts and parameter parsing; the reply
+vocabulary including a mechanical §14.1 audit that fails when an undocumented
+`5xx` is added; sanitisation against reply-splitting; both AUTH mechanisms and
+the timing-equalised unknown-username path; the buffer across the spill boundary
+and the dot-stuffing round trip; §10.1 exhaustively, as a pure function *and*
+against a scripted downstream that returns arbitrary codes, stalls, drops
+mid-`DATA`, drops after the terminating dot, and refuses TLS; PIPELINING
+including a batch containing an error; every limit in §5.5 and §5.6; the CIDR
+and session caps; command, data and session timeouts.
+
+The end-to-end assertion phase 4 has to keep passing: a body containing a bare
+dot line, a dot-prefixed line and a trailing blank line arrives at the downstream
+**byte for byte**.
+
+### What is not tested
+
+- **Real TLS.** The `required_verify` path is asserted only through its failure
+  modes; there is no test with a real certificate. §12.3's acceptance suite
+  (phase 10) is the place for that.
+- **Concurrency under load.** §12.3's "N concurrent sessions against a route with
+  N-1 remaining allowance" needs quota, so it belongs to phase 3.
+- **`max_concurrent_sessions` under genuine contention** — the test holds
+  connections open rather than racing them.
+- The `Stream::Taken` variant's error path, which is unreachable by construction.
+
+### Things the spec did not cover
+
+Recorded above as D-018 through D-023. In brief: the `SMTPUTF8` advertisement
+problem (§5.2 promises a capability Simmer cannot guarantee); line-length limits
+and what to do with the remainder of an oversized `DATA`; where a downstream
+`5xx` at `EHLO`/`AUTH` belongs in D-008's split; and whether `550 5.6.0` depends
+on the matching rule or on any rule.
+
+Two smaller calls not worth their own entry:
+
+- **`RCPT TO` addresses are not validated.** §5.2 lists no syntax rule for them
+  and RFC 5321 §4.5.1 requires bare `postmaster` to be accepted. The downstream
+  is the authority on deliverability, and pre-validating would mean Simmer
+  emitting `550`s about recipients on its own initiative — precisely what §14.1
+  is about.
+- **`AUTH=` on `MAIL FROM` is accepted and dropped.** §5.3 makes the
+  authenticated identity irrelevant to routing, so there is nothing to do with an
+  unverified assertion except not forward it.
+
+### Carried into phase 3
+
+`src/relay.rs` marks the two seams: the §3.2 step 3 eligibility walk replaces one
+`chain.iter().find_map(...)`, and `reserve()` goes between `select()` and
+`deliver()`. `downstream::Outcome` already carries the `commit` flag every row of
+§10.1 owes the reservation protocol, so phase 3 consumes it rather than
+re-deriving it. O-2 through O-7 and O-12 are still open and due then.
+
+
+---
+
+## Phase 3 summary
+
+### What changed
+
+| Module | § | What |
+|---|---|---|
+| `migrations/…_quota.sql` | 7, 11 | `quota_usage`, `quota_reservation`, `route_state` |
+| `src/quota/day.rs` | 7.2 | Day-index arithmetic, in milliseconds, signed |
+| `src/quota/store.rs` | 11 | The storage trait, `Usage`, `Reserved`, `RouteState` |
+| `src/quota/postgres.rs` | 7.4 | The three-phase protocol, under a row lock |
+| `src/quota/mod.rs` | 7.2, 7.4 | `Allowance` resolution, reservation expiry |
+| `src/quota/registry.rs` | 10.4 | Reservations this process holds |
+| `src/quota/sweeper.rs` | 7.4 | Expired-reservation release |
+| `src/models/quota.rs` | 11 | Runtime `sqlx`, free functions, house pattern |
+| `src/models/route_state.rs` | 9.3 | `paused`, `graduated`, allowance override |
+| `src/routing/domain_group.rs` | 3.2.2 | Literal, case-insensitive, catch-all fallback |
+| `src/routing/chain.rs` | 3.2.3 | The walk, with a typed skip reason per route |
+| `src/relay.rs` | 3.2, 7.4 | decide → reserve → relay → commit/release |
+
+323 tests (was 241): 190 unit, 43 config validation, 30 quota storage, 26
+validation integration, 21 reply mapping, 8 quota-through-the-relay, 5 shipped
+config.
+
+### What is tested
+
+Day-index arithmetic across both DST directions, a start inside a DST gap, a
+future start, a 400-day monotonicity sweep, and the leap-second no-op; the
+schedule's final-value-repeats rule and graduation; domain-group resolution
+including the suffix-match trap; the chain walk producing the right skip reason
+per route.
+
+Against real Postgres: reserve/commit/release round trips; a reservation counting
+against headroom *before* it commits; exhausting an allowance exactly; per-group
+and per-day bucket independence; the allowance staying authoritative across a
+config change; the override raising, lowering and expiring; the sweeper; and both
+sides of the sweeper race — committing after a sweep still counts the delivery,
+releasing after a sweep does not steal another message's slot.
+
+**§12.3's concurrency requirement, twice**: 16 concurrent reservations against 15
+slots granting exactly 15, and 8 concurrent *sessions* through the real ingress
+where the warming route carries exactly its allowance and one message spills to
+overflow. A post-hoc increment passes everything else and fails these.
+
+Through the relay: a failed send leaving `committed` unchanged (§12.3, verbatim),
+a connect failure not falling through to the next route (§3.3), fall-through to
+overflow at exhaustion, and chain exhaustion answered `451` at `RCPT TO` when
+rules are envelope-only and at the final dot when they are not.
+
+### What is not tested
+
+- **Clock movement.** No test advances `warmup.started` across a real day
+  boundary in a running process; the day-index tests are pure and the storage
+  tests set `day_index` directly. §12.3's acceptance suite (phase 10) is where a
+  ramp gets walked across simulated boundaries.
+- **`fail_closed` behaviour** — the `451 4.3.0` path is unit-tested as a reply
+  but not driven by an actually-unreachable database.
+- **The sweeper's interval loop** — `sweep_once` is tested, `run` is not.
+- **§10.4's reservation release under a real SIGTERM** — `release_by_ids` and the
+  registry are tested; the wiring in `main` is not.
+
+### Things the spec did not cover
+
+D-024 through D-031. The two that changed a schema: overflow routes needing a day
+origin at all (D-024), and §11's `route_state.allowance_override` being unable to
+express §9.3's per-group scope (D-025).
+
+One smaller call: **`route_state` is read once per message rather than cached.**
+A cache would mean `POST /routes/{name}/pause` did not take effect immediately,
+which is the one property an operator reaching for that endpoint needs. At warm-up
+volumes the query costs nothing.
+
+### Carried into phase 4
+
+Nothing in the quota model blocks it. The rewrite engine slots between the buffer
+and `downstream::relay`, both of which are already isolated behind
+`relay::reserve_relay_commit`. O-8 and O-9 (phase 9) and O-11 (phase 7) remain
+open.

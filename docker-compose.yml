@@ -34,8 +34,9 @@ services:
     environment:
       DATABASE_URL: "postgres://simmer:simmer@simmer-db:5432/simmer"
       SIMMER_ADMIN_TOKEN: "local-dev-token"
-      # argon2id hash of "local-dev-password".
-      SIMMER_CFAPP_HASH: "$$argon2id$$v=19$$m=19456,t=2,p=1$$c29tZXNhbHRzYWx0$$Zm9vYmFyYmF6cXV4Zm9vYmFyYmF6cXV4Zm9vYmE"
+      # argon2id hash of "local-dev-password". The `$$` are compose escaping for
+      # a literal `$`. Local development only — never a real credential.
+      SIMMER_CFAPP_HASH: "$$argon2id$$v=19$$m=19456,t=2,p=1$$iYj0sVhRvzAWM9kzsFBKyg$$V1tnVXTGEO+BD0x9q1uccuo91w84jrz+qDKA3qElLFE"
       POSTAL_USER: "postal"
       POSTAL_PASS: "postal-local"
       SENDGRID_KEY: "SG.local"
@@ -58,7 +59,10 @@ services:
       POSTGRES_USER: simmer
       POSTGRES_PASSWORD: simmer
     ports:
-      - "5432"
+      # Fixed rather than ephemeral: the phase 3 tests reach this database
+      # directly (see README "Development"). 5433 to avoid clashing with a
+      # Postgres already running on the developer's machine.
+      - "127.0.0.1:5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -q -h simmer-db -U simmer"]
       interval: 2s
