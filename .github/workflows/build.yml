@@ -56,6 +56,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
 
+      # The check job compiles because `cargo test` cannot run without building
+      # the test binaries. It cannot share that work with the `build` job below —
+      # that one is release profile with lto + codegen-units=1, inside a
+      # container, per architecture, so the two builds have no artifacts in
+      # common even in principle.
+      #
+      # What *is* shareable is the dependency graph: 252 crates, pinned by a
+      # committed Cargo.lock and built with --locked, so they are identical on
+      # every run. Rebuilding the workspace crate itself takes about 4 seconds;
+      # everything else in this job is those dependencies. `cargo clippy` sets
+      # RUSTC_WORKSPACE_WRAPPER rather than RUSTC_WRAPPER, so it reuses their
+      # artifacts too and only re-checks our own crate — meaning one cached
+      # dependency build serves fmt, clippy and test alike.
+      #
+      # Saved only from main: a cache written on the default branch is readable
+      # from every branch, whereas per-branch caches would each write a copy and
+      # evict one another under the repository cache quota.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -77,10 +99,19 @@ jobs:
       # See LICENSES.md. Several well-known Rust mail crates have been AGPL at
       # some point in their history, so this is a build failure rather than a
       # discovery. Also covers advisories and unexpected sources.
+      #
+      # Installed as a prebuilt binary rather than `cargo install cargo-deny`,
+      # which compiles it from source on every run — several minutes of work to
+      # produce a tool that is byte-identical each time. Deliberately not
+      # EmbarkStudios/cargo-deny-action: keeping the bare `cargo deny check`
+      # means CI runs exactly the command the README tells a developer to run.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
       - name: Licences, advisories, sources
-        run: |
-          cargo install cargo-deny --locked
-          cargo deny check
+        run: cargo deny check
   build:
     needs: check
     runs-on: ${{ matrix.runner }}
