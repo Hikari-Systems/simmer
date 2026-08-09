@@ -22,7 +22,7 @@ this file disagrees with any of them, they win.
 | 7 | Admin API, metrics exporter, dry-run | |
 | 8 | DNS preflight | |
 | 9 | Multi-recipient splitting and result collapse | |
-| 10 | Hardening: pooling, graceful shutdown, acceptance suite, README | |
+| 10 | Hardening: pooling, graceful shutdown, acceptance suite, README | acceptance harness **designed** — `docs/ACCEPTANCE.md`, D-032 |
 
 ### What the service actually does today
 
@@ -193,10 +193,14 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 **Test coverage**
 
 - **No real-certificate TLS test.** `required_verify` is asserted only through its
-  failure modes. Phase 10's acceptance suite is where a real chain belongs.
+  failure modes. The acceptance harness closes this by giving Mailpit a
+  certificate from a CA mounted into the `app` container (`docs/ACCEPTANCE.md` §5).
 - **No clock movement.** Day-index tests are pure; storage tests set `day_index`
-  directly. Nothing walks a ramp across a real boundary in a running process
-  (§12.3 acceptance, phase 10).
+  directly. Nothing walks a ramp across a real boundary in a running process.
+  This is the acceptance harness's central job (`docs/ACCEPTANCE.md` §3).
+- **No test proves a message reaches a real mail server under the rewritten
+  identity**, or that the two arrangements of §1.1 produce byte-equivalent output.
+  Only the acceptance tier can, and it is designed but not built.
 - **`fail_closed`** — the `451 4.3.0` reply is unit-tested, but no test drives it
   with an actually-unreachable database.
 - **§10.4 under a real `SIGTERM`** — `release_by_ids` and the registry are tested;

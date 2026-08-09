@@ -16,9 +16,13 @@ picking up at phase 4.
    `DECISIONS.md`. §6 is phase 4's subject; read §1.1 and §6.6 twice.
 2. `CLAUDE.md` — the three constraints that will bite you, and the key-file map.
 3. `docs/STATE.md` — where the build has got to, what is tested, what is not.
-4. `DECISIONS.md` — 31 decisions (D-001..D-031) and 3 open questions (O-8, O-9,
+4. `DECISIONS.md` — 32 decisions (D-001..D-032) and 3 open questions (O-8, O-9,
    O-11), none of which phase 4 needs.
-5. `docs/CLAUDE_CODE_PROMPT.md` — the original kickoff and working agreement.
+5. `docs/ACCEPTANCE.md` — the §12.3 acceptance harness, **designed but not
+   built**. Read §4.4 before writing the rewrite engine: the cutover invariant is
+   the property phase 4 exists to make true, and that section is the only test
+   that will ever state it.
+6. `docs/CLAUDE_CODE_PROMPT.md` — the original kickoff and working agreement.
 
 ## Where we are
 
@@ -37,8 +41,9 @@ identity it arrived with. `identity.set_headers`, `envelope_from`,
 ignored. That is what phase 4 fixes, and until it lands the component does not
 actually do its job.
 
-**Nothing is committed.** `git log` is empty; phase 1 is staged, phases 2–3 are
-untracked. `git add -A` picks it all up. Do not commit unless asked.
+Committed on `main`, no remote: one commit for phase 1, one for phases 2–3 (they
+could not be split — see `docs/STATE.md` §8). Working tree clean. Do not commit or
+push unless asked.
 
 ## Phase 4 — the rewriting engine
 
@@ -84,6 +89,22 @@ only to pull the first `From:` address out of the header block.
   baseline phase 4 must consciously break and replace. Its awkward body (a bare
   dot line, a dot-prefixed line, a trailing blank line) should survive rewriting
   unchanged in the parts nothing touches.
+
+## The acceptance harness
+
+`docs/ACCEPTANCE.md` designs a compose profile with two Mailpit traps, a bulk
+sender container, and a ramp walked by moving `warmup.started` and restarting
+(D-032). It is planned, not built.
+
+Its ramp-walk half is buildable today and does not need phase 4. Its rewrite and
+cutover-invariant assertions need phase 4 and are the strongest available check
+that the rewriting engine is right — §1.1's whole thesis is that both arrangements
+produce byte-equivalent output, and nothing else tests it.
+
+**Worth agreeing with the user up front** whether to build the harness before,
+alongside, or after the rewrite engine. Building it first means phase 4 has
+somewhere to plug its assertions in; building it after risks discovering a
+rewriting fault several phases late.
 
 ## Non-negotiables
 

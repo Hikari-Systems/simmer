@@ -582,6 +582,57 @@ compile-time verification. `CLAUDE.md`'s ban is on the latter, which would need
 
 ---
 
+## Phase 10 (planned)
+
+### D-032 — The acceptance harness is a compose profile with two Mailpit traps
+
+**Spec:** §12.3 requires an acceptance tier — "compose stack with real Postgres; a
+warm-up walked across simulated day boundaries by manipulating `warmup.started`;
+verifying fall-through to overflow at exhaustion; verifying the cutover invariant
+by sending the same logical message under both arrangements of §1.1 and asserting
+byte-equivalent downstream output". §13.10 places it in phase 10. Neither says how.
+
+**Decision:** designed in full in `docs/ACCEPTANCE.md`. The load-bearing calls:
+
+- **Two downstream traps, not one** — `trap-warming` and `trap-overflow`, separate
+  Mailpit containers. Which container holds the message is what makes "delivered
+  to the correct downstream" a physical fact. With a single sink the only
+  available evidence is headers Simmer itself wrote, which proves Simmer *said*
+  it used a route, not that it did.
+- **Mailpit** (`axllent/mailpit`, MIT, pinned by digest) over MailHog. Both would
+  serve; Mailpit is maintained, and it can be made to require STARTTLS and SMTP
+  AUTH, which is what lets the suite close `STATE.md`'s largest gap — no test
+  anywhere exercises §8.2's `required_verify` against a real certificate.
+- **The bulk sender is a container**, because §2.3 says port 25 must not be
+  published to a host interface and `docker-compose.yml` deliberately does not
+  publish it. A host-side sender would mean punching a hole in the one file that
+  documents why it should stay shut. It is a second `[[bin]]` in this crate added
+  by an `acceptance` image stage, so the shipped runtime image is unchanged.
+- **The sender reads the acceptance config through `simmer::config`**, so the
+  schedule it sends against is the same file Simmer reads. A shell or Python
+  sender would need the expected allowances written down a second time, and the
+  day the two drift is the day the suite starts lying.
+- **Days are simulated by moving `warmup.started` and restarting**, via
+  `${SIMMER_WARMUP_STARTED}` and the §4 interpolation already in place. Not by
+  moving the container clock: that needs privileges, invalidates certificates, and
+  would make the stack lie to itself.
+- **A compose profile**, so `docker compose up -d` keeps meaning what it means
+  today, and the suite runs behind `--ignored` rather than in `cargo test`.
+
+**Why plan it now rather than in phase 10.** The ramp-walk half is buildable
+today — phase 3 finished the quota model, and *which container received the
+message* needs no rewriting to be meaningful. Phase 4 then plugs rewrite
+assertions into an existing harness instead of building both at once, and the
+cutover invariant (§1.1) gets its only real test the moment there is a rewrite to
+test. Discovering in phase 10 that the rewrite has been wrong since phase 4 is the
+outcome this ordering avoids.
+
+**Open, and listed in `docs/ACCEPTANCE.md` §8:** whether the ramp-walk half lands
+now or waits; whether the acceptance config is its own file; and whether CI runs
+the suite on every push.
+
+---
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

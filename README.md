@@ -203,6 +203,7 @@ migrations/     plain SQL, applied at startup
 tests/support/  a scripted fake downstream (§12.3)
 docs/SPEC.md    the specification
 docs/STATE.md   where the build has got to (snapshot, for session handover)
+docs/ACCEPTANCE.md  design for the §12.3 acceptance harness (planned, not built)
 DECISIONS.md    divergences from it, and the questions still open
 LICENSES.md     dependency licence findings
 ```
