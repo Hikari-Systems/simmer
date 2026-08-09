@@ -563,7 +563,14 @@ check the configured start date.
 `#[sqlx::test]`, which creates a fresh database per test and applies
 `migrations/`. `docker compose up -d simmer-db` plus `DATABASE_URL` is now part of
 the documented development loop, and the compose file publishes the database on a
-fixed `127.0.0.1:5433`.
+fixed `127.0.0.1:5433`. CI supplies the same thing as a `postgres:18` service on
+the same host port, so `DATABASE_URL` has one spelling everywhere.
+
+There is no fixture step and there should not be one: `#[sqlx::test]` applies
+`migrations/` to each test database, so the migrations *are* the fixtures and every
+test builds the state it needs. Shared seed data would give the tests a hidden
+dependency on each other, which is the first thing that goes wrong in a suite whose
+assertions are counters.
 
 **Why:** §12.3's concurrency requirement — "N concurrent sessions against a route
 with N−1 remaining allowance; assert exactly N−1 delivered and no overshoot" — is

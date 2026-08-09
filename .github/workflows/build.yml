@@ -19,6 +19,39 @@ jobs:
   check:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 25
+
+    services:
+      # tests/quota.rs and tests/quota_relay.rs use `#[sqlx::test]`, which needs a
+      # real Postgres (DECISIONS.md D-031). Faking it would defeat the point:
+      # SPEC.md §12.3's overshoot test is a claim about what two transactions do
+      # to one row simultaneously, and a post-hoc increment passes every other
+      # test in the suite and fails that one.
+      #
+      # Pinned to the same major version as docker-compose.yml. A quota model
+      # whose correctness rests on row locking should not be tested against a
+      # different engine than it runs on.
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: simmer
+          POSTGRES_USER: simmer
+          POSTGRES_PASSWORD: simmer
+        ports:
+          # 5433 on the host to match the local development URL exactly, so
+          # DATABASE_URL is one string everywhere — README, CLAUDE.md and here.
+          # (Locally 5433 avoids clashing with a developer's own Postgres; on a
+          # runner there is nothing to clash with, but a second spelling of the
+          # same URL is a thing to get wrong.)
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U simmer -d simmer"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgres://simmer:simmer@127.0.0.1:5433/simmer
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
@@ -29,6 +62,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      # No fixture step, and that is deliberate: `#[sqlx::test]` creates a fresh
+      # database per test and applies `migrations/` to it, so the migrations are
+      # the fixtures and every test builds the state it needs. Seeding shared data
+      # here would give the tests a hidden dependency on each other, which is the
+      # first thing that goes wrong in a suite that asserts on counters.
+      #
+      # What the service above must provide is therefore only: a reachable
+      # database, and a role that may CREATE DATABASE. `POSTGRES_USER` on the
+      # official image is a superuser, so both hold.
       - name: Test
         run: cargo test --locked
 
