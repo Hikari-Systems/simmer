@@ -1,4 +1,4 @@
-# Resume prompt — Simmer, phase 5
+# Resume prompt — Simmer, phase 7
 
 > Paste everything after the horizontal rule into a fresh Claude Code session
 > opened in `/home/rickk/git/hs/simmer`.
@@ -7,104 +7,101 @@
 
 We are building `simmer` in this directory — a Rust SMTP relay facade
 (`bookworm-slim` container) that applies a domain reputation warm-up ramp between
-an application and real SMTP providers. Phases 1–4 of ten are done. You are
-picking up at phase 5.
+an application and real SMTP providers. Phases 1–6 of ten are done, and phase 9 is
+void. You are picking up at phase 7.
 
 ## Read these first, in order
 
 1. `docs/SPEC.md` — **authoritative**. Never amend it; record divergences in
-   `DECISIONS.md`. §6.4 is phase 5's subject, and it is short — read §6.1, §6.6
-   and §12.3 around it, because they are what constrain how it may be done.
-2. `CLAUDE.md` — the three constraints that will bite you, and the key-file map.
+   `DECISIONS.md`. §9 is phase 7's subject, all five subsections. Read §9.3
+   alongside §14.1: a write API that can pause a route can also, through an
+   `allowance_override` of zero, make every message `451`.
+2. `CLAUDE.md` — the four constraints that will bite you, and the key-file map.
 3. `docs/STATE.md` — where the build has got to, what is tested, what is not.
-4. `DECISIONS.md` — 42 decisions (D-001..D-042), 3 open questions (O-8, O-9,
-   O-11) none of which phase 5 needs, and one **known defect** in phase 2's
-   `smtp/auth.rs` still worth fixing on its own.
-5. `docs/ACCEPTANCE.md` — the §12.3 acceptance suite, now **built**. Its §4.3
-   has one row left unbuilt, and it is phase 5's: the body-rewrite assertion.
+4. `DECISIONS.md` — 52 decisions (D-001..D-052) and **one** open question, O-11,
+   which is phase 7's: §9.3 says mutations are logged "with the acting token's
+   identifier", but `admin.auth_token` is a single scalar with no identity.
+   Settle it before writing the write API rather than after.
 
 ## Where we are
 
-452 tests pass, plus 4 acceptance tests against a real stack.
+593 tests pass, plus 4 acceptance tests against a real stack.
 `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` and
 `cargo deny check` are clean. `docker compose up -d --build` comes up healthy.
 
-Simmer accepts a message, authenticates the client, buffers the body, matches a
-sender rule, resolves the recipient's domain group, walks the chain reserving
-quota under a row lock, **rewrites the message to the selected route's identity**,
-forwards to that route's downstream over TLS, and maps the verdict back —
-committing quota only on a downstream `2xx`.
+Simmer accepts a message, authenticates the client, **refuses a second `RCPT TO`**
+(D-047), buffers the body, matches a sender rule, resolves the recipient's domain
+group, walks the chain — skipping a route whose §7.3 recipient-frequency window is
+full, then reserving quota under a row lock — rewrites the message to the selected
+route's identity (headers and body both), forwards to that route's downstream over
+TLS, and maps the verdict back, committing quota **and recording the frequency
+event** only on a downstream `2xx`.
 
-**The one thing §6 still does not do is rewrite bodies.** `body_rewrites` is
-parsed and its regexes are compiled at startup (§4.2), and then ignored. The body
-is carried through the engine as an opaque slice and arrives byte for byte.
+**§6 is finished** apart from §6.7's DNS preflight, which §13 puts in phase 8.
+**§7 is finished.**
 
 Committed and pushed on `main` (remote `origin`): phase 1, then phases 2–3, then
-five commits of planning and CI work, then phase 4. Working tree is clean. Do not
-commit or push unless asked.
+five commits of planning and CI work, then phase 4. **Phases 5 and 6 are in the
+working tree and uncommitted.** Do not commit or push unless asked.
 
-## Phase 5 — body rewriting
+## Phase 7 — the control plane
 
-`SPEC.md` §13.5, and §6.4 is the whole specification:
+`SPEC.md` §13.7 and §9 in full. Four pieces:
 
-> Scope is `text/*` parts only. Attachments and non-text parts are never touched.
-> For each `text/*` part: decode according to `Content-Transfer-Encoding`
-> (handling `quoted-printable` and `base64`), decode the charset to UTF-8, apply
-> each `body_rewrites` entry in order as a regex replacement, re-encode, and fix
-> up `Content-Transfer-Encoding` and any length-bearing headers.
-
-§6.1 step 7 is where it goes: after `set_headers`, before the `Received:` header
-is prepended. The seam is already there — `rewrite::rewrite` in `src/rewrite/mod.rs`
-has steps 6 and 8 adjacent with a comment saying so.
+1. **The metrics exporter.** `src/metrics.rs` already records every counter and
+   gauge §9.1 asks for, behind named functions, with no recorder installed —
+   every call is currently a no-op (D-021). Phase 7 adds
+   `metrics-exporter-prometheus` and `GET /metrics`, and **no call site should
+   need to change**. If one does, that is worth understanding before changing it.
+2. **The read API** (§9.2): `/routes`, `/routes/{name}`, `/quota`. `GET /health`
+   exists. The data is all in `quota_usage`, `route_state` and the config.
+3. **The write API** (§9.3): pause, resume, graduate, allowance override. The
+   database honours all four already — `chain::walk_and_reserve` reads
+   `route_states()` per message and `quota_usage.allowance_override` wins over the
+   schedule (D-025) — so this is the HTTP surface and the audit log, not new
+   semantics.
+4. **Dry run** (§9.4).
 
 ### What will bite you
 
-- **This is the step that ends D-039.** Phase 4 keeps the body as an opaque slice
-  and every untouched header as its original bytes, which is what makes "nothing
-  Simmer was not configured to change is changed" structurally true rather than
-  tested. Body rewriting cannot preserve that structurally, so it has to become a
-  *tested* property: a message with no matching `body_rewrites` must still come
-  out byte-identical, including its MIME boundaries, its transfer encodings and
-  its trailing whitespace. Write that test before the feature.
-- **`tests/acceptance.rs::the_rewrite_is_what_a_real_mail_server_receives` will
-  start failing on purpose.** It asserts the body link is *not yet* rewritten,
-  with a message telling you to finish `ACCEPTANCE.md` §4.3's last row. That is
-  the reminder working; replace the assertion with the real one.
-- **§6.4 rejects raw-byte matching explicitly**, and gives the reason: a URL split
-  across a quoted-printable soft line break (`https://old.=\r\nbrand.com/x`)
-  would not match, and that is the common case rather than an edge case. Decode
-  first, always.
-- **Signed and encrypted parts are never rewritten** — `multipart/signed`,
-  `multipart/encrypted`, `application/pkcs7-*`. Rewriting invalidates them.
-- **A part that cannot be decoded is left untouched**, logged at `WARN`, and
-  counted in `simmer_body_rewrite_skipped_total{route,reason}` — one of the §9.1
-  counters, and the only one phase 5 owns.
-- **§6.6's property must still hold.** `tests/rewrite_stability.rs` composes the
-  whole rewrite with itself over generated messages; a regex whose replacement
-  can match its own output (`s/a/aa/`) is unstable in exactly §6.6's sense, and
-  the body is not covered by `unstable_headers`. Decide what happens there and
-  record it — it is the phase's real open question.
-- **Charset decoding needs a crate.** `mail-parser` decodes for reading, but
-  re-encoding is not its job. Check the licence of anything new **for the exact
-  version pinned, across every published version**, and record it in
-  `LICENSES.md` before adopting it. If the only good option is AGPL, stop and ask.
+- **O-11 is the phase's open question.** Settle it first and record it.
+- **An admin mutation must not become a §14.1 violation.** An override of zero, or
+  pausing every route in a chain, produces `451` on every message — which is the
+  correct reply and a serious operational event. Whatever the write API does, the
+  answer to the client stays temporary.
+- **`allowance_override` lives on `quota_usage`, not `route_state`** (D-025).
+  §11 suggests otherwise. Because the row is keyed by `day_index`, the override
+  expires at the day boundary by construction, which is §9.3's stated behaviour.
+- **`quota_usage.allowance` is authoritative once written** (D-026). A config
+  change does not retroactively raise today's ceiling, so a read API that reports
+  the *configured* schedule where the row says something else will mislead an
+  operator at exactly the wrong moment.
+- **No plaintext recipient anywhere in the control plane.** §7.3's hashing exists
+  so the container does not accumulate a record of who was mailed; a `/quota` or
+  `/routes` response that exposed recipient keys would undo it. The counters are
+  already shaped for this — `simmer_recipient_events_evicted_total` is
+  deliberately unlabelled.
+- **The admin listener is not authenticated today.** `GET /health` is open by
+  design; §9.3's write API is not, and `admin.auth_token` is already in the config
+  and already interpolated from the environment.
 
 ## Non-negotiables
 
 - **Not an MTA**: no spool, queue, retry scheduler or DSN. Only quota state and
   recipient-frequency events persist. The `DATA` buffer is tmpfs and not durable.
 - **Cutover invariant (§1.1)**: rewrites are absolute assignments, never relative,
-  and stable under repetition. Identity fields are not overridable; other headers
-  only via `unstable_headers` (§6.6, D-001). Enforced at startup since phase 4 —
-  and it already caught a violation in `SPEC.md`'s own §4.1 example (D-036).
+  and stable under repetition. Enforced at startup by the real engine against a
+  synthetic probe, for headers (D-036) and for `body_rewrites` (D-046).
 - **Never emit a reply that makes a client record permanent state** (§14.1).
   `src/smtp/reply.rs` holds every reply Simmer can emit and has a test that fails
   when an undocumented `5xx` is added. Keep it that way.
-- **No DKIM signing, no key material.** `DKIM-Signature`, `Authentication-Results`
-  and `ARC-*` are stripped unconditionally (§6.5) — and body rewriting is one of
-  the two reasons that has to happen.
-- Quota increments on downstream `2xx` only, via §7.4. No failover between routes
-  (§3.3). Fail closed when Postgres is unavailable (§7.5).
+- **One recipient per transaction** (D-047). A second `RCPT TO` is `452`,
+  unconditionally; §5.6's splitting and §13's phase 9 are void, not deferred.
+- **A `text/*` part no `body_rewrites` pattern matched keeps its original bytes**
+  (D-043), and a part's transfer encoding and charset are never changed (D-045).
+- Quota increments on downstream `2xx` only, via §7.4 — and §7.3's events with it,
+  in the same transaction (D-051). No failover between routes (§3.3). Fail closed
+  when Postgres is unavailable (§7.5).
 - **Building the shipped image needs `--target runtime`.** The Dockerfile's last
   stage is the acceptance loadgen.
 
@@ -112,10 +109,10 @@ has steps 6 and 8 adjacent with a comment saying so.
 
 Build in the phases of `SPEC.md` §13. **Write a short plan at the start of the
 phase and wait for confirmation before writing code.** Test-first for the
-logic-heavy parts — transfer-encoding round trips and the "nothing matched, so
-nothing changed" property are exactly that. At the end, summarise what changed,
-what is tested, what is not, and anything the spec did not cover, appending to
-`DECISIONS.md`. Raise ambiguities rather than defaulting past them.
+logic-heavy parts — the §9.2 projections and the §9.3 mutation semantics are
+exactly that. At the end, summarise what changed, what is tested, what is not, and
+anything the spec did not cover, appending to `DECISIONS.md`. Raise ambiguities
+rather than defaulting past them.
 
 Storage follows the hikari-systems data-service pattern (`hs-rust-data-service`
 skill): runtime sqlx, never `query_as!`; `models/<entity>.rs` free functions over
@@ -135,20 +132,30 @@ cargo deny check
 docker compose up -d --build      # not optional
 ```
 
-And the acceptance tier, which phase 5 changes and which is not in `cargo test`:
+And the acceptance tier, which is not in `cargo test`. Phase 7 does not touch the
+relay path, so it is only worth running if something in `src/relay.rs`,
+`src/routing/` or `src/rewrite/` changes:
 
 ```sh
 docker compose --profile acceptance up -d --build
 cargo test --test acceptance -- --ignored --test-threads=1
 ```
 
-`DATABASE_URL` is needed only by `tests/quota*.rs` (D-031). It does not affect the
-Docker build.
+**Every** compose invocation must carry `SIMMER_WARMUP_STARTED` (D-042), or
+compose silently re-creates `app` at the default warm-up instant mid-test and the
+suite measures the wrong day while appearing to pass.
+
+`DATABASE_URL` is needed only by `tests/quota*.rs` and `tests/frequency.rs`
+(D-031). It does not affect the Docker build.
 
 ## Outstanding non-code items
 
+- **`docs/RECIPIENTS.md` needs the spec's author** (D-047). It deletes §13's phase
+  9 and reverses §5.6; either the spec absorbs it or the divergence stands.
 - **`SPEC.md` §4.1's example configuration fails `SPEC.md` §4.2** (D-036). The
   spec author's call; `simmer.yaml` was corrected and `SPEC.md` was left alone.
+- **`docs/INGRESS.md`** (D-033) — listeners, inbound TLS and a sender ACL,
+  designed and not built. Reverses four `SPEC.md` passages.
 - The `smtp/auth.rs` timing defect, still unfixed and still separable.
 - Decide whether to keep the cargo-deny licence gate (analysis in `LICENSES.md`).
 - `hs-utils` — and every hikari-systems Rust service — declares no `license`

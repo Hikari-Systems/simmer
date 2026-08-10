@@ -499,32 +499,12 @@ async fn a_body_over_the_limit_is_552() {
 }
 
 #[tokio::test]
-async fn max_recipients_is_452() {
+async fn a_generous_max_recipients_does_not_permit_a_second_one() {
+    // D-047 — §5.5's ceiling is subsumed. The fixture says `max_recipients: 5`,
+    // and it makes no difference: the second RCPT TO is refused anyway, so no
+    // configuration can reach the ceiling.
     let down = FakeDownstream::start(Script::default()).await;
-    let cfg = config_for(down.addr, "").replace("max_recipients: 5", "max_recipients: 2");
-    let simmer = Simmer::start(&cfg).await;
-
-    let mut c = simmer.connect().await;
-    c.hello().await;
-    assert_eq!(c.command("MAIL FROM:<jane@oldbrand.com>").await.code, 250);
-    assert_eq!(c.command("RCPT TO:<a@gmail.com>").await.code, 250);
-    assert_eq!(c.command("RCPT TO:<b@gmail.com>").await.code, 250);
-
-    let r = c.command("RCPT TO:<c@gmail.com>").await;
-    assert_eq!(r.code, 452, "{r:?}");
-    assert!(r.contains("4.5.3"), "{r:?}");
-    // 452 is temporary on purpose: the recipient is fine, the batch is too big.
-}
-
-#[tokio::test]
-async fn single_recipient_only_refuses_the_second_rcpt() {
-    // §5.6 — the default, because collapsing several outcomes into one reply is
-    // lossy.
-    let down = FakeDownstream::start(Script::default()).await;
-    let cfg = config_for(down.addr, "").replace(
-        "single_recipient_only: false",
-        "single_recipient_only: true",
-    );
+    let cfg = config_for(down.addr, "").replace("max_recipients: 5", "max_recipients: 100");
     let simmer = Simmer::start(&cfg).await;
 
     let mut c = simmer.connect().await;
@@ -534,7 +514,50 @@ async fn single_recipient_only_refuses_the_second_rcpt() {
 
     let r = c.command("RCPT TO:<b@gmail.com>").await;
     assert_eq!(r.code, 452, "{r:?}");
+    assert!(r.contains("4.5.3"), "{r:?}");
+}
+
+#[tokio::test]
+async fn a_second_rcpt_to_is_always_refused() {
+    // D-047 — unconditional, with no switch to turn it off: collapsing several
+    // per-recipient outcomes into one reply is lossy, and SMTP allows exactly
+    // one reply.
+    let down = FakeDownstream::start(Script::default()).await;
+    let simmer = Simmer::start(&config_for(down.addr, "")).await;
+
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    assert_eq!(c.command("MAIL FROM:<jane@oldbrand.com>").await.code, 250);
+    assert_eq!(c.command("RCPT TO:<a@gmail.com>").await.code, 250);
+
+    let r = c.command("RCPT TO:<b@gmail.com>").await;
+    assert_eq!(r.code, 452, "{r:?}");
     assert!(r.contains("multiple recipients"), "{r:?}");
+    // 452 rather than 5xx: the recipient is deliverable and §14.1 will not have
+    // a limit of ours recorded against them permanently.
+}
+
+#[tokio::test]
+async fn a_refused_second_recipient_leaves_the_transaction_usable() {
+    // The refusal is per RCPT TO, not per transaction: RFC 5321 lets the client
+    // carry on with the recipients it does have, and a session that had to be
+    // reset would turn our limit into a delivery failure for recipient one.
+    let down = FakeDownstream::start(Script::default()).await;
+    let simmer = Simmer::start(&config_for(down.addr, "")).await;
+
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    assert_eq!(c.command("MAIL FROM:<jane@oldbrand.com>").await.code, 250);
+    assert_eq!(c.command("RCPT TO:<a@gmail.com>").await.code, 250);
+    assert_eq!(c.command("RCPT TO:<b@gmail.com>").await.code, 452);
+
+    assert_eq!(c.command("DATA").await.code, 354);
+    c.send_raw(BODY.as_bytes()).await;
+    c.send(".").await;
+    assert_eq!(c.read_reply().await.code, 250);
+
+    let got = down.last().expect("received");
+    assert_eq!(got.recipients, vec!["a@gmail.com".to_string()]);
 }
 
 #[tokio::test]
@@ -753,26 +776,32 @@ async fn a_second_message_on_the_same_connection_works() {
 }
 
 #[tokio::test]
-async fn several_recipients_go_out_in_one_downstream_transaction() {
-    // Phase 2 does not split by recipient — that is phase 9, behind the
-    // default-off switch. All recipients ride one transaction.
+async fn every_downstream_transaction_carries_exactly_one_recipient() {
+    // D-047, as the downstream sees it. Two recipients means two messages, and
+    // each arrives on its own transaction with one RCPT TO — which is what makes
+    // the reply the client gets unambiguously about the recipient it names.
     let (down, simmer) = stack("").await;
     let mut c = simmer.connect().await;
     c.hello().await;
 
-    assert_eq!(c.command("MAIL FROM:<jane@oldbrand.com>").await.code, 250);
-    assert_eq!(c.command("RCPT TO:<a@gmail.com>").await.code, 250);
-    assert_eq!(c.command("RCPT TO:<b@yahoo.com>").await.code, 250);
-    assert_eq!(c.command("DATA").await.code, 354);
-    c.send_raw(BODY.as_bytes()).await;
-    c.send(".").await;
-    assert_eq!(c.read_reply().await.code, 250);
-
-    let got = down.last().expect("received");
     assert_eq!(
-        got.recipients,
-        vec!["a@gmail.com".to_string(), "b@yahoo.com".to_string()]
+        c.deliver("jane@oldbrand.com", "a@gmail.com", BODY)
+            .await
+            .code,
+        250
     );
+    assert_eq!(
+        c.deliver("jane@oldbrand.com", "b@yahoo.com", BODY)
+            .await
+            .code,
+        250
+    );
+
+    let messages = down.messages();
+    assert_eq!(messages.len(), 2);
+    for m in &messages {
+        assert_eq!(m.recipients.len(), 1, "{:?}", m.recipients);
+    }
 }
 
 #[tokio::test]

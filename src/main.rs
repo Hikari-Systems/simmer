@@ -70,7 +70,6 @@ async fn run() -> anyhow::Result<()> {
         domain_groups = config.domain_groups.len(),
         listen = %config.server.listen,
         admin = %config.admin.listen,
-        single_recipient_only = config.server.single_recipient_only,
         strict_senders = config.strict_senders,
         "starting simmer"
     );
@@ -123,12 +122,29 @@ async fn run() -> anyhow::Result<()> {
     let rewriters = simmer::rewrite::Rewriters::compile(&config)
         .map_err(|errors| anyhow::anyhow!("rewrite templates failed to compile: {errors:?}"))?;
 
+    // §7.3 — the recipient-hash salt. Resolved lazily, because §7.5 says an
+    // unreachable database keeps the listener up rather than stopping the
+    // process; this is only a best-effort warm so that the first message does not
+    // pay for it and so an operator can see it happened.
+    let frequency = Arc::new(simmer::frequency::Frequency::new());
+    if simmer::frequency::any_configured(&config) {
+        match frequency.keyer(quota.as_ref()).await {
+            Ok(_) => info!("recipient-frequency salt loaded"),
+            Err(e) => warn!(
+                error = %e,
+                "recipient-frequency salt could not be loaded yet; it will be resolved \
+                 on the first message that needs it"
+            ),
+        }
+    }
+
     let engine = relay::Engine {
         config: Arc::clone(&config),
         tls: Arc::new(tls),
         quota: Arc::clone(&quota),
         registry: quota::ReservationRegistry::new(),
         rewriters: Arc::new(rewriters),
+        frequency,
     };
 
     // §5.1 — bind before announcing readiness, so a port clash is a startup
@@ -159,6 +175,18 @@ async fn run() -> anyhow::Result<()> {
         Arc::clone(&quota),
         stop_accepting.clone(),
     ));
+
+    // §7.3 — "a sweeper evicts rows older than the longest configured window plus
+    // a margin, on an interval". Not started at all when no route declares a
+    // constraint: nothing writes `recipient_event` then, so there is nothing to
+    // evict and no reason to wake up hourly to discover that.
+    let frequency_sweeper = simmer::frequency::retention(&config).map(|retention| {
+        tokio::spawn(simmer::frequency::sweeper::run(
+            Arc::clone(&quota),
+            retention,
+            stop_accepting.clone(),
+        ))
+    });
 
     let admin_task = {
         let stop = stop_accepting.clone();
@@ -192,6 +220,9 @@ async fn run() -> anyhow::Result<()> {
 
     let _ = smtp_task.await;
     let _ = sweeper.await;
+    if let Some(task) = frequency_sweeper {
+        let _ = task.await;
+    }
     let _ = admin_task.await;
 
     info!("shutdown complete");

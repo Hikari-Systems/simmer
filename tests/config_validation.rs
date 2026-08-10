@@ -251,6 +251,30 @@ fn rejects_a_body_rewrite_pattern_that_does_not_compile() {
 }
 
 #[test]
+fn rejects_body_rewrites_that_are_not_a_fixed_point() {
+    // D-046. §6.6 applied to the body: a rule whose pattern matches its own
+    // replacement grows the message every time it passes through, and corrupts
+    // traffic from an application that has already been cut over. The body is
+    // not a header, so `unstable_headers` cannot excuse it and nothing does.
+    let yaml = BASE.replace(
+        r#"      unstable_headers: ["Reply-To"]"#,
+        "      unstable_headers: [\"Reply-To\"]\n      body_rewrites:\n        - pattern: 'https://newbrand\\.com/x'\n          replacement: 'https://newbrand.com/x?ref=1'",
+    );
+    rejected_for(&yaml, "are not stable");
+}
+
+#[test]
+fn accepts_body_rewrites_where_one_rule_consumes_anothers_output() {
+    // The false positive the check has to avoid: applying the *chain* twice is a
+    // no-op even though rule 2 reads what rule 1 wrote.
+    let yaml = BASE.replace(
+        r#"      unstable_headers: ["Reply-To"]"#,
+        "      unstable_headers: [\"Reply-To\"]\n      body_rewrites:\n        - pattern: 'oldbrand\\.example'\n          replacement: 'interim.example'\n        - pattern: 'interim\\.example'\n          replacement: 'newbrand.example'",
+    );
+    load(&yaml).expect("a chain that settles should be accepted");
+}
+
+#[test]
 fn accepts_a_valid_body_rewrite_pattern() {
     let yaml = BASE.replace(
         r#"      unstable_headers: ["Reply-To"]"#,
@@ -320,6 +344,55 @@ fn warns_when_a_declared_header_turns_out_to_be_stable() {
             .iter()
             .any(|w| w.message.contains("Reply-To") && w.message.contains("stale")),
         "expected a declared-but-stable warning, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn warns_when_max_recipients_is_set_above_one() {
+    // D-047 — the key stays because §4.1 mandates it, but no value above 1 is
+    // reachable. BASE says 100, which is §4.1's own example.
+    let cfg = load(BASE).expect("valid");
+    let warnings = config::validate::warnings(&cfg);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.path == "server.max_recipients" && w.message.contains("no effect")),
+        "expected a vestigial-max_recipients warning, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn warns_when_the_last_route_in_a_chain_carries_a_frequency_constraint() {
+    // §7.3 steers to the *next* link. On the last link there is no next link, so
+    // a recipient over threshold gets §10.3's `451` instead of another route —
+    // legitimate, but far more often a mistake, and invisible until someone
+    // reaches the threshold.
+    let yaml = BASE.replace(
+        "  - name: overflow\n    overflow: true",
+        "  - name: overflow\n    overflow: true\n    recipient_frequency:\n      \
+         mode: to_address\n      window: { unit: daily, count: 1 }\n      threshold: 3",
+    );
+    let cfg = load(&yaml).expect("a constraint on the last link is a warning, not a violation");
+    let warnings = config::validate::warnings(&cfg);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.message.contains("nothing to fall through to")),
+        "expected a last-link frequency warning, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn does_not_warn_when_the_constraint_is_on_a_route_with_something_after_it() {
+    // The normal arrangement: the warming route is constrained and the overflow
+    // route catches what it turns away.
+    let cfg = load(BASE).expect("valid");
+    let warnings = config::validate::warnings(&cfg);
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.message.contains("nothing to fall through to")),
+        "unexpected last-link warning: {warnings:?}"
     );
 }
 
@@ -429,6 +502,25 @@ fn rejects_an_unknown_key() {
     match load(&yaml) {
         Err(LoadError::Parse { .. }) => {}
         other => panic!("expected a parse error for an unknown key, got: {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_a_removed_key_by_name() {
+    // D-047 removed `single_recipient_only`. `deny_unknown_fields` would already
+    // refuse it, but with a bare "unknown field" — and this is a key that worked
+    // in a previous version, so the operator gets told which decision took it
+    // away and what to do instead.
+    let yaml = BASE.replace(
+        "  max_recipients: 100",
+        "  max_recipients: 100\n  single_recipient_only: false",
+    );
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            assert!(v.mentions("single_recipient_only"), "{v}");
+            assert!(v.mentions("D-047"), "{v}");
+        }
+        other => panic!("expected a named violation for a removed key, got: {other:?}"),
     }
 }
 

@@ -284,12 +284,15 @@ pub fn access_denied() -> Reply {
     Reply::new(554, "5.7.1 access denied")
 }
 
-pub fn too_many_recipients() -> Reply {
-    Reply::new(452, "4.5.3 too many recipients")
-}
-
-/// §5.6 — `single_recipient_only` defaults true, because collapsing several
-/// per-recipient outcomes into one reply is lossy.
+/// D-047 — the second `RCPT TO` of any transaction, always.
+///
+/// §5.5's `too_many_recipients` used to sit beside this one, for `max_recipients`.
+/// It was removed rather than left unreachable: one recipient is a stricter limit
+/// than any ceiling, so nothing could ever reach it, and an unused reply in this
+/// file is exactly what its enumeration test exists to catch.
+///
+/// `452`, not `5xx`: the recipient is perfectly deliverable and §14.1 will not
+/// have a limit of ours recorded against them permanently.
 pub fn multiple_recipients_not_permitted() -> Reply {
     Reply::new(452, "4.5.3 multiple recipients not permitted")
 }
@@ -495,7 +498,6 @@ mod tests {
         }
 
         assert_eq!(no_eligible_route(false).code, 451, "§10.3 default");
-        assert_eq!(too_many_recipients().code, 452);
         assert_eq!(multiple_recipients_not_permitted().code, 452);
         assert_eq!(command_timeout().code, 421);
     }

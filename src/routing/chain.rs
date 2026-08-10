@@ -26,6 +26,7 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use crate::config::{Config, Route};
+use crate::frequency::{self, Frequency};
 use crate::metrics;
 use crate::quota::{
     self,
@@ -85,6 +86,13 @@ pub struct Selected<'a> {
     pub domain_group: String,
     pub day_index: i64,
     pub reservation: Reservation,
+    /// §7.3 — the recipient keys this route's constraint was evaluated against,
+    /// carried forward so §7.4 phase 3 can record them on a downstream `2xx`.
+    ///
+    /// Empty when the route declares no `recipient_frequency`: the keys are
+    /// mode-specific, so they belong to the route that produced them, and a
+    /// route with no constraint records nothing at all.
+    pub recipient_keys: Vec<frequency::Key>,
 }
 
 /// The result of walking a chain.
@@ -99,6 +107,7 @@ pub enum Walk<'a> {
 pub async fn walk_and_reserve<'a>(
     cfg: &'a Config,
     store: &Arc<dyn QuotaStore>,
+    frequency: &Frequency,
     chain: &[String],
     recipients: &[String],
     correlation_id: &str,
@@ -108,11 +117,14 @@ pub async fn walk_and_reserve<'a>(
     let states = store.route_states().await?;
 
     // §3.2: "Quota is decremented per message, by the recipient count, not per
-    // recipient" — one reservation of this magnitude (O-7).
+    // recipient" — one reservation of this magnitude (O-7). D-047 makes that
+    // count 1 for every message that arrives over SMTP; the arithmetic stays
+    // because the walk is callable with any slice and the spec's rule is about
+    // magnitude, not about how many recipients a transaction may hold.
     let count = recipients.len().max(1) as i64;
 
-    // §3.2 step 2. Every recipient of one transaction shares a domain group
-    // while `single_recipient_only` holds; phase 9 splits when it does not.
+    // §3.2 step 2. One recipient per transaction (D-047), so there is one domain
+    // group and no question of a transaction spanning two.
     let group = recipients
         .first()
         .and_then(|r| super::domain_group::resolve(cfg, r))
@@ -133,9 +145,49 @@ pub async fn walk_and_reserve<'a>(
             continue;
         }
 
-        // (b) recipient frequency — phase 6. Evaluated first among the
-        // *eligibility* checks per §3.2 3b, hence its position above the quota
-        // check rather than below it.
+        // (b) §7.3 recipient frequency. Evaluated first among the *eligibility*
+        // checks per §3.2 3b — "Evaluated **first** — it can eliminate routes
+        // outright" — hence its position above the quota check rather than below
+        // it. Being over threshold makes this route ineligible and nothing more:
+        // the message falls through to the next link, and a chain with no link
+        // left is §10.3's `451`, never a drop.
+        let recipient_keys = match &route.recipient_frequency {
+            None => Vec::new(),
+            Some(constraint) => {
+                let keyer = frequency.keyer(store.as_ref()).await?;
+                let keys: Vec<_> = recipients
+                    .iter()
+                    .map(|r| keyer.key_for(r, constraint.mode, &cfg.dot_insensitive_domains))
+                    .collect();
+
+                let since = frequency::window_start(constraint, now);
+                let mut over = false;
+                for key in &keys {
+                    let seen = store.recipient_event_count(name, key, since).await?;
+                    if seen >= i64::from(constraint.threshold) {
+                        // No recipient in the log line, and no recipient label on
+                        // the metric: §7.3 hashes precisely so that the container
+                        // does not accumulate a record of who was mailed, and a
+                        // log line would be that record by another route.
+                        tracing::debug!(
+                            route = %name,
+                            seen,
+                            threshold = constraint.threshold,
+                            window_start = %since.to_rfc3339(),
+                            "route is over its recipient-frequency threshold"
+                        );
+                        over = true;
+                        break;
+                    }
+                }
+
+                if over {
+                    record(evaluation, name, Err(SkipReason::Frequency));
+                    continue;
+                }
+                keys
+            }
+        };
 
         let day_index = quota::day::for_route(route, now);
         let allowance = quota::allowance_for(route, &group, day_index, state);
@@ -172,6 +224,7 @@ pub async fn walk_and_reserve<'a>(
                     domain_group: group,
                     day_index,
                     reservation,
+                    recipient_keys,
                 })));
             }
             Reserved::NoHeadroom { usage } => {

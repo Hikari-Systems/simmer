@@ -18,8 +18,7 @@ server:
   listen: "0.0.0.0:25"
   hostname: "simmer.internal"        # EHLO banner and Received headers
   max_message_bytes: 26214400        # 25 MiB, advertised via SIZE
-  max_recipients: 100
-  single_recipient_only: true        # §5.6 — multi-recipient replies are lossy
+  max_recipients: 1                  # D-047 — one recipient per transaction, always
   max_concurrent_sessions: 64
   allowed_cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
   timeouts:

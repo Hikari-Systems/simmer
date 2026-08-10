@@ -113,8 +113,23 @@ pub trait QuotaStore: Send + Sync + 'static {
     async fn reserve(&self, req: &ReserveRequest) -> Result<Reserved, QuotaError>;
 
     /// §7.4 phase 3 — downstream said `2xx`: move the count from `reserved` to
-    /// `committed`.
-    async fn commit(&self, reservation: &Reservation) -> Result<(), QuotaError>;
+    /// `committed`, **and record recipient-frequency events**.
+    ///
+    /// The second half is §7.4's own wording, and it is one method rather than
+    /// two because it is one transaction. A delivered message whose event was not
+    /// recorded would under-count somebody's window silently; a recorded event
+    /// for a message that did not commit would over-count it. Neither is
+    /// reachable if they cannot be separated.
+    ///
+    /// `recipient_keys` is empty for a route that declares no
+    /// `recipient_frequency` — §7.3's reason for hashing is that the container
+    /// does not accumulate a record of every address mailed, and rows nothing
+    /// will ever read are the opposite of that.
+    async fn commit(
+        &self,
+        reservation: &Reservation,
+        recipient_keys: &[crate::frequency::Key],
+    ) -> Result<(), QuotaError>;
 
     /// §7.4 phase 3 — anything else: give the headroom back.
     async fn release(&self, reservation: &Reservation) -> Result<(), QuotaError>;
@@ -139,6 +154,26 @@ pub trait QuotaStore: Send + Sync + 'static {
     /// §7.4 — release reservations past their expiry. Returns what was released
     /// so the caller can log and count it.
     async fn sweep_expired(&self) -> Result<Vec<Expired>, QuotaError>;
+
+    /// §7.3 — how many events this route has recorded for this recipient inside
+    /// the window. Unlocked, and outside the reservation transaction (D-049).
+    async fn recipient_event_count(
+        &self,
+        route: &str,
+        key: &crate::frequency::Key,
+        since: DateTime<Utc>,
+    ) -> Result<i64, QuotaError>;
+
+    /// §7.3's persisted salt, minting one if this is a fresh instance.
+    ///
+    /// On the store rather than in `main` because §7.5 says an unreachable
+    /// database is not a startup failure: the salt has to be obtainable later,
+    /// on the message path, and a failure here has to become the same `451` any
+    /// other storage failure does.
+    async fn recipient_hash_salt(&self) -> Result<Vec<u8>, QuotaError>;
+
+    /// §7.3's sweeper — evict events older than `cutoff`. Returns how many.
+    async fn sweep_recipient_events(&self, cutoff: DateTime<Utc>) -> Result<u64, QuotaError>;
 
     /// Is the backing store reachable? §7.5.
     async fn is_available(&self) -> bool;

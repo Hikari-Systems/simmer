@@ -1,11 +1,11 @@
 # Acceptance harness — design
 
-**Status: built in phase 4** (was: planned, not built). This document is the
-design; `tests/acceptance.rs`, `simmer.acceptance.yaml`, `src/bin/loadgen.rs` and
+**Status: built in phase 4, completed in phase 5.** This document is the design;
+`tests/acceptance.rs`, `simmer.acceptance.yaml`, `src/bin/loadgen.rs` and
 `docker-compose.yml`'s `acceptance` profile are the build. §7's phasing table
-records what is deliberately still outstanding — real-certificate TLS, failure
-injection, and §6.4's body-rewrite assertion — and §8's three open questions were
-settled as `DECISIONS.md` D-042.
+records what is deliberately still outstanding — real-certificate TLS and failure
+injection — and §8's three open questions were settled as `DECISIONS.md` D-042.
+§4.3's body-rewrite row landed in phase 5 with §6.4.
 
 ```sh
 docker compose --profile acceptance up -d --build
@@ -211,7 +211,7 @@ Per message in `trap-warming`, against the §4.1 example config:
 | `List-Unsubscribe` and `List-Unsubscribe-Post` present and well-formed | §6.2 |
 | `Return-Path` and `X-Mailer` **absent** | `remove_headers` |
 | `DKIM-Signature`, `Authentication-Results`, `ARC-*` **absent** | §6.5 |
-| body links rewritten `oldbrand.com` → `newbrand.com` | §6.4 |
+| body links rewritten `oldbrand.com` → `newbrand.com`, and the sentence around them untouched | §6.4 |
 
 The §6.5 row is the one worth being loud about. It is unconditional, it has no
 config switch, and a failing signature is treated more harshly by filters than an
@@ -264,9 +264,10 @@ is trustworthy.
 
 ## 6. Things that will bite
 
-- **`single_recipient_only: true`** is the shipped default, so bulk means one
-  transaction per recipient. The loadgen must not batch recipients unless the
-  acceptance config turns the switch off.
+- **One recipient per transaction** (D-047), so bulk means one transaction per
+  recipient. The loadgen cannot batch recipients: a second `RCPT TO` is refused
+  `452`, and there is no longer a switch that would permit it. A batching loadgen
+  would therefore measure refusals rather than the ramp.
 - **Polling, not sleeping.** Assert by polling the trap API until the count is
   stable with a timeout, never by sleeping a fixed interval. This is the single
   most likely source of flakes.
@@ -297,7 +298,7 @@ trade.
 |---|---|---|
 | Compose profile, traps, loadgen, ramp walk, routing evidence (§4.1, §4.2) | **landed, phase 4** | phase 3, which is done |
 | Header rewrite assertions (§4.3 less the body row) | **landed, phase 4** | the rewriting engine |
-| Body rewrite assertion | phase 5 | §6.4 |
+| Body rewrite assertion | **landed, phase 5** | §6.4 |
 | **Cutover invariant** (§4.4) | **landed, phase 4** | the rewriting engine |
 | Real-certificate TLS (§5) | phase 10 | nothing; deferred for scope |
 | Failure injection (`fail_closed`, `SIGTERM`) | phase 10 | nothing; deferred for scope |
@@ -316,9 +317,11 @@ received the message* is evidence that needs no rewriting to be meaningful.
    into, rather than building both at once. It also means the ramp is proven
    end to end before more is stacked on it.
 2. **Does the acceptance config mirror `simmer.yaml`, or is it its own file?** A
-   separate `simmer.acceptance.yaml` is proposed — it needs `${SIMMER_WARMUP_STARTED}`,
-   trap hostnames and possibly `single_recipient_only: false`, none of which belong
-   in the shipped example. The cost is a second file that can drift from the first;
+   separate `simmer.acceptance.yaml` is proposed — it needs `${SIMMER_WARMUP_STARTED}`
+   and trap hostnames, neither of which belongs in the shipped example. *(Settled:
+   it is its own file, and the drift guard exists. The third thing it was expected
+   to need, `single_recipient_only: false`, was removed from the schema entirely by
+   D-047.)* The cost is a second file that can drift from the first;
    a test asserting both parse and expose the same route names would contain that.
 3. **CI.** The suite needs Docker and takes minutes. Run it on every push, or only
    on a tag / manual dispatch? The house `build.yml` currently has no test gate at

@@ -45,7 +45,7 @@ deliverable recipient on a suppression list that outlives Simmer by years.
 
 ## Status
 
-Phases 1–3 of the ten in `docs/SPEC.md` §13.
+Phases 1–6 of the ten in `docs/SPEC.md` §13. Phase 9 is void — see D-047 below.
 
 **Phase 1** — configuration loading, full startup validation, structured
 logging, the container skeleton.
@@ -75,16 +75,56 @@ on a compose profile, a ramp walked across simulated days by moving
 `warmup.started`, and an assertion that both arrangements of the cutover invariant
 produce byte-equal output.
 
-What works today: **an end-to-end relay that applies the ramp and rewrites the
-identity.** What does not, yet:
+**Phase 5** — body rewriting (§6.4), which completes §6. Each `text/*` part is
+decoded according to its `Content-Transfer-Encoding` and charset, the route's
+`body_rewrites` patterns are applied in order, and the part is written back in the
+encoding and charset it arrived with. A URL split across a quoted-printable soft
+line break matches, which is the case §6.4 exists for. Attachments, non-text
+parts, and signed or encrypted parts are never touched, and a part that cannot be
+decoded is left alone, warned about and counted.
 
-- **No body rewriting.** `body_rewrites` is validated at startup and then ignored;
-  the body is forwarded byte for byte. That is phase 5 (§6.4).
+A part that matches nothing is not re-encoded at all — a body in which nothing
+matched is forwarded as the bytes it arrived as, MIME boundaries and trailing
+whitespace included.
+
+**Phase 6** — the recipient-frequency constraint (§7.3), preceded by a policy
+reversal: **a transaction may now carry exactly one recipient** (D-047, below).
+
+A route may declare `recipient_frequency`, and a recipient at or over its
+threshold inside a rolling window makes that route **ineligible** — the message
+steers to the next link in the chain and is never dropped. The recipient is
+normalised first, so `Bob.Smith+news@gmail.com` and `bobsmith@gmail.com` count as
+the one inbox they are: lowercased, everything from `+` to `@` removed, and dots
+folded out of the local part at the providers listed in `dot_insensitive_domains`.
+
+What is stored is a **keyed hash**, never the address: HMAC-SHA256 under a salt
+minted once and persisted in `instance_config`, truncated to 16 bytes. No
+plaintext address reaches the database, a log line or a metric label. Events are
+recorded only on a downstream `2xx`, in the same transaction that commits the
+quota, and only for routes that declare a constraint; an hourly sweeper evicts
+anything past the longest configured window plus a margin.
+
+What works today: **an end-to-end relay that applies the ramp, rewrites both the
+identity and the body, and paces how often one recipient hears from a warming
+route.** What does not, yet:
+
 - **No connection pool.** One downstream connection per message (phase 10).
 - **No admin API and no metrics endpoint.** The counters are being recorded, and
   `pause` / `graduate` / `allowance` are honoured from the database, but nothing
   writes or exports them until phase 7.
-- No preflight, no recipient-frequency constraint, no multi-recipient splitting.
+- No preflight (phase 8).
+
+And one thing that will not arrive, because it is a decision rather than a gap:
+
+- **A transaction may carry exactly one recipient.** A second `RCPT TO` is
+  refused `452 4.5.3 multiple recipients not permitted`, and no configuration
+  changes that. An application that batches recipients into one transaction must
+  send one message per recipient instead — which is what it will be doing anyway
+  once Simmer is unplugged. The reason is that SMTP allows one reply per
+  transaction, so several per-recipient outcomes have to be collapsed into a
+  single code, and every way of doing that either drops mail silently or records
+  one recipient's permanent failure against the others. See `DECISIONS.md` D-047
+  and `docs/RECIPIENTS.md`.
 
 ```sh
 $ printf 'EHLO me\r\nMAIL FROM:<jane@oldbrand.com>\r\nRCPT TO:<bob@gmail.com>\r\nDATA\r\n' | nc simmer 25

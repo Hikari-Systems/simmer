@@ -18,10 +18,12 @@
 //!
 //! ## The body is not in here
 //!
-//! [`split`] returns the body as an opaque slice and phase 4 puts it back
-//! untouched. Body rewriting is §6.4 and phase 5. Until then, "the body arrives
-//! byte for byte" is a property this module makes structurally true rather than
-//! one that has to be tested for every message shape.
+//! [`split`] returns the body as an opaque slice. §6.4 is `body.rs`, and it
+//! rewrites that slice only where a `body_rewrites` entry matched — a body in
+//! which nothing matched comes back through this module's caller as the same
+//! bytes it arrived as. The division is the same one D-039 draws: this module
+//! knows nothing about MIME, and the MIME walk knows nothing about the header
+//! block except how to read a `Content-Type` out of one.
 
 use super::encode;
 

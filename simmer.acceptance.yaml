@@ -20,11 +20,10 @@ server:
   listen: "0.0.0.0:25"
   hostname: "simmer.acceptance"
   max_message_bytes: 26214400
-  max_recipients: 100
-  # §5.6 and `ACCEPTANCE.md` §6: the shipped default, so the loadgen opens one
-  # transaction per recipient. Turning it off here would make the ramp
-  # assertions count transactions rather than messages.
-  single_recipient_only: true
+  # D-047 and `ACCEPTANCE.md` §6: one recipient per transaction, so the loadgen
+  # opens one transaction per recipient and the ramp assertions count messages
+  # rather than transactions. There is no longer a switch that could change it.
+  max_recipients: 1
   max_concurrent_sessions: 64
   # The compose network. `loadgen` is the only client.
   allowed_cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
@@ -99,6 +98,11 @@ routes:
         X-Simmer-Route: "{{route.name}}"
       unstable_headers: ["Reply-To"]
       remove_headers: ["Return-Path", "X-Mailer"]
+      # §6.4, and `ACCEPTANCE.md` §4.3's last row. The loadgen's body carries
+      # this link; the suite reads it back off a real mail server.
+      body_rewrites:
+        - pattern: 'https://oldbrand\.com/'
+          replacement: "https://newbrand.com/"
     preflight:
       # §6.7 is phase 8. Off rather than left at its default, so the suite is not
       # asserting against a feature that does not exist yet.

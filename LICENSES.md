@@ -223,6 +223,55 @@ disjunction offers `MIT` regardless, which is the branch cargo-deny accepts.
 
 `cargo deny check licenses` passes unchanged.
 
+### Phase 5
+
+**No new dependencies.** §6.4 needs quoted-printable and base64 codecs and a
+charset layer, and the phase was expected to take at least one crate for the
+last of those. It did not, and the reason is worth recording because it was a
+licence-adjacent decision even though nothing was adopted.
+
+The obvious candidate was `encoding_rs`, reachable without a new *direct*
+dependency by turning on `mail-parser`'s `full_encoding` feature. Its licence is
+clean — `(Apache-2.0 OR MIT) AND BSD-3-Clause`, all three permissive — so this
+was not a licence rejection. It was rejected on behaviour: its encoder
+substitutes numeric character references for characters the target charset cannot
+represent, which is correct for HTML form submission and wrong in a mail body,
+where it would emit a literal `&#8212;` in place of an em dash. §6.4 already
+specifies what to do with a charset we cannot handle — leave the part alone, warn,
+count it — so the narrower hand-written codec (D-044) is both closer to the spec
+and one fewer crate.
+
+`base64` and `regex` were already in the graph, from phase 2 and phase 1
+respectively.
+
+### Phase 6
+
+Two new **direct** dependencies that add nothing to the build, because both were
+already being compiled as transitive dependencies of `sqlx-postgres` (SCRAM
+authentication needs exactly this pair). Taking them directly pins nothing new
+and downloads nothing new; it only makes the use in `src/frequency/mod.rs`
+explicit. Verified 2026-08-10 against the crates.io API.
+
+| Crate | Pinned | Licence | Versions checked | For |
+|---|---|---|---|---|
+| `sha2` | 0.10.9 | `MIT OR Apache-2.0` | all | §7.3's salted hash |
+| `hmac` | 0.12.1 | `MIT OR Apache-2.0` | all | §7.3's salted hash |
+
+Both are RustCrypto crates, the same family `argon2` already comes from.
+
+**Why not reuse `argon2`, which is already a direct dependency.** §5.3 wants a
+password hash to be *slow*; §7.3's key is computed on the message path for every
+recipient of every message. The threat models differ as well: the salt and the
+hashes live in the same database, so slowness buys nothing against an attacker
+who has the table. What §7.3 asks for is that the container stop *accumulating*
+plaintext, which a keyed hash does.
+
+**Randomness for the salt did not need a crate.** `rand` is in the resolved graph
+transitively but is not a direct dependency, and adding it for 32 bytes would be
+a fourth way to reach the operating system's randomness. `uuid` — already direct,
+for §9.5's correlation id — carries 122 bits of `getrandom` output per v4 value,
+so two of them make the salt.
+
 ---
 
 ## 3. Direct dependencies, as resolved
@@ -232,12 +281,14 @@ disjunction offers `MIT` regardless, which is the branch cargo-deny accepts.
 | `anyhow` | 1.0.104 | `MIT OR Apache-2.0` |
 | `axum` | 0.8.9 | `MIT` |
 | `chrono` | 0.4.45 | `MIT OR Apache-2.0` |
+| `hmac` | 0.12.1 | `MIT OR Apache-2.0` |
 | `hs-utils` | 0.31.2 | *(none declared — see above)* |
 | `ipnet` | 2.12.1 | `MIT OR Apache-2.0` |
 | `regex` | 1.13.1 | `MIT OR Apache-2.0` |
 | `serde` | 1.0.229 | `MIT OR Apache-2.0` |
 | `serde_json` | 1.0.151 | `MIT OR Apache-2.0` |
 | `serde_yaml_ng` | 0.10.0 | `MIT` |
+| `sha2` | 0.10.9 | `MIT OR Apache-2.0` |
 | `sqlx` | 0.8.6 | `MIT OR Apache-2.0` |
 | `thiserror` | 2.0.19 | `MIT OR Apache-2.0` |
 | `tokio` | 1.53.1 | `MIT` |

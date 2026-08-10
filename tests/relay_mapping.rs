@@ -65,6 +65,157 @@ async fn everything_the_route_does_not_name_is_forwarded_byte_for_byte() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// §6.4 through the relay
+// ---------------------------------------------------------------------------
+
+/// A route that rewrites links in the body, as `simmer.yaml` does.
+const WITH_BODY_REWRITES: &str = concat!(
+    "      body_rewrites:\n",
+    "        - pattern: 'https://oldbrand\\.com/'\n",
+    "          replacement: \"https://newbrand.com/\"\n",
+);
+
+async fn stack_rewriting_bodies() -> (FakeDownstream, Simmer) {
+    let down = FakeDownstream::start(Script::default()).await;
+    let simmer = Simmer::start(&config_for(down.addr, WITH_BODY_REWRITES)).await;
+    (down, simmer)
+}
+
+#[tokio::test]
+async fn a_body_no_rule_matches_still_arrives_byte_for_byte() {
+    // The end-to-end half of what D-039 used to guarantee structurally. §6.4
+    // means the body is no longer opaque, so this is the property that replaces
+    // it: a configured route that finds nothing to change changes nothing —
+    // including the MIME boundaries, the transfer encodings and the trailing
+    // whitespace.
+    let (down, simmer) = stack_rewriting_bodies().await;
+    let mut c = simmer.connect().await;
+    c.hello().await;
+
+    let body = concat!(
+        "From: jane@oldbrand.com\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: multipart/mixed; boundary=\"b1\"\r\n",
+        "\r\n",
+        "preamble text\r\n",
+        "--b1\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: quoted-printable\r\n",
+        "\r\n",
+        "Nothing here matches. Gr=C3=BC=C3=9Fe, and a soft=20\r\n",
+        "break.\r\n",
+        "--b1\r\n",
+        "Content-Type: application/pdf\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "JVBERi0xLjQK\r\n",
+        "--b1--\r\n",
+        "epilogue\r\n",
+        "\r\n",
+    );
+    let r = c.deliver("jane@oldbrand.com", "bob@gmail.com", body).await;
+    assert_eq!(r.code, 250, "{r:?}");
+
+    let got = down.last().expect("received");
+    assert_eq!(support::without_received(&got.body), body);
+}
+
+#[tokio::test]
+async fn a_link_in_a_text_part_is_rewritten_on_the_way_through() {
+    let (down, simmer) = stack_rewriting_bodies().await;
+    let mut c = simmer.connect().await;
+    c.hello().await;
+
+    let body = concat!(
+        "From: jane@oldbrand.com\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "\r\n",
+        "Track it at https://oldbrand.com/track\r\n",
+    );
+    let r = c.deliver("jane@oldbrand.com", "bob@gmail.com", body).await;
+    assert_eq!(r.code, 250, "{r:?}");
+
+    let got = support::without_received(&down.last().expect("received").body);
+    assert!(got.contains("https://newbrand.com/track"), "{got}");
+    assert!(!got.contains("oldbrand.com/track"), "{got}");
+}
+
+#[tokio::test]
+async fn a_link_split_across_a_soft_line_break_is_rewritten_and_the_rest_is_left_alone() {
+    // §6.4's stated reason for decoding first: a URL written across a
+    // quoted-printable soft break "is the common case in real mail rather than
+    // an edge case". The attachment beside it encodes the same URL and must
+    // survive — decoding it to find out is exactly what §6.4 forbids.
+    let (down, simmer) = stack_rewriting_bodies().await;
+    let mut c = simmer.connect().await;
+    c.hello().await;
+
+    let body = concat!(
+        "From: jane@oldbrand.com\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: multipart/mixed; boundary=\"b1\"\r\n",
+        "\r\n",
+        "--b1\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "Content-Transfer-Encoding: quoted-printable\r\n",
+        "\r\n",
+        "Track it at https://old=\r\nbrand.com/track today\r\n",
+        "--b1\r\n",
+        "Content-Type: application/octet-stream\r\n",
+        "Content-Transfer-Encoding: base64\r\n",
+        "\r\n",
+        "aHR0cHM6Ly9vbGRicmFuZC5jb20vdHJhY2s=\r\n",
+        "--b1--\r\n",
+    );
+    let r = c.deliver("jane@oldbrand.com", "bob@gmail.com", body).await;
+    assert_eq!(r.code, 250, "{r:?}");
+
+    let got = support::without_received(&down.last().expect("received").body);
+    assert!(got.contains("https://newbrand.com/track"), "{got}");
+    assert!(
+        got.contains("aHR0cHM6Ly9vbGRicmFuZC5jb20vdHJhY2s="),
+        "the attachment was touched:\n{got}"
+    );
+    // And the framing around the rewritten part is still the framing that
+    // arrived.
+    assert!(got.contains("--b1--\r\n"), "{got}");
+}
+
+#[tokio::test]
+async fn a_signed_message_passes_through_unrewritten() {
+    // §6.4: "Signed or encrypted parts … are never rewritten; rewriting would
+    // invalidate them." The link inside is a live match, which is the point.
+    let (down, simmer) = stack_rewriting_bodies().await;
+    let mut c = simmer.connect().await;
+    c.hello().await;
+
+    let body = concat!(
+        "From: jane@oldbrand.com\r\n",
+        "MIME-Version: 1.0\r\n",
+        "Content-Type: multipart/signed; boundary=\"sig\"; ",
+        "protocol=\"application/pkcs7-signature\"\r\n",
+        "\r\n",
+        "--sig\r\n",
+        "Content-Type: text/plain\r\n",
+        "\r\n",
+        "Track it at https://oldbrand.com/track\r\n",
+        "--sig\r\n",
+        "Content-Type: application/pkcs7-signature\r\n",
+        "\r\n",
+        "MIIFnotarealsignature\r\n",
+        "--sig--\r\n",
+    );
+    let r = c.deliver("jane@oldbrand.com", "bob@gmail.com", body).await;
+    assert_eq!(r.code, 250, "{r:?}");
+
+    assert_eq!(
+        support::without_received(&down.last().expect("received").body),
+        body,
+        "a signed message must arrive exactly as it was sent"
+    );
+}
+
 #[tokio::test]
 async fn exactly_one_received_header_is_added() {
     // §6.1 step 8, and the phase 4 call that Simmer adds nothing else: one

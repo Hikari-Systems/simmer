@@ -26,6 +26,16 @@
 //!
 //! `Received:` is the one field genuinely excluded: pass 2 prepends a second one
 //! by design, and §6.1 step 8 says it should.
+//!
+//! ## The body is checked elsewhere
+//!
+//! This probe compares the header block and the envelope sender, not the body.
+//! §6.4's half of §6.6 is `body::Rules::fixed_point_violation`, which asks the
+//! same question of the rewrite rules directly: a probe built from a message
+//! would only exercise them if it happened to contain a match, and one built
+//! from the rules' own replacements always does. `config::validate` runs both,
+//! and `tests/rewrite_stability.rs` composes the whole engine — bodies included
+//! — over generated messages.
 
 use std::collections::BTreeSet;
 

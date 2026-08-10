@@ -5,5 +5,7 @@
 //! The reservation protocol that composes these into transactions lives in
 //! [`crate::quota::postgres`], behind §11's storage trait.
 
+pub mod instance_config;
 pub mod quota;
+pub mod recipient_event;
 pub mod route_state;

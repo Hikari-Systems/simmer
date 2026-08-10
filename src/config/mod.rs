@@ -89,10 +89,10 @@ pub struct Server {
     /// Used in the EHLO banner and `Received:` headers (§6.1 step 8).
     pub hostname: String,
     pub max_message_bytes: u64,
+    /// §5.5's recipient ceiling. Vestigial since D-047: a transaction may carry
+    /// exactly one recipient, so no value above 1 is reachable. Kept because
+    /// §4.1 mandates the key; §4.2 warns when it is set above 1.
     pub max_recipients: usize,
-    /// §5.6 — defaults to **true**. Multi-recipient splitting is lossy on reply.
-    #[serde(default = "yes")]
-    pub single_recipient_only: bool,
     pub max_concurrent_sessions: usize,
     pub allowed_cidrs: Vec<String>,
     pub timeouts: ServerTimeouts,
@@ -653,6 +653,13 @@ pub fn from_str(text: &str, origin: &str) -> Result<Config, LoadError> {
             path: origin.to_string(),
             source,
         })?;
+
+    // Before anything else: a key this version has removed would otherwise fail
+    // as a bare `unknown field`, which says nothing about what replaced it.
+    let removed = validate::removed_keys(&tree);
+    if !removed.is_empty() {
+        return Err(LoadError::Invalid(removed));
+    }
 
     // Interpolate before deserialising: ${VAR} may appear in a field typed as
     // something other than String (a port, say), and substituting into the

@@ -11,14 +11,14 @@
 //! 4. Strip authentication artefacts (§6.5)
 //! 5. Apply remove_headers
 //! 6. Apply set_headers, rendering templates
+//! 7. Apply body_rewrites to text/* parts (§6.4)
 //! 8. Prepend a Received: header naming Simmer
 //! 9. Compute the outbound envelope sender
 //! 10. Serialise and transmit
 //! ```
 //!
 //! Steps 1 and 3 happened before we got here (`smtp::session` buffered, `relay`
-//! selected). Step 7 — `body_rewrites` — is §6.4 and phase 5; the body is
-//! carried through as an opaque slice until then.
+//! selected).
 //!
 //! Two orderings inside that list are load-bearing rather than arbitrary:
 //!
@@ -38,11 +38,21 @@
 //! overwritten. Composing that with itself is a no-op — unless a template reads
 //! a field the same pass writes, which is exactly the accident §6.6's property
 //! is designed to catch. See `stability.rs`.
+//!
+//! Step 7 is the one place that reasoning has to be made rather than inherited.
+//! A `body_rewrites` entry whose replacement its own pattern matches — `s/a/aa/`
+//! — grows the body on every pass, and unlike a header there is nothing it can
+//! be declared as. `body::Rules::fixed_point_violation` is the check, and D-046
+//! is why it is fatal.
 
+pub mod body;
+pub mod charset;
 pub mod encode;
 pub mod headers;
+pub mod mime;
 pub mod stability;
 pub mod template;
+pub mod transfer;
 
 use std::collections::HashMap;
 
@@ -80,14 +90,51 @@ pub struct RouteRewrite {
     pub set_headers: Vec<(String, Template)>,
     pub remove_headers: Vec<String>,
     pub unstable_headers: Vec<String>,
+    /// §6.4, compiled. Empty for a route that configures none.
+    pub body_rewrites: body::Rules,
 }
 
-/// Where a template failed to parse, so §4.2 can name the YAML key.
+/// Where an `identity` entry failed to compile, so §4.2 can name the YAML key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileError {
     /// Relative to the route's `identity`, e.g. `set_headers.From`.
     pub field: String,
-    pub error: ParseError,
+    pub error: CompileErrorKind,
+}
+
+/// The two things in an `identity` block that are compiled rather than read:
+/// §6.3 templates and §6.4 patterns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompileErrorKind {
+    Template(ParseError),
+    /// The regex crate's own diagnosis, reduced to the line that names the
+    /// problem — see [`CompileErrorKind::pattern`].
+    Pattern(String),
+}
+
+impl CompileErrorKind {
+    /// A `regex::Error` renders over several lines: a "regex parse error:"
+    /// banner, the offending pattern, a caret, then the diagnosis. The banner
+    /// alone tells the reader nothing, so take the last non-empty line — that is
+    /// the one that names the problem.
+    fn pattern(error: &regex::Error) -> CompileErrorKind {
+        let rendered = error.to_string();
+        let reason = rendered
+            .lines()
+            .map(str::trim)
+            .rfind(|l| !l.is_empty())
+            .unwrap_or("invalid");
+        CompileErrorKind::Pattern(format!("does not compile: {reason}"))
+    }
+}
+
+impl std::fmt::Display for CompileErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompileErrorKind::Template(e) => e.fmt(f),
+            CompileErrorKind::Pattern(message) => f.write_str(message),
+        }
+    }
 }
 
 impl RouteRewrite {
@@ -99,7 +146,7 @@ impl RouteRewrite {
             Err(error) => {
                 errors.push(CompileError {
                     field: "envelope_from".to_string(),
-                    error,
+                    error: CompileErrorKind::Template(error),
                 });
                 None
             }
@@ -111,10 +158,24 @@ impl RouteRewrite {
                 Ok(t) => set_headers.push((name.to_string(), t)),
                 Err(error) => errors.push(CompileError {
                     field: format!("set_headers.{name}"),
-                    error,
+                    error: CompileErrorKind::Template(error),
                 }),
             }
         }
+
+        // §4.2: "A `body_rewrites.pattern` fails to compile."
+        let body_rewrites = match body::Rules::compile(&identity.body_rewrites) {
+            Ok(rules) => Some(rules),
+            Err(failures) => {
+                for (i, error) in failures {
+                    errors.push(CompileError {
+                        field: format!("body_rewrites[{i}].pattern"),
+                        error: CompileErrorKind::pattern(&error),
+                    });
+                }
+                None
+            }
+        };
 
         if !errors.is_empty() {
             return Err(errors);
@@ -125,6 +186,7 @@ impl RouteRewrite {
             set_headers,
             remove_headers: identity.remove_headers.clone(),
             unstable_headers: identity.unstable_headers.clone(),
+            body_rewrites: body_rewrites.expect("no errors means it compiled"),
         })
     }
 
@@ -208,6 +270,10 @@ pub struct Rewritten {
     pub raw: Vec<u8>,
     /// `None` is the null sender. Ready for `MAIL FROM:<…>` — no angle brackets.
     pub envelope_from: Option<String>,
+    /// §6.4 — one per `text/*` part the route's `body_rewrites` would have been
+    /// applied to and was not. Carried out rather than counted here so the relay
+    /// owns every metric call and the engine stays a pure function.
+    pub skipped_parts: Vec<body::SkipReason>,
 }
 
 // ---------------------------------------------------------------------------
@@ -259,10 +325,10 @@ pub fn rewrite(route: &RouteRewrite, inbound: &Inbound<'_>) -> Rewritten {
         message_id,
         subject,
         header: &header_lookup,
-        // §6.3 scopes recipient.* to the single-recipient case. Multi-recipient
-        // splitting is §5.6 and phase 9 (O-9); until then a message with more
-        // than one recipient renders these empty rather than picking one
-        // arbitrarily, which would be worse than admitting we do not know.
+        // §6.3's `recipient.*`. D-047 makes the single-recipient case the only
+        // case, so this is `Some` for every real message; the other arm covers a
+        // caller with no recipient at all — §6.6's synthetic probe is one — and
+        // renders empty rather than inventing an address.
         recipient: match inbound.recipients {
             [only] => Some(AddressParts::split(only)),
             _ => None,
@@ -288,6 +354,23 @@ pub fn rewrite(route: &RouteRewrite, inbound: &Inbound<'_>) -> Rewritten {
         message.headers.set(name, tmpl.render_header(name, &ctx));
     }
 
+    // -- step 7: §6.4 --------------------------------------------------
+    //
+    // After step 6 and not before, so a route that sets `Content-Type` is read
+    // the way it will be sent. The body is handed over as the slice it arrived
+    // as: steps 4–6 touch only the header block.
+    let rewritten_body = body::rewrite(&route.body_rewrites, &message.headers, message.body);
+    for (name, value) in &rewritten_body.header_fixups {
+        message.headers.set(name, value.clone());
+    }
+    for reason in &rewritten_body.skipped {
+        tracing::warn!(
+            reason = reason.as_str(),
+            "body_rewrites not applied to a part: {}",
+            reason.describe()
+        );
+    }
+
     // -- step 8 --------------------------------------------------------
     message
         .headers
@@ -298,9 +381,18 @@ pub fn rewrite(route: &RouteRewrite, inbound: &Inbound<'_>) -> Rewritten {
 
     // -- step 10 -------------------------------------------------------
     let mut raw = message.headers.to_bytes();
-    raw.extend_from_slice(message.body);
+    match &rewritten_body.body {
+        Some(body) => raw.extend_from_slice(body),
+        // Nothing matched, so the original slice goes back untouched. See
+        // `body.rs`'s module comment: this is what is left of D-039.
+        None => raw.extend_from_slice(message.body),
+    }
 
-    Rewritten { raw, envelope_from }
+    Rewritten {
+        raw,
+        envelope_from,
+        skipped_parts: rewritten_body.skipped,
+    }
 }
 
 /// §6.1 step 9.
@@ -703,8 +795,11 @@ set_headers:
     }
 
     #[test]
-    fn a_multi_recipient_message_renders_recipient_variables_empty() {
-        // §6.3 scopes them to the single-recipient case; O-9 is phase 9.
+    fn recipient_variables_render_empty_when_there_is_no_single_recipient() {
+        // Defensive, not reachable through the relay: D-047 refuses a second
+        // RCPT TO, so `recipients` always holds exactly one. The engine is
+        // callable directly — §6.6's probe does exactly that — and picking one
+        // address arbitrarily would be worse than admitting we do not know.
         let route = compile(
             r#"
 envelope_from: "b@new.com"

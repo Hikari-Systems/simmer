@@ -662,8 +662,10 @@ to decide.
 
 **Worth knowing if the intent was VERP:** per-sender return paths cannot be
 expressed absolutely from a field the route rewrites. They *can* be expressed from
-one it does not — `bounce+{{recipient.local}}@newbrand.com` is stable — at the
-cost of forcing per-recipient splitting (§6.3, O-9).
+one it does not — `bounce+{{recipient.local}}@newbrand.com` is stable — which when
+this was written cost per-recipient splitting (§6.3, O-9). **Since D-047 it costs
+nothing:** every transaction has exactly one recipient, so `recipient.*` always
+renders a real value and there is no splitting left to force.
 
 ### D-037 — `Received:` is the only header Simmer adds unbidden
 
@@ -763,6 +765,325 @@ a choice, and any choice becomes part of the bytes §12.3 compares. Folding only
 the hard limit means the common case emits exactly what the operator's template
 describes and the uncommon case stays legal. The fold point is always a space and
 unfolding restores that space, so §6.6's property survives it.
+
+---
+
+## Phase 5
+
+### D-043 — The MIME structure is walked as byte ranges, and only matched spans are rebuilt
+
+**Spec:** §6.4 describes a per-part decode/rewrite/re-encode and says nothing about
+what happens to the parts that do not match.
+
+**Decision:** the body is located as **ranges** — `src/rewrite/mime.rs` returns the
+byte span of each `text/*` part rather than its content — and `body.rs` rebuilds
+the body by copying every span it did not rewrite verbatim. A part no rule matches
+is never decoded-and-re-encoded, and a body in which no part matched is returned as
+`None`, so the caller splices the original slice straight back.
+
+**Why:** D-039 made "nothing Simmer was not configured to change is changed"
+structurally true for the body by never touching it. §6.4 ends that, and the
+obvious replacement is a test. Ranges give something better: the guarantee narrows
+rather than disappearing. It still holds structurally for every part that did not
+match, and only the spans the operator's configuration actually hit are rebuilt.
+
+That distinction is not cosmetic. **Re-encoding is not the identity.** A
+quoted-printable part re-wrapped by our encoder rather than the client's is
+equivalent but not equal, and §12.3 compares bytes. Confining re-encoding to the
+matched parts means the difference exists exactly where the operator asked for one
+and nowhere else.
+
+`mail-parser` does expose `offset_body`/`offset_end` per part and was the first
+approach tried. It was dropped for two reasons: it decodes every part as it parses,
+which doubles the peak memory of a large message to obtain structure a scan can
+give; and it has to be handed the whole message, which would mean re-serialising
+the header block §6.1 steps 4–6 have just edited before step 7 could read a
+`Content-Type` those steps might have set. Walking the edited `HeaderBlock` and the
+untouched body avoids both.
+
+**Consequences:** `message/rfc822` and any part carrying
+`Content-Disposition: attachment` are not descended into and produce no counter —
+§6.4's first sentence puts attachments outside the scope, so they are not "skipped"
+from a scope they were never in. `multipart/signed`, `multipart/encrypted` and
+`application/pkcs7-*` *are* counted, because those are §6.4 protecting a signature
+and an operator whose rewrite silently stops applying to signed mail should see it.
+
+### D-044 — Four charsets are supported; every other charset is §6.4's "unknown charset"
+
+**Spec:** §6.4 says "decode the charset to UTF-8", and also says "if a part cannot
+be decoded (unknown charset, malformed encoding), leave it untouched, log at
+`WARN`, and increment `simmer_body_rewrite_skipped_total`".
+
+**Decision:** UTF-8, US-ASCII, ISO-8859-1 and Windows-1252 are decoded and encoded
+exactly, by hand, in `src/rewrite/charset.rs`. Everything else takes the second
+sentence: the part is left untouched, warned about, and counted with
+`reason="unsupported_charset"`. **No new dependency was taken.**
+
+**Why:** the line has to be drawn somewhere, and the spec supplies the behaviour
+for whatever falls outside it, so this is a scope choice rather than a gap. It is
+drawn at what an application generating its own mail actually emits.
+
+`encoding_rs` — reachable through `mail-parser`'s `full_encoding` feature — would
+decode far more. It was rejected on its *encoder*, not its licence (which is
+clean; see `LICENSES.md` §4): for a character the target charset cannot represent
+it emits a numeric character reference, which is right for HTML form submission and
+puts a literal `&#8212;` in the middle of an email body. Round-tripping a part
+faithfully matters more here than covering Shift-JIS, and adding it later is a
+change to one file.
+
+US-ASCII is deliberately decoded *as* UTF-8. The two agree on every byte a
+conforming us-ascii part can contain, and mail that labels UTF-8 content as
+us-ascii is common enough that refusing it would skip rewrites that are perfectly
+safe. A part whose label is us-ascii and whose bytes are neither ASCII nor valid
+UTF-8 still fails to decode, which is the honest answer.
+
+### D-045 — A part's transfer encoding and charset are never changed
+
+**Spec:** §6.4 says to "re-encode, and fix up `Content-Transfer-Encoding` and any
+length-bearing headers", which anticipates the encoding changing.
+
+**Decision:** a rewritten part is always written back in the charset and the
+transfer encoding it arrived with. If the rewritten text cannot be — a
+`body_rewrites` replacement containing a character the part's charset has no room
+for, or a non-ASCII character entering a part that genuinely was `7bit` clean — the
+part is left untouched, warned about, and counted with
+`reason="unrepresentable"`. So the `Content-Transfer-Encoding` fix-up §6.4 asks for
+is never needed. Length-bearing headers (`Content-Length`, `Lines`) **are** fixed
+up when the part carries them, because those are statements about the part that a
+rewrite can falsify.
+
+**Why:** §1.1. Simmer's output has to stay "exactly expressible as application-side
+configuration", and re-framing a part from `7bit` to `quoted-printable` — or
+relabelling its charset — is not something the operator could hand back to the
+application as a setting. Not needing the fix-up is a better answer than performing
+it well.
+
+The branch is close to dead in practice: a replacement string is operator-written
+and is essentially always ASCII, which every supported charset can carry. It exists
+so that the one case where it is not has a defined, observable outcome instead of
+mojibake.
+
+One softening: the 7bit check applies only to a part that was **itself** 7-bit
+clean. A part carrying high bytes under a `7bit` label was already breaking its own
+declaration before Simmer saw it, and §6.4's exclusions are about what Simmer would
+damage, not about policing the sender.
+
+### D-046 — Unstable `body_rewrites` are a fatal startup error, with no override
+
+**Spec:** §6.6 classifies stability violations into identity fields (fatal, no
+override) and "all other headers" (fatal, downgradable via `unstable_headers`). The
+body is neither.
+
+**Decision:** at startup, a route's `body_rewrites` must be a **fixed point**:
+applying the whole chain to its own output must not change it again. A violation is
+a fatal startup error and there is nothing to declare that downgrades it.
+
+Detection is `body::Rules::fixed_point_violation`. It builds a probe from the
+rules' own **replacements** — that is what an unstable rule re-matches — and
+compares `apply(probe)` with `apply(apply(probe))`. Comparing against `probe`
+itself would be wrong: a chain where rule 2 consumes rule 1's output is perfectly
+stable and must not be reported, and comparing the two successive results is what
+distinguishes the two cases. `s/a/aa/` is caught; `s/a/b/` then `s/b/c/` is not.
+
+**Why fatal rather than a warning.** `s/a/aa/` matches what it just wrote, so every
+pass through Simmer grows the body. That is §1.1 constraint 1 — "append `.new` to
+the sending domain is not permitted, because applying it to already-migrated
+traffic corrupts it" — in a different place, and it corrupts traffic from an
+application that has already been cut over. Unlike `Reply-To`, there is no
+migration-only reading of it: nobody configures a rule intending it to apply twice.
+
+**Why no escape hatch.** `unstable_headers` names headers, and a body is not a
+header. Adding an `unstable_body_rewrites` acknowledgement would be inventing
+configuration `SPEC.md` does not have, which needs the spec's author rather than a
+decision here. If a real case for one turns up, that is the conversation to have.
+
+This is a §4.2 rule the spec does not list, in the same way D-034 is.
+
+---
+
+## Phase 6
+
+### D-047 — Multi-recipient transactions are refused outright, and §13 phase 9 is void
+
+**Spec:** §5.6 makes `single_recipient_only` a switch defaulting to true and
+specifies, for the `false` case, splitting by route and a four-row table collapsing
+the per-recipient outcomes into one reply. §4.1 lists the key; §13 phase 9 builds
+the machinery; §9.1 counts the mixed outcome as `simmer_partial_delivery_total`.
+
+**Decision:** a second `RCPT TO` is refused with `452 4.5.3 multiple recipients not
+permitted`, unconditionally. `single_recipient_only` is deleted from the schema —
+a configuration still carrying it is refused at startup by name (`validate::
+removed_keys`), rather than by serde's bare "unknown field". §13 phase 9 is void:
+there is no splitting and no collapse table.
+
+**Why.** §5.6's own last paragraph is the argument: "The client is not told which
+recipients failed, because SMTP provides no way to say so in a single reply. This
+lossiness is the reason the switch defaults to rejecting multi-recipient messages."
+Two of its four rows are worse than lossy. `250 partially accepted` empties the
+client's queue while some recipients silently got nothing — and Simmer is not an
+MTA (§2.2), so nothing generates a DSN for them. And `550` when *any* split failed
+permanently is emitted about the transaction but recorded by the client against
+every recipient in it, which is §14.1's prohibition exactly.
+
+Keeping it as a switch would mean building, testing and maintaining a path whose
+correct answer is "do not use this", to save round trips on an ingress leg inside
+our own network.
+
+**What it dissolves** — not settles; the cases stop existing:
+
+- **O-9** — one recipient per transaction, so there is nothing to group and no
+  granularity to choose between §5.6's route-splitting and §6.3's.
+- **O-8** — there is no collapse table to return `550` from.
+- §6.3's "single-recipient case only" caveat on `recipient.*`, which is now the
+  only case. The §6.3 startup warning in `validate::warnings` is deleted, and
+  D-036's stable VERP spelling `bounce+{{recipient.local}}@newbrand.com` becomes
+  available at no cost — the cost D-036 named *was* O-9.
+
+**What it costs.** An application that batches recipients must be changed before it
+can sit behind Simmer. Not a §1.1 cost: the invariant constrains Simmer's *output*,
+and one message per recipient is exactly what the application keeps doing once
+Simmer is unplugged. `max_recipients` becomes vestigial — kept because §4.1
+mandates it, warned about above 1, and `reply::too_many_recipients` deleted rather
+than left unreachable, because a dead reply in `src/smtp/reply.rs` is what that
+file's enumeration test exists to catch.
+
+**This needs the spec's author.** §5.6, §4.1, §13 phase 9 and §9.1's
+`simmer_partial_delivery_total` all describe behaviour that no longer exists. Long
+form, with the alternatives and what stays open, in `docs/RECIPIENTS.md`.
+
+### D-048 — `recipient_event`'s row shape, which D-029 deferred to here
+
+**Spec:** §11 gives it as `recipient_event(recipient_hash, route, sent_at)`,
+"indexed on `(recipient_hash, sent_at)` and on `sent_at` for the sweeper. This is
+the high-cardinality table." §7.3 says the key is "a **salted hash** of the
+normalised value, never plaintext … This bounds row size".
+
+**Decision:** exactly those three columns, with no primary key and no surrogate
+id. `recipient_hash` is `BYTEA` holding **HMAC-SHA256 truncated to 16 bytes**. The
+lookup index is `(recipient_hash, route, sent_at)` rather than §11's
+`(recipient_hash, sent_at)`.
+
+**Why each part:**
+
+- **Keyed hash, not a plain digest.** An unkeyed SHA-256 of an address is
+  reversible by anyone with a word list, which would leave §7.3's "avoids the
+  container accumulating a plaintext record of every address mailed" true only in
+  the most literal sense. HMAC under a persisted salt is what makes the table
+  useless to someone who has only the table.
+- **16 bytes, not 32.** §7.3 asks the key to bound row size, and this is the
+  table §11 calls high-cardinality. 128 bits is far past what a collision needs to
+  be unlikely, and a collision costs one message steered to the next link — not
+  anything permanent, and not anything the recipient sees.
+- **`route` in the index.** Every read is "this route, this recipient, since this
+  instant", because the constraint is per route (D-051). §11's two-column form
+  would work and then filter; adding the column keeps it an index scan. §11 calls
+  its tables "indicative", so this is a refinement rather than a divergence.
+- **No primary key.** The table is append-only and swept by age. A surrogate key
+  would be an index to maintain for nobody's benefit, and there is no natural key:
+  two messages to one recipient in the same second are two real events.
+
+### D-049 — The frequency check reads outside the reservation transaction
+
+**Spec:** §3.2 3b puts the frequency check *before* the quota check. §7.4 makes
+the headroom check and the reservation one operation under a row lock.
+
+**Decision:** the frequency count is an unlocked read of `recipient_event`, taken
+immediately before the reserve and outside its transaction. Only the quota half
+holds the lock.
+
+**Why.** The two checks fail differently. Quota is a **ceiling**: overshooting it
+is the one thing Simmer exists to prevent, so §7.4 pays for a row lock and a
+three-phase protocol. Frequency is a **steering rule** — §7.3 says so twice — and
+the cost of a race is that two concurrent messages to one recipient both read "2"
+against a threshold of 3 and both go out on the warming route. That is one extra
+message, on a route that is *under* its quota, to a recipient who was going to
+receive it from the overflow route anyway. Nothing is dropped and the ramp is not
+corrupted.
+
+Against that: `recipient_event` is the high-cardinality table, and putting a read
+of it inside the transaction that holds `quota_usage`'s row lock would serialise
+every message on the route behind it. The lock is the ramp's chokepoint by design;
+lengthening it to close a race whose worst case is "one extra message" is the
+wrong trade.
+
+**What follows:** the check is also *not* re-evaluated after the reservation, and
+§3.2 3d's "re-evaluate this route once" still does not apply (D-027).
+
+### D-050 — The salt is minted idempotently and resolved lazily
+
+**Spec:** §7.3: "The salt is generated once and persisted." §11 puts
+`instance_config(key, value)` there for "the recipient hash salt and similar
+singletons". §7.5: an unreachable database means `451`, not a refusal to start.
+
+**Decision:** `instance_config('recipient_hash_salt')`, written with `INSERT …
+ON CONFLICT (key) DO NOTHING` followed by a read, so whoever inserts first wins
+and every replica uses that one. It is resolved on **first use**, not at startup —
+`main` warms it best-effort and logs, but a failure there is not fatal.
+
+**Why idempotent:** "generated once" has to hold across replicas, not just across
+restarts. Two instances each minting their own would give the two of them
+different keys for one recipient, and the windows would silently disagree.
+
+**Why lazy:** loading it in `main` would make a database that is merely late into
+a process that will not start, which contradicts §7.5's whole posture. Resolved on
+the message path, a failure becomes the same `451 4.3.0 quota service
+unavailable` every other storage failure produces, and the first message after the
+database returns picks it up. A deployment with no `recipient_frequency` anywhere
+never asks for it at all.
+
+**Why not `rand`:** two v4 UUIDs are 32 bytes of `getrandom` output, and `uuid` is
+already a direct dependency. See `LICENSES.md` §6.
+
+### D-051 — Events are counted and recorded per route, and only for constrained routes
+
+**Spec:** §7.3 makes the constraint per route. §7.4 phase 3: "On downstream `2xx`,
+move the count from `reserved` to `committed` and record recipient-frequency
+events." §11's row carries `route`.
+
+**Decision:** a window counts only that route's own events, and a row is written
+only when the selected route declares a `recipient_frequency` — in the same
+transaction as the commit.
+
+**Why per route:** §11 put `route` in the row and §7.3 declares the threshold on a
+route. A global count would make that column meaningless.
+
+**Worth knowing, because it is the surprising half:** a message that fell through
+to the overflow route does **not** count against the warming route's window. The
+recipient did receive it, so an argument exists for counting real inbox pressure
+across every route. That argument needs a spec decision rather than an
+implementation one — the row shape leaves it open, since a global count is the
+same table read without the `route` predicate.
+
+**Why only constrained routes:** rows nothing will ever read are exactly the
+accumulation §7.3 exists to prevent. An unconstrained route is not consulted and
+so should not be recorded.
+
+**Why in the commit's transaction:** it is one sentence in §7.4 and it should be
+one transaction. A delivered message whose event was lost under-counts a window
+silently; an event recorded for a message that did not commit over-counts it.
+Neither is reachable if they cannot be separated — which is why
+`QuotaStore::commit` takes the keys rather than exposing a second method the relay
+could forget to call.
+
+### D-052 — A constraint on the last link of a chain is a startup warning
+
+**Spec:** §4.2's list does not mention it. §7.3 says the constraint makes a route
+ineligible "so the message falls through to the next link".
+
+**Decision:** `config::validate::warnings` emits a `WARN` when the last route of
+any chain — a sender rule's or the `default_chain` — carries a
+`recipient_frequency`. Not a violation.
+
+**Why warn:** on the last link there is no next link, so the rule stops steering
+and starts refusing: a recipient over threshold gets §10.3's `451` instead of
+another route. Nothing about that is invisible in the config, but it is invisible
+in *behaviour* until the first recipient reaches the threshold, which may be weeks
+after the deployment.
+
+**Why not a violation:** it is the only way to express "never mail this person
+more than twice a day, full stop", and that is a legitimate thing to want. §4.2 is
+a list of things that are *wrong*, and this is a thing that is usually
+unintended — D-040's distinction exactly.
 
 ---
 
@@ -951,8 +1272,8 @@ the phase that depends on each.
 | ~~O-5~~ | *Settled in phase 3 — see **D-027**.* | | |
 | ~~O-6~~ | *Settled in phase 3: the default chain is walked normally, like any other. Implemented in `relay::resolve_chain`.* | | |
 | ~~O-7~~ | *Settled in phase 3: one reservation of magnitude `recipient_count`, tested directly.* | | |
-| O-8 | §5.6's collapse table returns `550` when *any* split failed permanently, which records permanent state about recipients that did not fail — the §14.1 problem again. | `550` only when *all* failures are permanent; `451` otherwise. | Phase 9 |
-| O-9 | §5.6 splits by route; §6.3 implies per-recipient splitting when a template references `recipient.*`. | If a selected route's templates reference `recipient.*`, split that route's recipients one per transaction; otherwise group by route. | Phase 9 |
+| ~~O-8~~ | ***Dissolved** in phase 6 by **D-047**, not answered: there are no splits, so there is no collapse table to return `550` from.* | | |
+| ~~O-9~~ | ***Dissolved** in phase 6 by **D-047**, not answered: one recipient per transaction, so there is nothing to group and no granularity to choose between.* | | |
 | ~~O-10~~ | *Settled in phase 2 — see **D-018**. The working assumption did not survive: the route is not known at `MAIL FROM`. Replaced by a config-declared capability.* | | |
 | O-11 | §9.3 logs mutations "with the acting token's identifier", but `admin.auth_token` is a single scalar with no identity. | Either named admin tokens, or drop the wording. Currently one token, logged as `admin`. | Phase 7 |
 | ~~O-12~~ | *Settled in phase 3: DST transitions both directions, a start inside a DST gap, and a future start are all tested; the leap-second case is asserted to be a no-op rather than merely argued.* | | |
@@ -992,6 +1313,10 @@ against a scripted downstream that returns arbitrary codes, stalls, drops
 mid-`DATA`, drops after the terminating dot, and refuses TLS; PIPELINING
 including a batch containing an error; every limit in §5.5 and §5.6; the CIDR
 and session caps; command, data and session timeouts.
+
+> Since D-047, §5.5's `max_recipients` has no reachable limit to test and §5.6's
+> switch is gone. The two tests named here became one: a second `RCPT TO` is
+> refused whatever `max_recipients` says.
 
 The end-to-end assertion phase 4 has to keep passing: a body containing a bare
 dot line, a dot-prefixed line and a trailing blank line arrives at the downstream
@@ -1175,8 +1500,9 @@ same bytes**, which is the one claim nothing else in the suite can make.
 - **`fail_closed` and §10.4 under a real `SIGTERM`** — still only unit-level.
   Both are now cheap to add: the compose stack is there, and stopping `simmer-db`
   mid-run is one command.
-- **Multi-recipient rewriting** — `recipient.*` renders empty above one
-  recipient. §5.6 splitting is phase 9 (O-9).
+- ~~**Multi-recipient rewriting** — `recipient.*` renders empty above one
+  recipient. §5.6 splitting is phase 9 (O-9).~~ Closed by **D-047**: a transaction
+  carries exactly one recipient, so `recipient.*` always renders a real value.
 - **A `Received:` chain long enough to fold**, and messages above the §8.1 spill
   threshold *through the rewrite* — the spill test covers the buffer, not a
   rewritten 25 MiB message.
@@ -1240,3 +1566,233 @@ rewritten" assertion is the reminder.
 
 O-8 and O-9 (phase 9) and O-11 (phase 7) remain open. The `smtp/auth.rs` timing
 defect above is still unfixed and still worth fixing on its own.
+
+---
+
+## Phase 5 summary
+
+### What changed
+
+| Module | § | What |
+|---|---|---|
+| `src/rewrite/transfer.rs` | 6.4 | Quoted-printable and base64, decoder *and* matching encoder |
+| `src/rewrite/charset.rs` | 6.4 | UTF-8, US-ASCII, ISO-8859-1, Windows-1252 (D-044) |
+| `src/rewrite/mime.rs` | 6.4 | The MIME structure as byte ranges into the body (D-043) |
+| `src/rewrite/body.rs` | 6.4, 6.6 | The engine: compiled rules, per-part decode/rewrite/re-encode, the fixed-point check |
+| `src/rewrite/mod.rs` | 6.1 | Step 7, in its place — after `set_headers`, before `Received:` |
+| `src/config/validate.rs` | 4.2, 6.6 | D-046's fatal rule; `body_rewrites.pattern` compilation moved onto the same path as the templates |
+| `src/metrics.rs`, `src/relay.rs` | 9.1, 6.4 | `simmer_body_rewrite_skipped_total{route,reason}` |
+| `simmer.acceptance.yaml`, `tests/acceptance.rs` | 12.3 | `ACCEPTANCE.md` §4.3's last row, which phase 4 left as a deliberate reminder |
+
+537 tests, from 452: 375 unit (was 298), 43 ingress, 36 config validation, 30
+quota, 28 reply mapping, 11 rewrite stability, 8 quota-through-the-relay, 5
+shipped config, 1 acceptance drift guard — plus the 4 acceptance tests behind
+`--ignored`, all of which still pass with body rewriting live.
+
+**No new dependencies.** The phase was budgeted for a charset crate and did not
+need one; `LICENSES.md` §4 records why, since the reasoning was licence-adjacent
+even though nothing was adopted.
+
+### What is tested
+
+- **The transfer codecs round-trip every byte.** `encode` then `decode` returns
+  the input for all 256 byte values, for each of the three encodings. This is the
+  claim `body.rs` makes when it puts a part back, so it is asserted rather than
+  assumed. Same for the single-byte charsets, byte by byte.
+- **§6.4's headline case**, three tiers deep: `https://old=\r\nbrand.com/x` is
+  matched and rewritten as a unit test, through the relay against a scripted
+  downstream, and — as the plain form — off a real Mailpit trap.
+- **The MIME spans reassemble the message byte for byte.** Copying the untouched
+  spans back in order reproduces the original, for a single part, a multipart with
+  a preamble and epilogue, and a nested multipart. This is what licenses D-043's
+  claim that an unmatched part is unchanged.
+- **"Nothing matched, so nothing changed"**, as two proptests over generated
+  messages: once for a route with no rules, once for the shipped route over bodies
+  chosen to contain no match *under any decoding*. Filtering the general generator
+  would not have worked — `aHR0cHM6…` is a match once base64 is undone.
+- **§6.6 with the body live.** `tests/rewrite_stability.rs`'s SHIPPED route now
+  carries the shipped `body_rewrites`, and the generated bodies include a live
+  match, an already-migrated body, a soft-broken URL, a base64 text part, a
+  multipart with a matching text part beside an attachment encoding the same
+  string, and a signed message. `rewrite(rewrite(m)) == rewrite(m)` holds over all
+  of them.
+- **§6.4's exclusions**, positively: a signed message arrives at the downstream
+  byte-identical with a live match inside it, and the base64 attachment beside a
+  rewritten text part comes back untouched.
+- **D-046 at startup**, both directions: `s/…/…?ref=1/` is refused, and a chain
+  where rule 2 consumes rule 1's output is accepted.
+
+### What is not tested
+
+- **A part above the §8.1 spill threshold through the body rewriter.** Carried
+  from phase 4 and now sharper: the engine copies the whole body when any part
+  matched, so a 25 MiB message with one matching part allocates 25 MiB. Nothing
+  measures that.
+- **Windows-1252 and ISO-8859-1 end to end.** Unit-tested byte by byte and through
+  `body.rs`, but no message in the relay or acceptance tiers carries one.
+- **A malformed part reaching the metric.** `SkipReason` is asserted at the
+  `body.rs` boundary and the relay call site is one line, but no test observes the
+  counter — there is still no recorder installed (phase 7, D-021).
+- **RFC 2231 parameter continuations.** A `boundary*0=`/`charset*=` spelling is not
+  reassembled, so the parameter is simply not found. That lands the part in
+  §6.4's "cannot be decoded" case rather than producing a wrong answer, which is
+  the safe direction, but it is untested because no mailer writes them.
+
+### Things the spec did not cover
+
+D-043 through D-046. The two a reader would not predict from `SPEC.md`:
+
+- **D-045** — Simmer never changes a part's `Content-Transfer-Encoding`, so the
+  fix-up §6.4 asks for never happens. A rewrite that would need one does not
+  happen either.
+- **D-046** — an unstable `body_rewrites` chain is a fatal startup error that
+  nothing can downgrade. §6.6's two field classes do not cover the body, and this
+  adds a third with the identity fields' severity.
+
+Three smaller calls not worth their own entry:
+
+- **`body_rewrites` replace every occurrence, not the first.** §6.4 says "as a
+  regex replacement" without saying which. Replacing only the first would make the
+  result depend on where in the body a link appeared, which is exactly the kind of
+  relative behaviour §1.1 rules out.
+- **Capture references (`$1`) work in a replacement**, because that is what the
+  `regex` crate's `replace_all` does and taking it away would need an escape pass
+  of its own. `$$` escapes a literal dollar.
+- **Where two `Content-Type` headers exist, the first wins**, inherited from
+  `HeaderBlock::get`. The message is malformed either way; first-wins at least
+  matches what §6.3's `original.header[…]` already does.
+
+### Carried into phase 6
+
+Nothing in §6 is outstanding. `body_rewrites` was the last unimplemented part of
+the rewriting engine, and §6.7's DNS preflight — the only other §6 subsection with
+no code — is phase 8 by §13's own ordering.
+
+Phase 6 is §7.3 recipient frequency: hashing, normalisation and the sweeper. The
+`recipient_event` table does **not** exist yet — D-029 deferred it out of phase 3
+precisely so its row shape could be decided alongside them. `config::RecipientFrequency`
+is parsed and validated, and `chain::SkipReason::Frequency` exists and is never
+produced: the chain walk has a hole where the check goes.
+
+O-8 and O-9 (phase 9) and O-11 (phase 7) remain open; none of them is phase 6's.
+The `smtp/auth.rs` timing defect above is still unfixed and still separable.
+
+> **What actually happened at the start of phase 6.** D-047 landed first: multi-
+> recipient transactions are refused outright, which dissolved O-8 and O-9 and made
+> §13 phase 9 void. Only O-11 (phase 7) is still open. The frequency check that
+> follows therefore sees exactly one recipient, always.
+
+---
+
+## Phase 6 summary
+
+Two changes, in order: D-047's reversal of §5.6, then §7.3 itself.
+
+### What changed
+
+| Module | § | What |
+|---|---|---|
+| `src/config/mod.rs`, `src/smtp/session.rs`, `src/smtp/reply.rs` | 5.5, 5.6 | D-047: `single_recipient_only` deleted, the second `RCPT TO` always refused, `too_many_recipients` removed |
+| `src/config/validate.rs` | 4.2 | `removed_keys` names a key a previous version accepted; two new warnings (vestigial `max_recipients`, D-052's last-link constraint); the dead §6.3 recipient-template warning deleted |
+| `docs/RECIPIENTS.md` | 5.6, 13 | The reversal in full, for the spec's author — `docs/INGRESS.md`'s shape |
+| `migrations/20260810000000_recipient_event.sql` | 7.3, 11 | D-048's row shape, which D-029 deferred out of phase 3 |
+| `src/frequency/mod.rs` | 7.3 | Normalisation, the keyed hash, the rolling window, the retention |
+| `src/frequency/sweeper.rs` | 7.3 | Hourly eviction, on the same shutdown token as `quota::sweeper` |
+| `src/models/instance_config.rs` | 11 | D-050's idempotent get-or-insert |
+| `src/models/recipient_event.rs` | 7.3 | Count, record, evict |
+| `src/quota/store.rs`, `src/quota/postgres.rs` | 7.3, 7.4 | Three new trait methods; `commit` takes the keys, so phase 3's transaction now carries both halves of §7.4 phase 3 |
+| `src/routing/chain.rs` | 3.2 3b | The check, producing the `SkipReason::Frequency` that had existed unconstructed since phase 3 |
+| `src/relay.rs`, `src/main.rs` | 7.3 | The keys carried from walk to commit; the sweeper started only when a route declares a constraint |
+| `src/metrics.rs` | 7.3 | `simmer_recipient_events_evicted_total`, deliberately unlabelled |
+
+593 tests, from 537: 405 unit (was 375), 44 ingress, 40 config validation, 30
+quota, 28 reply mapping, **21 frequency (new)**, 11 rewrite stability, 8
+quota-through-the-relay, 5 shipped config, 1 acceptance drift guard — plus the 4
+acceptance tests behind `--ignored`, all of which still pass.
+
+**Two new direct dependencies that add nothing to the build**: `sha2` and `hmac`,
+both already compiled as transitive dependencies of `sqlx-postgres`. `LICENSES.md`
+§6 records the check and why `argon2`, already present, is the wrong tool here.
+
+### What is tested
+
+- **§7.3's normalisation, case by case.** The spec's own headline pair
+  (`Bob.Smith+news@gmail.com` ≡ `bobsmith@gmail.com`), the `+` rule applying at
+  every domain, the dot rule applying at *only* the configured ones, dots in the
+  domain never touched, a quoted local part left entirely alone, and the last `@`
+  as the separator.
+- **The key is not the address.** Asserted twice: no substring of the address
+  appears in the key bytes, and none appears in `Key`'s `Debug` form. Then again
+  against the database — after a real delivery, the stored `recipient_hash` is 16
+  bytes and contains neither `bob` nor `gmail`.
+- **The window is rolling**, against stored timestamps rather than arithmetic: an
+  event 30 hours old is outside a 24-hour window and inside a 48-hour one, and two
+  events 25 and 26 hours old do not keep a route ineligible.
+- **The salt survives.** Two stores over one database agree, including when they
+  race for the first insert.
+- **§7.4 phase 3, both halves.** A delivered message records exactly one event; a
+  message the downstream refused at the final dot records none.
+- **The whole feature end to end**: three messages to one recipient, the first two
+  leaving by the warming route and the third by the overflow route *under the
+  overflow identity* — steered, not dropped. And the same with three different
+  spellings of one Gmail inbox, which is the case §7.3 exists for.
+- **§10.3 when the chain runs out**: over threshold with nothing to fall through
+  to is `451 4.7.1`, never `550`.
+- **The sweeper's cutoff**, either side of it, and the interval loop itself —
+  which `quota::sweeper` still lacks (`sweep_once` is tested there, `run` is not).
+- **D-047**: a second `RCPT TO` refused whatever `max_recipients` says, the
+  transaction still usable for the recipient that was accepted, every downstream
+  transaction carrying exactly one recipient, and a config carrying the removed
+  key refused by name.
+
+### What is not tested
+
+- **The acceptance tier does not exercise §7.3.** `simmer.acceptance.yaml`
+  declares no `recipient_frequency`, so the ramp assertions measure quota alone.
+  Adding one would need the loadgen to send repeatedly to *one* recipient, which
+  is a different shape of run from the bulk it does now. The relay-level coverage
+  in `tests/frequency.rs` is against real Postgres and a real downstream, so what
+  is missing is only the real-mail-server leg.
+- **No test drives the frequency check with an unreachable database.** The path is
+  the same `QuotaError` → §7.5 → `451` every other storage failure takes, and that
+  mapping is tested, but the specific "salt could not be resolved" case is not.
+  Same gap `fail_closed` has had since phase 3.
+- **Nothing observes `simmer_recipient_events_evicted_total`**, for the same
+  reason as every other counter: there is no recorder until phase 7 (D-021).
+- **No test of two concurrent messages to one recipient racing the check.** D-049
+  argues the race is benign and bounded at one extra message; it is argued rather
+  than demonstrated.
+- **The dot-insensitive list is not validated.** A typo (`gmial.com`) silently
+  turns the folding off for the domain it was meant for. §4.2 has no rule for it
+  and inventing one would mean deciding what a "valid provider domain" is.
+
+### Things the spec did not cover
+
+D-047 through D-052. The two a reader would not predict from `SPEC.md`:
+
+- **D-047** — §5.6 reversed and §13 phase 9 deleted. The largest divergence so
+  far, and the only one that removes a numbered phase. `docs/RECIPIENTS.md`.
+- **D-051's per-route counting.** §7.3 does not say whether a send via the
+  overflow route counts against the warming route's window. §11's row carries
+  `route`, so it counts per route — which means it does not. The recipient did
+  receive the message, so there is a real argument for the other answer; it needs
+  the spec, not an implementation.
+
+Two smaller calls not worth their own entry:
+
+- **"At or over" is the threshold test**, per §3.2 3b's wording, so `threshold: 3`
+  admits two messages and steers the third. §7.3 alone would have allowed the
+  off-by-one reading.
+- **A domainless recipient** (`RCPT TO:<postmaster>`, legal SMTP) keys on the whole
+  string in both modes rather than on an empty domain, so it shares a bucket only
+  with itself.
+
+### Carried into phase 7
+
+Phase 7 is the admin API, the metrics exporter and dry-run. **O-11 is its open
+question** and the only one left: §9.3 logs mutations "with the acting token's
+identifier", but `admin.auth_token` is a single scalar with no identity.
+
+Everything the exporter needs is already recorded through `src/metrics.rs`,
+including this phase's two additions. The `smtp/auth.rs` timing defect above is
+still unfixed and still separable.

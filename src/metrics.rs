@@ -83,6 +83,23 @@ pub fn sender_mismatch() {
     counter!("simmer_sender_mismatch_total").increment(1);
 }
 
+/// §9.1 `simmer_body_rewrite_skipped_total{route,reason}` (§6.4).
+///
+/// The one §9.1 counter phase 5 owns. Every increment is a `text/*` part the
+/// route's `body_rewrites` was configured to change and did not: `signed` and
+/// `encrypted` are §6.4 protecting a signature, and the rest are a part Simmer
+/// cannot read or cannot write back. A rewrite that silently stops applying is
+/// invisible everywhere else in the mail flow, which is why the reasons that are
+/// working as designed are counted alongside the ones that are not.
+pub fn body_rewrite_skipped(route: &str, reason: &'static str) {
+    counter!(
+        "simmer_body_rewrite_skipped_total",
+        "route" => route.to_string(),
+        "reason" => reason,
+    )
+    .increment(1);
+}
+
 /// §9.1 `simmer_downstream_latency_seconds{route}` — a histogram in phase 7.
 pub fn downstream_latency(route: &str, seconds: f64) {
     metrics::histogram!("simmer_downstream_latency_seconds", "route" => route.to_string())
@@ -160,6 +177,16 @@ pub fn route_skipped(route: &str, reason: &str) {
 pub fn reservation_expired(route: &str, count: i64) {
     counter!("simmer_reservation_expired_total", "route" => route.to_string())
         .increment(count.max(0) as u64);
+}
+
+/// §7.3 — `recipient_event` rows evicted past their retention.
+///
+/// Not in §9.1's list. Deliberately unlabelled: the whole point of §7.3's
+/// hashing is that the container does not accumulate a record of who was mailed,
+/// and a label per route would be the thin end of that. A count is enough to see
+/// that the sweeper is running and that the table is not growing without bound.
+pub fn recipient_events_evicted(count: u64) {
+    counter!("simmer_recipient_events_evicted_total").increment(count);
 }
 
 /// §7.5 — a message answered `451` because the quota store was unreachable.

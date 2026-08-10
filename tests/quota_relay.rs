@@ -26,7 +26,6 @@ server:
   hostname: "simmer.test"
   max_message_bytes: 100000
   max_recipients: 5
-  single_recipient_only: false
   max_concurrent_sessions: 16
   allowed_cidrs: ["127.0.0.0/8"]
   timeouts: {{ command: 5s, data: 5s, session: 60s }}

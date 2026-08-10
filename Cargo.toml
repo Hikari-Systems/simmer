@@ -125,6 +125,23 @@ async-trait = "0.1"
 # machinery this service deliberately does not use.
 hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.31.2", default-features = false }
 
+# --- phase 6 -------------------------------------------------------------
+
+# §7.3: "The stored key is a salted hash of the normalised value, never
+# plaintext." HMAC-SHA256 keyed with the persisted salt. Both crates are already
+# in the graph — sqlx-postgres pulls them for SCRAM authentication — so this
+# takes a direct dependency on versions that are already being compiled, and adds
+# nothing to the build. `MIT OR Apache-2.0`, every published version of each.
+#
+# Deliberately not argon2, which is already a dependency: §5.3 wants a password
+# hash to be slow, and this runs on the message path for every recipient of every
+# message. The threat model is different too — the salt and the hashes live in
+# the same database, so slowness buys nothing an attacker with the table cannot
+# already have. What §7.3 asks for is that the container stop *accumulating*
+# plaintext, and a keyed hash does that.
+sha2 = "0.10"
+hmac = "0.12"
+
 [profile.release]
 strip = true
 lto = true

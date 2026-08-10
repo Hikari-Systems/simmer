@@ -97,6 +97,34 @@ impl fmt::Display for Warning {
 
 // ---------------------------------------------------------------------------
 
+/// Keys that a previous version accepted and this one does not.
+///
+/// Every struct is `deny_unknown_fields`, so a removed key already refuses to
+/// start — but it refuses with serde's `unknown field`, which tells an operator
+/// what is wrong and nothing about why. A configuration that worked yesterday
+/// deserves to be told which decision took the key away, so this runs against the
+/// raw document before deserialisation and answers in §4.2's own form.
+///
+/// Removing an entry from this table is safe once nobody is upgrading across it;
+/// the `deny_unknown_fields` refusal remains either way.
+pub fn removed_keys(tree: &serde_yaml_ng::Value) -> ViolationList {
+    const REMOVED: [(&str, &str, &str); 1] = [(
+        "server",
+        "single_recipient_only",
+        "removed: a transaction may carry exactly one recipient and a second \
+         RCPT TO is always refused, so the switch has nothing to select. Delete \
+         the key. See DECISIONS.md D-047 and docs/RECIPIENTS.md",
+    )];
+
+    let mut v = ViolationList::default();
+    for (section, key, message) in REMOVED {
+        if tree.get(section).and_then(|s| s.get(key)).is_some() {
+            v.push(format!("{section}.{key}"), message);
+        }
+    }
+    v
+}
+
 pub fn validate(cfg: &Config) -> ViolationList {
     let mut v = ViolationList::default();
 
@@ -115,6 +143,47 @@ pub fn validate(cfg: &Config) -> ViolationList {
 /// Non-fatal conditions, logged at `WARN` at startup.
 pub fn warnings(cfg: &Config) -> Vec<Warning> {
     let mut out = Vec::new();
+
+    // §5.5's ceiling can no longer be reached: D-047 refuses the second RCPT TO
+    // whatever this says, so any value above 1 describes a limit that will never
+    // apply. Left in the schema because §4.1 mandates the key, and warned about
+    // rather than rejected because it is a stale expectation, not a mistake —
+    // the same reasoning D-040 applies to a stale `unstable_headers`.
+    if cfg.server.max_recipients > 1 {
+        out.push(Warning {
+            path: "server.max_recipients".to_string(),
+            message: format!(
+                "is {}, but has no effect: a transaction may carry exactly one recipient \
+                 and a second RCPT TO is always refused (D-047). Set it to 1",
+                cfg.server.max_recipients
+            ),
+        });
+    }
+
+    // §7.3 is a *steering* rule: over threshold means "try the next link". A
+    // constraint on the last link of a chain has no next link to steer to, so it
+    // stops steering and starts refusing — the message gets §10.3's `451` instead
+    // of going out by another route. That is a legitimate configuration (it is
+    // how "never mail this person more than twice a day, full stop" is spelled),
+    // but it is much more often a mistake, and it is invisible until the day a
+    // recipient reaches the threshold.
+    for chain in chains(cfg) {
+        let Some(last) = chain.routes.last() else {
+            continue;
+        };
+        if cfg
+            .route(last)
+            .is_some_and(|r| r.recipient_frequency.is_some())
+        {
+            out.push(Warning {
+                path: format!("{}: {last}", chain.path),
+                message: "is the last route in this chain and carries a recipient_frequency \
+                          constraint, so a recipient over threshold has nothing to fall through \
+                          to and the message is answered 451 rather than steered (§7.3, §10.3)"
+                    .to_string(),
+            });
+        }
+    }
 
     for route in &cfg.routes {
         // §6.6: "Startup logs a WARN naming each declared header and the route."
@@ -151,29 +220,11 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
             continue;
         };
 
-        // §6.3: "A template referencing recipient.* in a configuration where
-        // single_recipient_only: false is a startup validation warning, since it
-        // forces per-recipient splitting."
-        if !cfg.server.single_recipient_only {
-            for (name, template) in &compiled.set_headers {
-                if template.references_recipient() {
-                    out.push(Warning {
-                        path: format!("routes.{}.identity.set_headers.{name}", route.name),
-                        message: "references recipient.*, which forces per-recipient splitting \
-                                  when single_recipient_only is false"
-                            .to_string(),
-                    });
-                }
-            }
-            if compiled.envelope_from.references_recipient() {
-                out.push(Warning {
-                    path: format!("routes.{}.identity.envelope_from", route.name),
-                    message: "references recipient.*, which forces per-recipient splitting \
-                              when single_recipient_only is false"
-                        .to_string(),
-                });
-            }
-        }
+        // §6.3's "a template referencing recipient.* is a startup validation
+        // warning, since it forces per-recipient splitting" used to live here.
+        // It fired only when `single_recipient_only` was false, and D-047 removed
+        // that case: every transaction has exactly one recipient, so `recipient.*`
+        // always renders a real value and forces nothing.
 
         // §6.6: "Naming a header that is in fact stable is also a startup WARN —
         // it means either the declaration is stale or the intent was
@@ -525,25 +576,10 @@ fn check_identity(identity: &Identity, route_name: &str, v: &mut ViolationList) 
         v.push(at("envelope_from"), "must not be empty");
     }
 
-    // §4.2: "A body_rewrites.pattern fails to compile."
-    for (i, rewrite) in identity.body_rewrites.iter().enumerate() {
-        if let Err(e) = regex::Regex::new(&rewrite.pattern) {
-            // A regex parse error renders over several lines: a "regex parse
-            // error:" banner, the offending pattern, a caret, then the actual
-            // diagnosis. The banner alone tells the reader nothing, so take the
-            // last non-empty line — that is the one that names the problem.
-            let rendered = e.to_string();
-            let reason = rendered
-                .lines()
-                .map(str::trim)
-                .rfind(|l| !l.is_empty())
-                .unwrap_or("invalid");
-            v.push(
-                at(&format!("body_rewrites[{i}].pattern")),
-                format!("does not compile: {reason}"),
-            );
-        }
-    }
+    // §4.2's "a body_rewrites.pattern fails to compile" is reported by
+    // `RouteRewrite::compile` below, alongside the template parse errors — one
+    // compile, one source of truth for what an `identity` block has to satisfy
+    // before the stability checks can mean anything.
 
     // §6.6 / §4.2: "An identity field is named in unstable_headers." This half of
     // the stability rules is purely syntactic, so it is enforced now rather than
@@ -609,6 +645,25 @@ fn check_identity(identity: &Identity, route_name: &str, v: &mut ViolationList) 
             }
         }
         Ok(compiled) => {
+            // §6.6 in the body (D-046). A `body_rewrites` entry whose pattern
+            // matches its own replacement grows the message on every pass, which
+            // is §1.1 constraint 1 — "append `.new` to the sending domain is not
+            // permitted, because applying it to already-migrated traffic
+            // corrupts it" — in a different place. There is no `unstable_headers`
+            // for it because it is not a header, and there is no migration-only
+            // reading of it the way there is for `Reply-To`, so it is fatal.
+            if let Some((once, twice)) = compiled.body_rewrites.fixed_point_violation() {
+                v.push(
+                    at("body_rewrites"),
+                    format!(
+                        "are not stable: applying them to their own output changes it again \
+                         ({once:?} then {twice:?}). A rule that matches what it just wrote \
+                         corrupts a message every time it passes through, and would corrupt \
+                         traffic from an application that has already been cut over (§1.1, §6.6)"
+                    ),
+                );
+            }
+
             let report = stability::probe(&compiled);
             for u in report.unstable {
                 if u.identity {
@@ -649,6 +704,34 @@ fn stability_path(field: &str) -> String {
     } else {
         format!("set_headers.{field}")
     }
+}
+
+/// One chain, with a path naming where in the document it came from.
+struct NamedChain<'a> {
+    path: String,
+    routes: &'a [String],
+}
+
+/// Every chain in the configuration: one per sender rule, plus the default.
+fn chains(cfg: &Config) -> Vec<NamedChain<'_>> {
+    let mut out: Vec<NamedChain<'_>> = cfg
+        .senders
+        .iter()
+        .enumerate()
+        .map(|(i, rule)| NamedChain {
+            path: format!("senders[{i}] (match '{}').chain", rule.pattern),
+            routes: &rule.chain,
+        })
+        .collect();
+
+    if let Some(default) = cfg.default_chain.as_deref() {
+        out.push(NamedChain {
+            path: "default_chain".to_string(),
+            routes: default,
+        });
+    }
+
+    out
 }
 
 fn check_chains(cfg: &Config, v: &mut ViolationList) {

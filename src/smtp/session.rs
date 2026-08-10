@@ -395,13 +395,17 @@ where
         }
 
         let cfg = &self.engine.config;
-        // §5.6 — the default. Collapsing several per-recipient outcomes into one
-        // reply is lossy, so the switch defaults to refusing rather than lying.
-        if cfg.server.single_recipient_only && !tx.recipients.is_empty() {
+        // D-047 — one recipient per transaction, unconditionally. Collapsing
+        // several per-recipient outcomes into one reply is lossy: SMTP allows one
+        // reply, so a mixed result has to be reported as a single code and the
+        // client cannot be told which recipients it applies to. Refusing is the
+        // honest answer, and it is `452` rather than `5xx` because §14.1 will not
+        // have a deliverable recipient suppressed by a limit of ours.
+        //
+        // §5.5's `max_recipients` is subsumed: no value of it is reachable past
+        // the first recipient. §4.2 warns when it is set above 1.
+        if !tx.recipients.is_empty() {
             return self.reply(reply::multiple_recipients_not_permitted()).await;
-        }
-        if tx.recipients.len() >= cfg.server.max_recipients {
-            return self.reply(reply::too_many_recipients()).await;
         }
 
         // §5.4: "When all rules use `envelope`, Simmer should decide early and

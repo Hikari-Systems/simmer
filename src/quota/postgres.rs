@@ -77,7 +77,11 @@ impl QuotaStore for PgQuotaStore {
         }))
     }
 
-    async fn commit(&self, reservation: &Reservation) -> Result<(), QuotaError> {
+    async fn commit(
+        &self,
+        reservation: &Reservation,
+        recipient_keys: &[crate::frequency::Key],
+    ) -> Result<(), QuotaError> {
         let mut tx = self.pool.begin().await?;
 
         let still_reserved = models::quota::take_reservation(&mut tx, reservation.id).await?;
@@ -102,6 +106,19 @@ impl QuotaStore for PgQuotaStore {
             still_reserved,
         )
         .await?;
+
+        // §7.4 phase 3's second clause, in the same transaction as the first:
+        // "move the count from `reserved` to `committed` **and record
+        // recipient-frequency events**". Empty for a route with no constraint.
+        if !recipient_keys.is_empty() {
+            models::recipient_event::record(
+                &mut tx,
+                &reservation.route,
+                recipient_keys,
+                chrono::Utc::now(),
+            )
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(())
@@ -148,6 +165,47 @@ impl QuotaStore for PgQuotaStore {
 
     async fn sweep_expired(&self) -> Result<Vec<Expired>, QuotaError> {
         models::quota::sweep_expired(&self.pool).await
+    }
+
+    async fn recipient_event_count(
+        &self,
+        route: &str,
+        key: &crate::frequency::Key,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<i64, QuotaError> {
+        models::recipient_event::count_since(&self.pool, route, key, since).await
+    }
+
+    async fn recipient_hash_salt(&self) -> Result<Vec<u8>, QuotaError> {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        // Generated locally and offered to the table; whoever got there first
+        // wins, and both replicas end up using that one (D-050).
+        let mine = B64.encode(crate::frequency::generate_salt());
+        let stored = models::instance_config::get_or_insert(
+            &self.pool,
+            models::instance_config::RECIPIENT_HASH_SALT,
+            &mine,
+        )
+        .await?;
+
+        B64.decode(stored.as_bytes()).map_err(|e| {
+            // The row exists but is not what we wrote. Failing is the only safe
+            // answer: inventing a salt here would silently reset every window,
+            // and §7.3's whole point is that the salt is the *same* one.
+            QuotaError::Storage(format!(
+                "instance_config '{}' is not valid base64: {e}",
+                models::instance_config::RECIPIENT_HASH_SALT
+            ))
+        })
+    }
+
+    async fn sweep_recipient_events(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, QuotaError> {
+        models::recipient_event::evict_before(&self.pool, cutoff).await
     }
 
     async fn is_available(&self) -> bool {

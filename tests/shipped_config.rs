@@ -65,8 +65,9 @@ fn the_shipped_config_loads_and_validates() {
     assert_eq!(cfg.senders.len(), 4);
     assert!(cfg.catchall_group().is_some());
 
-    // §5.6 default.
-    assert!(cfg.server.single_recipient_only);
+    // D-047 — one recipient per transaction, so §5.5's ceiling has nothing left
+    // to limit and the shipped file says so rather than warning at every start.
+    assert_eq!(cfg.server.max_recipients, 1);
     // §7.5 default.
     assert!(cfg.database.fail_closed);
     // §10.3 default.

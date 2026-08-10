@@ -8,10 +8,12 @@
 
 #![allow(dead_code)] // each integration test file uses a different subset
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use simmer::frequency::{Frequency, Key};
 use simmer::quota::store::{
     Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, RouteState, Usage,
 };
@@ -352,6 +354,7 @@ impl Simmer {
             quota,
             registry: ReservationRegistry::new(),
             rewriters: Arc::new(rewriters),
+            frequency: Arc::new(Frequency::new()),
         };
 
         let listener = smtp::Listener::bind(engine).await.expect("bind simmer");
@@ -394,7 +397,6 @@ server:
   hostname: "simmer.test"
   max_message_bytes: 100000
   max_recipients: 5
-  single_recipient_only: false
   max_concurrent_sessions: 16
   allowed_cidrs: ["127.0.0.0/8"]
   timeouts: {{ command: 5s, data: 5s, session: 60s }}
@@ -581,6 +583,14 @@ pub struct GrantAllQuota {
     committed: Arc<Mutex<Vec<Reservation>>>,
     released: Arc<Mutex<Vec<Reservation>>>,
     paused: Arc<Mutex<Vec<String>>>,
+    /// §7.3 — every key handed to `commit`, in order. The relay's half of the
+    /// §7.4 phase 3 obligation: events are recorded on a downstream `2xx` and on
+    /// nothing else.
+    recorded: Arc<Mutex<Vec<(String, Key)>>>,
+    /// What `recipient_event_count` should answer, keyed by route. Lets a test
+    /// put a route over its threshold without a database and without waiting for
+    /// a window to fill.
+    counts: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl GrantAllQuota {
@@ -603,6 +613,21 @@ impl GrantAllQuota {
     pub fn released(&self) -> Vec<Reservation> {
         self.released.lock().expect("not poisoned").clone()
     }
+
+    /// §7.3 — the recipient keys recorded so far, with the route they were
+    /// recorded for.
+    pub fn recorded(&self) -> Vec<(String, Key)> {
+        self.recorded.lock().expect("not poisoned").clone()
+    }
+
+    /// Put a route at `count` events for every recipient, so a test can drive the
+    /// §3.2 3b skip without writing rows or moving a clock.
+    pub fn set_recipient_count(&self, route: &str, count: i64) {
+        self.counts
+            .lock()
+            .expect("not poisoned")
+            .insert(route.to_string(), count);
+    }
 }
 
 #[async_trait::async_trait]
@@ -617,11 +642,20 @@ impl QuotaStore for GrantAllQuota {
         }))
     }
 
-    async fn commit(&self, reservation: &Reservation) -> Result<(), QuotaError> {
+    async fn commit(
+        &self,
+        reservation: &Reservation,
+        recipient_keys: &[Key],
+    ) -> Result<(), QuotaError> {
         self.committed
             .lock()
             .expect("not poisoned")
             .push(reservation.clone());
+
+        let mut recorded = self.recorded.lock().expect("not poisoned");
+        for key in recipient_keys {
+            recorded.push((reservation.route.clone(), key.clone()));
+        }
         Ok(())
     }
 
@@ -659,6 +693,34 @@ impl QuotaStore for GrantAllQuota {
 
     async fn sweep_expired(&self) -> Result<Vec<Expired>, QuotaError> {
         Ok(Vec::new())
+    }
+
+    async fn recipient_event_count(
+        &self,
+        route: &str,
+        _key: &Key,
+        _since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<i64, QuotaError> {
+        Ok(self
+            .counts
+            .lock()
+            .expect("not poisoned")
+            .get(route)
+            .copied()
+            .unwrap_or(0))
+    }
+
+    async fn recipient_hash_salt(&self) -> Result<Vec<u8>, QuotaError> {
+        // Fixed rather than generated: a test that asserts on a key needs the
+        // same key twice.
+        Ok(b"a fixed salt for the in-memory store".to_vec())
+    }
+
+    async fn sweep_recipient_events(
+        &self,
+        _cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, QuotaError> {
+        Ok(0)
     }
 
     async fn is_available(&self) -> bool {

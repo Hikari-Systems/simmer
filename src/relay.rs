@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::downstream::{self, TlsConfigs};
+use crate::frequency::Frequency;
 use crate::metrics;
 use crate::quota::{self, QuotaStore, ReservationRegistry};
 use crate::rewrite::{self, Rewriters};
@@ -48,6 +49,10 @@ pub struct Engine {
     /// (D-034), and configuration errors belong at startup rather than on a
     /// connection that has already been accepted.
     pub rewriters: Arc<Rewriters>,
+    /// §7.3 — the instance's recipient-hash salt, resolved from storage on first
+    /// use. Shared, because "generated once and persisted" is a property of the
+    /// instance rather than of a message.
+    pub frequency: Arc<Frequency>,
 }
 
 /// Why no route could be selected. Each maps to a specific reply, and the
@@ -209,6 +214,7 @@ pub async fn reserve_relay_commit(
     let selected = match chain::walk_and_reserve(
         cfg,
         &engine.quota,
+        &engine.frequency,
         chain,
         message.recipients,
         correlation_id,
@@ -275,6 +281,12 @@ pub async fn reserve_relay_commit(
         },
     );
 
+    // §6.4 — a `text/*` part the route's `body_rewrites` did not reach. The
+    // engine has already logged each one; this is the counter §9.1 asks for.
+    for reason in &rewritten.skipped_parts {
+        metrics::body_rewrite_skipped(&selected.route.name, reason.as_str());
+    }
+
     tracing::info!(
         correlation_id,
         route = %selected.route.name,
@@ -331,7 +343,13 @@ pub async fn reserve_relay_commit(
     // is the §10.1 table's answer, carried since phase 2.
     let store = Arc::clone(&engine.quota);
     let resolution = if outcome.commit {
-        store.commit(&selected.reservation).await
+        // §7.4 phase 3, both halves in one transaction: the count moves from
+        // `reserved` to `committed` and this message's recipient-frequency
+        // events are recorded. `recipient_keys` is empty unless the selected
+        // route declares a constraint.
+        store
+            .commit(&selected.reservation, &selected.recipient_keys)
+            .await
     } else {
         store.release(&selected.reservation).await
     };

@@ -185,6 +185,84 @@ fn body() -> impl Strategy<Value = String> {
         Just("From: not-a-header@example.com\r\nSubject: also not\r\n\r\ntext\r\n".to_string()),
         Just("Grüße — non-ASCII in the body\r\n".to_string()),
         Just("line\r\n".repeat(50)),
+        // -- §6.4, phase 5 -------------------------------------------------
+        // A live match for the shipped rule, so pass 2 sees pass 1's rewritten
+        // body rather than the one that arrived.
+        Just("Track it at https://oldbrand.com/track\r\n".to_string()),
+        // Already migrated: arrangement B of §1.1, in the body.
+        Just("Track it at https://newbrand.com/track\r\n".to_string()),
+        // The construct §6.4 is written about, and its own example.
+        Just("Visit https://old=\r\nbrand.com/x today\r\n".to_string()),
+        Just("Grüße =E2=80=94 https://oldbrand.com/x\r\n".to_string()),
+        // A part whose bytes encode a match that must not be found.
+        Just("aHR0cHM6Ly9vbGRicmFuZC5jb20vdHJhY2s=\r\n".to_string()),
+        Just(BASE64_TEXT_BODY.to_string()),
+        Just(MULTIPART_BODY.to_string()),
+        Just(SIGNED_BODY.to_string()),
+    ]
+}
+
+/// A `text/plain` part carrying a match, base64 encoded. Paired with
+/// `base64_headers()` below; on its own it is just an odd-looking body, which is
+/// also worth generating.
+const BASE64_TEXT_BODY: &str = "VHJhY2sgaXQgYXQgaHR0cHM6Ly9vbGRicmFuZC5jb20vdHJhY2sNCg==\r\n";
+
+/// One matching text part, one attachment that encodes the same match, a
+/// preamble and an epilogue. Everything but the text part must survive.
+const MULTIPART_BODY: &str = concat!(
+    "preamble\r\n",
+    "--b1\r\n",
+    "Content-Type: text/plain; charset=utf-8\r\n",
+    "Content-Transfer-Encoding: quoted-printable\r\n",
+    "\r\n",
+    "Track it at https://old=\r\nbrand.com/track\r\n",
+    "--b1\r\n",
+    "Content-Type: application/pdf\r\n",
+    "Content-Disposition: attachment; filename=receipt.pdf\r\n",
+    "Content-Transfer-Encoding: base64\r\n",
+    "\r\n",
+    "aHR0cHM6Ly9vbGRicmFuZC5jb20vdHJhY2s=\r\n",
+    "--b1--\r\n",
+    "epilogue\r\n",
+);
+
+/// §6.4's never-rewrite case, with a live match inside it.
+const SIGNED_BODY: &str = concat!(
+    "--sig\r\n",
+    "Content-Type: text/plain\r\n",
+    "\r\n",
+    "Track it at https://oldbrand.com/track\r\n",
+    "--sig\r\n",
+    "Content-Type: application/pkcs7-signature\r\n",
+    "\r\n",
+    "MIIFnotarealsignature\r\n",
+    "--sig--\r\n",
+);
+
+/// `Content-Type` headers that make the generated bodies mean something.
+///
+/// The generator pairs these freely with the bodies above, so most combinations
+/// are a mislabelled message — a `multipart/mixed` header over a plain body, a
+/// `base64` label over text that is not base64. That is deliberate: §6.4 has to
+/// survive a message whose headers lie about its body, and those are the inputs
+/// that reach the decode-failure paths.
+fn mime_header() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just(String::new()),
+        Just("Content-Type: text/plain; charset=utf-8\r\n".to_string()),
+        Just("Content-Type: text/plain; charset=iso-8859-1\r\n".to_string()),
+        Just("Content-Type: text/plain; charset=shift_jis\r\n".to_string()),
+        Just("Content-Type: text/html\r\n".to_string()),
+        Just("Content-Type: application/octet-stream\r\n".to_string()),
+        Just("Content-Type: multipart/mixed; boundary=\"b1\"\r\n".to_string()),
+        Just("Content-Type: multipart/signed; boundary=\"sig\"\r\n".to_string()),
+        Just("Content-Type: multipart/mixed\r\n".to_string()),
+        Just("Content-Transfer-Encoding: quoted-printable\r\n".to_string()),
+        Just("Content-Transfer-Encoding: base64\r\n".to_string()),
+        Just("Content-Transfer-Encoding: 7bit\r\n".to_string()),
+        Just("Content-Transfer-Encoding: x-uuencode\r\n".to_string()),
+        Just("Content-Length: 42\r\n".to_string()),
+        Just("Lines: 3\r\n".to_string()),
     ]
 }
 
@@ -192,9 +270,79 @@ prop_compose! {
     fn message()(
         from in from_header(),
         extras in prop::collection::vec(extra_header(), 0..7),
+        mime in prop::collection::vec(mime_header(), 0..3),
         body in body(),
     ) -> String {
-        format!("{from}{}\r\n{body}", extras.concat())
+        format!("{from}{}{}\r\n{body}", extras.concat(), mime.concat())
+    }
+}
+
+/// Bodies that contain no match for the shipped rule under **any** decoding.
+///
+/// Filtering the general generator would not do: `aHR0cHM6…` is a match once
+/// base64 is undone, so "the raw text has no match" is not the same question as
+/// "the rule finds nothing". These are chosen so that both answers are no.
+fn harmless_body() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just(String::new()),
+        Just("Hello.\r\n".to_string()),
+        Just(".\r\n.hidden\r\n..two\r\nplain\r\n\r\n".to_string()),
+        Just("Grüße — non-ASCII in the body\r\n".to_string()),
+        Just("Grüße =E2=80=94 and a soft=20\r\nbreak\r\n".to_string()),
+        Just("SGVsbG8sIHdvcmxkCg==\r\n".to_string()),
+        Just("Track it at https://newbrand.com/track\r\n".to_string()),
+        Just("line\r\n".repeat(50)),
+        Just(
+            concat!(
+                "preamble\r\n",
+                "--b1\r\n",
+                "Content-Type: text/plain; charset=utf-8\r\n",
+                "\r\n",
+                "Already migrated: https://newbrand.com/track\r\n",
+                "--b1\r\n",
+                "Content-Type: application/pdf\r\n",
+                "Content-Transfer-Encoding: base64\r\n",
+                "\r\n",
+                "JVBERi0xLjQK\r\n",
+                "--b1--\r\n",
+                "epilogue\r\n",
+            )
+            .to_string()
+        ),
+    ]
+}
+
+prop_compose! {
+    fn harmless_message()(
+        from in from_header(),
+        extras in prop::collection::vec(extra_header(), 0..5),
+        mime in prop::collection::vec(mime_header(), 0..3),
+        body in harmless_body(),
+    ) -> String {
+        format!("{from}{}{}\r\n{body}", extras.concat(), mime.concat())
+    }
+}
+
+// A multipart whose headers describe its body truthfully, so the parts really
+// are the parts. `message()` pairs headers and bodies freely on purpose — a
+// message whose headers lie about its body is what reaches the decode-failure
+// paths — but a claim about which part was rewritten needs a message where the
+// question has an answer.
+prop_compose! {
+    fn well_formed_multipart()(
+        from in from_header(),
+        extras in prop::collection::vec(extra_header(), 0..5),
+    ) -> String {
+        // A second `Content-Type` would make the message malformed and the
+        // first one wins, which is a different test than this one.
+        let extras: String = extras
+            .iter()
+            .filter(|h| !h.starts_with("Content-Type:"))
+            .cloned()
+            .collect();
+        format!(
+            "{from}{extras}MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b1\"\r\n\r\n{MULTIPART_BODY}",
+        )
     }
 }
 
@@ -203,9 +351,10 @@ prop_compose! {
 prop_compose! {
     fn message_without_from()(
         extras in prop::collection::vec(extra_header(), 0..5),
+        mime in prop::collection::vec(mime_header(), 0..3),
         body in body(),
     ) -> String {
-        format!("{}\r\n{body}", extras.concat())
+        format!("{}{}\r\n{body}", extras.concat(), mime.concat())
     }
 }
 
@@ -213,8 +362,8 @@ prop_compose! {
 // the properties
 // ---------------------------------------------------------------------------
 
-/// The shipped idiom: everything `simmer.yaml` does on the warming route, less
-/// the body rewrites (§6.4, phase 5).
+/// The shipped idiom: everything `simmer.yaml` does on the warming route,
+/// §6.4's body rewrites included.
 const SHIPPED: &str = r#"
 envelope_from: "bounce@newbrand.com"
 set_headers:
@@ -225,6 +374,9 @@ set_headers:
   List-Unsubscribe-Post: "List-Unsubscribe=One-Click"
   X-Original-Subject: "{{original.subject}}"
 remove_headers: ["Return-Path", "X-Mailer"]
+body_rewrites:
+  - pattern: 'https://oldbrand\.com/'
+    replacement: "https://newbrand.com/"
 "#;
 
 /// The migration-only construct, declared as §6.6 requires.
@@ -271,15 +423,59 @@ proptest! {
     }
 
     #[test]
-    fn the_body_is_never_altered(m in message()) {
-        let route = compile(SHIPPED);
+    fn a_body_no_rule_matches_is_never_altered(m in message()) {
+        // What is left of D-039 once §6.4 exists, and the reason `body.rs`
+        // returns `None` rather than a rebuilt body: a route whose
+        // `body_rewrites` find nothing changes nothing at all — not the MIME
+        // boundaries, not the transfer encodings, not the trailing whitespace.
+        //
+        // A pass-through route has no rules, so nothing can match whatever the
+        // generator produced.
+        let route = compile(PASS_THROUGH);
         let out = pass(&route, m.as_bytes(), Some("sender@oldbrand.com"));
-        // Everything from the first blank line on must survive untouched. Body
-        // rewriting is §6.4 and phase 5; until then this is structural.
         let sent_body = m.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
         let got = String::from_utf8_lossy(&out.raw).to_string();
         let got_body = got.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
         prop_assert_eq!(got_body, sent_body);
+    }
+
+    #[test]
+    fn a_body_the_shipped_rule_does_not_match_is_never_altered(m in harmless_message()) {
+        // The same property with rules loaded, which is the case that can go
+        // wrong: the engine walks the MIME structure, decides nothing matched,
+        // and has to put every span back exactly as it found it.
+        let route = compile(SHIPPED);
+        let out = pass(&route, m.as_bytes(), Some("sender@oldbrand.com"));
+        let sent_body = m.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+        let got = String::from_utf8_lossy(&out.raw).to_string();
+        let got_body = got.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+        prop_assert_eq!(got_body, sent_body);
+    }
+
+    #[test]
+    fn nothing_outside_a_text_part_is_ever_rewritten(m in well_formed_multipart()) {
+        // The base64 attachment in `MULTIPART_BODY` encodes the very string the
+        // shipped rule matches. §6.4: "Attachments and non-text parts are never
+        // touched" — so if it comes back changed, the engine decoded something
+        // it had no business decoding.
+        let route = compile(SHIPPED);
+        let out = pass(&route, m.as_bytes(), Some("sender@oldbrand.com"));
+        let got = String::from_utf8_lossy(&out.raw).to_string();
+        prop_assert!(
+            got.contains("aHR0cHM6Ly9vbGRicmFuZC5jb20vdHJhY2s="),
+            "the attachment was rewritten:\n{}",
+            got
+        );
+        // The text part beside it, though, is exactly what the rule is for —
+        // soft line break and all.
+        prop_assert!(
+            got.contains("https://newbrand.com/track"),
+            "the text part was not rewritten:\n{}",
+            got
+        );
+        // And the framing is the framing that arrived.
+        prop_assert!(got.contains("preamble\r\n--b1\r\n"), "{}", got);
+        prop_assert!(got.ends_with("--b1--\r\nepilogue\r\n"), "{}", got);
     }
 
     #[test]

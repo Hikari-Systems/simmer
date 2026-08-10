@@ -219,13 +219,21 @@ fn the_rewrite_is_what_a_real_mail_server_receives() {
         "no Received: header naming Simmer:\n{raw}"
     );
 
-    // §6.4 is phase 5. Asserted as *not yet done* rather than left silent, so
-    // this test starts failing the moment body rewriting lands and has to be
-    // completed rather than forgotten.
+    // §6.4 — `ACCEPTANCE.md` §4.3's last row, and the only tier that reads a
+    // rewritten body back off a real mail server rather than out of a buffer.
     assert!(
-        raw.contains("https://oldbrand.com/track"),
-        "body rewriting appears to have landed — finish ACCEPTANCE.md §4.3's \
-         last row and delete this assertion:\n{raw}"
+        raw.contains("https://newbrand.com/track"),
+        "the body link was not rewritten:\n{raw}"
+    );
+    assert!(
+        !raw.contains("oldbrand.com/track"),
+        "the old link survived somewhere in the message:\n{raw}"
+    );
+    // The sentence around it is untouched — §6.4 replaces what the pattern
+    // matched, and a decode/re-encode round trip must not disturb the rest.
+    assert!(
+        raw.contains("Your order has shipped."),
+        "the rest of the body did not survive the round trip:\n{raw}"
     );
 }
 
@@ -644,9 +652,9 @@ fn the_acceptance_config_and_the_shipped_config_stay_in_step() {
             <= 4,
         "the acceptance schedule is one container restart per entry; keep it short"
     );
-    assert!(
-        acceptance.server.single_recipient_only,
-        "the loadgen sends one recipient per transaction (ACCEPTANCE.md §6)"
+    assert_eq!(
+        acceptance.server.max_recipients, 1,
+        "the loadgen sends one recipient per transaction (ACCEPTANCE.md §6, D-047)"
     );
 
     // And the identity must be the one the §4.3 assertions are written against.
@@ -654,4 +662,11 @@ fn the_acceptance_config_and_the_shipped_config_stay_in_step() {
     assert_eq!(identity.envelope_from, "bounce@newbrand.com");
     assert_eq!(identity.unstable_headers, ["Reply-To"]);
     assert!(identity.set_headers.contains_key("List-Unsubscribe"));
+    // §4.3's last row needs a rule to assert against, and the loadgen's body
+    // carries the link it matches.
+    assert_eq!(identity.body_rewrites.len(), 1, "§6.4 needs a rule here");
+    assert_eq!(
+        identity.body_rewrites[0].replacement,
+        "https://newbrand.com/"
+    );
 }
