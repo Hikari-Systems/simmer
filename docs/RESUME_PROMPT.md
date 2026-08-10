@@ -16,8 +16,9 @@ picking up at phase 4.
    `DECISIONS.md`. §6 is phase 4's subject; read §1.1 and §6.6 twice.
 2. `CLAUDE.md` — the three constraints that will bite you, and the key-file map.
 3. `docs/STATE.md` — where the build has got to, what is tested, what is not.
-4. `DECISIONS.md` — 32 decisions (D-001..D-032) and 3 open questions (O-8, O-9,
-   O-11), none of which phase 4 needs.
+4. `DECISIONS.md` — 33 decisions (D-001..D-033), 3 open questions (O-8, O-9,
+   O-11) none of which phase 4 needs, and one **known defect** in phase 2's
+   `smtp/auth.rs` worth fixing before anything else touches authentication.
 5. `docs/ACCEPTANCE.md` — the §12.3 acceptance harness, **designed but not
    built**. Read §4.4 before writing the rewrite engine: the cutover invariant is
    the property phase 4 exists to make true, and that section is the only test
@@ -100,6 +101,11 @@ Its ramp-walk half is buildable today and does not need phase 4. Its rewrite and
 cutover-invariant assertions need phase 4 and are the strongest available check
 that the rewriting engine is right — §1.1's whole thesis is that both arrangements
 produce byte-equivalent output, and nothing else tests it.
+
+`docs/INGRESS.md` separately designs listeners on 25/465/587, inbound TLS and a
+sender ACL (D-033) as a new phase 11. It is planned, not built, and **its §1 is a
+question for the spec's author**: it reverses four `SPEC.md` passages rather than
+diverging from one. Do not start it without that answer.
 
 **Worth agreeing with the user up front** whether to build the harness before,
 alongside, or after the rewrite engine. Building it first means phase 4 has

@@ -638,6 +638,83 @@ outcome this ordering avoids.
 now or waits; whether the acceptance config is its own file; and whether CI runs
 the suite on every push.
 
+### D-033 — Inbound listeners on 25/465/587, inbound TLS, and a sender ACL (planned)
+
+**Spec:** this contradicts `SPEC.md` in four places rather than diverging from one.
+§2.2 "**No inbound TLS**"; §5.1 "Plaintext TCP, default port 25. No STARTTLS, no
+implicit TLS, no ACME"; §2.3 "The listener is plaintext and accepts plaintext
+AUTH"; §5.2 "`EHLO` advertises **exactly** … Nothing else". And §4.2 currently
+makes it a *violation* for `allow_insecure_auth` to be false, a rule that has to
+invert.
+
+**Decision:** designed in full in `docs/INGRESS.md`. Planned only — nothing is
+built, and §1 of that document is a question for the spec's author before anything
+is.
+
+The load-bearing calls:
+
+- **Per-listener policy, not a global switch.** `server.listen` becomes
+  `server.listeners`, each with its own `tls` and `auth` mode. Ports 25, 465 and
+  587 have genuinely different rules (RFC 5321, RFC 8314, RFC 6409) and one flag
+  cannot express them. Defaults follow the RFCs so the common arrangement is not a
+  puzzle.
+- **No ACME.** That part of §5.1 stands. One PEM certificate and key read at
+  startup; §2.2's no-hot-reload makes rotation a restart.
+- **The ACL stays in `simmer.yaml`.** Slater keeps its equivalent in a separate
+  `acl.json` because that file is reloaded on generation hot-swap and lives on
+  shared storage. Simmer has neither property, so a second file would buy a second
+  thing to mount and nothing else.
+- **The ACL gates acceptance, never routing.** §5.3 says the authenticated
+  username "plays no part in route selection", and that survives intact: a grant
+  decides whether a sender identity is *permitted*, after which §5.4 selects the
+  chain exactly as today. Letting the ACL choose a chain would make the outbound
+  identity depend on who authenticated, which is not expressible as
+  application-side configuration and so breaks the cutover invariant (§1.1)
+  outright, not merely §5.3. Two users permitted the same identity must produce
+  byte-identical output, and that needs to be a test.
+- **`550 5.7.1` on denial**, reusing §10.3's explicit carve-out for
+  `strict_senders` — a statement about the sender, which cannot suppress a
+  recipient, so §14.1 holds.
+- **§5.4's pattern grammar is reused verbatim** for grants — exact domain,
+  `*.subdomain`, full address. `routing::sender_match::Pattern` implements it
+  already and operators know it.
+
+**Modelled on Slater** (`/home/rickk/git/hs/slater`), as instructed: users keyed by
+name, argon2id PHC strings at the same parameters, `grants` as per-resource
+capability lists, default deny, per-connection rather than per-account failure
+limits, and a `hash-password` subcommand. Two deliberate differences — the ACL file
+location above, and unrecognised grant keys, which Slater ignores (right for a
+runtime-reloaded file) and Simmer rejects at startup (D-013: a silently ignored
+grant is a limit that quietly does nothing).
+
+**Placed as a new phase 11**, after §13's ten. Not before phase 4: Simmer does not
+yet rewrite anything, so it does not yet do its job, and adding certificates to a
+component that warms nothing is decoration. A deployment that cannot wait would
+reverse that, which is a deployment question rather than an engineering one.
+
+**Found while modelling this, and separable from it:** Slater's `equalisation_hash`
+documents a defect Simmer has today — see the note under "Still open" below.
+
+---
+
+## Defects found, not yet fixed
+
+**Timing-based username enumeration in `smtp/auth.rs`.** `Verifier` hashes an
+unknown username against a *fixed* decoy minted at `m=19456,t=2,p=1`, so that a
+miss costs what a hit costs. But argon2 verification is parameter-agnostic —
+`PasswordHash::new` reads `m`/`t`/`p` from the *stored* PHC string and re-derives at
+those. An operator who mints with anything other than the §4.1 example's parameters
+therefore makes the two paths diverge in cost, and username enumeration by timing
+returns with the mitigation still apparently in place. The code's own comment
+concedes it: the decoy costs "*roughly*" what a real verification costs.
+
+Slater solves this (their HIK-222) by borrowing the costliest hash the ACL actually
+holds, so the unknown-user path runs the very derivation a real login runs — exact
+when parameters are uniform, and degrading in the safe direction when they are not.
+
+Live in phase 2 code and independent of D-033. Worth fixing on its own rather than
+inside a feature.
+
 ---
 
 ## Still open — to settle at the start of the phase that needs them

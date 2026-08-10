@@ -23,6 +23,7 @@ this file disagrees with any of them, they win.
 | 8 | DNS preflight | |
 | 9 | Multi-recipient splitting and result collapse | |
 | 10 | Hardening: pooling, graceful shutdown, acceptance suite, README | acceptance harness **designed** — `docs/ACCEPTANCE.md`, D-032 |
+| 11 | *(new, beyond §13)* Listeners on 25/465/587, inbound TLS, sender ACL | **designed** — `docs/INGRESS.md`, D-033. Reverses four SPEC.md passages; needs the spec author |
 
 ### What the service actually does today
 
@@ -206,6 +207,18 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 - **§10.4 under a real `SIGTERM`** — `release_by_ids` and the registry are tested;
   the wiring in `main` is not.
 - The sweeper's interval loop (`sweep_once` is tested, `run` is not).
+
+---
+
+## 6a. Known defect
+
+**Timing-based username enumeration in `smtp/auth.rs`.** The unknown-username decoy
+hash is minted at fixed argon2 parameters, but verification is parameter-agnostic —
+so an operator minting with different parameters silently reopens the oracle the
+decoy exists to close. Found by modelling D-033's ACL on Slater, which fixes the
+same bug by borrowing the costliest hash the ACL actually holds. Live in phase 2
+code, independent of D-033, and worth fixing on its own. See `DECISIONS.md`
+"Defects found, not yet fixed".
 
 ---
 
