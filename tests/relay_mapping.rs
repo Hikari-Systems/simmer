@@ -33,14 +33,19 @@ async fn a_2xx_on_the_final_dot_becomes_250_accepted() {
     assert!(r.contains("accepted"));
 
     let got = down.last().expect("downstream received the message");
-    assert_eq!(got.mail_from.as_deref(), Some("jane@oldbrand.com"));
+    // §6.1 step 9: the envelope sender is the route's, not the client's. The
+    // fixture route sets `envelope_from: "b@example.com"`.
+    assert_eq!(got.mail_from.as_deref(), Some("b@example.com"));
     assert_eq!(got.recipients, vec!["bob@gmail.com".to_string()]);
 }
 
 #[tokio::test]
-async fn phase_2_forwards_the_body_byte_for_byte() {
-    // Phase 2 does no rewriting, so this is the baseline phase 4 must preserve:
-    // whatever the client sent is what the downstream saw.
+async fn everything_the_route_does_not_name_is_forwarded_byte_for_byte() {
+    // Phase 2's `phase_2_forwards_the_body_byte_for_byte`, sharpened rather than
+    // deleted. Phase 4 prepends a Received: header (§6.1 step 8) and rewrites the
+    // envelope sender, so "the whole message is verbatim" is no longer true —
+    // but everything the route was not configured to touch still is, and the
+    // awkward body is the part that would break first.
     let (down, simmer) = stack(Script::default()).await;
     let mut c = simmer.connect().await;
     c.hello().await;
@@ -54,10 +59,79 @@ async fn phase_2_forwards_the_body_byte_for_byte() {
 
     let got = down.last().expect("received");
     assert_eq!(
-        String::from_utf8_lossy(&got.body),
+        support::without_received(&got.body),
         body,
-        "body was not forwarded verbatim"
+        "everything below the Received: header should be untouched"
     );
+}
+
+#[tokio::test]
+async fn exactly_one_received_header_is_added() {
+    // §6.1 step 8, and the phase 4 call that Simmer adds nothing else: one
+    // header, at the top, naming the client and this hop.
+    let (down, simmer) = stack(Script::default()).await;
+    let mut c = simmer.connect().await;
+    c.hello().await;
+
+    let body = "From: jane@oldbrand.com\r\nSubject: t\r\n\r\nhi\r\n";
+    assert_eq!(
+        c.deliver("jane@oldbrand.com", "bob@gmail.com", body)
+            .await
+            .code,
+        250
+    );
+
+    let got = down.last().expect("received");
+    let text = String::from_utf8_lossy(&got.body).to_string();
+    assert_eq!(text.matches("Received:").count(), 1, "{text}");
+    assert!(text.starts_with("Received: from "), "{text}");
+    assert!(text.contains("by simmer.test with ESMTP id "), "{text}");
+    // No X-Simmer-* headers: every header Simmer adds is one the recipient sees
+    // that would vanish when Simmer is unplugged.
+    assert!(!text.contains("X-Simmer"), "{text}");
+}
+
+#[tokio::test]
+async fn authentication_artefacts_are_stripped_on_the_way_through() {
+    // §6.5, end to end. Simmer holds no key material, and a *failing* signature
+    // is treated more harshly by filters than an absent one.
+    let (down, simmer) = stack(Script::default()).await;
+    let mut c = simmer.connect().await;
+    c.hello().await;
+
+    let body = "From: jane@oldbrand.com\r\n\
+                DKIM-Signature: v=1; a=rsa-sha256; d=oldbrand.com; b=abc\r\n\
+                Authentication-Results: mx.example.com; spf=pass\r\n\
+                ARC-Seal: i=1; cv=none\r\n\
+                Subject: t\r\n\r\nhi\r\n";
+    assert_eq!(
+        c.deliver("jane@oldbrand.com", "bob@gmail.com", body)
+            .await
+            .code,
+        250
+    );
+
+    let text = String::from_utf8_lossy(&down.last().expect("received").body).to_string();
+    for artefact in ["DKIM-Signature", "Authentication-Results", "ARC-Seal"] {
+        assert!(!text.contains(artefact), "{artefact} survived:\n{text}");
+    }
+    assert!(text.contains("Subject: t\r\n"), "{text}");
+}
+
+#[tokio::test]
+async fn a_null_sender_survives_the_rewrite() {
+    // D-035: MAIL FROM:<> identifies a bounce and RFC 5321 §6.1 requires it.
+    // The fixture route sets envelope_from unconditionally; the null sender is
+    // the one input it must not apply to.
+    let (down, simmer) = stack(Script::default()).await;
+    let mut c = simmer.connect().await;
+    c.hello().await;
+
+    let body = "From: jane@oldbrand.com\r\nSubject: bounce\r\n\r\nfailed\r\n";
+    assert_eq!(c.deliver("", "bob@gmail.com", body).await.code, 250);
+
+    let got = down.last().expect("received");
+    assert_eq!(got.mail_from.as_deref(), None);
 }
 
 #[tokio::test]
@@ -78,7 +152,7 @@ async fn a_message_larger_than_the_spill_threshold_still_arrives_intact() {
     let r = c.deliver("jane@oldbrand.com", "bob@gmail.com", &body).await;
     assert_eq!(r.code, 250, "{r:?}");
     let got = down.last().expect("received");
-    assert_eq!(String::from_utf8_lossy(&got.body), body);
+    assert_eq!(support::without_received(&got.body), body);
 }
 
 // ---------------------------------------------------------------------------

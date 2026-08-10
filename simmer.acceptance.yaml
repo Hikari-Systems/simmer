@@ -1,0 +1,135 @@
+# Acceptance-suite configuration — `docs/ACCEPTANCE.md`, D-032.
+#
+# **Not a deployment example.** `simmer.yaml` is the one to copy. This file
+# exists so the acceptance stack can differ from the shipped example in the three
+# ways it has to, without those differences leaking into the file operators read:
+#
+#   1. `warmup.started` comes from `${SIMMER_WARMUP_STARTED}`, which the harness
+#      moves backwards to walk the ramp across simulated day boundaries (§12.3,
+#      `ACCEPTANCE.md` §3).
+#   2. The downstreams are the two Mailpit traps on the compose network, in
+#      plaintext. Real-certificate TLS is `ACCEPTANCE.md` §5 and phase 10.
+#   3. The schedule is three short days rather than eight long ones, because
+#      every day costs a container restart.
+#
+# `tests/acceptance.rs` reads *this file* for the schedule it asserts against, so
+# the expected numbers exist once rather than twice. Changing the schedule below
+# changes what the suite expects, with nothing else to keep in step.
+
+server:
+  listen: "0.0.0.0:25"
+  hostname: "simmer.acceptance"
+  max_message_bytes: 26214400
+  max_recipients: 100
+  # §5.6 and `ACCEPTANCE.md` §6: the shipped default, so the loadgen opens one
+  # transaction per recipient. Turning it off here would make the ramp
+  # assertions count transactions rather than messages.
+  single_recipient_only: true
+  max_concurrent_sessions: 64
+  # The compose network. `loadgen` is the only client.
+  allowed_cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+  timeouts:
+    command: 30s
+    data: 300s
+    session: 600s
+  auth:
+    # Kept on. The loadgen authenticates, so the suite exercises §5.3 against the
+    # real listener rather than only against the in-process tests.
+    required: true
+    allow_insecure_auth: true
+    mechanisms: [PLAIN, LOGIN]
+    users:
+      - username: "cfapp"
+        password_hash: "${SIMMER_CFAPP_HASH}"
+
+database:
+  url: "${DATABASE_URL}"
+  max_connections: 10
+  connect_timeout: 5s
+  fail_closed: true
+
+admin:
+  listen: "0.0.0.0:8080"
+  auth_token: "${SIMMER_ADMIN_TOKEN}"
+
+logging:
+  level: info
+  format: json
+
+domain_groups:
+  - name: catchall
+    domains: ["*"]
+
+senders:
+  - match: "oldbrand.com"
+    match_on: envelope
+    chain: [warming-newbrand, overflow-established]
+
+default_chain: [overflow-established]
+strict_senders: false
+
+routes:
+  - name: warming-newbrand
+    downstream:
+      host: "trap-warming"
+      port: 1025
+      # Phase 10 gives the traps a certificate and moves this to
+      # `required_verify` (`ACCEPTANCE.md` §5). Until then the suite proves the
+      # ramp and the rewrite, not the TLS modes.
+      tls: off
+      pool:
+        max_connections: 4
+        idle_ttl: 60s
+        max_messages_per_connection: 100
+      timeouts:
+        connect: 10s
+        command: 30s
+        data: 120s
+      smtputf8: false
+    identity:
+      # Absolute assignment (§1.1 constraint 1). See the note in `simmer.yaml`
+      # about why this is not the sub-addressed form SPEC.md §4.1 shows.
+      envelope_from: "bounce@newbrand.com"
+      set_headers:
+        From: "{{original.from.display_name}} <sales@newbrand.com>"
+        Reply-To: "{{original.from.address}}"
+        Message-ID: "<{{uuid}}@newbrand.com>"
+        List-Unsubscribe: "<mailto:unsub@newbrand.com>, <https://newbrand.com/u/{{uuid}}>"
+        List-Unsubscribe-Post: "List-Unsubscribe=One-Click"
+        X-Simmer-Route: "{{route.name}}"
+      unstable_headers: ["Reply-To"]
+      remove_headers: ["Return-Path", "X-Mailer"]
+    preflight:
+      # §6.7 is phase 8. Off rather than left at its default, so the suite is not
+      # asserting against a feature that does not exist yet.
+      enabled: false
+    warmup:
+      # The whole mechanism of `ACCEPTANCE.md` §3: the harness sets this to
+      # `now - (day × 24h) - 1h` and restarts the container, and §7.2's
+      # elapsed-duration day index does the rest.
+      started: "${SIMMER_WARMUP_STARTED}"
+      schedule:
+        # Short on purpose — each entry is one container restart. Small enough
+        # that a miscount is visible by eye in the trap's UI, and large enough
+        # that concurrency has somewhere to go wrong.
+        default: [5, 10, 20]
+
+  - name: overflow-established
+    overflow: true
+    downstream:
+      host: "trap-overflow"
+      port: 1025
+      tls: off
+      pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
+      smtputf8: false
+    identity:
+      envelope_from: "bounce@mail.established.com"
+      set_headers:
+        From: "{{original.from.display_name}} <news@mail.established.com>"
+        Reply-To: "{{original.from.address}}"
+        Message-ID: "<{{uuid}}@mail.established.com>"
+        X-Simmer-Route: "{{route.name}}"
+      unstable_headers: ["Reply-To"]
+      remove_headers: ["Return-Path", "X-Mailer"]
+    preflight:
+      enabled: false

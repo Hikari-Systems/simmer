@@ -116,11 +116,19 @@ async fn run() -> anyhow::Result<()> {
     // about and tested without a database in the way.
     let quota: Arc<dyn quota::QuotaStore> = Arc::new(quota::PgQuotaStore::new(pool.clone()));
 
+    // §6 — templates compiled once. Infallible here: `config::load` has already
+    // run §4.2, which compiles every one of them to check §6.6's property, so a
+    // failure at this point would mean validation and the relay disagree about
+    // what the configuration says.
+    let rewriters = simmer::rewrite::Rewriters::compile(&config)
+        .map_err(|errors| anyhow::anyhow!("rewrite templates failed to compile: {errors:?}"))?;
+
     let engine = relay::Engine {
         config: Arc::clone(&config),
         tls: Arc::new(tls),
         quota: Arc::clone(&quota),
         registry: quota::ReservationRegistry::new(),
+        rewriters: Arc::new(rewriters),
     };
 
     // §5.1 — bind before announcing readiness, so a port clash is a startup

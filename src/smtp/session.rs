@@ -514,6 +514,11 @@ where
         // reservation is taken inside, immediately before the conversation, and
         // resolved on every path out (O-1, §3.3's no-failover rule).
         let engine = self.engine.clone();
+        // §6.1 step 8's raw material. `greeted` is `Some` by here — §5.2 rejects
+        // `MAIL FROM` before a greeting — but a missing one is not worth failing
+        // an accepted message over.
+        let helo = self.greeted.clone().unwrap_or_default();
+        let peer = self.peer.ip().to_string();
         relay::reserve_relay_commit(
             &engine,
             &senders,
@@ -523,6 +528,9 @@ where
                 body: &bytes,
                 smtputf8: tx.params.smtputf8,
                 body_8bitmime: tx.params.body_8bitmime,
+                helo: &helo,
+                peer: &peer,
+                authenticated: self.authenticated,
             },
             &self.correlation_id,
         )

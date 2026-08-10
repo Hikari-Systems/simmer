@@ -589,7 +589,184 @@ compile-time verification. `CLAUDE.md`'s ban is on the latter, which would need
 
 ---
 
-## Phase 10 (planned)
+## Phase 4
+
+### D-034 — An unknown template variable is a fatal startup error
+
+**Spec:** §6.3 lists the available variables. §4.2's list of startup violations
+does not mention templates at all, so on a literal reading `{{original.frm.address}}`
+is neither valid nor invalid — it is simply not covered.
+
+**Decision:** `rewrite::template::Template::parse` rejects any name outside §6.3's
+table, and `check_identity` reports the failure as a §4.2 violation naming the
+YAML key it came from. Reported alongside every other violation, per §4.2's
+"report all violations, not just the first".
+
+**Why:** the alternative — rendering an unknown variable as the empty string,
+which is what §6.3 does for *absent values* — makes a typo invisible. A misspelt
+variable in `set_headers.From` would emit `From: <sales@newbrand.com>` with no
+display name, on every message, for as long as nobody looked at a delivered
+message closely. Simmer's whole job is to build reputation on a domain, and doing
+it under a subtly malformed identity for a fortnight is the expensive failure.
+Startup is the cheap place to find it.
+
+The empty-string treatment stays for the cases §6.3 actually specifies —
+`original.header["X-Absent"]`, `original.message_id` on a message with none.
+Those are properties of the *message*, which arrives long after startup and must
+not fail a message already accepted from a client.
+
+### D-035 — The null sender is never rewritten
+
+**Spec:** §6.2 makes the envelope `MAIL FROM` an absolute assignment from
+`identity.envelope_from`, with no exceptions stated.
+
+**Decision:** an incoming `MAIL FROM:<>` is forwarded as `<>`. The template is
+not rendered.
+
+**Why:** RFC 5321 §6.1 requires the null reverse-path on delivery status
+notifications, and it is what stops a bounce from being bounceable. Assigning
+`bounce@newbrand.com` to a bounce makes a mail loop a live possibility, and the
+loop would be between two systems neither of which is Simmer.
+
+It is also the §1.1-correct answer, which is why it is a decision rather than a
+carve-out: an application sending its own notifications directly to the provider
+would use `<>` too, so passing it through is exactly what "output identity must be
+exactly expressible as application-side configuration" requires. Rewriting it
+would be Simmer emitting mail the application could not.
+
+### D-036 — `SPEC.md` §4.1's example configuration fails `SPEC.md` §4.2
+
+**Not a decision — a finding, and one for the spec's author.**
+
+§4.1's example sets, on the warming route:
+
+```yaml
+envelope_from: "bounce+{{original.envelope_from.local}}@newbrand.com"
+```
+
+That is a **relative transformation**, which §1.1 constraint 1 prohibits by name:
+"Append `.new` to the sending domain is not permitted, because applying it to
+already-migrated traffic corrupts it." Composed with itself it gives
+`bounce+bounce+jane@newbrand.com`, and again on the next pass. §6.6 classes
+`envelope_from` as an identity field, so §4.2 makes it "a fatal startup error with
+no override".
+
+The §4.2 stability check, implemented in this phase, therefore refuses to start on
+the spec's own example. `tests/rewrite_stability.rs::a_relative_transformation_is_caught`
+demonstrates the composition directly.
+
+**What we did:** changed the shipped `simmer.yaml` to `bounce@newbrand.com` with a
+comment explaining the removal, and left `SPEC.md` untouched. The engine is right
+and the example is wrong; which of the two the author wants to change is not ours
+to decide.
+
+**Worth knowing if the intent was VERP:** per-sender return paths cannot be
+expressed absolutely from a field the route rewrites. They *can* be expressed from
+one it does not — `bounce+{{recipient.local}}@newbrand.com` is stable — at the
+cost of forcing per-recipient splitting (§6.3, O-9).
+
+### D-037 — `Received:` is the only header Simmer adds unbidden
+
+**Spec:** §6.1 step 8 requires a prepended `Received:`. D-002 additionally
+excludes "the `X-Simmer-*` headers" from §12.3's byte-equivalence comparison,
+which implies they exist.
+
+**Decision:** the engine emits exactly one header of its own, the `Received:`.
+It emits no `X-Simmer-*` header. An operator who wants them writes them in
+`set_headers`, where they are ordinary configuration — the shipped `simmer.yaml`
+does exactly that.
+
+**Why:** §1.1 says "neither ordering may change what the recipient sees", and
+every header Simmer adds on its own initiative is a header that vanishes the day
+Simmer is unplugged. D-002 already admits the `Received:` as an operationally
+essential exception; making it the *only* one keeps the exception as small as it
+can be. D-002's exclusion of `X-Simmer-*` still stands and still matters, because
+a configuration that sets them is entitled to expect the comparison to allow it.
+
+### D-038 — §6.3 conformance is applied at substitution boundaries, not to the finished value
+
+**Spec:** §6.3: "Rendered header values must be RFC 5322-conformant; non-ASCII in
+display names is RFC 2047-encoded automatically."
+
+**Decision:** quoting and encoding are applied to each substituted variable as it
+is placed, with the surrounding literal text used to decide what position it
+lands in — display name, `addr-spec`, or inside operator-supplied quotes. The
+finished string is then conformed as a whole.
+
+**Why:** the property test found it. A display name of `Smith, Jane` rendered into
+`{{original.from.display_name}} <sales@newbrand.com>` produces
+`Smith, Jane <sales@newbrand.com>`, which is not one mailbox with a comma in its
+name — it is two mailboxes, and a second pass reads the display name as `Smith`.
+By the time the value is a flat string that comma is indistinguishable from one
+the operator wrote deliberately to separate two addresses, so no amount of
+cleverness afterwards can recover the distinction. Escaping at the boundary is the
+standard injection fix and the only correct one here: operator text stays grammar,
+message-derived text stays a value.
+
+The position analysis is what keeps it safe. `{{original.from.address}}` alone in
+`Reply-To:` is an address, not a phrase, and quoting it would break it; a variable
+inside `<…>` is part of the `addr-spec`. The rule is that a value is a display
+name when an `<` follows it before any top-level comma, which is precisely RFC
+5322's `name-addr` production.
+
+### D-039 — The header block is edited in place; the body is opaque
+
+**Spec:** §6.1 step 2 says "parse into headers and MIME structure".
+
+**Decision:** phase 4 splits the message at the header/body separator, edits the
+header block as a list of fields that carry their *original bytes*, and
+concatenates the body back untouched. Only headers a route actually names are
+re-serialised. No MIME parsing happens, and `mail-parser` is used to *read*
+values — `{{original.subject}}` is specified as the decoded subject — never to
+write them.
+
+**Why:** §12.3 compares raw downstream output byte for byte. A message that
+arrived with `Subject:  two  spaces`, a lowercase `message-id:`, or a
+tab-indented continuation must leave with all three intact, because none of them
+is something Simmer was configured to change. Round-tripping through a parsed
+representation normalises exactly those things, invisibly, on every message.
+
+Carrying original bytes also makes "the body arrives unaltered" structurally true
+rather than a property that has to be tested for every message shape. §6.4 body
+rewriting (phase 5) is where the body stops being opaque, and it should open it
+deliberately rather than inherit an already-reserialised message.
+
+### D-040 — A stale `unstable_headers` declaration is a `WARN`, not a violation
+
+**Spec:** §6.6: "Naming a header that is in fact stable is also a startup `WARN` —
+it means either the declaration is stale or the intent was misunderstood, and both
+are worth surfacing."
+
+**Decision:** naming a header the route never sets is now a startup warning.
+**This supersedes phase 1**, which made it a fatal violation.
+
+**Why:** phase 1 had no stability engine, so "declared but stable" was not
+computable and "declared but never set" was the only approximation available —
+and it was made fatal, which the spec does not ask for. A header nothing writes is
+stable by definition, so it is exactly the case §6.6 assigns a `WARN`. Now that
+the probe exists, both halves of the sentence are implementable and the spec's
+severity applies to both.
+
+Worth noting because it *loosens* validation: a configuration that phase 1 refused
+to start on will now start, with a warning.
+
+### D-041 — Header lines are folded only at RFC 5322's hard limit, never at 78
+
+**Spec:** silent. RFC 5322 §2.1.1 makes 998 octets a MUST and 78 a SHOULD.
+
+**Decision:** a header Simmer writes is emitted on one line unless that line would
+exceed 998 octets, in which case it is folded at spaces.
+
+**Why:** folding is the one transformation here that a downstream, a filter or a
+spam scorer can observe *and* that has no single right answer — where to break is
+a choice, and any choice becomes part of the bytes §12.3 compares. Folding only at
+the hard limit means the common case emits exactly what the operator's template
+describes and the uncommon case stays legal. The fold point is always a space and
+unfolding restores that space, so §6.6's property survives it.
+
+---
+
+## Phase 10 (partly built in phase 4)
 
 ### D-032 — The acceptance harness is a compose profile with two Mailpit traps
 
@@ -694,6 +871,49 @@ reverse that, which is a deployment question rather than an engineering one.
 
 **Found while modelling this, and separable from it:** Slater's `equalisation_hash`
 documents a defect Simmer has today — see the note under "Still open" below.
+
+### D-042 — The acceptance harness's three open questions, settled
+
+`ACCEPTANCE.md` §8 left three. All three were decided in phase 4, when the harness
+was built.
+
+**1. Land it now, or keep the whole suite for phase 10?** Landed now, whole. The
+design's own argument won: "waiting until phase 10 to discover the rewrite has
+been wrong since phase 4 would be a bad trade." It earned that immediately — the
+first green run was green for the wrong reason, and only the assertions this suite
+adds could have shown it (see the phase 4 summary, "What the harness caught").
+What remains deferred is what §7 already deferred: real-certificate TLS and
+failure injection, both phase 10, and §6.4's body-rewrite row, which is phase 5.
+
+**2. Its own config file, or a mirror of `simmer.yaml`?** Its own —
+`simmer.acceptance.yaml`. It has to differ in three ways (the `${SIMMER_WARMUP_STARTED}`
+interpolation, trap hostnames, a three-day schedule) and none of them belong in the
+file operators copy. The drift the design worried about is contained by
+`tests/acceptance.rs::the_acceptance_config_and_the_shipped_config_stay_in_step`,
+which runs in the ordinary `cargo test` — *not* behind `--ignored` — so a change
+to one file that is not mirrored in the other fails without Docker anywhere near
+it.
+
+**3. CI.** Manual dispatch, not every push. It needs Docker-in-Docker, takes about
+two minutes of container restarts, and its value is as a gate before a release
+rather than as a per-commit signal. The existing `cargo test` gate keeps every
+other tier on every push, and that includes the §6.6 property test, which is where
+rewriting bugs actually surface.
+
+**Two things the build added that the design did not anticipate:**
+
+- **Every compose invocation must carry `SIMMER_WARMUP_STARTED`.** Compose
+  re-renders the whole file on each command and reconciles running containers
+  against it, so `docker compose run loadgen` — which resolves `depends_on: app` —
+  silently recreated `app` at the compose *default* warm-up instant, mid-test. The
+  suite then measured the wrong day while appearing to work. The harness now holds
+  the current value and applies it to every invocation, and runs the loadgen with
+  `--no-deps`.
+- **Quota state needs resetting between tests, exactly as the traps do.** §7.4's
+  accounting lives in Postgres and outlives a container restart by design, so a
+  test re-using a simulated day another test has already spent finds the allowance
+  gone and watches everything fall through to overflow — which looks precisely
+  like a routing bug. `reset_quota()` is the analogue of `reset_traps()`.
 
 ---
 
@@ -895,3 +1115,128 @@ Nothing in the quota model blocks it. The rewrite engine slots between the buffe
 and `downstream::relay`, both of which are already isolated behind
 `relay::reserve_relay_commit`. O-8 and O-9 (phase 9) and O-11 (phase 7) remain
 open.
+
+
+---
+
+## Phase 4 summary
+
+### What changed
+
+| Module | § | What |
+|---|---|---|
+| `src/rewrite/template.rs` | 6.3 | The variable table as a parsed grammar; position-aware rendering |
+| `src/rewrite/encode.rs` | 6.3 | Sanitising, RFC 2047 encoding, phrase quoting, folding |
+| `src/rewrite/headers.rs` | 6.1 | The header block as something editable without disturbing what it was not asked to change |
+| `src/rewrite/mod.rs` | 6.1, 6.2, 6.5 | The order of operations; auth-artefact stripping; `Received:`; the outbound envelope sender |
+| `src/rewrite/stability.rs` | 6.6 | The property, against a synthetic probe |
+| `src/config/validate.rs` | 4.2, 6.6 | The three stability rules the phase-1 `TODO` left open, plus D-034 |
+| `src/relay.rs` | 6.1, 7.4 | Rewriting between the reservation and the downstream conversation |
+| `src/smtp/session.rs` | 6.1 | HELO name and peer address threaded through for `Received:` |
+| `src/bin/loadgen.rs` | 12.3 | The acceptance suite's bulk sender |
+| `simmer.acceptance.yaml`, `docker-compose.yml`, `Dockerfile` | 12.3 | The acceptance profile |
+| `tests/acceptance.rs`, `tests/rewrite_stability.rs` | 12.3, 6.6 | The two new tiers |
+
+452 tests, from 431: 298 unit (was 190), 43 ingress, 34 config validation, 30
+quota, 24 reply mapping, 9 rewrite stability, 8 quota-through-the-relay, 5 shipped
+config, 1 acceptance drift guard — plus 4 acceptance tests behind `--ignored`.
+
+### What is tested
+
+Every §6.3 variable; the template grammar including the malformed cases D-034
+makes fatal; RFC 2047 encoding across the chunk boundary, with a decode-back
+assertion that no character is split; phrase quoting for every RFC 5322 special,
+with the unquote/requote round trip that keeps it idempotent; the header block
+preserving lowercase names, doubled spaces, tab continuations and missing spaces
+after the colon; §6.2's remove-before-set and replace-all-instances rules;
+§6.5 against multiple instances; header injection through `{{original.subject}}`
+and through the `EHLO` name; SMTP command injection through `envelope_from`.
+
+`rewrite(rewrite(m)) == rewrite(m)` as a proptest over generated messages —
+display names that are absent, quoted, comma-bearing, non-ASCII and
+already-encoded; folded and unfolded headers; bodies that look like header blocks;
+the awkward body from phase 2. Run at 20,000 cases before landing. The negative
+case is asserted too: §6.6's worked example *must* fail the property, or every
+other assertion in the file is vacuous.
+
+Through the container, against two real SMTP servers: the ramp walked across three
+simulated days carrying exactly its allowance each day; the excess reaching a
+different provider under a different identity; the §6.2 and §6.5 rewrites as a
+receiving mail server sees them; and **both arrangements of §1.1 producing the
+same bytes**, which is the one claim nothing else in the suite can make.
+
+### What is not tested
+
+- **§6.4 body rewriting** — phase 5. `tests/acceptance.rs` asserts the body link
+  is *not yet* rewritten, so the assertion fails the day it lands rather than
+  being forgotten.
+- **Real-certificate TLS** — the traps are plaintext. Unchanged from phase 3;
+  `ACCEPTANCE.md` §5 and phase 10.
+- **`fail_closed` and §10.4 under a real `SIGTERM`** — still only unit-level.
+  Both are now cheap to add: the compose stack is there, and stopping `simmer-db`
+  mid-run is one command.
+- **Multi-recipient rewriting** — `recipient.*` renders empty above one
+  recipient. §5.6 splitting is phase 9 (O-9).
+- **A `Received:` chain long enough to fold**, and messages above the §8.1 spill
+  threshold *through the rewrite* — the spill test covers the buffer, not a
+  rewritten 25 MiB message.
+
+### What the harness caught
+
+Worth recording, because it is the argument for having built it in this phase
+rather than phase 10.
+
+Its first full run was **green on three of four tests, for the wrong reason**.
+`SIMMER_WARMUP_STARTED` was not reaching the container (D-042), so every test ran
+at day index 9 — past the end of a three-day schedule, where §7.2's
+final-value-repeats rule gives an allowance of 20. Nothing hit a ceiling, nothing
+fell through to overflow, and the routing test's assertions were loops over an
+empty trap, which pass. The rewrite and cutover-invariant tests were genuinely
+passing; the ramp test was the only one that failed, and it was the only one
+looking at a number.
+
+Two lessons, both applied: assert the counts *before* iterating over content, or
+an empty collection passes everything; and a suite that drives infrastructure has
+to verify the infrastructure took the settings it was given.
+
+### Things the spec did not cover
+
+D-034 through D-042. The three that change behaviour a reader would not predict
+from `SPEC.md`:
+
+- **D-035** — the null sender is never rewritten, so bounces stay bounces.
+- **D-037** — `Received:` is the only header the engine adds on its own.
+- **D-040** — a stale `unstable_headers` declaration is now a `WARN` rather than a
+  fatal error, which *loosens* phase 1's validation.
+
+And **D-036 is not a decision but a defect in `SPEC.md`**: §4.1's example
+configuration fails §4.2's stability rule, which §6.6 makes non-overridable. The
+shipped `simmer.yaml` was corrected; `SPEC.md` was not touched.
+
+Two smaller calls not worth their own entry:
+
+- **`original.header["X-Foo"]` returns the raw value, not a decoded one.** §6.3
+  decodes `original.subject` and the `From:` parts because it says so explicitly
+  ("Decoded subject"); the arbitrary-header escape hatch has no such wording, and
+  raw is the more predictable answer for a header whose semantics Simmer cannot
+  know.
+- **A `set_headers` entry whose template renders to empty still writes the
+  header**, producing `X-Foo: ` rather than omitting it. Omitting would make the
+  presence of a header depend on the message, which is a relative behaviour in
+  §1.1's sense. The `envelope_from` case is the exception and is handled
+  explicitly, because an empty envelope sender means something specific (D-035).
+
+### Carried into phase 5
+
+§6.4 body rewriting is the only part of §6 still missing, and `rewrite::headers`
+is deliberately shaped for it: `split()` already hands back the body as its own
+slice, and nothing else in the engine touches it. The `regex` dependency and the
+`body_rewrites` validation have been in place since phase 1.
+
+The one design point to settle first: §6.4 requires decode → rewrite → re-encode
+per `text/*` part, which means the body stops being byte-preserved and D-039's
+structural guarantee becomes a tested one. `tests/acceptance.rs`'s "not yet
+rewritten" assertion is the reminder.
+
+O-8 and O-9 (phase 9) and O-11 (phase 7) remain open. The `smtp/auth.rs` timing
+defect above is still unfixed and still worth fixing on its own.

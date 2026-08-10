@@ -22,7 +22,7 @@ RUN rm -rf target/release/server \
 
 COPY src ./src
 COPY migrations ./migrations
-COPY simmer.yaml ./
+COPY simmer.yaml simmer.acceptance.yaml ./
 # COPY preserves source mtimes, which can be older than the cached stub
 # artifacts; without this cargo decides nothing changed and ships the stub.
 RUN find src -name '*.rs' -exec touch {} + \
@@ -42,6 +42,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/server ./server
 COPY --from=builder /app/migrations ./migrations
 COPY --from=builder /app/simmer.yaml ./simmer.yaml
+COPY --from=builder /app/simmer.acceptance.yaml ./simmer.acceptance.yaml
 
 RUN useradd -r -u 1000 appuser
 USER appuser
@@ -65,3 +66,25 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
     CMD ["/app/server", "healthcheck"]
 
 ENTRYPOINT ["/app/server"]
+
+# ---------------------------------------------------------------------------
+
+# The acceptance suite's bulk sender (`docs/ACCEPTANCE.md` §2). A separate stage
+# so `runtime` — the image that ships — stays exactly what it was: this binary
+# never reaches it, and only the `acceptance` compose profile builds this target.
+#
+# **It has to be last**, because it builds on `runtime`, and "last" is what an
+# unpinned `docker build` produces. Anything building the shipped image must name
+# `--target runtime` explicitly — `docker-compose.yml`'s `app` service does, and
+# any deployment pipeline must too.
+#
+# It has to run inside the compose network because §2.3 says port 25 must not be
+# published to a host interface, and `docker-compose.yml` deliberately does not
+# publish it.
+FROM runtime AS acceptance
+
+COPY --from=builder /app/target/release/loadgen /app/loadgen
+
+# No HEALTHCHECK: the loadgen is a one-shot command, not a service. Compose runs
+# it with `run --rm` and reads its stdout.
+ENTRYPOINT ["/app/loadgen"]

@@ -283,12 +283,113 @@ fn rejects_envelope_from_named_in_unstable_headers() {
 }
 
 #[test]
-fn rejects_a_stale_unstable_header_declaration() {
+fn warns_about_a_stale_unstable_header_declaration_rather_than_rejecting_it() {
+    // §6.6: "Naming a header that is in fact stable is also a startup WARN — it
+    // means either the declaration is stale or the intent was misunderstood, and
+    // both are worth surfacing." A header the route never sets is stable by
+    // definition, so it belongs here and not in the violation list.
+    //
+    // Phase 1 rejected it outright, having no stability engine to tell a stale
+    // declaration from a live one. Phase 4 does, so the spec's severity applies.
     let yaml = BASE.replace(
         r#"unstable_headers: ["Reply-To"]"#,
-        r#"unstable_headers: ["X-Never-Set"]"#,
+        r#"unstable_headers: ["Reply-To", "X-Never-Set"]"#,
     );
-    rejected_for(&yaml, "does not set");
+    let cfg = load(&yaml).expect("a stale declaration is a warning, not a violation");
+    let warnings = config::validate::warnings(&cfg);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.message.contains("X-Never-Set") && w.message.contains("stale")),
+        "expected a stale-declaration warning, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn warns_when_a_declared_header_turns_out_to_be_stable() {
+    // The other half of the same §6.6 sentence: the header *is* set, but its
+    // template reads nothing this route writes, so declaring it achieves nothing.
+    let yaml = BASE.replace(
+        r#"Reply-To: "{{original.from.address}}""#,
+        r#"Reply-To: "support@newbrand.com""#,
+    );
+    let cfg = load(&yaml).expect("a stable declared header is a warning, not a violation");
+    let warnings = config::validate::warnings(&cfg);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.message.contains("Reply-To") && w.message.contains("stale")),
+        "expected a declared-but-stable warning, got: {warnings:?}"
+    );
+}
+
+// -- §6.6 / §4.2: the stability property itself --------------------------
+
+#[test]
+fn rejects_an_unstable_identity_field_with_no_override_available() {
+    // §6.6: "A stability violation here is a fatal startup error with no
+    // override." Sender: reads From:, which the same pass overwrites.
+    let yaml = BASE
+        .replace(
+            r#"        Reply-To: "{{original.from.address}}""#,
+            r#"        Sender: "{{original.from.address}}""#,
+        )
+        .replace(r#"      unstable_headers: ["Reply-To"]"#, "");
+    rejected_for(&yaml, "not overridable");
+}
+
+#[test]
+fn declaring_an_unstable_identity_field_does_not_rescue_it() {
+    // Belt and braces: the syntactic rule already rejects naming an identity
+    // field in unstable_headers, and the property would reject it anyway.
+    let yaml = BASE
+        .replace(
+            r#"        Reply-To: "{{original.from.address}}""#,
+            r#"        Sender: "{{original.from.address}}""#,
+        )
+        .replace(
+            r#"      unstable_headers: ["Reply-To"]"#,
+            r#"      unstable_headers: ["Sender"]"#,
+        );
+    rejected_for(&yaml, "not overridable");
+}
+
+#[test]
+fn rejects_an_undeclared_unstable_header() {
+    let yaml = BASE.replace(r#"      unstable_headers: ["Reply-To"]"#, "");
+    rejected_for(&yaml, "unstable_headers");
+}
+
+#[test]
+fn accepts_the_same_header_once_it_is_declared() {
+    // BASE itself is this case: Reply-To reads From:, which the route rewrites,
+    // and Reply-To is declared. §6.6's canonical migration-only construct.
+    load(BASE).expect("the shipped idiom must validate");
+}
+
+#[test]
+fn rejects_an_unstable_envelope_sender() {
+    let yaml = BASE.replace(
+        r#"envelope_from: "bounce@newbrand.com""#,
+        r#"envelope_from: "{{original.envelope_from.local}}-x@newbrand.com""#,
+    );
+    rejected_for(&yaml, "not overridable");
+}
+
+// -- D-034: unknown template variables -----------------------------------
+
+#[test]
+fn rejects_an_unknown_template_variable() {
+    // Not a §4.2 rule; D-034. A typo in an identity template would otherwise
+    // emit a broken From: for as long as nobody looked.
+    let yaml = BASE.replace("{{original.from.address}}", "{{original.frm.address}}");
+    rejected_for(&yaml, "unknown template variable");
+}
+
+#[test]
+fn names_the_key_a_bad_template_came_from() {
+    let yaml = BASE.replace("{{original.from.address}}", "{{original.frm.address}}");
+    rejected_for(&yaml, "set_headers.Reply-To");
 }
 
 // -- §4.2: default_chain -------------------------------------------------

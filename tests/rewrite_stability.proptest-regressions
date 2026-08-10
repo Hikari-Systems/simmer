@@ -1,0 +1,28 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# Trimmed by hand to one seed per distinct finding. What each one caught:
+#
+#   "\r\n"                     — a message that is only the separator. The
+#                                leading CRLF was parsed as a nameless field and
+#                                carried above everything the rewrite wrote,
+#                                cutting the header block off before it started.
+#                                Fixed in rewrite::headers::find_separator.
+#   "Smith, Jane"              — a display name containing a comma, written
+#                                unquoted, turns one mailbox into two; the second
+#                                pass then read the display name as "Smith".
+#                                Fixed by quoting substituted values at the
+#                                substitution boundary
+#                                (rewrite::template::Template::render_header).
+#   minimal From:-only message — a harness fault, not a code fault: the two
+#                                passes were being compared after stripping one
+#                                Received: from each, when only the second pass
+#                                has one to spare. Kept because it is the
+#                                smallest input the properties run on.
+cc d34eda30172306590424f103473607147b5a58cd390cd79843523c2f569c15f3 # shrinks to m = "\r\n"
+cc cf595d3d4a2a5496d75871987f069c6a74176fb64eba5b766529f6aa15bd247b # shrinks to m = "From: \"Smith, Jane\" <jane@oldbrand.com>\r\n\r\n"
+cc f3408c04e4b47ff36e7eb5bb984a601fd48d9b3d2f8aa00b1ef75cfafe64701d # shrinks to m = "From: jane@oldbrand.com\r\n\r\n"

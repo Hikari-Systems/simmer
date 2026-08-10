@@ -6,6 +6,11 @@ services:
   app:
     build:
       context: .
+      # Explicit, and load-bearing: the Dockerfile's last stage is `acceptance`
+      # (it has to come after `runtime`, since it builds on it), and an unpinned
+      # target means the *last* stage. Without this line `app` is built as the
+      # acceptance suite's loadgen and exits immediately.
+      target: runtime
     ports:
       # §12.2 and §2.3: port 25 is deliberately not published to a host
       # interface by default. Uncomment to test against a local MUA — note it
@@ -41,6 +46,13 @@ services:
       POSTAL_PASS: "postal-local"
       SENDGRID_KEY: "SG.local"
       RUST_LOG: "info,sqlx=warn"
+      # Both default to the local-development answer, so `docker compose up -d`
+      # is unchanged. The acceptance suite overrides them in its own environment
+      # and re-creates this one service: that is the whole mechanism by which the
+      # ramp is walked across simulated day boundaries (docs/ACCEPTANCE.md §3),
+      # since §2.2 rules out a hot reload.
+      SIMMER_CONFIG: "${SIMMER_CONFIG:-/app/simmer.yaml}"
+      SIMMER_WARMUP_STARTED: "${SIMMER_WARMUP_STARTED:-2026-08-01T09:00:00Z}"
     healthcheck:
       # Must match the Dockerfile HEALTHCHECK exactly.
       test: ["CMD", "/app/server", "healthcheck"]
@@ -68,3 +80,69 @@ services:
       interval: 2s
       timeout: 5s
       retries: 20
+
+  # -------------------------------------------------------------------------
+  # The acceptance stack — docs/ACCEPTANCE.md, DECISIONS.md D-032.
+  #
+  # Behind a profile, so `docker compose up -d` keeps meaning exactly what it
+  # meant before and none of this starts unless it is asked for:
+  #
+  #   docker compose --profile acceptance up -d --build
+  #   cargo test --test acceptance -- --ignored --test-threads=1
+  #
+  # `tests/acceptance.rs` drives it: it restarts `app` with a different
+  # SIMMER_WARMUP_STARTED to walk the ramp, runs `loadgen`, and reads the traps'
+  # HTTP APIs and Postgres — both of which are safe to publish to loopback.
+  # -------------------------------------------------------------------------
+
+  # Two traps, not one. With a single sink you can only assert on headers Simmer
+  # wrote, which proves it *said* it used the overflow route rather than that it
+  # did. Two separate servers make the routing decision a physical fact.
+  trap-warming:
+    profiles: ["acceptance"]
+    # Pinned by digest, not by tag: the suite reads this API's JSON field names,
+    # and `:latest` moving under it would be a failure with no commit behind it.
+    # v1.30.7.
+    image: axllent/mailpit@sha256:d5ecbb067db3705fa953d79e1b7f81ef84038df67aba6c52825d8c02a1ea748a
+    ports:
+      # 18025 rather than Mailpit's conventional 8025: that port and MailHog's
+      # 8025 are the same number, and a developer with any other mail trap
+      # running loses the acceptance stack to a port clash. SMTP stays on the
+      # container network and is never published.
+      - "127.0.0.1:18025:8025"
+    environment:
+      MP_SMTP_BIND_ADDR: "0.0.0.0:1025"
+      MP_MAX_MESSAGES: "0"          # no eviction — the suite counts them
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  trap-overflow:
+    profiles: ["acceptance"]
+    image: axllent/mailpit@sha256:d5ecbb067db3705fa953d79e1b7f81ef84038df67aba6c52825d8c02a1ea748a
+    ports:
+      - "127.0.0.1:18026:8025"
+    environment:
+      MP_SMTP_BIND_ADDR: "0.0.0.0:1025"
+      MP_MAX_MESSAGES: "0"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  # Built from the Dockerfile's `acceptance` stage, which adds the loadgen binary
+  # on top of the runtime image. Never started by `up`: the host test invokes it
+  # with `docker compose run --rm loadgen …` and reads its stdout.
+  loadgen:
+    profiles: ["acceptance"]
+    build:
+      context: .
+      target: acceptance
+    environment:
+      SIMMER_PASSWORD: "local-dev-password"
+    depends_on:
+      app:
+        condition: service_healthy

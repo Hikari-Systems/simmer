@@ -343,11 +343,15 @@ impl Simmer {
         });
         let (tls, _) = simmer::downstream::TlsConfigs::load().expect("tls");
 
+        let rewriters = simmer::rewrite::Rewriters::compile(&config)
+            .unwrap_or_else(|e| panic!("test config's templates do not compile: {e:?}"));
+
         let engine = Engine {
             config: Arc::new(config),
             tls: Arc::new(tls),
             quota,
             registry: ReservationRegistry::new(),
+            rewriters: Arc::new(rewriters),
         };
 
         let listener = smtp::Listener::bind(engine).await.expect("bind simmer");
@@ -362,6 +366,21 @@ impl Simmer {
 
     pub async fn connect(&self) -> Client {
         Client::connect(self.addr).await
+    }
+}
+
+/// A received message with the `Received:` header Simmer prepended taken back
+/// off, so a test can compare against what the client sent.
+///
+/// §6.1 step 8 makes exactly one new header, at the top, and D-002 excludes it
+/// from §12.3's byte-equivalence comparison for the same reason this helper
+/// exists: it is present only because Simmer is in the path. Everything after it
+/// is fair game for a byte-for-byte assertion.
+pub fn without_received(raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw);
+    match text.split_once("\r\n") {
+        Some((first, rest)) if first.starts_with("Received: ") => rest.to_string(),
+        _ => text.to_string(),
     }
 }
 

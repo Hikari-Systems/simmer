@@ -130,3 +130,11 @@ strip = true
 lto = true
 codegen-units = 1
 opt-level = "s"
+
+[dev-dependencies]
+# §6.6 — "enforced by a property test over generated messages". `MIT OR
+# Apache-2.0` for all 48 published versions (the 38 before 1.3.0 spell it with
+# the deprecated slash syntax). Default features off: `fork` and `timeout` pull
+# rusty-fork, wait-timeout and quick-error for a process-isolation harness the
+# stability property does not need.
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }

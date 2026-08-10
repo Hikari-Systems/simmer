@@ -19,5 +19,6 @@ pub mod metrics;
 pub mod models;
 pub mod quota;
 pub mod relay;
+pub mod rewrite;
 pub mod routing;
 pub mod smtp;

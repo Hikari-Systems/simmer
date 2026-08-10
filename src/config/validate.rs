@@ -9,15 +9,19 @@
 //! fix-one-restart-discover-the-next loop against a service that takes minutes
 //! to build.
 //!
-//! The §6.6 rewrite-stability rules are the exception — they need the rewrite
-//! engine and land in phase 4. The purely syntactic half of them (naming an
-//! identity field in `unstable_headers`) is enforced here already.
+//! The §6.6 rewrite-stability rules are checked by running the real engine:
+//! `check_identity` compiles the route's templates and hands them to
+//! `rewrite::stability::probe`, which composes `rewrite()` with itself. Deriving
+//! the property from a second, validation-only implementation would mean the
+//! startup check and the relay could disagree, and the check exists precisely
+//! because that disagreement is invisible in production.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 
 use super::{Config, Identity, Route};
+use crate::rewrite::{stability, RouteRewrite};
 
 /// The identity fields of §6.6. A stability violation in one of these is fatal
 /// with no override, and naming one in `unstable_headers` is itself a violation.
@@ -140,12 +144,19 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
             }
         }
 
+        // Everything below needs the templates parsed. A route whose templates do
+        // not compile has already failed `validate()`, so there is nothing here
+        // worth reporting about it.
+        let Ok(compiled) = RouteRewrite::compile(&route.identity) else {
+            continue;
+        };
+
         // §6.3: "A template referencing recipient.* in a configuration where
         // single_recipient_only: false is a startup validation warning, since it
         // forces per-recipient splitting."
         if !cfg.server.single_recipient_only {
-            for (name, template) in route.identity.set_headers.iter() {
-                if references_recipient(template) {
+            for (name, template) in &compiled.set_headers {
+                if template.references_recipient() {
                     out.push(Warning {
                         path: format!("routes.{}.identity.set_headers.{name}", route.name),
                         message: "references recipient.*, which forces per-recipient splitting \
@@ -154,7 +165,7 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
                     });
                 }
             }
-            if references_recipient(&route.identity.envelope_from) {
+            if compiled.envelope_from.references_recipient() {
                 out.push(Warning {
                     path: format!("routes.{}.identity.envelope_from", route.name),
                     message: "references recipient.*, which forces per-recipient splitting \
@@ -162,6 +173,20 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
                         .to_string(),
                 });
             }
+        }
+
+        // §6.6: "Naming a header that is in fact stable is also a startup WARN —
+        // it means either the declaration is stale or the intent was
+        // misunderstood, and both are worth surfacing."
+        for header in stability::probe(&compiled).declared_but_stable {
+            out.push(Warning {
+                path: format!("routes.{}.identity.unstable_headers", route.name),
+                message: format!(
+                    "declares '{header}' migration-only, but nothing this route does makes it \
+                     unstable. Either the declaration is stale or the intent was misunderstood \
+                     (§6.6)"
+                ),
+            });
         }
     }
 
@@ -178,10 +203,6 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
     }
 
     out
-}
-
-fn references_recipient(template: &str) -> bool {
-    template.contains("{{recipient.") || template.contains("{{ recipient.")
 }
 
 fn is_identity_header(name: &str) -> bool {
@@ -537,14 +558,13 @@ fn check_identity(identity: &Identity, route_name: &str, v: &mut ViolationList) 
                 ),
             );
         }
-        // Declaring a header that the route never sets is a stale declaration.
-        if !identity.set_headers.contains_key(header) {
-            v.push(
-                at("unstable_headers"),
-                format!("names '{header}', which this route does not set"),
-            );
-        }
     }
+    // A header the route never sets was a *violation* in phase 1, when there was
+    // no way to tell a stale declaration from a live one. §6.6 says otherwise —
+    // "Naming a header that is in fact stable is also a startup WARN" — and a
+    // header nothing writes is stable by definition. The stability probe below
+    // now reports it, and `warnings()` emits it at the severity the spec asks
+    // for.
 
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for (i, (name, _)) in identity.set_headers.0.iter().enumerate() {
@@ -575,11 +595,60 @@ fn check_identity(identity: &Identity, route_name: &str, v: &mut ViolationList) 
         }
     }
 
-    // TODO(phase 4): the §6.6 stability property itself — rewrite(rewrite(m)) ==
-    // rewrite(m) against a synthetic probe. Fatal for IDENTITY_HEADERS and
-    // envelope_from with no override; fatal for other headers unless declared in
-    // unstable_headers; a WARN when a declared header turns out to be stable.
-    // Needs rewrite::stability, which lands with the rewriting engine.
+    // §6.6, the property itself. Everything above this point is syntactic; this
+    // is the rule the whole component turns on, and it is checked by running the
+    // real rewrite engine against a synthetic probe — the same `rewrite()` the
+    // relay calls, never a second implementation of it.
+    match RouteRewrite::compile(identity) {
+        // D-034 — an unknown template variable is a configuration error. Nothing
+        // downstream of a failed compile can be checked, so the stability probe
+        // is skipped and the parse errors stand on their own.
+        Err(errors) => {
+            for e in errors {
+                v.push(at(&e.field), e.error.to_string());
+            }
+        }
+        Ok(compiled) => {
+            let report = stability::probe(&compiled);
+            for u in report.unstable {
+                if u.identity {
+                    // "A stability violation here is a fatal startup error with
+                    // no override."
+                    v.push(
+                        at(&stability_path(&u.field)),
+                        format!(
+                            "is not stable: rewriting twice gives '{}' then '{}'. {} is an \
+                             identity field, so this is not overridable — arrangement A and \
+                             arrangement B of §1.1 would produce materially different mail (§6.6)",
+                            u.first, u.second, u.field
+                        ),
+                    );
+                } else if !compiled.is_declared_unstable(&u.field) {
+                    v.push(
+                        at(&stability_path(&u.field)),
+                        format!(
+                            "is not stable: rewriting twice gives '{}' then '{}'. It reads a \
+                             field this route also writes, so reconfiguring the application \
+                             would silently change what the recipient sees. Declare it in \
+                             unstable_headers if that is intended and migration-only (§6.6)",
+                            u.first, u.second
+                        ),
+                    );
+                }
+                // Declared: downgraded to the WARN `warnings()` emits.
+            }
+        }
+    }
+}
+
+/// Point at the key the operator would edit, which for a header is its
+/// `set_headers` entry.
+fn stability_path(field: &str) -> String {
+    if field == "envelope_from" {
+        field.to_string()
+    } else {
+        format!("set_headers.{field}")
+    }
 }
 
 fn check_chains(cfg: &Config, v: &mut ViolationList) {

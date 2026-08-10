@@ -179,6 +179,50 @@ occurred", which client crates normalise into one error type.
 Taken because §11 asks the storage layer to sit behind a trait and `async fn` in
 a trait is not yet dyn-compatible. Droppable the moment it is.
 
+### Phase 4
+
+A **dev-dependency only** — it is not linked into the shipped binary. §6.6 asks
+for the stability property to be "enforced by a property test over generated
+messages", and that is what this is for.
+
+| Crate | Pinned | Licence | Versions checked | For |
+|---|---|---|---|---|
+| `proptest` | 1.11.0 | `MIT OR Apache-2.0` | all 48 published, 0.1.0 → 1.11.0 | §6.6 `rewrite(rewrite(m)) == rewrite(m)` |
+
+The 38 versions before 1.3.0 declare `MIT/Apache-2.0` — the deprecated SPDX slash
+syntax for the same pair, not a different licence. `proptest-derive` is a separate
+crate and is **not** taken; the generators here are hand-written strategies over
+message parts, not derived from types.
+
+Adopted with `default-features = false, features = ["std", "bit-set"]`. The
+`fork` and `timeout` default features spawn a subprocess per test case to survive
+a panicking or hanging property, which this property cannot do — it is a pure
+function over bytes — and turning them off keeps `rusty-fork`, `wait-timeout` and
+`quick-error` out of the graph entirely.
+
+What it did add, all permissive and all dev-only:
+
+| Crate | Version | Licence |
+|---|---|---|
+| `bit-set` | 0.8.0 | `Apache-2.0 OR MIT` |
+| `bit-vec` | 0.8.0 | `Apache-2.0 OR MIT` |
+| `getrandom` | 0.2.17 | `MIT OR Apache-2.0` |
+| `rand` | 0.8.7 | `MIT OR Apache-2.0` |
+| `rand_chacha` | 0.3.1 | `MIT OR Apache-2.0` |
+| `rand_core` | 0.6.4 | `MIT OR Apache-2.0` |
+| `rand_xorshift` | 0.4.0 | `MIT OR Apache-2.0` |
+| `unarray` | 0.1.4 | `MIT OR Apache-2.0` |
+| `r-efi` | 5.3.0 | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` |
+| `wasip2` | 1.0.4 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` |
+| `wit-bindgen` | 0.57.1 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` |
+
+`r-efi` is the only entry with a copyleft option in its disjunction, and it is
+never built here: it is `getrandom`'s UEFI-target backend, pulled into the lock
+file by target resolution and compiled on no platform Simmer runs on. The
+disjunction offers `MIT` regardless, which is the branch cargo-deny accepts.
+
+`cargo deny check licenses` passes unchanged.
+
 ---
 
 ## 3. Direct dependencies, as resolved

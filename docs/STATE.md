@@ -1,6 +1,6 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-08-08, at the end of phase 3.** This is a session-handover
+**Snapshot taken 2026-08-10, at the end of phase 4.** This is a session-handover
 document, not a maintained one: `README.md` describes the service, `DECISIONS.md`
 records why it is the way it is, and `docs/SPEC.md` is authoritative over both. If
 this file disagrees with any of them, they win.
@@ -16,13 +16,13 @@ this file disagrees with any of them, they win.
 | 1 | Config loading, full validation, structured logging, container skeleton | **done** |
 | 2 | SMTP ingress, AUTH, limits, buffering, downstream forwarding, reply mapping | **done** |
 | 3 | Postgres, migrations, quota model, reservation protocol, day index, chain selection, sweepers | **done** |
-| 4 | Rewriting engine: templates, header set/remove, auth-artefact stripping, idempotency property test | next |
-| 5 | Body rewriting with decode/re-encode | |
+| 4 | Rewriting engine: templates, header set/remove, auth-artefact stripping, idempotency property test | **done** |
+| 5 | Body rewriting with decode/re-encode | next |
 | 6 | Recipient frequency: hashing, normalisation, sweeper | |
 | 7 | Admin API, metrics exporter, dry-run | |
 | 8 | DNS preflight | |
 | 9 | Multi-recipient splitting and result collapse | |
-| 10 | Hardening: pooling, graceful shutdown, acceptance suite, README | acceptance harness **designed** — `docs/ACCEPTANCE.md`, D-032 |
+| 10 | Hardening: pooling, graceful shutdown, acceptance suite, README | acceptance suite **built in phase 4** (D-032, D-042); pooling, shutdown and real-certificate TLS outstanding |
 | 11 | *(new, beyond §13)* Listeners on 25/465/587, inbound TLS, sender ACL | **designed** — `docs/INGRESS.md`, D-033. Reverses four SPEC.md passages; needs the spec author |
 
 ### What the service actually does today
@@ -30,14 +30,21 @@ this file disagrees with any of them, they win.
 Accepts a message on port 25 from a client inside `allowed_cidrs`, authenticates
 it against argon2id hashes, buffers the body (memory to 1 MiB, then an unlinked
 tmpfs file), matches a sender rule, resolves the recipient's domain group, walks
-the chain reserving quota under a row lock, forwards to the selected route's
-downstream over TLS, and maps the downstream's verdict back on the same
-connection — committing the quota only on a `2xx` at the final dot.
+the chain reserving quota under a row lock, **rewrites the message to the selected
+route's identity**, forwards to that route's downstream over TLS, and maps the
+downstream's verdict back on the same connection — committing the quota only on a
+`2xx` at the final dot.
 
-**It does not rewrite anything.** The message is forwarded byte for byte under the
-identity it arrived with, so a route's *outbound identity* is currently
-configuration that nothing reads. That is phase 4, and it is what makes the whole
-component mean anything.
+The rewrite is §6.1's order of operations less step 7: authentication artefacts
+stripped unconditionally (§6.5), `remove_headers` then `set_headers` with
+templates rendered against the message *as it arrived*, a `Received:` header
+prepended, and the envelope sender computed. §6.6's stability property is checked
+at startup by running the real engine against a synthetic probe, and again as a
+proptest over generated messages.
+
+**Body rewriting (§6.4) is the one part of §6 still missing.** The body is carried
+through as an opaque slice, so it arrives byte for byte; `body_rewrites` is parsed
+and its regexes are compiled at startup, and then ignored. That is phase 5.
 
 ---
 
@@ -46,22 +53,41 @@ component mean anything.
 Everything below was run on 2026-08-08 against the current working tree.
 
 ```
-cargo test                                    323 passed, 0 failed
+cargo test                                    452 passed, 0 failed
 cargo clippy --all-targets -- -D warnings     clean
 cargo fmt --all -- --check                    clean
 cargo deny check                              advisories ok, bans ok, licenses ok, sources ok
 docker compose up -d --build                  both containers healthy
 ```
 
+Plus the acceptance tier, which needs its own stack and is not in `cargo test`:
+
+```
+docker compose --profile acceptance up -d --build
+cargo test --test acceptance -- --ignored --test-threads=1     4 passed, 0 failed
+```
+
 | Suite | Tests | What it covers |
 |---|---:|---|
-| `src/` unit tests | 190 | Everything logic-heavy, in place |
+| `src/` unit tests | 298 | Everything logic-heavy, in place |
 | `tests/smtp_ingress.rs` | 43 | §5 ingress end to end |
+| `tests/config_validation.rs` | 34 | §4.2, one test per rule |
 | `tests/quota.rs` | 30 | §7 against real Postgres |
-| `tests/config_validation.rs` | 26 | §4.2, one test per rule |
-| `tests/relay_mapping.rs` | 21 | §10.1 against a scripted downstream |
+| `tests/relay_mapping.rs` | 24 | §10.1 against a scripted downstream, plus §6 through the relay |
+| `tests/rewrite_stability.rs` | 9 | §6.6 as a proptest over generated messages |
 | `tests/quota_relay.rs` | 8 | §7.4 through the whole stack |
 | `tests/shipped_config.rs` | 5 | `simmer.yaml` round-trips |
+| `tests/acceptance.rs` | 1 + 4 | Config drift guard; the rest behind `--ignored` |
+
+### The acceptance tier
+
+`docs/ACCEPTANCE.md`, built in phase 4 rather than phase 10 (D-042). Two Mailpit
+traps, a loadgen container and `simmer.acceptance.yaml`, driven by a host test
+that walks the ramp by moving `warmup.started` and re-creating the container. It
+proves four things nothing else can: the ramp carrying exactly its allowance
+across three simulated days, the excess reaching a *different provider*, the
+rewrite as a real mail server receives it, and **both arrangements of §1.1
+producing byte-equal output**.
 
 ### The container gate
 
@@ -109,16 +135,24 @@ src/quota/           §7
   mod.rs               allowance resolution, reservation expiry
   registry.rs          §10.4 in-flight reservations
   sweeper.rs           §7.4 expiry release
+src/rewrite/         §6 the rewriting engine
+  template.rs          §6.3's variable table as a parsed grammar
+  encode.rs            sanitising, RFC 2047, phrase quoting, folding
+  headers.rs           the header block, edited without disturbing the rest (D-039)
+  mod.rs               §6.1's order of operations
+  stability.rs         §6.6's property, against a synthetic probe
 src/models/          runtime sqlx over &PgPool, house pattern
 src/routing/         §5.4 sender match, §3.2.2 domain group, §3.2.3 chain walk
-src/relay.rs         decide -> reserve -> relay -> commit/release
+src/relay.rs         decide -> reserve -> rewrite -> relay -> commit/release
 src/metrics.rs       §9.1 counters; no exporter until phase 7
 src/admin/           §9 control plane; GET /health only
+src/bin/loadgen.rs   the acceptance suite's bulk sender; not in the shipped image
 tests/support/       the scripted fake downstream (§12.3)
 migrations/          two: baseline (instance_config), quota (three tables)
+simmer.acceptance.yaml   the acceptance stack's config (D-042)
 ```
 
-Roughly 13,500 lines including tests and comments.
+Roughly 18,000 lines including tests and comments.
 
 ---
 
@@ -149,7 +183,7 @@ Two things about `quota_usage` that are not obvious:
 
 ## 5. Decisions on record
 
-31 entries, `D-001` to `D-031`. The ones a new reader most needs:
+42 entries, `D-001` to `D-042`. The ones a new reader most needs:
 
 | | |
 |---|---|
@@ -160,6 +194,12 @@ Two things about `quota_usage` that are not obvious:
 | **D-025** | The allowance override is a column on `quota_usage`, not a `route_state` field. |
 | **D-026** | `quota_usage.allowance` is authoritative once written — a config change applies from the next day boundary, not retroactively. |
 | **D-031** | Database tests use `#[sqlx::test]`, so `cargo test` needs a Postgres. |
+| **D-034** | An unknown template variable is a fatal startup error — a §4.2 rule the spec does not list. |
+| **D-035** | The null sender is never rewritten, so a bounce stays a bounce. |
+| **D-036** | **`SPEC.md` §4.1's example configuration fails `SPEC.md` §4.2.** A finding for the spec's author; `simmer.yaml` was corrected instead. |
+| **D-037** | `Received:` is the only header the engine adds unbidden. No `X-Simmer-*` unless configured. |
+| **D-039** | The header block is edited in place and the body is opaque — no MIME round trip, so untouched bytes stay untouched. |
+| **D-040** | A stale `unstable_headers` declaration is a `WARN`, not a violation. Loosens phase 1. |
 
 Nine of the twelve original open questions are settled. Three remain, each due in
 a later phase:
@@ -180,9 +220,11 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 
 **Functional**
 
-- No rewriting of any kind (phases 4–5). `identity.set_headers`,
-  `envelope_from`, `remove_headers` and `body_rewrites` are parsed, validated for
-  §6.6 stability at startup, and then ignored.
+- **No body rewriting (§6.4, phase 5).** `body_rewrites` is parsed and its
+  regexes are compiled at startup, and then ignored. Header rewriting, templating,
+  auth-artefact stripping and the envelope sender all landed in phase 4.
+- `recipient.*` templates render empty above one recipient — §5.6 splitting is
+  phase 9 (O-9).
 - No connection pool — one downstream connection per message (D-019, phase 10).
 - No admin API. `paused` / `graduated` / `allowance_override` are honoured from
   the database, but nothing writes them except tests (phase 7).
@@ -194,14 +236,18 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 **Test coverage**
 
 - **No real-certificate TLS test.** `required_verify` is asserted only through its
-  failure modes. The acceptance harness closes this by giving Mailpit a
-  certificate from a CA mounted into the `app` container (`docs/ACCEPTANCE.md` §5).
-- **No clock movement.** Day-index tests are pure; storage tests set `day_index`
-  directly. Nothing walks a ramp across a real boundary in a running process.
-  This is the acceptance harness's central job (`docs/ACCEPTANCE.md` §3).
-- **No test proves a message reaches a real mail server under the rewritten
-  identity**, or that the two arrangements of §1.1 produce byte-equivalent output.
-  Only the acceptance tier can, and it is designed but not built.
+  failure modes; the acceptance traps are plaintext. Still open, and still what
+  `docs/ACCEPTANCE.md` §5 describes — the stack it needs now exists.
+- ~~**No clock movement.**~~ Closed: the acceptance suite walks three simulated
+  days by moving `warmup.started` and re-creating the container.
+- ~~**No test proves a message reaches a real mail server under the rewritten
+  identity**, or that the two arrangements of §1.1 produce byte-equivalent
+  output.~~ Closed: both are acceptance tests, and the second is the suite's
+  centrepiece.
+- **No rewrite of a message above the §8.1 spill threshold.** The spill test
+  covers the buffer, not a rewritten 25 MiB message.
+- **No `Received:` chain long enough to fold.** `fold_if_needed` is unit-tested;
+  nothing drives it through the relay.
 - **`fail_closed`** — the `451 4.3.0` reply is unit-tested, but no test drives it
   with an actually-unreachable database.
 - **§10.4 under a real `SIGTERM`** — `release_by_ids` and the registry are tested;
@@ -224,6 +270,16 @@ code, independent of D-033, and worth fixing on its own. See `DECISIONS.md`
 
 ## 7. Outstanding non-code items
 
+**New in phase 4, and the one that needs the spec's author:**
+
+- **`SPEC.md` §4.1's example configuration fails `SPEC.md` §4.2.** Its
+  `envelope_from: "bounce+{{original.envelope_from.local}}@newbrand.com"` is a
+  relative transformation, which §1.1 constraint 1 prohibits by name and which
+  §6.6 makes a non-overridable startup error for an identity field. The stability
+  check built in this phase refuses to start on it. `simmer.yaml` was corrected
+  and `SPEC.md` was left alone — see D-036, which also notes what a VERP-shaped
+  intent *can* be expressed as.
+
 Carried since phase 1, none blocking:
 
 - **Decide whether to keep the cargo-deny licence gate.** `LICENSES.md` concludes
@@ -240,12 +296,24 @@ Carried since phase 1, none blocking:
 
 ## 8. Git
 
-Local repository on `main`, **no remote**. Two commits:
+On `main`, with an `origin` at `git@github.com:Hikari-Systems/simmer.git`.
+Committed so far:
 
 | | |
 |---|---|
 | `Phase 1: configuration, validation, structured logging, container` | 74 tests |
 | `Phases 2 and 3: SMTP relay and the warm-up quota model` | 323 tests |
+| *(then five commits of planning and CI work — D-032, D-033)* | |
+| `Phase 4: the rewriting engine, and the acceptance harness` | 452 tests + 4 acceptance |
+
+Working tree is clean. **`main` is one commit ahead of `origin/main`** — phase 4
+is committed but not pushed.
+
+Phase 4 is one commit covering both the engine and the acceptance suite. They are
+separable in principle, but the suite's §4.3 and §4.4 assertions only mean
+anything against the engine, and the engine's most valuable evidence is those
+assertions — splitting them would produce one commit whose tests do not yet test
+what they claim to.
 
 **Why phases 2 and 3 share a commit.** The work was never snapshotted between
 them, and several files — `src/relay.rs`, `src/smtp/session.rs`, `src/main.rs`,
@@ -255,5 +323,3 @@ current content is phase 3's. Committing the phase-2 files alongside a phase-3
 intermediate tree would mean fabricating a state that never existed and was never
 tested. The phase 1 boundary was real (its tree was still intact in the index) and
 was verified to build and pass its 74 tests before being committed.
-
-Working tree is clean.

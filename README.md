@@ -62,12 +62,24 @@ route. Counters increment on downstream `2xx` only, via the §7.4
 reserve/send/commit protocol, so a failed send never consumes allowance and
 concurrent sessions cannot both claim the last slot.
 
-What works today: **an end-to-end relay that applies the ramp.** What does not,
-yet:
+**Phase 4** — the rewriting engine, which is what makes a route's *outbound
+identity* mean anything. Authentication artefacts are stripped unconditionally
+(§6.5), `remove_headers` and `set_headers` are applied with §6.3's templates
+rendered against the message as it arrived, a `Received:` header is prepended, and
+the envelope sender is computed from the route. §6.6's stability property —
+`rewrite(rewrite(m)) == rewrite(m)` — is enforced at startup against a synthetic
+probe and again as a property test over generated messages.
 
-- **No rewriting.** The message is forwarded byte for byte, under the identity it
-  arrived with. Header and body rewriting are phases 4 and 5, and they are what
-  make the route's *outbound identity* mean anything.
+Phase 4 also built the §12.3 acceptance suite ahead of schedule: two Mailpit traps
+on a compose profile, a ramp walked across simulated days by moving
+`warmup.started`, and an assertion that both arrangements of the cutover invariant
+produce byte-equal output.
+
+What works today: **an end-to-end relay that applies the ramp and rewrites the
+identity.** What does not, yet:
+
+- **No body rewriting.** `body_rewrites` is validated at startup and then ignored;
+  the body is forwarded byte for byte. That is phase 5 (§6.4).
 - **No connection pool.** One downstream connection per message (phase 10).
 - **No admin API and no metrics endpoint.** The counters are being recorded, and
   `pause` / `graduate` / `allowance` are honoured from the database, but nothing
@@ -171,6 +183,19 @@ cargo deny check                 # licences, advisories, sources
 docker compose up -d --build     # not optional before pushing
 ```
 
+The §12.3 acceptance suite runs against its own stack and is not part of
+`cargo test` — it needs Docker and about two minutes of container restarts:
+
+```sh
+docker compose --profile acceptance up -d --build
+cargo test --test acceptance -- --ignored --test-threads=1
+```
+
+It walks a warm-up across simulated days by moving `warmup.started` and
+re-creating the container, and it is the only tier that proves both arrangements
+of the cutover invariant (§1.1) produce byte-equal output. `docs/ACCEPTANCE.md`
+explains the topology; `DECISIONS.md` D-042 explains what will bite.
+
 `DATABASE_URL` is needed only by `tests/quota*.rs`, which use `#[sqlx::test]` to
 get a fresh database per test. Faking Postgres there would defeat the point:
 §12.3's overshoot test is a claim about what two transactions do to one row at the
@@ -190,20 +215,25 @@ platform root store the §8.2 `required_verify` mode needs.
 
 ```
 src/config/     the §4.1 schema, ${ENV_VAR} interpolation, §4.2 validation
-src/routing/    sender matching (§5.4); chain selection lands in phase 3
+src/routing/    sender matching (§5.4), domain groups (§3.2.2), the chain walk
 src/smtp/       §5 ingress: listener, state machine, AUTH, DATA buffer, replies
 src/downstream/ §8 outbound: TLS, the SMTP client, the §10.1 reply mapping
 src/quota/      §7 day index, allowance, the reserve/commit protocol, sweeper
 src/models/     runtime sqlx over &PgPool, house pattern
-src/relay.rs    decide -> reserve -> relay -> commit/release
+src/rewrite/    §6 the rewriting engine: templates, headers, encoding, stability
+src/relay.rs    decide -> reserve -> rewrite -> relay -> commit/release
 src/metrics.rs  §9.1 counters; the exporter arrives in phase 7
 src/admin/      the §9 control plane; phase 1 has GET /health only
 src/db.rs       pool construction and migrations
+src/bin/loadgen.rs  the acceptance suite's bulk sender; not in the shipped image
 migrations/     plain SQL, applied at startup
 tests/support/  a scripted fake downstream (§12.3)
+tests/rewrite_stability.rs  §6.6 as a property test over generated messages
+tests/acceptance.rs  §12.3 against real mail servers; behind --ignored
+simmer.acceptance.yaml  config for the acceptance stack
 docs/SPEC.md    the specification
 docs/STATE.md   where the build has got to (snapshot, for session handover)
-docs/ACCEPTANCE.md  design for the §12.3 acceptance harness (planned, not built)
+docs/ACCEPTANCE.md  the §12.3 acceptance harness: design, and now built
 DECISIONS.md    divergences from it, and the questions still open
 LICENSES.md     dependency licence findings
 ```

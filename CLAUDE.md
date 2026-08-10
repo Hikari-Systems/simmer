@@ -26,6 +26,14 @@ anything, and do not amend `SPEC.md` — record divergences in `DECISIONS.md`.
    `Sender:`, `Message-ID:`) must be stable with no override; other headers can be
    exempted only by declaring them in `unstable_headers`.
 
+   Since phase 4 this is **enforced**, not just documented: `config::validate`
+   runs the real rewrite engine against a synthetic probe at startup and refuses
+   to boot on a violation. It caught one in `SPEC.md`'s own §4.1 example
+   configuration — see D-036 before assuming a failure is the checker's fault.
+   Two corollaries when working in `src/rewrite/`: a header the route does not
+   name keeps its **original bytes** (D-039), and anything derived from the
+   message gets escaped at the substitution boundary, never afterwards (D-038).
+
 3. **Never emit a reply that makes a client record permanent state.** §14.1. A
    `550` puts a deliverable recipient on suppression lists that outlive Simmer by
    years. Chain exhaustion is `451`. When adding any new failure path, apply this
@@ -44,11 +52,33 @@ export DATABASE_URL=postgres://simmer:simmer@127.0.0.1:5433/simmer
 
 cargo test
 cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
 cargo deny check
 docker compose up -d --build     # the real gate; do not skip
 ```
 
+**Anything that builds the shipped image must pass `--target runtime`.** The
+Dockerfile's last stage is `acceptance` (it builds on `runtime`, so it has to come
+after it), and an unpinned `docker build` produces the *last* stage — which is the
+loadgen, not the server. `docker-compose.yml`'s `app` service pins it; a
+deployment pipeline would have to as well.
+
 `SIMMER_CONFIG` overrides the config path (default `simmer.yaml`).
+
+The §12.3 acceptance suite runs against its own stack and is **not** in
+`cargo test` — it needs Docker and a couple of minutes of container restarts:
+
+```sh
+docker compose --profile acceptance up -d --build
+cargo test --test acceptance -- --ignored --test-threads=1
+```
+
+Run it after any change to `src/rewrite/`, the quota walk or the config schema.
+It is the only tier that proves both arrangements of §1.1 produce byte-equal
+output. `docs/ACCEPTANCE.md` is the topology; `DECISIONS.md` D-042 is what bites —
+in particular, **every** compose invocation must carry `SIMMER_WARMUP_STARTED`, or
+compose silently re-creates `app` at the default warm-up instant mid-test and the
+suite measures the wrong day while appearing to pass.
 
 ## Key files
 
@@ -62,14 +92,23 @@ src/smtp/reply.rs        EVERY reply Simmer can emit. Adding a 5xx here is a dec
 src/smtp/buffer.rs       §8.1 — transient, tmpfs above 1 MiB. Not a spool
 src/downstream/outcome.rs  §10.1 + D-008, as data. The §14.1 test lives in its tests
 src/downstream/client.rs   the outbound conversation; §10.2's ambiguity is in `deliver`
-src/relay.rs             decide → reserve → relay → commit/release (§7.4)
+src/rewrite/mod.rs       §6.1's order of operations. The order is not arbitrary
+src/rewrite/template.rs  §6.3's variables, parsed. An unknown one is fatal (D-034)
+src/rewrite/encode.rs    RFC 2047/5322 conformance. EVERY function is idempotent
+src/rewrite/headers.rs   an untouched header keeps its ORIGINAL BYTES (D-039)
+src/rewrite/stability.rs §6.6's property; `validate.rs` runs it at startup
+src/relay.rs             decide → reserve → rewrite → relay → commit/release (§7.4)
 src/quota/postgres.rs    the §7.4 protocol. The row lock is what makes it correct
 src/quota/day.rs         §7.2 elapsed-duration day index; NEVER calendar arithmetic
 src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve are ONE op
 src/metrics.rs           §9.1 counters; no exporter until phase 7
 src/db.rs                pool + migrations
 src/admin/               §9 control plane (phase 1: GET /health only)
+src/bin/loadgen.rs       the acceptance suite's sender; NOT in the shipped image
 tests/support/mod.rs     the scripted fake downstream (§12.3)
+tests/rewrite_stability.rs  §6.6 as a proptest. It found two real bugs; keep it
+tests/acceptance.rs      §12.3 against real mail servers; behind --ignored
+simmer.acceptance.yaml   the acceptance stack's config (D-042)
 ```
 
 ## House pattern

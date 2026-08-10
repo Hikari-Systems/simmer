@@ -7,13 +7,21 @@
 //! 2. **Reserve** — §7.4 phase 1, walking the chain (§3.2 step 3). This happens
 //!    **immediately before** the downstream conversation, never before `DATA`, so
 //!    a reservation cannot outlive §7.4's expiry while a body transfers.
-//! 3. **Relay, then commit or release** — §7.4 phases 2 and 3, with the §10.1
+//! 3. **Rewrite** — §6.1 steps 2 and 4–10, now that the route, and therefore the
+//!    identity, is known.
+//! 4. **Relay, then commit or release** — §7.4 phases 2 and 3, with the §10.1
 //!    mapping deciding which.
 //!
-//! §3.3 governs the seam between 2 and 3: **no failover**. A route that reserved
+//! §3.3 governs the seam between 2 and 4: **no failover**. A route that reserved
 //! and then failed downstream releases and reports. It does not fall through to
 //! the next link, because that would emit under the wrong identity and corrupt
 //! both the ramp accounting and the reputation being built.
+//!
+//! Rewriting sits *inside* the reservation rather than before it because §6.1
+//! step 3 — "resolve incoming identity; select route" — is what tells it which
+//! identity to apply, and selection is what takes the reservation. The cost is
+//! that a rewrite happens while a reservation is held; it is CPU-bound work over
+//! bytes already in memory, and the alternative is not knowing what to write.
 
 use std::sync::Arc;
 
@@ -21,6 +29,7 @@ use crate::config::Config;
 use crate::downstream::{self, TlsConfigs};
 use crate::metrics;
 use crate::quota::{self, QuotaStore, ReservationRegistry};
+use crate::rewrite::{self, Rewriters};
 use crate::routing::chain::{self, Walk};
 use crate::routing::sender_match::{self, Senders};
 use crate::smtp::reply::{self, Reply};
@@ -34,6 +43,11 @@ pub struct Engine {
     pub quota: Arc<dyn QuotaStore>,
     /// §10.4 — reservations this process is holding.
     pub registry: ReservationRegistry,
+    /// §6 — every route's identity, with its templates compiled. Built once at
+    /// startup because a template parse failure is a configuration error
+    /// (D-034), and configuration errors belong at startup rather than on a
+    /// connection that has already been accepted.
+    pub rewriters: Arc<Rewriters>,
 }
 
 /// Why no route could be selected. Each maps to a specific reply, and the
@@ -222,6 +236,45 @@ pub async fn reserve_relay_commit(
 
     engine.registry.insert(&selected.reservation);
 
+    // -- §6.1 steps 2 and 4–10 -----------------------------------------
+    //
+    // The identity is known only now, because it belongs to the route the walk
+    // just picked. Everything before this point has treated the message as
+    // opaque bytes.
+    let Some(rewriter) = engine.rewriters.get(&selected.route.name) else {
+        // Unreachable: `Rewriters` is compiled from the same `cfg.routes` the
+        // walk selected from. Answered rather than panicked because the message
+        // has already been accepted from the client, and §14.1 makes the answer
+        // temporary.
+        tracing::error!(
+            correlation_id,
+            route = %selected.route.name,
+            "no compiled rewrite for the selected route"
+        );
+        let _ = engine.quota.release(&selected.reservation).await;
+        engine.registry.remove(selected.reservation.id);
+        return Reply::new(451, "4.3.0 internal configuration error");
+    };
+
+    let rewritten = rewrite::rewrite(
+        rewriter,
+        &rewrite::Inbound {
+            raw: message.body,
+            envelope_from: message.mail_from,
+            recipients: message.recipients,
+            route_name: &selected.route.name,
+            correlation_id,
+            received: rewrite::Received {
+                helo: message.helo,
+                peer: message.peer,
+                by: &cfg.server.hostname,
+                authenticated: message.authenticated,
+            },
+            now: chrono::Utc::now(),
+            uuid: &|| uuid::Uuid::new_v4().to_string(),
+        },
+    );
+
     tracing::info!(
         correlation_id,
         route = %selected.route.name,
@@ -229,9 +282,13 @@ pub async fn reserve_relay_commit(
         day_index = selected.day_index,
         reservation = %selected.reservation.id,
         chain = %chain::render(&evaluation),
+        // §9.5 forbids logging bodies; the two envelope senders are the whole
+        // point of the component and are exactly what an operator needs when
+        // asking "which identity did this leave under".
         envelope_from = message.mail_from.unwrap_or("<>"),
+        outbound_envelope_from = rewritten.envelope_from.as_deref().unwrap_or("<>"),
         recipients = message.recipients.len(),
-        bytes = message.body.len(),
+        bytes = rewritten.raw.len(),
         "relaying"
     );
 
@@ -242,9 +299,9 @@ pub async fn reserve_relay_commit(
         &engine.tls,
         &cfg.server.hostname,
         &downstream::Message {
-            mail_from: message.mail_from,
+            mail_from: rewritten.envelope_from.as_deref(),
             recipients: message.recipients,
-            body: message.body,
+            body: &rewritten.raw,
             smtputf8: message.smtputf8,
             body_8bitmime: message.body_8bitmime,
         },
@@ -328,6 +385,12 @@ pub struct Message<'a> {
     pub body: &'a [u8],
     pub smtputf8: bool,
     pub body_8bitmime: bool,
+    /// §6.1 step 8 — what the client said in `EHLO`/`HELO`.
+    pub helo: &'a str,
+    /// §6.1 step 8 — the client's address, as the listener saw it.
+    pub peer: &'a str,
+    /// §6.1 step 8 — RFC 3848's `ESMTPA` versus `ESMTP`.
+    pub authenticated: bool,
 }
 
 /// §10.4 — release whatever this process is still holding.

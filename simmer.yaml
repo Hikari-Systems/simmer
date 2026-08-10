@@ -122,7 +122,21 @@ routes:
       # rather than discovered mid-relay. See DECISIONS.md D-018.
       smtputf8: false
     identity:
-      envelope_from: "bounce+{{original.envelope_from.local}}@newbrand.com"
+      # §1.1 constraint 1: absolute assignment, never a relative transformation.
+      #
+      # SPEC.md §4.1's example writes this as
+      # `bounce+{{original.envelope_from.local}}@newbrand.com`, which is a
+      # relative transformation and fails §6.6 — the sub-address is prepended to
+      # a value this same field overwrites, so applying it to already-migrated
+      # traffic gives `bounce+bounce+jane@newbrand.com`, and once more again.
+      # The §4.2 stability check rejects it at startup. See DECISIONS.md D-036;
+      # the contradiction is SPEC.md's to resolve.
+      #
+      # Per-sender VERP cannot be expressed absolutely from a field the route
+      # rewrites. It *can* be expressed from one the route leaves alone —
+      # `bounce+{{recipient.local}}@newbrand.com` is stable — at the cost of
+      # forcing per-recipient splitting (§6.3).
+      envelope_from: "bounce@newbrand.com"
       set_headers:
         From: "{{original.from.display_name}} <sales@newbrand.com>"
         Reply-To: "{{original.from.address}}"

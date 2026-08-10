@@ -1,8 +1,20 @@
 # Acceptance harness — design
 
-**Status: planned, not built.** This is the design for `SPEC.md` §12.3's
-acceptance tier and §13.10's "acceptance suite". Nothing in this document exists
-in the repository yet.
+**Status: built in phase 4** (was: planned, not built). This document is the
+design; `tests/acceptance.rs`, `simmer.acceptance.yaml`, `src/bin/loadgen.rs` and
+`docker-compose.yml`'s `acceptance` profile are the build. §7's phasing table
+records what is deliberately still outstanding — real-certificate TLS, failure
+injection, and §6.4's body-rewrite assertion — and §8's three open questions were
+settled as `DECISIONS.md` D-042.
+
+```sh
+docker compose --profile acceptance up -d --build
+cargo test --test acceptance -- --ignored --test-threads=1
+```
+
+Two details the design did not anticipate, both in D-042: every compose
+invocation has to carry `SIMMER_WARMUP_STARTED` or compose quietly resets the ramp
+mid-test, and quota state needs resetting between tests exactly as the traps do.
 
 `SPEC.md` says *what* the acceptance suite must prove:
 
@@ -62,7 +74,7 @@ and the acceptance stack is opt-in.
                  └────┬───┘ └───┬────┘
                       │ HTTP    │ HTTP        ┌──────────┐
                       ▼         ▼             │ postgres │
-                 127.0.0.1:8025 / :8026       └────┬─────┘
+                127.0.0.1:18025 / :18026       └────┬─────┘
                                                    │ 127.0.0.1:5433
                               ┌────────────────────┴───────┐
                               │  tests/acceptance.rs (host) │
@@ -94,8 +106,8 @@ Postgres, both of which are safe to publish to loopback.
 
 | Service | Image | Purpose |
 |---|---|---|
-| `trap-warming` | `axllent/mailpit`, pinned by digest | Stands in for Postal. API on `127.0.0.1:8025` |
-| `trap-overflow` | `axllent/mailpit`, pinned by digest | Stands in for SendGrid. API on `127.0.0.1:8026` |
+| `trap-warming` | `axllent/mailpit`, pinned by digest | Stands in for Postal. API on `127.0.0.1:18025` |
+| `trap-overflow` | `axllent/mailpit`, pinned by digest | Stands in for SendGrid. API on `127.0.0.1:18026` |
 | `loadgen` | built from this repo | Bulk sender |
 
 `simmer-db` and `app` are the existing services, with `app` given
@@ -283,10 +295,10 @@ trade.
 
 | | Lands | Needs |
 |---|---|---|
-| Compose profile, traps, loadgen, ramp walk, routing evidence (§4.1, §4.2) | **could land now** | phase 3, which is done |
-| Header rewrite assertions (§4.3 less the body row) | phase 4 | the rewriting engine |
+| Compose profile, traps, loadgen, ramp walk, routing evidence (§4.1, §4.2) | **landed, phase 4** | phase 3, which is done |
+| Header rewrite assertions (§4.3 less the body row) | **landed, phase 4** | the rewriting engine |
 | Body rewrite assertion | phase 5 | §6.4 |
-| **Cutover invariant** (§4.4) | phase 4 | the rewriting engine |
+| **Cutover invariant** (§4.4) | **landed, phase 4** | the rewriting engine |
 | Real-certificate TLS (§5) | phase 10 | nothing; deferred for scope |
 | Failure injection (`fail_closed`, `SIGTERM`) | phase 10 | nothing; deferred for scope |
 
@@ -295,7 +307,9 @@ received the message* is evidence that needs no rewriting to be meaningful.
 
 ---
 
-## 8. Open questions
+## 8. Open questions — all three settled, `DECISIONS.md` D-042
+
+*Kept as written, because the reasoning below is what D-042 decided against.*
 
 1. **Land the ramp-walk half now, or keep the whole suite in phase 10?** Landing
    it now means phase 4 gets an acceptance harness to plug rewrite assertions
