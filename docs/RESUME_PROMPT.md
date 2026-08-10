@@ -39,9 +39,8 @@ committing quota only on a downstream `2xx`.
 parsed and its regexes are compiled at startup (§4.2), and then ignored. The body
 is carried through the engine as an opaque slice and arrives byte for byte.
 
-Committed on `main` (remote `origin`): phase 1, then phases 2–3, then five commits
-of planning and CI work, then phase 4. Working tree is clean, and **`main` is one
-commit ahead of `origin/main`** — phase 4 is committed but not pushed. Do not
+Committed and pushed on `main` (remote `origin`): phase 1, then phases 2–3, then
+five commits of planning and CI work, then phase 4. Working tree is clean. Do not
 commit or push unless asked.
 
 ## Phase 5 — body rewriting

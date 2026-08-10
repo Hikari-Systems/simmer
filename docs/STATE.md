@@ -9,7 +9,7 @@ this file disagrees with any of them, they win.
 
 ## 1. Where the build has got to
 
-`SPEC.md` §13 lists ten phases. Three are done.
+`SPEC.md` §13 lists ten phases. Four are done.
 
 | Phase | | Status |
 |---|---|---|
@@ -50,7 +50,7 @@ and its regexes are compiled at startup, and then ignored. That is phase 5.
 
 ## 2. Verification status
 
-Everything below was run on 2026-08-08 against the current working tree.
+Everything below was run on 2026-08-10 against the phase 4 commit.
 
 ```
 cargo test                                    452 passed, 0 failed
@@ -306,8 +306,7 @@ Committed so far:
 | *(then five commits of planning and CI work — D-032, D-033)* | |
 | `Phase 4: the rewriting engine, and the acceptance harness` | 452 tests + 4 acceptance |
 
-Working tree is clean. **`main` is one commit ahead of `origin/main`** — phase 4
-is committed but not pushed.
+Working tree is clean and `main` is pushed.
 
 Phase 4 is one commit covering both the engine and the acceptance suite. They are
 separable in principle, but the suite's §4.3 and §4.4 assertions only mean
