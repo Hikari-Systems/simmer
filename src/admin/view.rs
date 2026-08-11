@@ -118,9 +118,14 @@ pub struct RouteView {
     /// tell "no answer" from "passed" — reporting a pass we never established is
     /// exactly the §9 lie the control plane must not tell.
     pub preflight: Option<PreflightView>,
-    /// §9.2 asks for pool statistics. There is no connection pool until phase 10
-    /// (D-019) — one downstream connection per message has no states to report.
-    pub pool: Option<serde_json::Value>,
+    /// §9.2's pool statistics (§8.3).
+    ///
+    /// `null` only for a route this process has no pool for at all, which cannot
+    /// happen for a configured route — the pool is seeded from the same `Config`.
+    /// A route nothing has sent through reports zeros against its configured
+    /// `max_connections`, which is the honest answer and a more useful one than
+    /// an absent field.
+    pub pool: Option<crate::downstream::PoolStats>,
 }
 
 /// §9.2 `GET /routes`.
@@ -180,6 +185,7 @@ pub fn project_route(
     state: RouteState,
     usage: &UsageByRoute,
     preflight: &crate::preflight::Registry,
+    pools: &crate::downstream::Pool,
     now: DateTime<Utc>,
 ) -> RouteView {
     let day_index = quota::day::for_route(route, now);
@@ -225,7 +231,7 @@ pub fn project_route(
         recipient_frequency: route.recipient_frequency.as_ref().map(frequency_view),
         groups,
         preflight: preflight_view(route, preflight),
-        pool: None,
+        pool: pools.stats(&route.name),
     }
 }
 
@@ -275,6 +281,7 @@ pub fn project_routes(
     states: &HashMap<String, RouteState>,
     usage: &UsageByRoute,
     preflight: &crate::preflight::Registry,
+    pools: &crate::downstream::Pool,
     now: DateTime<Utc>,
 ) -> RoutesView {
     RoutesView {
@@ -284,7 +291,7 @@ pub fn project_routes(
             .iter()
             .map(|route| {
                 let state = states.get(&route.name).copied().unwrap_or_default();
-                project_route(cfg, route, state, usage, preflight, now)
+                project_route(cfg, route, state, usage, preflight, pools, now)
             })
             .collect(),
     }
@@ -388,6 +395,7 @@ routes:
             state,
             usage,
             &crate::preflight::Registry::new(),
+            &crate::downstream::Pool::build(cfg),
             now(),
         )
     }
@@ -556,6 +564,7 @@ routes:
             RouteState::default(),
             &UsageByRoute::new(),
             &crate::preflight::Registry::new(),
+            &crate::downstream::Pool::build(&cfg),
             earlier,
         );
         assert_eq!(v.status, RouteStatus::NotStarted);
@@ -577,6 +586,7 @@ routes:
             },
             &UsageByRoute::new(),
             &crate::preflight::Registry::new(),
+            &crate::downstream::Pool::build(&cfg),
             earlier,
         );
         assert_eq!(v.status, RouteStatus::Paused);
@@ -598,6 +608,7 @@ routes:
             state,
             &UsageByRoute::new(),
             &crate::preflight::Registry::new(),
+            &crate::downstream::Pool::build(&cfg),
             earlier,
         );
         assert!(v.graduated);
@@ -710,6 +721,7 @@ routes:
             &states,
             &usage,
             &crate::preflight::Registry::new(),
+            &crate::downstream::Pool::build(&cfg),
             now(),
         ))
         .unwrap();
@@ -744,17 +756,33 @@ routes:
         assert_eq!(overflow.downstream.tls, "required");
     }
 
-    // -- unimplemented, and honest about it --------------------------------
+    // -- the two fields §9.2 asks for beyond the quota ---------------------
 
     #[test]
-    fn preflight_and_pool_are_null_rather_than_absent() {
-        // §9.2 asks for both. Omitting the keys would let a reader conclude the
-        // checks passed; null says the field exists and has no answer.
+    fn an_unchecked_preflight_is_null_rather_than_absent() {
+        // Omitting the key would let a reader conclude the checks passed; null
+        // says the field exists and has no answer.
         let cfg = config();
         let v = view(&cfg, "warming", RouteState::default(), &UsageByRoute::new());
         let json = serde_json::to_value(&v).unwrap();
         assert_eq!(json["preflight"], serde_json::Value::Null);
-        assert_eq!(json["pool"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_route_nothing_has_sent_through_reports_its_pool_as_zeros() {
+        // §9.2's pool statistics. The contrast with preflight above is the point:
+        // "no connection has been opened" is a fact we know, and reporting it as
+        // zeros against the configured ceiling is more use than null. Null here
+        // would mean the process has no pool for this route at all, which cannot
+        // happen for a configured one.
+        let cfg = config();
+        let v = view(&cfg, "warming", RouteState::default(), &UsageByRoute::new());
+        let pool = v.pool.expect("a configured route always has a pool");
+        assert_eq!(pool.max_connections, 1);
+        assert_eq!(pool.idle, 0);
+        assert_eq!(pool.active, 0);
+        assert_eq!(pool.opened, 0);
+        assert_eq!(pool.reused, 0);
     }
 
     #[test]
@@ -767,6 +795,7 @@ routes:
             &HashMap::new(),
             &UsageByRoute::new(),
             &crate::preflight::Registry::new(),
+            &crate::downstream::Pool::build(&cfg),
             now(),
         );
         let names: Vec<_> = v.routes.iter().map(|r| r.name.as_str()).collect();
@@ -781,6 +810,7 @@ routes:
             &HashMap::new(),
             &UsageByRoute::new(),
             &crate::preflight::Registry::new(),
+            &crate::downstream::Pool::build(&cfg),
             now(),
         );
         assert!(!v.routes[0].paused);

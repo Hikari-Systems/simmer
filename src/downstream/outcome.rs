@@ -30,6 +30,13 @@ pub enum Stage {
     /// The `.` that ends `DATA`. The only stage whose `2xx` means "delivered".
     FinalDot,
     Quit,
+    /// §8.3's own traffic on a pooled connection: the `NOOP` that validates one
+    /// idle beyond the threshold, and the `RSET` between messages.
+    ///
+    /// Never reaches [`failed`]: a failure here means the pool discards the
+    /// connection and opens another, which is the whole point of validating. It
+    /// exists so that when it is logged it says what it was.
+    Keepalive,
 }
 
 impl Stage {
@@ -45,6 +52,7 @@ impl Stage {
             Stage::Data => "data",
             Stage::FinalDot => "final_dot",
             Stage::Quit => "quit",
+            Stage::Keepalive => "keepalive",
         }
     }
 
@@ -86,6 +94,13 @@ pub enum RelayError {
     /// D-018 — the downstream does not advertise a capability the client used and
     /// configuration claimed was available.
     MissingCapability(&'static str),
+    /// §8.3 — every one of the route's `max_connections` was in use for longer
+    /// than the connect budget allowed us to wait.
+    ///
+    /// Not a downstream failure: the downstream was never reached. It is what
+    /// "the pool bounds concurrency against each downstream" costs when the
+    /// bound binds, and it is the reason the pool is not just a socket cache.
+    PoolExhausted,
 }
 
 /// A downstream `2xx` on the final dot.
@@ -180,6 +195,20 @@ pub fn failed(route: &str, err: &RelayError) -> Outcome {
             reply::Reply::new(451, "4.3.5 downstream capability mismatch")
         }
 
+        // §8.3. Deliberately its own class rather than folded into `connect`:
+        // an exhausted pool is Simmer declining to open a fifth connection, not
+        // a downstream that would not accept one, and the two call for opposite
+        // responses — raise `max_connections`, or go and look at the provider.
+        RelayError::PoolExhausted => {
+            tracing::warn!(
+                route,
+                "every pooled connection to this downstream was busy for the whole \
+                 connect budget; raise downstream.pool.max_connections if this persists"
+            );
+            metrics::downstream_error(route, "pool_exhausted");
+            reply::Reply::new(451, "4.4.5 downstream connection pool exhausted")
+        }
+
         // -- the code-bearing rows -------------------------------------
         RelayError::Rejected { stage, code, text } if *code >= 500 => {
             if *stage == Stage::RcptTo {
@@ -250,7 +279,10 @@ mod tests {
         }
     }
 
-    const ALL_STAGES: [Stage; 10] = [
+    // Includes `Keepalive`, which the pool swallows and `failed` should never
+    // see. It is here so that if it ever does reach the table, §14.1's assertion
+    // below covers it rather than discovering it on somebody's suppression list.
+    const ALL_STAGES: [Stage; 11] = [
         Stage::Connect,
         Stage::Greeting,
         Stage::Ehlo,
@@ -261,6 +293,7 @@ mod tests {
         Stage::Data,
         Stage::FinalDot,
         Stage::Quit,
+        Stage::Keepalive,
     ];
 
     // -- §10.1 as written -------------------------------------------------
@@ -399,6 +432,18 @@ mod tests {
     }
 
     #[test]
+    fn an_exhausted_pool_is_451_and_its_own_class() {
+        // §8.3. Distinct from `connect` on purpose: one says raise
+        // `max_connections`, the other says go and look at the provider, and a
+        // dashboard that conflates them sends somebody to the wrong place.
+        let o = failed("r", &RelayError::PoolExhausted);
+        assert_eq!(o.reply.code, 451);
+        assert!(o.reply.to_wire().contains("4.4.5"));
+        assert!(!o.commit);
+        assert_eq!(o.result, metrics::MessageResult::Deferred);
+    }
+
+    #[test]
     fn a_missing_capability_is_451_not_550() {
         let o = failed("r", &RelayError::MissingCapability("SMTPUTF8"));
         assert_eq!(o.reply.code, 451);
@@ -424,6 +469,7 @@ mod tests {
                 RelayError::Protocol(stage, "x".into()),
                 RelayError::Ambiguous,
                 RelayError::MissingCapability("X"),
+                RelayError::PoolExhausted,
             ] {
                 assert!(
                     failed("r", &err).reply.code < 500,

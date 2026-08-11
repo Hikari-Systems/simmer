@@ -179,9 +179,15 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // §8.3 — one pool per route, built from the same `Config` the engine holds.
+    // Opening nothing yet: a pool is a bound and a set of idle sockets, and there
+    // is no reason to dial a downstream before a message needs one.
+    let pools = Arc::new(simmer::downstream::Pool::build(&config));
+
     let engine = relay::Engine {
         config: Arc::clone(&config),
         tls: Arc::new(tls),
+        pools: Arc::clone(&pools),
         quota: Arc::clone(&quota),
         registry: quota::ReservationRegistry::new(),
         rewriters: Arc::new(rewriters),
@@ -273,6 +279,12 @@ async fn run() -> anyhow::Result<()> {
     // the grace period never reached their own commit-or-release, so this is the
     // only thing that gives their headroom back before `expires_at`.
     relay::release_outstanding(&engine).await;
+
+    // §10.4 — "drain pools". Last of the four clauses, and in this order for a
+    // reason: a connection still checked out by a session that is finishing is
+    // not idle, so draining before the grace period would leave exactly the
+    // connections a drain is for.
+    pools.drain().await;
 
     let _ = smtp_task.await;
     let _ = sweeper.await;

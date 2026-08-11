@@ -71,6 +71,20 @@ change the *class* of reply: a pause and a zero allowance both end at §10.3's
 `451`, which is the point, but they can make every message on a chain get it, so
 every mutation reports which chains it just emptied (D-057).
 
+And a sixth, which is the third applied to §8.3: **a pooled connection must not
+turn Simmer's optimisation into somebody's deferral — or into a duplicate.** A
+downstream that reaped an idle connection gives EOF on the first command of the
+reused conversation, and reporting that like any other failure manufactures a
+`451` for a perfectly deliverable recipient. So `client::relay` retries **once**,
+and the three conditions on it are each load-bearing (D-068): only on a *reused*
+connection, only on a *protocol* error — not a timeout, not a rejection — and
+**never at `FinalDot`**, which is §10.2's window where a retry sends the message
+twice. If you widen any of the three, work out which of those two failures you
+have just chosen. Relatedly, `max_connections` is a bound held for the whole
+checkout rather than a socket cache (D-067): a cache satisfies three of §8.3's
+four clauses and leaves the downstream unprotected, which is the clause worth
+having.
+
 ## Build and run
 
 ```sh
@@ -118,7 +132,9 @@ src/smtp/session.rs      §5.2 state machine; PIPELINING means never drop buffer
 src/smtp/reply.rs        EVERY reply Simmer can emit. Adding a 5xx here is a decision
 src/smtp/buffer.rs       §8.1 — transient, tmpfs above 1 MiB. Not a spool
 src/downstream/outcome.rs  §10.1 + D-008, as data. The §14.1 test lives in its tests
-src/downstream/client.rs   the outbound conversation; §10.2's ambiguity is in `deliver`
+src/downstream/client.rs   the outbound conversation; §10.2's ambiguity is in `deliver`.
+                         The ONE retry lives here and is bounded by three conditions
+src/downstream/pool.rs   §8.3 — max_connections is a SEMAPHORE, not a cache (D-067)
 src/rewrite/mod.rs       §6.1's order of operations. The order is not arbitrary
 src/rewrite/template.rs  §6.3's variables, parsed. An unknown one is fatal (D-034)
 src/rewrite/encode.rs    RFC 2047/5322 conformance. EVERY function is idempotent
@@ -156,6 +172,8 @@ tests/quota_multi_instance.rs  TWO pools, one database. Why D-007's reason was
                          wrong, and what the §7.3 race actually costs (D-061)
 tests/preflight.rs       §6.7 through the walk. A strict failure STEERS; a chain
                          with none left is 451 on the wire, never a 5xx
+tests/pool.rs            §8.3 counted from the DOWNSTREAM's side — accepted
+                         connections and command lines, never the pool's own view
 tests/admin_api.rs       §9. Pins dry run against the REAL walk, step for step
 tests/metrics_endpoint.rs  §9.1. Its own binary — one global recorder per process
 tests/acceptance.rs      §12.3 against real mail servers; behind --ignored

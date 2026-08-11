@@ -1,6 +1,6 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-08-11, at the end of phase 8.** This is a session-handover
+**Snapshot taken 2026-08-11, at the end of phase 10 — the last phase.** This is a session-handover
 document, not a maintained one: `README.md` describes the service, `DECISIONS.md`
 records why it is the way it is, and `docs/SPEC.md` is authoritative over both. If
 this file disagrees with any of them, they win.
@@ -9,7 +9,8 @@ this file disagrees with any of them, they win.
 
 ## 1. Where the build has got to
 
-`SPEC.md` §13 lists ten phases. Eight are done, and one is void.
+`SPEC.md` §13 lists ten phases. **Nine are done and one is void**, so the build
+order is complete. Phase 11 below is new work beyond §13, designed and not built.
 
 | Phase | | Status |
 |---|---|---|
@@ -22,7 +23,7 @@ this file disagrees with any of them, they win.
 | 7 | Admin API, metrics exporter, dry-run | **done** |
 | 8 | DNS preflight | **done** |
 | 9 | Multi-recipient splitting and result collapse | **void** — D-047 refuses multi-recipient transactions outright; `docs/RECIPIENTS.md` |
-| 10 | Hardening: pooling, graceful shutdown, acceptance suite, README | acceptance suite **built in phase 4** (D-032, D-042); pooling, shutdown and real-certificate TLS outstanding |
+| 10 | Hardening: pooling, graceful shutdown, acceptance suite, README | **done** — §8.3's pool (D-067, D-068), §10.4's drain, the README, and D-066's auth fix. The acceptance suite landed in phase 4 (D-032, D-042); real-certificate TLS is still untested |
 | 11 | *(new, beyond §13)* Listeners on 25/465/587, inbound TLS, sender ACL | **designed** — `docs/INGRESS.md`, D-033. Reverses four SPEC.md passages; needs the spec author |
 
 ### What the service actually does today
@@ -73,6 +74,18 @@ Three things about it that are not obvious from §9:
   the two things that can make every message on a chain fail without anyone
   meaning it.
 
+**Since phase 10 it pools its downstream connections** (§8.3). Each route holds up
+to `max_connections`, and that is a **bound** rather than a hint — it is held for
+the whole time a connection is in use, so the pool protects the downstream from a
+burst as much as it saves a handshake. A session that cannot get one within the
+route's connect budget is answered `451 4.4.5` as its own error class (D-067).
+`RSET` goes out on the way *back* to the pool, so nothing idle is ever
+mid-transaction; a connection idle beyond five seconds is validated with `NOOP` on
+the way out; and a connection that turns out to be dead anyway costs one reconnect
+and not the message — retried once, never past the terminating dot, which is
+§10.2's window (D-068). §10.4 drains it, after the grace period and the
+reservation release.
+
 **§6 is now complete.** Since phase 8 a route with a `preflight` block has its
 outbound identity's domain checked for SPF, DKIM and DMARC at startup and every
 fifteen minutes. A failure is a `WARN` and a `0` gauge and nothing else; only
@@ -90,10 +103,10 @@ re-encoded at all, so a body with no match is forwarded as the bytes it arrived 
 
 ## 2. Verification status
 
-Everything below was run on 2026-08-11 against the phase 8 tree.
+Everything below was run on 2026-08-11 against the phase 10 tree.
 
 ```
-cargo test                                    747 passed, 0 failed
+cargo test                                    771 passed, 0 failed
 cargo clippy --all-targets -- -D warnings     clean
 cargo fmt --all -- --check                    clean
 cargo deny check                              advisories ok, bans ok, licenses ok, sources ok
@@ -109,17 +122,18 @@ cargo test --test acceptance -- --ignored --test-threads=1     4 passed, 0 faile
 
 | Suite | Tests | What it covers |
 |---|---:|---|
-| `src/` unit tests | 474 | Everything logic-heavy, in place |
-| `tests/admin_api.rs` | 47 | §9 against the real router and real Postgres |
+| `src/` unit tests | 485 | Everything logic-heavy, in place |
+| `tests/admin_api.rs` | 48 | §9 against the real router and real Postgres |
 | `tests/smtp_ingress.rs` | 44 | §5 ingress end to end |
 | `tests/config_validation.rs` | 50 | §4.2, one test per rule |
 | `tests/quota.rs` | 30 | §7 against real Postgres |
 | `tests/preflight.rs` | 13 | §6.7 through the chain walk and onto the wire |
+| `tests/pool.rs` | 11 | §8.3 from the downstream's side: connections, not intentions |
 | `tests/quota_multi_instance.rs` | 5 | Two independent pools, one database (D-061) |
 | `tests/relay_mapping.rs` | 28 | §10.1 against a scripted downstream, plus §6 through the relay |
 | `tests/frequency.rs` | 21 | §7.3 against real Postgres, and through the relay |
 | `tests/rewrite_stability.rs` | 11 | §6.6 as a proptest over generated messages, bodies included |
-| `tests/metrics_endpoint.rs` | 10 | §9.1 against a real recorder — its own binary, deliberately |
+| `tests/metrics_endpoint.rs` | 11 | §9.1 against a real recorder — its own binary, deliberately |
 | `tests/quota_relay.rs` | 8 | §7.4 through the whole stack |
 | `tests/shipped_config.rs` | 5 | `simmer.yaml` round-trips |
 | `tests/acceptance.rs` | 1 + 4 | Config drift guard; the rest behind `--ignored` |
@@ -165,6 +179,18 @@ running it — and every documented invocation was driven inside the image:
 `healthcheck` (0), `healthcheck deps` (0), `healthcheck localhost 8080` (0),
 `healthcheck --deps localhost 8080` (0), and `healthcheck localhost 9999` (1).
 
+**And once more for phase 10.** `/routes` reports a `pool` object for both routes
+rather than `null`, `/metrics` carries `simmer_pool_connections` for both states of
+both routes at zero in a process that has relayed nothing, and a full conversation
+through the image ends at `451 4.4.1 downstream unavailable` with the pool
+correctly reporting nothing opened — a connect failure never counts a connection.
+The acceptance stack is the real evidence: after its four tests, the warming route
+had delivered **five messages over one connection** (`opened: 1, reused: 4`) to a
+real Mailpit server, with no discards and no retries. And a real `SIGTERM` produced
+§10.4's four clauses in order — `all sessions drained`, sweepers stopped,
+`drained pooled connections route=warming-newbrand connections=1`,
+`shutdown complete`.
+
 **And re-driven again for phase 7, which is where it earned its keep.** `/health`
 reports the database up, `/routes` without a token is `401`, `/metrics` renders
 without one, a pause and a resume round-trip with the audit line
@@ -204,7 +230,8 @@ src/smtp/            §5 ingress
   mod.rs               listener, CIDR check, session cap, shutdown token
 src/downstream/      §8 outbound leg
   stream.rs            the four TLS modes over rustls
-  client.rs            the SMTP conversation, per-stage timeouts
+  client.rs            the SMTP conversation, per-stage timeouts, D-068's retry
+  pool.rs              §8.3 — max_connections is a semaphore, not a cache (D-067)
   outcome.rs           §10.1 + D-008, as data
 src/frequency/       §7.3 recipient frequency
   mod.rs               normalisation, the keyed hash, the rolling window
@@ -297,7 +324,7 @@ And two about `recipient_event`:
 
 ## 5. Decisions on record
 
-65 entries, `D-001` to `D-065`. The ones a new reader most needs:
+68 entries, `D-001` to `D-068`. The ones a new reader most needs:
 
 | | |
 |---|---|
@@ -332,6 +359,9 @@ And two about `recipient_event`:
 | **D-063** | §6.7's 15-minute interval is a constant, not config: §4.1 defines no key for it. |
 | **D-064** | A route whose identity domain is not a literal is **not preflighted** — a startup `WARN` that says outright that `strict` has no effect there, never a startup error. |
 | **D-065** | Preflight is evaluated **above** §7.3 in the walk: an in-memory read before a high-cardinality database one. Displaces §3.2 3b's "first" by a position. |
+| **D-066** | The unknown-user decoy hash borrows the ACL's costliest argon2 parameters. Closes the timing oracle a fixed decoy only appeared to close. |
+| **D-067** | `max_connections` is a **semaphore**, not a socket cache — §8.3's last sentence is the clause that decides the shape. An exhausted pool is `451 4.4.5`, its own class. |
+| **D-068** | A dead pooled connection is retried **once**, only on a reused connection, only on a protocol error, and **never past the final dot** — which is §10.2's window. |
 | **D-061** | **Quota *is* safe across instances**, by the row lock — D-007's stated reason was wrong from phase 3 onward. The real constraints are config skew (D-026) and §7.3's race, whose bound is `threshold + (C - 1)`, not one message. |
 
 **All twelve original open questions are now closed.** O-8 and O-9 were
@@ -346,7 +376,8 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 
 **Functional**
 
-- No connection pool — one downstream connection per message (D-019, phase 10).
+- ~~No connection pool~~ — built in phase 10. `max_connections` is a bound rather
+  than a hint, and an exhausted pool is `451 4.4.5` (D-067).
 - ~~No DNS preflight~~ — built in phase 8. `/routes` still reports
   `"preflight": null` for a route that is not checked, which is now a statement
   about the route rather than the phase (D-064).
@@ -392,8 +423,21 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
   nothing drives it through the relay.
 - **`fail_closed`** — the `451 4.3.0` reply is unit-tested, but no test drives it
   with an actually-unreachable database.
-- **§10.4 under a real `SIGTERM`** — `release_by_ids` and the registry are tested;
-  the wiring in `main` is not.
+- **§10.4 under a real `SIGTERM`** — `release_by_ids`, the registry and
+  `Pool::drain` are each tested directly; the wiring in `main` that orders them is
+  exercised only by `docker compose kill -s SIGTERM`, which was done for phase 10
+  and is recorded above.
+- **The pool's bound under real concurrency.** The saturation test uses one permit
+  and two sessions. Nothing drives sixteen sessions at four permits and asserts the
+  count never exceeded four — the invariant is enforced by the semaphore and
+  argued in `pool.rs`'s module comment rather than measured.
+- **No pooled connection over TLS.** Every test in `tests/pool.rs` runs `tls: off`.
+  The `Stream` is the same object either way, but nothing carries a *reused*
+  connection through a completed handshake. The acceptance stack's traps are
+  plaintext too, so this shares its fate with the real-certificate gap below.
+- **The `NOOP` validation path where the connection passes.** `VALIDATE_AFTER` is
+  five seconds, so driving it costs five seconds of wall clock per test; the
+  `idle_ttl` path is driven instead, at one second.
 - **The quota sweeper's interval loop** (`sweep_once` is tested, `run` is not).
   The §7.3 sweeper's loop *is* covered, so this is now the odd one out.
 - **§7.3 is absent from the acceptance tier.** `simmer.acceptance.yaml` declares
@@ -419,15 +463,14 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 
 ---
 
-## 6a. Known defect
+## 6a. Known defects
 
-**Timing-based username enumeration in `smtp/auth.rs`.** The unknown-username decoy
-hash is minted at fixed argon2 parameters, but verification is parameter-agnostic —
-so an operator minting with different parameters silently reopens the oracle the
-decoy exists to close. Found by modelling D-033's ACL on Slater, which fixes the
-same bug by borrowing the costliest hash the ACL actually holds. Live in phase 2
-code, independent of D-033, and worth fixing on its own. See `DECISIONS.md`
-"Defects found, not yet fixed".
+**None outstanding.** The one this section carried since phase 8 — timing-based
+username enumeration in `smtp/auth.rs`, where the decoy was minted at fixed argon2
+parameters while verification re-derives at whatever the *stored* hash says — was
+fixed in phase 10. The decoy now takes its parameters and salt from the costliest
+hash the configured ACL holds, so the unknown-user path runs the derivation a real
+login runs. Four tests pin it. See `DECISIONS.md` D-066.
 
 ---
 
@@ -500,9 +543,17 @@ Committed so far:
 | `Phases 5 and 6: body rewriting, one recipient, recipient frequency` | 593 tests + 4 acceptance |
 | `Phase 7 and the multi-instance correction: the control plane, and D-007's reason` | 714 tests + 4 acceptance |
 | `Phase 8: the DNS preflight, and the licence gate settled` | 747 tests + 4 acceptance |
+| `Phase 10: the connection pool, the drain, and the auth timing defect` | 771 tests + 4 acceptance |
 
-**`main` is pushed through the phase 7 commit; the phase 8 commit is local.** The
-working agreement is to commit only when asked, and pushing was not asked for.
+**`main` is pushed through the phase 10 commit** — phase 8 had been sitting local
+and went up alongside it.
+
+**Phase 10 is one commit**, for the same reason phase 8 was: it was built from a
+clean tree, so there is no interleaving to untangle. It carries D-066's auth fix
+alongside the pool, which is a separable change and was flagged as such in the
+plan — it goes here because phase 10 is the hardening phase and that defect had
+been carried, documented and unfixed since phase 2. Splitting it would produce a
+one-line commit whose reason lives in the other one.
 
 **Phase 8 is one commit and did not need to be more.** Unlike every other
 boundary in this table it was built from a clean tree — phase 7 and the

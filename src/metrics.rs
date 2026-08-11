@@ -15,8 +15,6 @@
 //! What §9.1 lists and this module does not emit, all by dependency rather than
 //! oversight:
 //!
-//! - `simmer_pool_connections{route,state}` — there is no connection pool until
-//!   phase 10 (D-019). One connection per message has no states to report.
 //! - `simmer_partial_delivery_total` — void. It counts a transaction whose
 //!   recipients did not all share an outcome, and D-047 makes that unreachable.
 
@@ -143,6 +141,17 @@ fn describe() {
     describe_counter!(
         "simmer_quota_unavailable_total",
         "Messages answered 451 because the quota store was unreachable (§7.5)"
+    );
+    describe_gauge!(
+        "simmer_pool_connections",
+        "Downstream connections this process holds for a route (§8.3), by state: \
+         active is checked out for a message, idle is waiting to be reused. \
+         active pinned at max_connections means sessions are queueing for one"
+    );
+    describe_counter!(
+        "simmer_pool_retries_total",
+        "Messages re-sent on a fresh connection because a pooled one was dead on \
+         reuse (§8.3). A steady rate means idle_ttl is above what the downstream allows"
     );
     describe_counter!(
         "simmer_admin_mutations_total",
@@ -284,6 +293,40 @@ pub fn downstream_latency(route: &str, seconds: f64) {
 /// in the metrics at all.
 pub fn connection_refused(reason: &'static str) {
     counter!("simmer_connections_refused_total", "reason" => reason).increment(1);
+}
+
+/// §9.1 `simmer_pool_connections{route,state}` — `state` is `idle` or `active`.
+///
+/// Read off the pool on every scrape rather than written by the relay, which is
+/// D-056 applied again: a gauge only ever set by a message that relayed reports
+/// stale numbers for an idle route, and here it would report *nothing at all*
+/// for a route that has never sent — the one whose pool an operator is most
+/// likely to be asking about. It also keeps a metric update off the latency path
+/// of every message.
+///
+/// A gauge over the pool's own counters rather than anything derived from the
+/// semaphore: `available_permits` does not distinguish a connection being used
+/// from one that has not been opened yet, and the difference between "four active"
+/// and "four permits gone" is the difference between a busy downstream and a
+/// stuck one.
+pub fn pool_connections(route: &str, state: &'static str, count: f64) {
+    metrics::gauge!(
+        "simmer_pool_connections",
+        "route" => route.to_string(),
+        "state" => state,
+    )
+    .set(count);
+}
+
+/// §8.3 — a message re-sent because the pooled connection it started on was
+/// already closed at the far end.
+///
+/// Not in §9.1's list. Added because the retry is invisible by design — the
+/// client sees a normal `250` — and a steady rate is the signal that a route's
+/// `idle_ttl` is longer than the downstream's own idle timeout, which costs an
+/// extra connection and an extra round trip on that fraction of all mail.
+pub fn pool_retry(route: &str) {
+    counter!("simmer_pool_retries_total", "route" => route.to_string()).increment(1);
 }
 
 // ---------------------------------------------------------------------------

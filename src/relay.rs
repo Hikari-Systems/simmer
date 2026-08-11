@@ -40,6 +40,10 @@ use crate::smtp::reply::{self, Reply};
 pub struct Engine {
     pub config: Arc<Config>,
     pub tls: Arc<TlsConfigs>,
+    /// §8.3 — one pool per route, shared by every session. Shared is the whole
+    /// point: a pool per session would bound nothing, and §8.3's last sentence
+    /// asks the pool to bound concurrency against each downstream.
+    pub pools: Arc<downstream::Pool>,
     /// §11 — the storage layer behind its trait.
     pub quota: Arc<dyn QuotaStore>,
     /// §10.4 — reservations this process is holding.
@@ -314,6 +318,7 @@ pub async fn reserve_relay_commit(
     let result = downstream::relay(
         selected.route,
         &engine.tls,
+        &engine.pools,
         &cfg.server.hostname,
         &downstream::Message {
             mail_from: rewritten.envelope_from.as_deref(),

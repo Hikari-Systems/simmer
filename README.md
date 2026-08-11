@@ -45,7 +45,8 @@ deliverable recipient on a suppression list that outlives Simmer by years.
 
 ## Status
 
-Phases 1–7 of the ten in `docs/SPEC.md` §13. Phase 9 is void — see D-047 below.
+All ten phases of `docs/SPEC.md` §13, except phase 9, which is void — see D-047
+below.
 
 **Phase 1** — configuration loading, full startup validation, structured
 logging, the container skeleton.
@@ -117,14 +118,36 @@ a route, or setting an allowance of zero, is a legitimate thing to do and also
 the thing most likely to make every message on a chain `451` without anyone
 meaning it.
 
+**Phase 8** — the DNS preflight (§6.7), which completes §6. A route with a
+`preflight` block has its outbound identity's domain checked for SPF, DKIM and
+DMARC at startup and every fifteen minutes. It is **non-blocking by design**: a
+failure is a `WARN` and a `0` gauge and nothing else, and only `strict: true`
+makes the route ineligible — at which point the message *steers* to the next link
+exactly as §7.3 does, and a chain with none left is §10.3's `451`, never a `5xx`.
+A route with no verdict yet is eligible, so a slow resolver at boot cannot empty a
+chain.
+
+**Phase 10** — hardening. §8.3's connection pool: per route, `max_connections`
+held as a bound rather than a hint, `RSET` between messages, `NOOP` validation of
+a connection idle beyond a short threshold, and retirement at `idle_ttl` or
+`max_messages_per_connection`. §10.4's shutdown drains it. Two things about it are
+worth knowing and are below under [Connection pooling](#connection-pooling).
+
+Phase 10 also fixed a defect carried since phase 2: the decoy hash that equalises
+the cost of a failed login now takes its parameters from the credentials actually
+configured, rather than from a fixed guess that only matched them by coincidence
+(`DECISIONS.md` D-066).
+
 What works today: **an end-to-end relay that applies the ramp, rewrites both the
 identity and the body, paces how often one recipient hears from a warming route,
-and can be inspected and steered without a restart.** What does not, yet:
+pools its downstream connections, and can be inspected and steered without a
+restart.** What does not:
 
-- **No connection pool.** One downstream connection per message (phase 10).
-- No preflight (phase 8), so `/routes` reports `"preflight": null`.
 - **No scopes on admin tokens.** Every token can do everything; a token that
   could read but not mutate is a plausible ask and is not built.
+- **No inbound TLS and no listener on 465 or 587.** Designed in `docs/INGRESS.md`
+  (D-033) and not built — it reverses four passages of `SPEC.md` and needs the
+  spec's author first.
 
 And one thing that will not arrive, because it is a decision rather than a gap:
 
@@ -223,6 +246,29 @@ With the shipped defaults the downstream budget is 10s + 30s + 120s = 160s
 against a client `data` timeout of 300s. If you raise the downstream timeouts,
 check that relationship still holds.
 
+### Connection pooling
+
+Each route has its own pool, configured under `downstream.pool`. Two things about
+it are not obvious from the keys:
+
+**`max_connections` is a bound, not a hint.** It is held for the whole time a
+connection is in use, so a route can never have more connections open than it
+says — which is the point: it protects the downstream from a burst as much as it
+saves Simmer a handshake. A session that cannot get one within the route's
+`connect` budget is answered `451 4.4.5 downstream connection pool exhausted`,
+its own error class so that a dashboard can tell it apart from a downstream that
+is refusing connections. The two call for opposite responses. If you see it,
+raise `max_connections`.
+
+**`idle_ttl` should sit below whatever the downstream's own idle timeout is.** If
+it does not, Simmer will regularly pick up connections the provider has already
+closed. That is survivable — the message is retried once on a fresh connection and
+the client never sees it — but it costs a reconnect, and
+`simmer_pool_retries_total` is the metric that tells you it is happening. The
+retry is deliberately never attempted after the message body has been sent
+(`DECISIONS.md` D-068): past that point a delivery may already have happened, and
+retrying would send it twice.
+
 ## Control plane
 
 On `admin.listen`, port 8080 by default. `/health`, `/healthcheck` and `/metrics`
@@ -234,7 +280,7 @@ shape. See `DECISIONS.md` D-055.
 |---|---|
 | `GET /health` | Liveness plus database reachability. `503` when the database is down |
 | `GET /metrics` | Prometheus exposition (§9.1) |
-| `GET /routes`, `GET /routes/{name}` | Configuration plus live state: warm-up day, per-group allowance and usage, paused, graduated |
+| `GET /routes`, `GET /routes/{name}` | Configuration plus live state: warm-up day, per-group allowance and usage, paused, graduated, preflight results, pool statistics |
 | `GET /quota?route=&group=` | The same windows, filtered. Both filters optional and independent |
 | `POST /routes/{name}/pause`, `/resume` | Make a route ineligible without a restart. Persisted |
 | `POST /routes/{name}/graduate` | Pin to the final schedule value. `{"graduated": false}` reverses it |
@@ -260,7 +306,14 @@ curl -sXPOST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/jso
   localhost:8080/dryrun | jq
 ```
 
-**Reading `/routes`.** Each domain group reports `scheduled` (what the
+**Reading `/routes`.** Each route also reports its `preflight` verdict — `null`
+means nothing has been checked, which is not the same as a pass and is reported
+differently on purpose — and its `pool`: `max_connections` and the live `idle` and
+`active` counts, plus lifetime `opened`, `reused`, `retired` and `discarded`.
+`reused` far below `opened` means connections are not surviving between messages;
+a climbing `discarded` means the downstream is closing them underneath you.
+
+Each domain group reports `scheduled` (what the
 configuration says today), `allowance` (what the row says, which is what the
 reservation protocol enforces), `override`, `committed`, `reserved`, `headroom`
 and `drift`. `drift: true` means the row and the schedule disagree — the expected
@@ -337,9 +390,12 @@ src/config/     the §4.1 schema, ${ENV_VAR} interpolation, §4.2 validation
 src/routing/    sender matching (§5.4), domain groups (§3.2.2), the chain walk
 src/smtp/       §5 ingress: listener, state machine, AUTH, DATA buffer, replies
 src/downstream/ §8 outbound: TLS, the SMTP client, the §10.1 reply mapping
+  pool.rs         §8.3's per-route pool. max_connections is a bound, not a hint
 src/quota/      §7 day index, allowance, the reserve/commit protocol, sweeper
+src/frequency/  §7.3 normalisation, the keyed hash, the rolling window, eviction
 src/models/     runtime sqlx over &PgPool, house pattern
 src/rewrite/    §6 the rewriting engine: templates, headers, encoding, stability
+src/preflight/  §6.7 the DNS preflight: three checks, a registry, an interval
 src/relay.rs    decide -> reserve -> rewrite -> relay -> commit/release
 src/metrics.rs  §9.1 counters and the Prometheus recorder
 src/admin/      the §9 control plane: reads, writes, dry run, /metrics
@@ -354,6 +410,7 @@ migrations/     plain SQL, applied at startup
 tests/support/  a scripted fake downstream (§12.3)
 tests/rewrite_stability.rs  §6.6 as a property test over generated messages
 tests/admin_api.rs   §9 against the real router and real Postgres
+tests/pool.rs        §8.3 from the downstream's side: connections, not intentions
 tests/metrics_endpoint.rs  §9.1 against a real recorder; its own binary
 tests/acceptance.rs  §12.3 against real mail servers; behind --ignored
 simmer.acceptance.yaml  config for the acceptance stack

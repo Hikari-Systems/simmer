@@ -1631,6 +1631,145 @@ rewriting bugs actually surface.
   gone and watches everything fall through to overflow — which looks precisely
   like a routing bug. `reset_quota()` is the analogue of `reset_traps()`.
 
+### D-066 — The unknown-user decoy hash borrows the ACL's costliest parameters
+
+**Spec:** §5.3 asks only that comparison be constant-time. The username-timing
+oracle is not something the spec raises at all; phase 2 raised it and mitigated it.
+
+**Decision:** `Verifier::new` picks the costliest hash the configured ACL holds —
+by `m_cost × t_cost`, which is the number of memory blocks argon2 computes — and
+builds the decoy from its algorithm, version, parameters and salt, replacing only
+the digest. An ACL with nothing parseable falls back to a constant at §4.1's
+example parameters.
+
+**Why:** phase 2 minted the decoy at a *fixed* `m=19456,t=2,p=1` and its own
+comment conceded that this cost "roughly" what a real verification costs. It does
+not, in general: argon2 verification is parameter-agnostic — `PasswordHash::new`
+reads `m`, `t` and `p` from the **stored** string and re-derives at those — so an
+operator who minted their hashes at anything else had an unknown username and a
+known one costing measurably different amounts, and username enumeration by
+timing was back with the mitigation still apparently in place.
+
+Taking the maximum rather than, say, the mean is what makes it degrade in the safe
+direction: with mixed parameters an unknown user costs *at least* what any known
+one costs. The other way round is the oracle.
+
+Only the digest is replaced, and that is deliberate on two counts: keeping the
+salt keeps the work byte-for-byte identical without reconstructing anything that
+could be subtly the wrong length, and replacing the digest means no real
+credential hash is held in a second place in memory — and makes "no password
+matches the decoy" true by construction rather than by luck.
+
+**Provenance.** Found in phase 8 while modelling D-033's ACL on Slater, which
+fixes the same bug (their HIK-222) by borrowing the costliest hash the ACL holds.
+Live in phase 2 code, independent of D-033, and fixed here on its own rather than
+inside a feature. `SPEC.md` neither asks for this nor forbids it.
+
+### D-067 — `max_connections` is a semaphore, and an exhausted pool is `451 4.4.5`
+
+**Spec:** §8.3, and specifically its last sentence — "the pool bounds concurrency
+against each downstream". §10.1 does not have a row for this case.
+
+**Decision:** the per-route pool holds `max_connections` permits, taken for the
+whole time a connection is checked out. A session that cannot get one within the
+route's **connect** budget is answered `451 4.4.5 downstream connection pool
+exhausted`, as its own error class rather than as a connect failure.
+
+**Why a semaphore.** A cache of idle sockets satisfies §8.3's first three clauses
+and none of the fourth: under a burst of two hundred concurrent sessions a cache
+opens two hundred connections and merely fails to reuse them. Bounding is the
+clause that protects the downstream, and it is the reason `max_connections` is
+worth configuring at all.
+
+**Why the connect budget bounds the wait.** §8.4 defines no budget for "waiting
+for a peer of yours to finish", and the connect budget is the closest thing with
+the right meaning — what this route's operator declared they will spend to get a
+connection. Unbounded waiting is the alternative, and it holds a client connection
+past the client's own timeout, which converts Simmer's saturation into the
+client's §10.2-shaped ambiguity.
+
+**Why its own class.** `451` either way, so §14.1 is satisfied by any of them; but
+"raise `max_connections`" and "go and look at the provider" are opposite actions,
+and a metric that conflates them sends somebody to the wrong place at 3am. Hence
+`simmer_downstream_errors_total{class="pool_exhausted"}` and a distinct enhanced
+status code.
+
+### D-068 — A dead pooled connection is retried exactly once, and never past the dot
+
+**Spec:** §8.3 says a connection is "validated with `NOOP` before reuse if idle
+beyond a short threshold". §10.2 governs what may happen after the terminating dot.
+Neither says what to do when a reused connection fails mid-conversation.
+
+**Decision:** `client::relay` retries a message once, on a freshly opened
+connection under the same pool permit, when **all three** hold: the connection was
+reused, the failure was a `Protocol` error, and the stage was not `FinalDot`.
+Counted as `simmer_pool_retries_total{route}`.
+
+**Why it is needed at all.** The `NOOP` catches only the connections that were
+already dead when checked out *and* had been idle longer than the threshold. A
+connection can die inside the threshold, or between the `NOOP` and the `MAIL
+FROM`. What that produces is an EOF on the first command — a `Protocol` error
+indistinguishable from a real one — and without the retry it becomes a `451` for a
+recipient that is perfectly deliverable. §14.1's concern arriving by a side door:
+the reply is temporary, so nothing is suppressed, but Simmer would be manufacturing
+failures out of its own optimisation.
+
+**Why each condition is load-bearing.**
+
+- **Reused only.** A failure on a socket opened a millisecond ago is the
+  downstream talking, not a stale pool entry, and retrying it just asks twice.
+- **Protocol only, not timeout.** A downstream slow enough to blow a stage budget
+  is slow; retrying spends the budget a second time and doubles the client's wait
+  for the same answer. A rejection is likewise not retried — it is the
+  downstream's considered answer, and it arrives over a connection that is still
+  perfectly well.
+- **Never at the final dot.** That is §10.2's window: past the terminating dot the
+  message may already have been accepted, and a retry there is exactly how one
+  message becomes two. `tests/pool.rs` asserts the body is offered once and the
+  client gets §10.2's "delivery unknown" `451`.
+
+**What goes back in the pool**, by the same logic: a conversation that ended in
+success, in a rejection, or in D-018's capability mismatch — everything else left
+the connection in a state nobody can describe, and §8.3 says discard it. The
+`RSET` happens on the way *back*, so what sits idle is never mid-transaction; a
+rejection at `RCPT TO` leaves one, and the next message must not inherit it.
+
+### What phase 10 also decided, without needing an entry
+
+- **`simmer_pool_connections` is read at scrape time, not written by the relay.**
+  D-056 again, with one addition: a gauge only ever written by a message that
+  relayed publishes *no series at all* for a route that has never sent — the one
+  whose pool an operator is most likely to be asking about. An absent series reads
+  on a dashboard as a route that does not exist. It also keeps a metric update off
+  the latency path of every message.
+- **§9.2's pool statistics are zeros, never `null`.** The field was `null` while
+  there was no pool. A configured route now always has one, so "nothing has been
+  opened" is a fact worth stating, and it is reported against the configured
+  `max_connections`. `null` survives only for a route the process has no pool for,
+  which cannot happen for a configured one.
+- **The `NOOP` validation threshold is a constant** (five seconds), on D-063's
+  precedent: §4.1 defines no key for it. Chosen against the asymmetry — too low
+  wastes a round trip on a healthy connection, too high spends a whole
+  conversation discovering a dead one, and the second is paid on the latency path
+  of a client holding a connection open.
+- **Idle connections are taken last-in-first-out.** The most recently returned is
+  the least likely to have been closed at the far end, and it keeps the rest of the
+  set ageing towards `idle_ttl` rather than cycling all of them just below it.
+- **A connection retired for `idle_ttl` is dropped without a `QUIT`;** one retired
+  for `max_messages_per_connection` gets one. The first is probably already closed
+  at the far end and the check would be paid on a waiting message's latency path;
+  the second is known-healthy and is being closed by our choice, so it says
+  goodbye rather than leaving the provider to count a reset against us.
+- **The pool map fills lazily on a miss** despite being seeded from the same
+  `Config` the engine holds. The miss is unreachable in the service; making it
+  *impossible* costs one `RwLock` and removes a branch whose only other handling
+  would have been to lie to a client.
+- **`Stage::Keepalive`** names the pool's own traffic. It never reaches §10.1's
+  table — a failed `NOOP` or `RSET` makes the pool discard the connection, which
+  is the point of issuing them — but it is in `ALL_STAGES` so that if it ever does,
+  §14.1's exhaustiveness assertion covers it rather than somebody's suppression
+  list discovering it first.
+
 ---
 
 ## The multi-instance correction (after phase 7)
@@ -1760,7 +1899,15 @@ justified itself by hs-utils being a git-tag dependency, which D-060 removed.
 
 ---
 
-## Defects found, not yet fixed
+## Defects found
+
+**Fixed in phase 10 — see D-066.** ~~Timing-based username enumeration in
+`smtp/auth.rs`.~~ The decoy now takes its parameters and salt from the costliest
+hash the configured ACL holds, so the unknown-user path runs the derivation a real
+login runs. Four tests in `src/smtp/auth.rs` pin it: the parameters are copied, the
+costliest of several wins, the decoy is not a copy of anybody's hash, and an ACL
+with nothing usable falls back rather than losing the ballast entirely. The
+original report follows, unchanged.
 
 **Timing-based username enumeration in `smtp/auth.rs`.** `Verifier` hashes an
 unknown username against a *fixed* decoy minted at `m=19456,t=2,p=1`, so that a
@@ -2478,3 +2625,90 @@ author are the next piece of work after this phase.
 > "one extra message" the plan assumed. No code changed.
 
 The `smtp/auth.rs` timing defect is still unfixed and still separable.
+
+> **Fixed in phase 10 — D-066.**
+
+---
+
+## Phase 10 summary
+
+§13's last phase, minus the two parts of it that were already done: the acceptance
+suite landed in phase 4 (D-032, D-042), and §8.4's timeout-budget documentation has
+been in `README.md` since phase 2. What was left was §8.3's pool, §10.4's fourth
+clause, and the `smtp/auth.rs` defect that has been carried since phase 2.
+
+Phase 9 is not here and never will be: D-047 refuses multi-recipient transactions
+outright, so the splitting and result-collapse phase has nothing to build.
+
+### What changed
+
+| Module | § | What |
+|---|---|---|
+| `src/downstream/pool.rs` | 8.3 | **New.** The per-route pool: `max_connections` as a semaphore (D-067), `idle_ttl`, `max_messages_per_connection`, `NOOP` validation, and §10.4's drain |
+| `src/downstream/client.rs` | 8.3, 10.2 | `relay` checks a connection out instead of dialling; D-068's single retry; `noop`/`rset`; `Budget` moves to the pool, resolved once per route |
+| `src/downstream/outcome.rs` | 10.1, 14.1 | `RelayError::PoolExhausted` → `451 4.4.5`, its own error class; `Stage::Keepalive` |
+| `src/smtp/auth.rs` | 5.3 | **D-066** — the decoy borrows the ACL's costliest parameters and salt, replacing only the digest |
+| `src/metrics.rs` | 9.1 | `simmer_pool_connections{route,state}`, the last unemitted §9.1 metric, plus `simmer_pool_retries_total` |
+| `src/admin/mod.rs` | 9.1 | The pool gauges refreshed on every scrape, for D-056's reason and one more |
+| `src/admin/view.rs` | 9.2 | `pool` stops being `null` and becomes `PoolStats` |
+| `src/relay.rs`, `src/main.rs` | 8.3, 10.4 | `Engine.pools`, built once; the drain, after the grace period and the reservation release |
+| `tests/support/mod.rs` | 12.3 | The fake counts connections and logs commands, and can answer an `RSET` then vanish |
+
+771 tests, from 747: 485 unit (was 474), 48 admin API (was 47), 50 config
+validation, 44 ingress, 30 quota, 28 reply mapping, 21 frequency, 13 preflight,
+**11 pool (new)**, 11 rewrite stability, 11 metrics endpoint (was 10), 8
+quota-through-the-relay, 5 multi-instance, 5 shipped config, 1 acceptance drift
+guard — plus the 4 acceptance tests behind `--ignored`.
+
+### What is tested
+
+- **What the downstream sees, not what the pool thinks.** Every assertion in
+  `tests/pool.rs` is a count of accepted TCP connections or of command lines on
+  the wire: three messages over one connection, an `RSET` between each, one `EHLO`
+  and no re-authentication, four messages at two per connection producing two
+  connections and two `QUIT`s.
+- **The retry, falsified.** Disabling the condition in `client::relay` makes
+  `a_connection_the_downstream_closed_costs_a_reconnect_and_not_the_message` fail
+  and nothing else — so the test measures the retry and not the fixture.
+- **§10.2 is not retried.** The downstream takes the whole message and drops
+  without replying to the dot; the client gets `451 … delivery unknown` and the
+  body was offered exactly once.
+- **The bound.** With `max_connections: 1` and a downstream stalled at the final
+  dot, the second session is answered `451 4.4.5` and **no second connection is
+  opened** — the assertion a socket cache would fail.
+- **The statistics agree with the wire.** `stats.opened` is asserted equal to the
+  fake's accepted-connection count, so §9.2 cannot report a fiction.
+- **D-066, four ways**, including that the decoy is not a copy of anybody's hash
+  and that the right password under the wrong username still fails.
+
+### What is not tested
+
+- **§10.4's drain under a real `SIGTERM`.** `Pool::drain` is driven directly and
+  asserted to `QUIT` its idle connections; the wiring in `main` is exercised only
+  by `docker compose up`. The same gap `release_by_ids` has had since phase 3.
+- **Concurrency against the bound.** The saturation test uses one permit and two
+  sessions. Nothing drives sixteen sessions at four permits and asserts the pool
+  never exceeded four — the invariant is argued in `pool.rs`'s module comment and
+  enforced by the semaphore rather than measured.
+- **A pooled connection over TLS.** Every pool test runs `tls: off`. The `Stream`
+  is the same object either way and `open` is unchanged, but no test carries a
+  reused connection through a completed handshake.
+- **The `NOOP` validation path.** `VALIDATE_AFTER` is five seconds, so exercising
+  it costs five seconds of wall clock per test; the `idle_ttl` path is driven
+  instead, at one second. What is untested is specifically the branch where a
+  connection is validated and *passes*.
+
+### Things the spec did not cover
+
+D-066 through D-068, and the five smaller calls listed under them. The two a
+reader would not predict from `SPEC.md`:
+
+- **D-067** — §8.3 asks the pool to bound concurrency and §10.1 has no row for
+  what happens when the bound binds. `451 4.4.5` as its own class is the answer,
+  and the reasoning is §14.1's: a saturated pool is Simmer's problem and must never
+  be charged to a recipient.
+- **D-068** — nothing in the spec says what to do when a *reused* connection dies
+  mid-conversation, and the naive answer (report it like any other failure)
+  manufactures deferrals out of Simmer's own optimisation. The retry's three
+  conditions are each there to stop it becoming the other failure mode, which is a
+  duplicate message.

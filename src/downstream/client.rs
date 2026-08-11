@@ -7,9 +7,11 @@
 //! occurred", which client crates normalise into a single error type — and that
 //! distinction is the whole of §10.2.
 //!
-//! Phase 2 opens one connection per message (`DECISIONS.md` D-019). The
-//! conversation is written against an owned [`Stream`] so §8.3's pool can wrap it
-//! in phase 10 without touching this code.
+//! Phase 2 opened one connection per message (`DECISIONS.md` D-019). The
+//! conversation was written against an owned [`Stream`] so that §8.3's pool could
+//! wrap it in phase 10 without touching it, and that is what happened: [`relay`]
+//! now checks a [`Connection`] out of [`super::pool`] instead of dialling, and
+//! everything below `open` is unchanged.
 
 use std::time::Duration;
 
@@ -19,8 +21,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use super::outcome::{Delivered, RelayError, Stage};
+use super::pool::Pool;
 use super::stream::{Stream, TlsConfigs};
 use crate::config::{Route, TlsMode};
+use crate::metrics;
 use crate::smtp::buffer::stuff_into;
 
 /// §8.4 defaults, used when a route declares no `timeouts` block.
@@ -52,14 +56,19 @@ pub struct Message<'a> {
 }
 
 /// Timeouts resolved for one route (§8.4).
-struct Budget {
-    connect: Duration,
-    command: Duration,
-    data: Duration,
+///
+/// Resolved once per route when its pool is built, rather than once per message:
+/// the answer is a pure function of configuration, and §8.3's own traffic —
+/// `NOOP`, `RSET`, the `QUIT` that retires a connection — needs the same budget
+/// with no message in hand.
+pub(super) struct Budget {
+    pub(super) connect: Duration,
+    pub(super) command: Duration,
+    pub(super) data: Duration,
 }
 
 impl Budget {
-    fn for_route(route: &Route) -> Self {
+    pub(super) fn for_route(route: &Route) -> Self {
         let t = route.downstream.timeouts.as_ref();
         Self {
             connect: t.and_then(|t| t.connect).unwrap_or(DEFAULT_CONNECT),
@@ -102,25 +111,75 @@ impl WireReply {
     }
 }
 
-/// Relay one message to a route's downstream, opening and closing a connection.
+/// Relay one message to a route's downstream over a pooled connection (§8.3).
 pub async fn relay(
     route: &Route,
     tls: &TlsConfigs,
+    pools: &Pool,
     hostname: &str,
     message: &Message<'_>,
 ) -> Result<Delivered, RelayError> {
-    let budget = Budget::for_route(route);
-    let mut conn = Connection::open(route, tls, &budget).await?;
-    let result = conn.deliver(hostname, message, &budget).await;
+    let pool = pools.for_route(route);
+    let budget = pool.budget();
+    let mut checkout = pool.checkout(route, tls).await?;
 
-    // QUIT is best-effort: the verdict is already known, and a downstream that
-    // will not accept a QUIT does not change it.
-    let _ = conn.quit(&budget).await;
+    let mut result = checkout.conn().deliver(hostname, message, budget).await;
 
+    // The one retry, and the exact shape of it matters.
+    //
+    // A downstream that closed an idle connection while we held it gives EOF on
+    // the first command of the *reused* conversation — a `Protocol` error
+    // indistinguishable from a real one, which would become a `451` for a
+    // message that would have delivered perfectly well on a fresh socket. So it
+    // is retried once, on a connection this process has just opened.
+    //
+    // Three conditions, each load-bearing:
+    //
+    // - only on a **reused** connection, because a failure on a socket we opened
+    //   a millisecond ago is the downstream talking, not a stale pool entry;
+    // - only on a **protocol** error, not a timeout — a downstream slow enough to
+    //   blow the stage budget is slow, and retrying spends the budget twice;
+    // - **never at the final dot**, which is §10.2's window. Past the terminating
+    //   dot the message may already be accepted, and a retry there is how one
+    //   message becomes two.
+    if checkout.reused() && is_stale_connection(&result) {
+        tracing::info!(
+            route = %route.name,
+            error = ?result.as_ref().err(),
+            "pooled connection was dead on reuse; retrying once on a fresh connection"
+        );
+        metrics::pool_retry(&route.name);
+        checkout.reopen(route, tls).await?;
+        result = checkout.conn().deliver(hostname, message, budget).await;
+    }
+
+    checkout.release(reusable(&result)).await;
     result
 }
 
-struct Connection {
+/// Whether a failure looks like a connection the downstream had already closed,
+/// rather than anything it said. See [`relay`] for why the final dot is excluded.
+fn is_stale_connection(result: &Result<Delivered, RelayError>) -> bool {
+    matches!(result, Err(RelayError::Protocol(stage, _)) if *stage != Stage::FinalDot)
+}
+
+/// Whether the connection can go back in the pool afterwards.
+///
+/// §8.3: "discarded on any protocol error rather than returned to the pool". The
+/// distinction that decides it is not success versus failure but *whose* failure:
+/// a rejection is the downstream's considered answer over a connection that is
+/// still perfectly well, and `RSET` puts it back to a clean transaction state. A
+/// timeout, a protocol error or §10.2's ambiguity all leave a connection whose
+/// state we cannot describe, and one of those must never be handed to the next
+/// message.
+fn reusable(result: &Result<Delivered, RelayError>) -> bool {
+    matches!(
+        result,
+        Ok(_) | Err(RelayError::Rejected { .. }) | Err(RelayError::MissingCapability(_))
+    )
+}
+
+pub(super) struct Connection {
     reader: BufReader<Stream>,
     /// Capabilities from the post-`STARTTLS` `EHLO`, which is the one that counts
     /// — RFC 3207 requires the server to discard prior state on upgrade.
@@ -128,7 +187,7 @@ struct Connection {
 }
 
 impl Connection {
-    async fn open(
+    pub(super) async fn open(
         route: &Route,
         tls: &TlsConfigs,
         budget: &Budget,
@@ -304,7 +363,7 @@ impl Connection {
         Ok(())
     }
 
-    async fn deliver(
+    pub(super) async fn deliver(
         &mut self,
         _hostname: &str,
         message: &Message<'_>,
@@ -394,10 +453,36 @@ impl Connection {
         })
     }
 
-    async fn quit(&mut self, budget: &Budget) -> Result<(), RelayError> {
+    pub(super) async fn quit(&mut self, budget: &Budget) -> Result<(), RelayError> {
         self.write("QUIT\r\n", Stage::Quit, budget.command).await?;
         let _ = self.read_reply(Stage::Quit, budget.command).await;
         Ok(())
+    }
+
+    /// §8.3 — "validated with `NOOP` before reuse if idle beyond a short
+    /// threshold".
+    ///
+    /// This is the cheap half of the staleness problem: a downstream that closed
+    /// the connection politely is discovered here, before a message is committed
+    /// to it. The expensive half — a close we only discover mid-conversation —
+    /// is what [`relay`]'s single retry exists for. Neither is sufficient alone:
+    /// a connection can die between the `NOOP` and the `MAIL FROM`.
+    pub(super) async fn noop(&mut self, budget: &Budget) -> Result<(), RelayError> {
+        self.command("NOOP\r\n", Stage::Keepalive, budget.command)
+            .await
+            .map(|_| ())
+    }
+
+    /// §8.3 — "`RSET` between messages on a reused connection".
+    ///
+    /// Issued when the connection goes back to the pool rather than when it comes
+    /// out, so that what sits idle is always a connection with no half-finished
+    /// transaction on it. A rejection at `RCPT TO` leaves one; the next message
+    /// must not inherit it.
+    pub(super) async fn rset(&mut self, budget: &Budget) -> Result<(), RelayError> {
+        self.command("RSET\r\n", Stage::Keepalive, budget.command)
+            .await
+            .map(|_| ())
     }
 
     /// Write a command and require a positive reply.

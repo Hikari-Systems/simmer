@@ -381,6 +381,7 @@ async fn the_route_view_reports_the_checks_and_whether_they_block() {
         Default::default(),
         &simmer::admin::view::UsageByRoute::new(),
         &registry,
+        &simmer::downstream::Pool::build(&cfg),
         chrono::Utc::now(),
     );
 
@@ -406,6 +407,7 @@ async fn a_route_that_was_never_checked_reports_null_rather_than_a_pass() {
         Default::default(),
         &simmer::admin::view::UsageByRoute::new(),
         &registry_after(&cfg, &healthy_dns()).await,
+        &simmer::downstream::Pool::build(&cfg),
         chrono::Utc::now(),
     );
 
@@ -428,6 +430,7 @@ async fn no_read_endpoint_leaks_a_recipient_through_the_preflight_block() {
         &Default::default(),
         &simmer::admin::view::UsageByRoute::new(),
         &registry,
+        &simmer::downstream::Pool::build(&cfg),
         chrono::Utc::now(),
     );
     let json = serde_json::to_string(&view).expect("serialises");

@@ -108,6 +108,7 @@ fn state_from(pool: PgPool, cfg: Config) -> AdminState {
         engine: Engine {
             config: Arc::clone(&cfg),
             tls: Arc::new(tls),
+            pools: Arc::new(simmer::downstream::Pool::build(&cfg)),
             quota: Arc::new(PgQuotaStore::new(pool)),
             registry: quota::ReservationRegistry::new(),
             rewriters: Arc::new(rewriters),
@@ -349,6 +350,32 @@ async fn routes_reports_every_route_and_every_group(pool: PgPool) {
     let overflow = route_of(&doc, "overflow");
     assert_eq!(overflow["overflow"], true);
     assert!(group_of(&overflow, "catchall")["headroom"].is_null());
+}
+
+#[sqlx::test]
+async fn routes_reports_the_pool_statistics_9_2_asks_for(pool: PgPool) {
+    // §9.2's last clause, unanswered until phase 10. The route has sent nothing,
+    // so the honest answer is its configured ceiling and zeros against it —
+    // rather than the `null` this field carried while there was no pool.
+    let state = state(pool);
+    let doc = get(&state, "/routes", Some(TOKEN)).await.json();
+
+    let warming = route_of(&doc, "warming")["pool"].clone();
+    assert!(
+        !warming.is_null(),
+        "a configured route always has a pool: {warming}"
+    );
+    assert_eq!(warming["max_connections"], 1);
+    assert_eq!(warming["idle"], 0);
+    assert_eq!(warming["active"], 0);
+    assert_eq!(warming["opened"], 0);
+    assert_eq!(warming["reused"], 0);
+    assert_eq!(warming["retired"], 0);
+    assert_eq!(warming["discarded"], 0);
+
+    // And the overflow route, whose pool is configured separately — the bound is
+    // per route because the downstreams are different providers.
+    assert!(!route_of(&doc, "overflow")["pool"].is_null());
 }
 
 #[sqlx::test]

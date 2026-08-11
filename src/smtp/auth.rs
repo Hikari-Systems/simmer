@@ -7,6 +7,19 @@
 //! microseconds instead of milliseconds. [`Verifier`] therefore hashes against a
 //! decoy when the user is unknown, so a failure costs the same either way.
 //!
+//! The decoy is **derived from the credentials the configuration actually
+//! holds**, and that is not a detail. Phase 2 minted it at the §4.1 example's
+//! parameters and left a comment saying it cost "roughly" what a real
+//! verification costs — but argon2 verification is parameter-agnostic:
+//! `PasswordHash::new` reads `m`, `t` and `p` from the *stored* string and
+//! re-derives at those. An operator who minted their hashes at anything else
+//! therefore had two paths of visibly different cost and a username-enumeration
+//! oracle back, with the mitigation still apparently in place. Borrowing the
+//! costliest parameters in the ACL makes the unknown-user path run the very
+//! derivation a real login runs: exact when parameters are uniform, and wrong in
+//! the safe direction — an unknown user costing *more* than a known one — when
+//! they are not. See `DECISIONS.md` D-066.
+//!
 //! *Authentication is authentication only.* The authenticated username plays no
 //! part in route selection, and nothing in this module hands it to the router.
 
@@ -32,20 +45,26 @@ pub struct Verifier {
     decoy: String,
 }
 
+/// The decoy used when the configuration holds no usable hash to take parameters
+/// from — an empty ACL, or one whose every entry fails to parse.
+///
+/// Never a secret: it is timing ballast, and the digest is deliberately not the
+/// hash of anything. The parameters are §4.1's example, which is the best guess
+/// available when there is nothing to copy.
+const FALLBACK_DECOY: &str = "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$\
+                              Zm9vYmFyYmF6cXV4Zm9vYmFyYmF6cXV4Zm9vYmE";
+
 impl Verifier {
     pub fn new(auth: &Auth) -> Self {
+        let users: Vec<(String, String)> = auth
+            .users
+            .iter()
+            .map(|u| (u.username.clone(), u.password_hash.clone()))
+            .collect();
+
         Self {
-            users: auth
-                .users
-                .iter()
-                .map(|u| (u.username.clone(), u.password_hash.clone()))
-                .collect(),
-            // Fixed salt and digest: this is never a secret, it is a timing
-            // ballast. The parameters match the §4.1 example so the decoy costs
-            // roughly what a real verification costs.
-            decoy: "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzYWx0$\
-                    Zm9vYmFyYmF6cXV4Zm9vYmFyYmF6cXV4Zm9vYmE"
-                .to_string(),
+            decoy: decoy_for(&users),
+            users,
         }
     }
 
@@ -87,6 +106,50 @@ impl Verifier {
     pub fn is_empty(&self) -> bool {
         self.users.is_empty()
     }
+}
+
+/// Build the decoy from the costliest hash the ACL holds.
+///
+/// "Costliest" is `m_cost × t_cost`: argon2 computes that many memory blocks
+/// whatever `p` is, and `p` divides them between lanes rather than reducing the
+/// total. So this is the work factor a verification pays, and taking the maximum
+/// means every real verification costs *at most* what the unknown-user path does.
+fn decoy_for(users: &[(String, String)]) -> String {
+    users
+        .iter()
+        .filter_map(|(_, h)| PasswordHash::new(h).ok())
+        .max_by_key(work_factor)
+        .and_then(|h| blind(&h))
+        .unwrap_or_else(|| FALLBACK_DECOY.to_string())
+}
+
+fn work_factor(hash: &PasswordHash) -> u64 {
+    let param = |name: &str| u64::from(hash.params.get_decimal(name).unwrap_or(0));
+    param("m").saturating_mul(param("t").max(1))
+}
+
+/// The same algorithm, version, parameters, salt and digest length — with a
+/// digest that is not the hash of anything.
+///
+/// Keeping the *salt* matters as much as the parameters: argon2's cost does not
+/// vary with salt content, but copying it means the decoy is byte-for-byte the
+/// same work, and reconstructing one would be a way to get the length subtly
+/// wrong. Replacing only the digest is what stops a real credential hash being
+/// held in a second place in memory, and makes "no password matches it" true by
+/// construction rather than by luck.
+fn blind(hash: &PasswordHash) -> Option<String> {
+    let digest = hash.hash?;
+    let blinded = argon2::password_hash::Output::new(&vec![0u8; digest.len()]).ok()?;
+    Some(
+        PasswordHash {
+            algorithm: hash.algorithm,
+            version: hash.version,
+            params: hash.params.clone(),
+            salt: hash.salt,
+            hash: Some(blinded),
+        }
+        .to_string(),
+    )
 }
 
 /// Where an `AUTH` exchange has got to.
@@ -445,6 +508,112 @@ mod tests {
         let v = verifier();
         assert!(PasswordHash::new(&v.decoy).is_ok());
         assert!(!v.verify_blocking("nobody", "anything at all"));
+    }
+
+    // -- the decoy's cost, which is the defect D-066 fixed ------------------
+
+    /// Mint a real argon2id hash at chosen parameters. Cheap ones, deliberately:
+    /// these tests are about which parameters end up in the decoy, not about
+    /// spending 19 MiB of CPU to find out.
+    fn hash_at(password: &str, m: u32, t: u32) -> String {
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        use argon2::{Algorithm, Params, Version};
+
+        let argon = Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(m, t, 1, None).expect("valid parameters"),
+        );
+        let salt = SaltString::encode_b64(b"sixteen-byte-slt").expect("valid salt");
+        argon
+            .hash_password(password.as_bytes(), &salt)
+            .expect("hashes")
+            .to_string()
+    }
+
+    fn verifier_over(users: &[(&str, String)]) -> Verifier {
+        Verifier::new(&crate::config::Auth {
+            required: true,
+            allow_insecure_auth: true,
+            mechanisms: both(),
+            users: users
+                .iter()
+                .map(|(u, h)| crate::config::User {
+                    username: (*u).into(),
+                    password_hash: h.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    fn params_of(phc: &str) -> (u32, u32) {
+        let parsed = PasswordHash::new(phc).expect("parses");
+        (
+            parsed.params.get_decimal("m").expect("m"),
+            parsed.params.get_decimal("t").expect("t"),
+        )
+    }
+
+    #[test]
+    fn the_decoy_takes_its_parameters_from_the_configured_hash() {
+        // The defect in phase 2's code: the decoy was minted at m=19456,t=2 no
+        // matter what the ACL held, and verification re-derives at whatever the
+        // *stored* string says. An operator minting at anything else had a known
+        // username and an unknown one costing measurably different amounts.
+        let v = verifier_over(&[("cfapp", hash_at("pw", 64, 3))]);
+        assert_eq!(
+            params_of(&v.decoy),
+            (64, 3),
+            "the unknown-user path must run the derivation a real login runs"
+        );
+    }
+
+    #[test]
+    fn the_decoy_takes_the_costliest_of_several() {
+        // Degrade in the safe direction: with mixed parameters, an unknown user
+        // costs at least what any known one costs, never less. The other way
+        // round is the oracle.
+        let v = verifier_over(&[
+            ("cheap", hash_at("pw", 32, 1)),
+            ("dear", hash_at("pw", 128, 2)),
+            ("middling", hash_at("pw", 64, 2)),
+        ]);
+        assert_eq!(params_of(&v.decoy), (128, 2));
+    }
+
+    #[test]
+    fn the_decoy_is_not_a_copy_of_anybodys_hash() {
+        // It borrows the *cost*, never the credential. If the digest came across
+        // intact, a decoy would be a second copy of a real hash — and the claim
+        // that no password matches it would hold only by luck.
+        let real = hash_at("pw", 64, 2);
+        let v = verifier_over(&[("cfapp", real.clone())]);
+
+        assert_ne!(v.decoy, real);
+        assert!(
+            !v.verify_blocking("nobody", "pw"),
+            "the right password under the wrong username must still fail"
+        );
+        assert!(
+            v.verify_blocking("cfapp", "pw"),
+            "and the real credential must still work"
+        );
+    }
+
+    #[test]
+    fn an_acl_with_nothing_usable_falls_back_rather_than_losing_the_ballast() {
+        // An empty ACL — §5.3 permits `required: false` with no users — and one
+        // whose entries do not parse both have no parameters to copy. Falling
+        // back keeps the unknown-user path expensive; failing to would make it
+        // free, which is the oracle again.
+        for users in [
+            vec![],
+            vec![("broken", "$argon2id$not-actually-a-hash".to_string())],
+        ] {
+            let v = verifier_over(&users);
+            assert_eq!(params_of(&v.decoy), (19456, 2));
+            assert!(!v.verify_blocking("nobody", "anything"));
+        }
     }
 
     #[test]

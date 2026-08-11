@@ -99,6 +99,7 @@ fn state(pool: PgPool) -> AdminState {
         engine: Engine {
             config: Arc::clone(&cfg),
             tls: Arc::new(tls),
+            pools: Arc::new(simmer::downstream::Pool::build(&cfg)),
             quota: Arc::new(PgQuotaStore::new(pool)),
             registry: quota::ReservationRegistry::new(),
             rewriters: Arc::new(rewriters),
@@ -309,6 +310,7 @@ async fn a_route_that_has_not_started_reports_a_ceiling_of_zero_not_infinity(poo
         engine: Engine {
             config: Arc::clone(&cfg),
             tls: Arc::new(tls),
+            pools: Arc::new(simmer::downstream::Pool::build(&cfg)),
             quota: Arc::new(PgQuotaStore::new(pool)),
             registry: quota::ReservationRegistry::new(),
             rewriters: Arc::new(rewriters),
@@ -390,6 +392,31 @@ async fn the_warmup_day_gauge_is_exported_for_every_route(pool: PgPool) {
     let (_, body) = scrape(&state(pool)).await;
     assert!(!value(&body, "simmer_warmup_day", &[("route", "warming")]).is_empty());
     assert!(!value(&body, "simmer_warmup_day", &[("route", "overflow")]).is_empty());
+}
+
+#[sqlx::test]
+async fn the_pool_gauges_are_exported_for_a_route_that_has_never_sent(pool: PgPool) {
+    // §9.1's `simmer_pool_connections{route,state}`, and the D-056 rule that
+    // decides where it is written. A gauge set by the relay would publish no
+    // series at all here — no message has ever been sent in this process — and
+    // an absent series reads on a dashboard as a route that does not exist.
+    // Zero is the answer, and it comes off the pool at scrape time.
+    let _serialised = exclusive().await;
+    let (_, body) = scrape(&state(pool)).await;
+
+    for route in ["warming", "overflow"] {
+        for state_label in ["idle", "active"] {
+            assert_eq!(
+                value(
+                    &body,
+                    "simmer_pool_connections",
+                    &[("route", route), ("state", state_label)]
+                ),
+                "0",
+                "{route}/{state_label} in:\n{body}"
+            );
+        }
+    }
 }
 
 #[sqlx::test]

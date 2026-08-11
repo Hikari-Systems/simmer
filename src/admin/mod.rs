@@ -179,6 +179,13 @@ async fn report(state: &AdminState, check_db: bool) -> (StatusCode, Json<serde_j
 /// A storage failure logs and renders anyway: a metrics endpoint that fails
 /// during an outage takes away the instrument at the moment it is wanted.
 async fn metrics_endpoint(State(state): State<AdminState>) -> Response {
+    // §8.3's gauges are read here for the same reason and by the same rule
+    // (D-056), and one extra: writing them from the relay would put a metric
+    // update on the latency path of every message to say something a scrape can
+    // read straight off the pool. A route nothing has sent through publishes
+    // `0`, which is the answer — not silence.
+    refresh_pool_gauges(&state);
+
     if let Err(e) = refresh_quota_gauges(&state).await {
         tracing::warn!(error = %e, "could not refresh quota gauges for /metrics");
     }
@@ -206,6 +213,20 @@ async fn metrics_endpoint(State(state): State<AdminState>) -> Response {
     }
 }
 
+/// §9.1 `simmer_pool_connections{route,state}`, read off the pools themselves.
+///
+/// Unlike the quota gauges this needs no storage, so it cannot fail and is not
+/// inside the fallible path above.
+fn refresh_pool_gauges(state: &AdminState) {
+    for route in &state.config().routes {
+        let Some(stats) = state.engine.pools.stats(&route.name) else {
+            continue;
+        };
+        crate::metrics::pool_connections(&route.name, "idle", stats.idle as f64);
+        crate::metrics::pool_connections(&route.name, "active", stats.active as f64);
+    }
+}
+
 async fn refresh_quota_gauges(state: &AdminState) -> Result<(), quota::QuotaError> {
     let cfg = state.config();
     let now = Utc::now();
@@ -219,6 +240,7 @@ async fn refresh_quota_gauges(state: &AdminState) -> Result<(), quota::QuotaErro
             states.get(&route.name).copied().unwrap_or_default(),
             &usage,
             &state.engine.preflight,
+            &state.engine.pools,
             now,
         );
         crate::metrics::warmup_day(&route.name, projected.day_index);
@@ -296,6 +318,7 @@ async fn routes(
         &states,
         &usage,
         &state.engine.preflight,
+        &state.engine.pools,
         now,
     )))
 }
@@ -331,6 +354,7 @@ async fn route_by_name(
         states.get(&name).copied().unwrap_or_default(),
         &usage,
         &state.engine.preflight,
+        &state.engine.pools,
         now,
     )))
 }
@@ -367,7 +391,14 @@ async fn quota_detail(
     let now = Utc::now();
     let states = state.store().route_states().await?;
     let usage = state.store().usage_many(&keys_for(cfg, now)).await?;
-    let projected = view::project_routes(cfg, &states, &usage, &state.engine.preflight, now);
+    let projected = view::project_routes(
+        cfg,
+        &states,
+        &usage,
+        &state.engine.preflight,
+        &state.engine.pools,
+        now,
+    );
 
     let windows: Vec<serde_json::Value> = projected
         .routes

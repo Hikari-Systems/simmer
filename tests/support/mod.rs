@@ -68,6 +68,13 @@ pub struct Script {
     pub caps: Vec<String>,
     /// Close the connection partway through reading the `DATA` payload.
     pub drop_mid_data: bool,
+    /// Answer `RSET` and then close, which is what §8.3's pool has to survive: a
+    /// downstream that reaps an idle connection between one message and the next.
+    ///
+    /// It closes *after* the reply, so the connection goes back into the pool
+    /// looking healthy and is dead by the time the next message picks it up —
+    /// precisely the case a `NOOP` on checkout cannot catch inside its threshold.
+    pub close_after_rset: bool,
 }
 
 impl Default for Script {
@@ -87,6 +94,7 @@ impl Default for Script {
                 "AUTH PLAIN".into(),
             ],
             drop_mid_data: false,
+            close_after_rset: false,
         }
     }
 }
@@ -114,6 +122,11 @@ pub struct Received {
 pub struct FakeDownstream {
     pub addr: SocketAddr,
     received: Arc<Mutex<Vec<Received>>>,
+    /// TCP connections accepted, ever. §8.3's pool is only observable from the
+    /// downstream's side as the difference between this and the message count.
+    connections: Arc<Mutex<usize>>,
+    /// Every command line, across every connection, in order.
+    commands: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeDownstream {
@@ -121,22 +134,50 @@ impl FakeDownstream {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake");
         let addr = listener.local_addr().expect("addr");
         let received = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(Mutex::new(0usize));
+        let commands = Arc::new(Mutex::new(Vec::new()));
 
         let sink = Arc::clone(&received);
+        let counter = Arc::clone(&connections);
+        let log = Arc::clone(&commands);
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
+                *counter.lock().expect("not poisoned") += 1;
                 let script = script.clone();
                 let sink = Arc::clone(&sink);
+                let log = Arc::clone(&log);
                 tokio::spawn(async move {
-                    let _ = serve_one(stream, script, sink).await;
+                    let _ = serve_one(stream, script, sink, log).await;
                 });
             }
         });
 
-        FakeDownstream { addr, received }
+        FakeDownstream {
+            addr,
+            received,
+            connections,
+            commands,
+        }
+    }
+
+    /// How many TCP connections have been accepted.
+    pub fn connections(&self) -> usize {
+        *self.connections.lock().expect("not poisoned")
+    }
+
+    /// Every command line seen, across every connection.
+    pub fn commands(&self) -> Vec<String> {
+        self.commands.lock().expect("not poisoned").clone()
+    }
+
+    pub fn command_count(&self, verb: &str) -> usize {
+        self.commands()
+            .iter()
+            .filter(|c| c.to_ascii_uppercase().starts_with(verb))
+            .count()
     }
 
     /// A downstream that is not listening at all, for the connect-failure row of
@@ -161,6 +202,7 @@ async fn serve_one(
     stream: TcpStream,
     script: Script,
     sink: Arc<Mutex<Vec<Received>>>,
+    log: Arc<Mutex<Vec<String>>>,
 ) -> std::io::Result<()> {
     let mut io = BufReader::new(stream);
     let mut seen = Received::default();
@@ -188,6 +230,7 @@ async fn serve_one(
         }
         let line = line.trim_end_matches(['\r', '\n']).to_string();
         let upper = line.to_ascii_uppercase();
+        log.lock().expect("not poisoned").push(line.clone());
 
         if upper.starts_with("EHLO") {
             seen.ehlo_seen = true;
@@ -279,7 +322,12 @@ async fn serve_one(
         } else if upper.starts_with("QUIT") {
             write(&mut io, "221 2.0.0 bye\r\n").await?;
             return Ok(());
-        } else if upper.starts_with("RSET") || upper.starts_with("NOOP") {
+        } else if upper.starts_with("RSET") {
+            write(&mut io, "250 2.0.0 ok\r\n").await?;
+            if script.close_after_rset {
+                return Ok(());
+            }
+        } else if upper.starts_with("NOOP") {
             write(&mut io, "250 2.0.0 ok\r\n").await?;
         } else {
             write(&mut io, "500 5.5.2 unrecognised\r\n").await?;
@@ -318,6 +366,9 @@ fn strip_eol(line: &[u8]) -> &[u8] {
 
 pub struct Simmer {
     pub addr: SocketAddr,
+    /// §8.3's pools, so a test can read the statistics §9.2 reports and drive
+    /// §10.4's drain without a process to signal.
+    pub pools: Arc<simmer::downstream::Pool>,
     stop: smtp::Shutdown,
     hard: smtp::Shutdown,
 }
@@ -359,9 +410,11 @@ impl Simmer {
         let rewriters = simmer::rewrite::Rewriters::compile(&config)
             .unwrap_or_else(|e| panic!("test config's templates do not compile: {e:?}"));
 
+        let pools = Arc::new(simmer::downstream::Pool::build(&config));
         let engine = Engine {
             config: Arc::new(config),
             tls: Arc::new(tls),
+            pools: Arc::clone(&pools),
             quota,
             registry: ReservationRegistry::new(),
             rewriters: Arc::new(rewriters),
@@ -376,7 +429,12 @@ impl Simmer {
         let hard = smtp::Shutdown::new();
         tokio::spawn(listener.serve(stop.clone(), hard.clone()));
 
-        Simmer { addr, stop, hard }
+        Simmer {
+            addr,
+            pools,
+            stop,
+            hard,
+        }
     }
 
     pub async fn connect(&self) -> Client {
