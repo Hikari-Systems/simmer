@@ -137,18 +137,25 @@ routes:
     identity:
       # §1.1 constraint 1: absolute assignment, never a relative transformation.
       #
-      # SPEC.md §4.1's example writes this as
+      # SPEC.md §4.1's example used to write this as
       # `bounce+{{original.envelope_from.local}}@newbrand.com`, which is a
       # relative transformation and fails §6.6 — the sub-address is prepended to
       # a value this same field overwrites, so applying it to already-migrated
       # traffic gives `bounce+bounce+jane@newbrand.com`, and once more again.
-      # The §4.2 stability check rejects it at startup. See DECISIONS.md D-036;
-      # the contradiction is SPEC.md's to resolve.
+      # The §4.2 stability check rejects it at startup. The spec's author has
+      # since confirmed the example was wrong and it is corrected there; see
+      # DECISIONS.md D-036.
+      #
+      # Two separate rules govern this field. §6.6 owns the LOCAL part and rejects
+      # relative transformations like the one above. §4.2's D-069 rule owns the
+      # DOMAIN, which must be a literal: `bounce@{{original.envelope_from.domain}}`
+      # is perfectly stable and still refused, because a route whose domain varies
+      # per message warms nothing while its quota row reads like a healthy ramp.
       #
       # Per-sender VERP cannot be expressed absolutely from a field the route
       # rewrites. It *can* be expressed from one the route leaves alone —
-      # `bounce+{{recipient.local}}@newbrand.com` is stable — at the cost of
-      # forcing per-recipient splitting (§6.3).
+      # `bounce+{{recipient.local}}@newbrand.com` is stable, and since D-047 there
+      # is exactly one recipient per transaction, so it no longer forces a split.
       envelope_from: "bounce@newbrand.com"
       set_headers:
         From: "{{original.from.display_name}} <sales@newbrand.com>"

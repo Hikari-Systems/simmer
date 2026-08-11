@@ -146,8 +146,7 @@ restart.** What does not:
 - **No scopes on admin tokens.** Every token can do everything; a token that
   could read but not mutate is a plausible ask and is not built.
 - **No inbound TLS and no listener on 465 or 587.** Designed in `docs/INGRESS.md`
-  (D-033) and not built — it reverses four passages of `SPEC.md` and needs the
-  spec's author first.
+  (D-033), approved, and not yet built — it is the next piece of work.
 
 And one thing that will not arrive, because it is a decision rather than a gap:
 
@@ -203,6 +202,14 @@ secret containing a newline and a colon cannot restructure the document.
 
 Unknown keys are rejected. There is no hot reload (spec §2.2): changes need a
 restart.
+
+**One rule catches people out.** A route's `identity.envelope_from` must have a
+**constant domain** — the part after the `@` cannot contain a template. The local
+part can (`bounce+{{recipient.local}}@newbrand.com` is fine); the domain cannot.
+This is not fussiness about templates: a route exists to build reputation for one
+domain, so a route whose domain varies per message warms nothing while its quota
+row still reads like a healthy ramp. Startup refuses it rather than letting you
+discover that in six weeks of unchanged deliverability. See `DECISIONS.md` D-069.
 
 See `simmer.yaml`, which is commented throughout, and `.env.example` for the
 variables it expects.

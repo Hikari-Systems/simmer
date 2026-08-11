@@ -243,6 +243,13 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
         // The second sentence is the point of the warning. Silence here would let
         // an operator set `strict: true`, see no error, and believe a gate is
         // protecting them that is not running at all.
+        //
+        // **Unreachable through `load()` since D-069**, which makes the same
+        // condition a §4.2 violation — the route is refused before this runs.
+        // Kept rather than deleted, because it is `warnings()` that would have to
+        // notice if that rule were ever relaxed, and rediscovering this reasoning
+        // from an empty function is not something a future reader should have to
+        // do. `preflight::plan` skips such a route for the same reason.
         if route.preflight_enabled()
             && crate::preflight::literal_domain(&route.identity.envelope_from).is_none()
         {
@@ -718,6 +725,33 @@ fn check_identity(identity: &Identity, route_name: &str, v: &mut ViolationList) 
 
     if identity.envelope_from.trim().is_empty() {
         v.push(at("envelope_from"), "must not be empty");
+    } else if crate::preflight::literal_domain(&identity.envelope_from).is_none() {
+        // §4.2, added after implementation — D-069.
+        //
+        // Stronger than the §6.6 stability rule below and separate from it:
+        // `bounce@{{original.envelope_from.domain}}` is perfectly stable, since
+        // applying it twice gives the same answer, and is nonetheless incoherent.
+        // The ramp, the daily allowance and reputation accrual all exist to build
+        // reputation for ONE domain. A route whose domain varies per message warms
+        // nothing, and its `quota_usage` row counts a mixture of domains under a
+        // single label — the ledger reads as a healthy ramp while no domain is
+        // actually being warmed.
+        //
+        // Until this rule existed, §6.7 was the only thing that noticed: it
+        // declined to preflight such a route and warned (D-064). That warning is
+        // now unreachable through a valid configuration, and the check has been
+        // promoted from "we cannot check this" to "this is not a route".
+        v.push(
+            at("envelope_from"),
+            format!(
+                "has a domain that is not a literal: '{}'. A warming route builds reputation \
+                 for one domain, so its outbound domain cannot vary per message — the ramp, \
+                 the daily allowance and the quota row are all keyed on the assumption that \
+                 it does not. Template the local part if you need to; the domain must be a \
+                 constant (§4.2, D-069)",
+                identity.envelope_from
+            ),
+        );
     }
 
     // §4.2's "a body_rewrites.pattern fails to compile" is reported by

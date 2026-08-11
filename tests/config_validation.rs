@@ -300,47 +300,46 @@ fn rejects_an_empty_admin_token() {
 // -- §6.7: preflight warnings (phase 8) ----------------------------------
 
 #[test]
-fn warns_when_a_preflighted_route_has_no_constant_identity_domain() {
-    // The domain is only knowable per message, so there is nothing to check on an
-    // interval and the route is silently never checked (D-064). Silence is the
-    // failure mode: the block is present and looks like it is doing something.
+fn a_route_whose_identity_domain_is_not_a_literal_is_refused() {
+    // D-069, and it inverts what phase 8 did here. This configuration used to
+    // load with a warning that preflight could not check it; §4.2 now refuses it
+    // outright, because the problem is not that we cannot check the domain — it
+    // is that a route whose domain varies per message warms nothing. The ramp,
+    // the allowance and the quota row are all keyed on there being one domain.
     let yaml = BASE.replace(
         r#"envelope_from: "bounce@newbrand.com""#,
         r#"envelope_from: "bounce@{{original.envelope_from.domain}}""#,
     );
-    let cfg = load(&yaml).expect("a warning, never a startup failure (§6.7)");
-    let warnings = config::validate::warnings(&cfg);
+    rejected_for(&yaml, "domain that is not a literal");
+}
 
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.path == "routes.warming.preflight" && w.message.contains("will not run")),
-        "expected a preflight-cannot-run warning, got: {warnings:?}"
+#[test]
+fn the_literal_domain_rule_is_about_the_domain_and_not_the_local_part() {
+    // The rule has to be exactly this narrow. A templated *local* part is a
+    // different question — §6.6's stability rule owns it, and rejects the
+    // relative ones — so this rule must not quietly take that decision too.
+    // `{{uuid}}` in a local part is stable under §6.6's probe and legitimate.
+    let yaml = BASE.replace(
+        r#"envelope_from: "bounce@newbrand.com""#,
+        r#"envelope_from: "bounce+{{uuid}}@newbrand.com""#,
+    );
+    let cfg = load(&yaml).expect("a constant domain is all §4.2 asks for");
+    assert_eq!(
+        cfg.route("warming").unwrap().identity.envelope_from,
+        "bounce+{{uuid}}@newbrand.com"
     );
 }
 
 #[test]
-fn the_warning_says_outright_that_strict_has_no_effect() {
-    // The half that matters. Without this sentence an operator sets strict: true,
-    // sees no error, and believes a gate is protecting them that never runs.
-    let yaml = BASE
-        .replace(
-            r#"envelope_from: "bounce@newbrand.com""#,
-            r#"envelope_from: "bounce@{{original.envelope_from.domain}}""#,
-        )
-        .replace(
-            "require_dmarc: true",
-            "require_dmarc: true\n      strict: true",
-        );
-    let cfg = load(&yaml).expect("still only a warning");
-    let warnings = config::validate::warnings(&cfg);
-
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.path == "routes.warming.preflight" && w.message.contains("NO EFFECT")),
-        "expected the warning to name the consequence for strict, got: {warnings:?}"
+fn a_templated_subdomain_is_refused_too() {
+    // The failure this catches is a multi-tenant shape — one route, a domain per
+    // tenant — which is the case where "the ledger looks healthy while nothing is
+    // being warmed" is most likely to go unnoticed.
+    let yaml = BASE.replace(
+        r#"envelope_from: "bounce@newbrand.com""#,
+        r#"envelope_from: "bounce@mail.{{original.from.domain}}.com""#,
     );
+    rejected_for(&yaml, "domain that is not a literal");
 }
 
 #[test]

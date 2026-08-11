@@ -1,7 +1,10 @@
 # One recipient per transaction — design
 
-**Status: built.** This is implemented in the repository as of phase 6. Recorded as
-`DECISIONS.md` D-047.
+**Status: built, and now specified.** Implemented as of phase 6, recorded as
+`DECISIONS.md` D-047, and **confirmed by the spec's author on 2026-08-11**. This
+document is no longer a proposal: `SPEC.md` §5.6 has been rewritten to specify the
+refusal unconditionally, so what follows is the reasoning behind a rule rather than
+the case for one. §1 below is kept as the record of what the spec used to say.
 
 This is the opposite of `docs/INGRESS.md`, which proposes capability `SPEC.md`
 rules out. This *removes* capability `SPEC.md` requires — a whole numbered phase of
@@ -30,11 +33,14 @@ no splitting to build and no collapse table to implement.
 `max_recipients` stays in the schema because §4.1 mandates the key, but no value
 above 1 is reachable and §4.2 warns when one is set.
 
-**This needs the spec's author to decide.** Either §5.6, §4.1, §13 and §9.1 are
-amended by whoever owns them, or D-047 stands as a divergence that deletes a phase.
-It is a smaller claim than D-033's — it removes rather than adds, and it makes
-Simmer stricter rather than more capable — but it is the first divergence to strike
-out a §13 phase entirely.
+> **Decided 2026-08-11: the spec was amended.** §5.6 now specifies the
+> unconditional refusal and carries a short form of §2's reasoning; `single_recipient_only`
+> is gone from §4.1; §6.3's warning about `recipient.*` templates forcing a split
+> goes with it, since there is now only ever one recipient to render; §13's phase 9
+> is struck through as void; and §9.1's `simmer_partial_delivery_total` is marked
+> unreachable and retained only so the metric list still matches the original. This
+> was the first divergence to strike out a §13 phase entirely, and it is now simply
+> what the specification says.
 
 ---
 

@@ -10,7 +10,16 @@ quota state, rewrites the message identity to match, forwards synchronously, and
 maps the downstream reply back on the same connection.
 
 `docs/SPEC.md` is **authoritative**. Read the relevant section before changing
-anything, and do not amend `SPEC.md` — record divergences in `DECISIONS.md`.
+anything, and **do not amend it on your own initiative** — record divergences in
+`DECISIONS.md` and put the question to the spec's author.
+
+It *has* been amended once, on 2026-08-11, when five such questions were answered:
+§2.2, §2.3, §4.1, §4.2, §5.6, §6.3, §9.1 and §13 all carry the results, each with a
+marker saying what it used to say. The rule that came out of it: **a divergence
+becomes a spec amendment only when its question has been put to the author and
+answered.** Everything else stays a `DECISIONS.md` entry. See "The spec
+settlements (after phase 10)" for what changed and what was deliberately left
+alone.
 
 ## The four things that will bite you
 
@@ -29,7 +38,15 @@ anything, and do not amend `SPEC.md` — record divergences in `DECISIONS.md`.
    Since phase 4 this is **enforced**, not just documented: `config::validate`
    runs the real rewrite engine against a synthetic probe at startup and refuses
    to boot on a violation. It caught one in `SPEC.md`'s own §4.1 example
-   configuration — see D-036 before assuming a failure is the checker's fault.
+   configuration, which the spec's author has since confirmed was the example's
+   fault and not the rule's — the example is now corrected (D-036).
+
+   Stability is necessary and **not sufficient** for `envelope_from`: its domain
+   must additionally be a **literal** (D-069). `bounce@{{original.envelope_from.domain}}`
+   is perfectly stable and still refused, because a route whose domain varies per
+   message warms nothing while its quota row reads like a healthy ramp. The rule is
+   about the domain only — a templated local part is §6.6's business, not this
+   rule's, and widening it would ban legitimate constructions.
    Three corollaries when working in `src/rewrite/`: a header the route does not
    name keeps its **original bytes** (D-039); anything derived from the message
    gets escaped at the substitution boundary, never afterwards (D-038); and since
@@ -48,9 +65,10 @@ anything, and do not amend `SPEC.md` — record divergences in `DECISIONS.md`.
    `single_recipient_only` switch and §13's phase 9 splitting are gone, not
    deferred: collapsing several per-recipient outcomes into SMTP's single reply
    either drops mail silently or records one recipient's failure against the
-   others. A second `RCPT TO` is `452`, unconditionally. `docs/RECIPIENTS.md` is
-   the reasoning and it still needs the spec's author — which is also why O-8 and
-   O-9 are struck through as *dissolved* rather than settled.
+   others. A second `RCPT TO` is `452`, unconditionally. Confirmed by the spec's
+   author and **now what §5.6 itself says**; `docs/RECIPIENTS.md` is the long-form
+   reasoning. O-8 and O-9 remain struck through as *dissolved* — D-047 removed the
+   case each was about, so neither was ever answered.
 
 Also: quota increments on downstream `2xx` only, via the §7.4 reserve/send/commit
 protocol — and so do §7.3's recipient-frequency events, in the same transaction.

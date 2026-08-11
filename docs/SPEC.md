@@ -79,8 +79,13 @@ Simmer is **not an MTA**. It does not own messages.
 - **No DKIM signing and no key material.** Downstreams sign. See §6.5.
 - **No inbound TLS.** See §5.1.
 - **No `CHUNKING`/`BDAT`, no `DSN` extension.**
-- **No multi-instance clustering.** One Simmer instance owns its quota state. Horizontal
-  scaling is not supported in v1; the storage layer should not preclude it later.
+- **No multi-instance clustering.** v1 runs a single instance; the storage layer is safe for
+  more. Quota state is owned by Postgres, not by a process: §7.4's reservation performs its
+  headroom check and its write inside one transaction holding a row lock, which serialises
+  contenders whether they are two tasks in one process or two processes on different hosts.
+  What actually constrains running two is narrower and is stated in §2.3. *(Amended — the
+  original wording described an ownership model the implementation does not have. See
+  `DECISIONS.md` D-061 and `docs/MULTI_INSTANCE.md`.)*
 - **No hot config reload.** Configuration changes require a restart.
 
 ### 2.3 Deployment assumption
@@ -88,6 +93,23 @@ Simmer is **not an MTA**. It does not own messages.
 Simmer runs on a trusted internal network segment. The listener is plaintext and accepts
 plaintext AUTH. The container must not be exposed to an untrusted network. Bind defaults to
 a private interface; publishing port 25 to a host interface must be a deliberate act.
+
+**Two operational constraints on running more than one instance**, which §2.2 defers to here.
+Neither is fixed by a lock, and neither is a quota-overshoot window:
+
+1. **Config skew during a rolling deploy.** `quota_usage.allowance` is authoritative once
+   written (`DECISIONS.md` D-026), so if two instances run different `warmup.schedule`
+   values, whichever writes the day's first row sets that day's ceiling and the other
+   silently honours it. Either roll with an unchanged `routes:` block, or accept that a
+   schedule change takes effect on the next day boundary after the roll rather than the first.
+2. **The §7.3 recipient-frequency bound.** The count is read outside the reservation
+   transaction (D-049), so `C` concurrent sends that all read before any commits can take a
+   window to `threshold + (C - 1)`. This is a documented property, not a defect: §7.3 is a
+   reputation-shaping heuristic rather than an accounting invariant, and the bound already
+   holds *within* one instance — a second instance widens the window rather than introducing
+   it.
+
+*(Added — see `docs/MULTI_INSTANCE.md`, which measures both.)*
 
 ---
 
@@ -159,8 +181,7 @@ server:
   listen: "127.0.0.1:25"
   hostname: "simmer.internal"          # used in EHLO banner and Received headers
   max_message_bytes: 26214400          # 25 MiB
-  max_recipients: 100
-  single_recipient_only: true          # DEFAULT true — see §5.6
+  max_recipients: 100                  # a transaction carries ONE recipient; see §5.6
   max_concurrent_sessions: 64
   allowed_cidrs: ["10.0.0.0/8", "172.16.0.0/12"]
   timeouts:
@@ -234,7 +255,7 @@ routes:
         command: 30s
         data: 120s
     identity:
-      envelope_from: "bounce+{{original.envelope_from.local}}@newbrand.com"
+      envelope_from: "bounce@newbrand.com"   # constant. See the note below §4.2
       set_headers:
         From: "{{original.from.display_name}} <sales@newbrand.com>"
         Reply-To: "{{original.from.address}}"
@@ -308,6 +329,24 @@ not just the first.
 - An identity field is named in `unstable_headers`.
 - `strict_senders: false` and `default_chain` is absent or its final route is not an
   overflow route.
+- Any route's `identity.envelope_from` has a **domain that is not a literal** — that is, the
+  part after the final `@` contains a template variable. *(Added; see the note below.)*
+
+**Note on `envelope_from`, added after implementation.** The example in §4.1 originally read
+`bounce+{{original.envelope_from.local}}@newbrand.com`. That is a *relative transformation* —
+the outgoing address is derived from the incoming one — which §1.1 constraint 1 prohibits by
+name and which the stability rule above already makes a non-overridable startup error. The
+example was wrong, not the rule; it has been corrected above. A VERP-shaped intent must be
+expressed as a constant plus something the downstream supplies, never as a function of the
+message. See `DECISIONS.md` D-036.
+
+The literal-domain rule is stronger than stability alone, and is separate from it:
+`bounce@{{original.envelope_from.domain}}` is perfectly *stable* — applying it twice gives the
+same answer — and is nonetheless incoherent for a warming route. The ramp, the daily allowance
+and reputation accrual all exist to build reputation for **one** domain; a route whose domain
+varies per message warms nothing, and its quota row counts a mixture of domains under a single
+label. It also cannot be preflighted (§6.7), because there is no name to look up. See
+`DECISIONS.md` D-069.
 
 ---
 
@@ -381,27 +420,29 @@ causes `550 5.6.0 malformed From header` when `match_on` requires it.
 
 ### 5.6 Multiple recipients
 
-`single_recipient_only` defaults to **true**. When true, a second `RCPT TO` in a transaction
-is rejected with `452 4.5.3 multiple recipients not permitted`.
+**A transaction carries exactly one recipient.** A second `RCPT TO` is rejected with
+`452 4.5.3 multiple recipients not permitted`, unconditionally — there is no configuration
+key and no way to enable splitting.
 
-When false, the message is **split by recipient**: each recipient is routed independently
-(different recipients may resolve to different domain groups, different frequency states, and
-therefore different routes) and one downstream transaction is performed per distinct selected
-route, carrying that route's recipients.
+An application that batches recipients into one transaction must send one message per
+recipient instead, which is what it will be doing in any case once Simmer is unplugged.
 
-Because only one reply may be returned to the client, results are collapsed:
+**Why, since this removes a capability rather than deferring one.** SMTP permits exactly one
+reply per transaction, so several per-recipient outcomes must be collapsed into a single
+code, and every available collapse is wrong in a way §14.1 forbids: reporting success loses
+the failures silently, and reporting failure records one recipient's permanent rejection
+against every other recipient in the batch — putting deliverable addresses on suppression
+lists that outlive Simmer by years. A `250 partially accepted` tells the client nothing it
+can act on, because SMTP gives no way to say *which* recipients failed.
 
-| Outcome across all splits | Client reply |
-|---|---|
-| All succeeded | `250 2.0.0 accepted` |
-| All failed, any permanently | `550` with a summary |
-| All failed, all temporarily | `451` with a summary |
-| Mixed success and failure | `250 2.0.0 partially accepted` |
+Splitting also breaks the §7.4 reservation protocol's one-reservation-one-outcome shape and
+would make the quota ledger depend on a collapse rule that is itself unsound.
 
-Partial outcomes are logged at `WARN` with per-recipient detail and counted in
-`simmer_partial_delivery_total`. The client is not told which recipients failed, because SMTP
-provides no way to say so in a single reply. This lossiness is the reason the switch defaults
-to rejecting multi-recipient messages.
+*(Amended — this section previously specified a `single_recipient_only` switch defaulting to
+true, with a result-collapse table for the false case, and §13 scheduled the splitting work
+as phase 9. The switch, the table and the phase are all deleted. `simmer_partial_delivery_total`
+in §9.1 is consequently unreachable and is retained only so the list matches the original.
+See `DECISIONS.md` D-047 and `docs/RECIPIENTS.md`, which is the long form.)*
 
 ---
 
@@ -460,9 +501,9 @@ both. Setting a header that already exists replaces all instances.
 | `now.rfc3339`, `now.date` | Current instant / date |
 
 Rendered header values must be RFC 5322-conformant; non-ASCII in display names is
-RFC 2047-encoded automatically. A template referencing `recipient.*` in a configuration where
-`single_recipient_only: false` is a startup validation warning, since it forces per-recipient
-splitting.
+RFC 2047-encoded automatically. A template may reference `recipient.*` freely: §5.6 makes one
+recipient per transaction unconditional, so there is exactly one value to render. *(Amended —
+this previously warned that such a template forces per-recipient splitting.)*
 
 ### 6.4 Body rewriting
 
@@ -744,7 +785,8 @@ Prometheus exposition on the admin listener. At minimum:
 - `simmer_pool_connections{route,state}`
 - `simmer_unmatched_sender_total{domain}`
 - `simmer_sender_mismatch_total`
-- `simmer_partial_delivery_total`
+- `simmer_partial_delivery_total` — unreachable since §5.6 was amended; retained for
+  continuity with the original list
 - `simmer_reservation_expired_total{route}`
 - `simmer_body_rewrite_skipped_total{route,reason}`
 
@@ -930,7 +972,8 @@ Each phase should end in a working, testable artefact.
 6. Recipient frequency constraint including hashing, normalisation, and sweeper.
 7. Admin API, metrics, dry-run.
 8. DNS preflight.
-9. Multi-recipient splitting and result collapse (behind the default-off switch).
+9. ~~Multi-recipient splitting and result collapse.~~ **Void** — §5.6 refuses multi-recipient
+   transactions outright, so there is nothing to split and no collapse rule to implement.
 10. Hardening: pooling refinements, graceful shutdown, acceptance suite, README.
 
 ---

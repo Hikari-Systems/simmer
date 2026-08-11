@@ -24,7 +24,7 @@ order is complete. Phase 11 below is new work beyond §13, designed and not buil
 | 8 | DNS preflight | **done** |
 | 9 | Multi-recipient splitting and result collapse | **void** — D-047 refuses multi-recipient transactions outright; `docs/RECIPIENTS.md` |
 | 10 | Hardening: pooling, graceful shutdown, acceptance suite, README | **done** — §8.3's pool (D-067, D-068), §10.4's drain, the README, and D-066's auth fix. The acceptance suite landed in phase 4 (D-032, D-042); real-certificate TLS is still untested |
-| 11 | *(new, beyond §13)* Listeners on 25/465/587, inbound TLS, sender ACL | **designed** — `docs/INGRESS.md`, D-033. Reverses four SPEC.md passages; needs the spec author |
+| 11 | *(new, beyond §13)* Listeners on 25/465/587, inbound TLS, sender ACL | **approved, not built** — `docs/INGRESS.md`, D-033. The spec's author said yes on 2026-08-11; three of its five open questions are settled. This is the next phase |
 
 ### What the service actually does today
 
@@ -91,7 +91,9 @@ outbound identity's domain checked for SPF, DKIM and DMARC at startup and every
 fifteen minutes. A failure is a `WARN` and a `0` gauge and nothing else; only
 `strict: true` makes the route ineligible, and then the message *steers* to the
 next link exactly as §7.3 does. A route with no verdict yet is eligible — fail
-open, so a slow resolver at boot cannot empty a chain (D-064).
+open, so a slow resolver at boot cannot empty a chain (D-064). Since D-069 a route
+with no constant domain is refused at startup rather than quietly left unchecked,
+so preflight's own handling of that case is now defence rather than a live path.
 
 Body rewriting decodes each `text/*` part's transfer encoding and charset, applies
 the route's patterns in order, and writes the part back in the encoding and charset
@@ -106,7 +108,7 @@ re-encoded at all, so a body with no match is forwarded as the bytes it arrived 
 Everything below was run on 2026-08-11 against the phase 10 tree.
 
 ```
-cargo test                                    771 passed, 0 failed
+cargo test                                    772 passed, 0 failed
 cargo clippy --all-targets -- -D warnings     clean
 cargo fmt --all -- --check                    clean
 cargo deny check                              advisories ok, bans ok, licenses ok, sources ok
@@ -125,7 +127,7 @@ cargo test --test acceptance -- --ignored --test-threads=1     4 passed, 0 faile
 | `src/` unit tests | 485 | Everything logic-heavy, in place |
 | `tests/admin_api.rs` | 48 | §9 against the real router and real Postgres |
 | `tests/smtp_ingress.rs` | 44 | §5 ingress end to end |
-| `tests/config_validation.rs` | 50 | §4.2, one test per rule |
+| `tests/config_validation.rs` | 51 | §4.2, one test per rule |
 | `tests/quota.rs` | 30 | §7 against real Postgres |
 | `tests/preflight.rs` | 13 | §6.7 through the chain walk and onto the wire |
 | `tests/pool.rs` | 11 | §8.3 from the downstream's side: connections, not intentions |
@@ -324,7 +326,7 @@ And two about `recipient_event`:
 
 ## 5. Decisions on record
 
-68 entries, `D-001` to `D-068`. The ones a new reader most needs:
+69 entries, `D-001` to `D-069`. The ones a new reader most needs:
 
 | | |
 |---|---|
@@ -359,6 +361,7 @@ And two about `recipient_event`:
 | **D-063** | §6.7's 15-minute interval is a constant, not config: §4.1 defines no key for it. |
 | **D-064** | A route whose identity domain is not a literal is **not preflighted** — a startup `WARN` that says outright that `strict` has no effect there, never a startup error. |
 | **D-065** | Preflight is evaluated **above** §7.3 in the walk: an in-memory read before a high-cardinality database one. Displaces §3.2 3b's "first" by a position. |
+| **D-069** | A route's `envelope_from` **domain must be a literal**. Stability is necessary and not sufficient: a route whose domain varies per message warms nothing while its quota row reads like a healthy ramp. |
 | **D-066** | The unknown-user decoy hash borrows the ACL's costliest argon2 parameters. Closes the timing oracle a fixed decoy only appeared to close. |
 | **D-067** | `max_connections` is a **semaphore**, not a socket cache — §8.3's last sentence is the clause that decides the shape. An exhausted pool is `451 4.4.5`, its own class. |
 | **D-068** | A dead pooled connection is retried **once**, only on a reused connection, only on a protocol error, and **never past the final dot** — which is §10.2's window. |
@@ -476,40 +479,30 @@ login runs. Four tests pin it. See `DECISIONS.md` D-066.
 
 ## 7. Outstanding non-code items
 
-**New in phase 8, and needing the spec's author:**
+**Everything that was waiting on the spec's author was answered on 2026-08-11**, and
+`SPEC.md` was amended for the first time. `DECISIONS.md`, "The spec settlements
+(after phase 10)", is the record; the short version:
 
-- **A route's `identity.envelope_from` can have a non-constant domain**, and
-  arguably should not be able to (D-064). §6.3's template grammar permits
-  `bounce@{{original.envelope_from.domain}}`, and §6.6 does not rule it out because
-  applying it twice is stable. Phase 8 handles it by declining to preflight such a
-  route and warning. But the deeper point is that *a warming route whose identity
-  domain varies per message is incoherent regardless of preflight*: the ramp, the
-  daily allowance and reputation accrual all exist to build reputation for one
-  domain, so the route warms nothing and its quota counts a mixture. That argues
-  for a §4.2 rule on `envelope_from` for **every** route, which is beyond phase 8
-  and is the spec author's call.
+| Question | Answer | Landed as |
+|---|---|---|
+| §4.1's example config fails §4.2 (D-036) | The rule is right; the example was wrong | §4.1 corrected, §4.2 carries the note |
+| Should a non-constant `envelope_from` domain be refused? (D-064) | Yes, refuse it | **D-069** — a new §4.2 rule, and code |
+| One recipient per transaction (D-047) | Confirmed | §5.6 rewritten; phase 9 struck out |
+| §2.2's ownership wording (D-061) | Reword, and record the two real constraints | §2.2 and §2.3 amended |
+| Inbound TLS, ports 465/587, the sender ACL (D-033) | Yes — build it | **The next phase.** See below |
 
-**Done since phase 7, and now needing the spec's author:**
+**The one open item, and it is now scheduled work rather than a question:**
 
-- **`docs/MULTI_INSTANCE.md`** (D-061). The multi-instance claim the repository
-  made was wrong: quota is cross-instance safe by the row lock `INSERT … ON
-  CONFLICT DO UPDATE` takes, and `tests/quota_multi_instance.rs` evidences it by
-  racing two independent pools against one database. D-007's *decision* stands —
-  simmer stays single-instance and off the spot fleet — but on the two constraints
-  that are real: config skew during a roll under D-026, and D-049's §7.3 race. The
-  document asks three questions, the first of which is whether §2.2's "one Simmer
-  instance **owns** its quota state" wants rewording, since Postgres owns it.
-  **No code changed.**
-
-**New in phase 4, and the one that needs the spec's author:**
-
-- **`SPEC.md` §4.1's example configuration fails `SPEC.md` §4.2.** Its
-  `envelope_from: "bounce+{{original.envelope_from.local}}@newbrand.com"` is a
-  relative transformation, which §1.1 constraint 1 prohibits by name and which
-  §6.6 makes a non-overridable startup error for an identity field. The stability
-  check built in this phase refuses to start on it. `simmer.yaml` was corrected
-  and `SPEC.md` was left alone — see D-036, which also notes what a VERP-shaped
-  intent *can* be expressed as.
+- **`docs/INGRESS.md` (D-033) is approved to build.** Two of its five open
+  questions were settled at the same time: `server.listen` is **replaced** by
+  `server.listeners` rather than kept as shorthand (nothing is deployed, and
+  `deny_unknown_fields` makes a stale key fail loudly), and port 25 keeps
+  `auth: optional` — the RFC-shaped default — while 465 and 587 require it. A third
+  is settled by the document's own reasoning: the ACL grants `send_as` and nothing
+  else, because a capability nobody uses is a capability nobody tests.
+  **The four `SPEC.md` passages this reverses are deliberately not yet amended** —
+  amending them before the capability exists would make the spec describe something
+  that is not there. They are amended by the phase that builds them.
 
 Carried since phase 1, none blocking:
 

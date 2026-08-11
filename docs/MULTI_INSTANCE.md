@@ -213,6 +213,14 @@ That is the finding, and it is a stronger position than §2.2 assumes.
 
 ## 7. Open questions for the spec's author
 
+> **All three answered 2026-08-11: yes, yes, and yes.** §2.2 is reworded to "v1 runs
+> a single instance; the storage layer is safe for more", with the row-lock reason
+> stated rather than implied. The §7.3 bound is accepted as a documented property
+> rather than a defect. And both constraints from §4 are written into §2.3's
+> deployment assumptions, which is where a deployer will actually meet them. No code
+> changed — the finding was always that the code was already right. See
+> `DECISIONS.md`, "The spec settlements (after phase 10)".
+
 1. **Does §2.2's wording want amending?** "One Simmer instance owns its quota
    state" describes an ownership model the code does not have and does not need.
    Postgres owns it. A form of words like *"v1 runs a single instance; the storage

@@ -647,6 +647,11 @@ would be Simmer emitting mail the application could not.
 
 ### D-036 — `SPEC.md` §4.1's example configuration fails `SPEC.md` §4.2
 
+> **Settled 2026-08-11 by the spec's author: the rule is right and the example was
+> wrong.** `SPEC.md` §4.1's example now reads `bounce@newbrand.com`, and §4.2
+> carries a note recording what it used to say and why that was prohibited. The
+> stronger rule this finding led to is D-069.
+
 **Not a decision — a finding, and one for the spec's author.**
 
 §4.1's example sets, on the warming route:
@@ -915,6 +920,13 @@ This is a §4.2 rule the spec does not list, in the same way D-034 is.
 ## Phase 6
 
 ### D-047 — Multi-recipient transactions are refused outright, and §13 phase 9 is void
+
+> **Confirmed 2026-08-11 by the spec's author.** `SPEC.md` §5.6 has been rewritten
+> to specify the refusal unconditionally; the `single_recipient_only` key, the
+> result-collapse table and §13's phase 9 are deleted from the spec, and §6.3's
+> warning about `recipient.*` templates forcing a split goes with them. This is no
+> longer a divergence — it is what the specification says. `docs/RECIPIENTS.md`
+> remains the long form of the reasoning. O-8 and O-9 stay dissolved.
 
 **Spec:** §5.6 makes `single_recipient_only` a switch defaulting to true and
 specifies, for the `false` case, splitting by route and a four-row table collapsing
@@ -1395,6 +1407,10 @@ If an override is ever wanted, it belongs in §4.1 first.
 
 ### D-064 — A route whose identity domain is not a constant is not preflighted
 
+> **Superseded in practice by D-069**, which makes that configuration a §4.2
+> startup violation. The behaviour described below is unreachable through a valid
+> configuration and is kept as defence — see D-069 for why it was not deleted.
+
 **Spec:** §6.7 checks "the outbound identity's domain". §6.3 makes
 `identity.envelope_from` a **template**.
 
@@ -1772,9 +1788,88 @@ rejection at `RCPT TO` leaves one, and the next message must not inherit it.
 
 ---
 
+## The spec settlements (after phase 10)
+
+Five questions carried for the spec's author, answered on 2026-08-11. Four were
+already-recorded findings and needed only a ruling; the fifth authorised new work.
+**`SPEC.md` was amended** — this is the first time, and it changes the standing
+rule in `CLAUDE.md`: the spec is authoritative and still is, but where a question
+has been put to its author and answered, the answer goes into the spec with a
+marker saying what it used to say, rather than accumulating as a divergence
+nobody reading the spec would see.
+
+What was amended, and what each replaced:
+
+| § | Was | Now |
+|---|---|---|
+| **2.2** | "One Simmer instance owns its quota state" | "v1 runs a single instance; the storage layer is safe for more", with the row-lock reason (D-061) |
+| **2.3** | Deployment assumption only | Plus the two real multi-instance constraints, config skew and the §7.3 bound |
+| **4.1** | `envelope_from: "bounce+{{original.envelope_from.local}}@newbrand.com"` | `bounce@newbrand.com`, with a note on why (D-036) |
+| **4.2** | — | A new rule: `envelope_from`'s domain must be a literal (D-069) |
+| **5.6** | `single_recipient_only`, defaulting true, plus a result-collapse table | One recipient per transaction, unconditionally (D-047) |
+| **6.3** | `recipient.*` in a template is a startup warning | Permitted freely; there is only ever one recipient |
+| **9.1** | `simmer_partial_delivery_total` | Marked unreachable, retained for continuity |
+| **13** | Phase 9: multi-recipient splitting | Struck through as void |
+
+Not amended yet, deliberately: §2.2's "No inbound TLS", §5.1, §2.3's plaintext
+sentence and §5.2's "advertises exactly". Those four are what D-033 reverses, and
+amending them before the capability exists would make the spec describe something
+that is not there — the same failure in the opposite direction. They are amended
+by the phase that builds them.
+
+### D-069 — A route's `envelope_from` domain must be a literal
+
+**Spec:** §4.2 had no such rule. §6.6's stability property is the closest thing and
+does not cover it.
+
+**Decision:** `config::validate` refuses to start if the part of any route's
+`identity.envelope_from` after the final `@` contains a template variable. Applies
+to **every** route, overflow included.
+
+**Why stability was not already enough.** `bounce@{{original.envelope_from.domain}}`
+passes §6.6: applied twice it gives the same answer, which is exactly what §6.6
+tests. It is nonetheless incoherent. The ramp, the daily allowance, reputation
+accrual and the `quota_usage` row are all keyed on a route having **one** outbound
+domain — that is what a warming route *is*. A route whose domain varies per message
+warms nothing, and its quota row counts a mixture of domains under a single label,
+so the ledger reads as a healthy ramp while no domain is actually being warmed.
+That is the worst available failure mode for this component: silent, and visible
+only as reputation that never improves.
+
+**Why it applies to overflow routes too**, which have no ramp: an overflow route's
+identity is the *established* domain, and "established" is equally a claim about
+one domain. A varying one there means §1.1's cutover cannot be expressed as
+application config either, which is the invariant everything else is subordinate
+to.
+
+**Why the local part is untouched.** The rule is deliberately narrow. A templated
+local part is a different question and §6.6 already owns it — it rejects the
+relative ones, which is what D-036 was about, and permits the rest. Widening this
+rule to the whole address would take a decision that belongs to §6.6 and would ban
+legitimate constructions.
+
+**What it makes unreachable.** D-064's warning — "preflight cannot check this route
+and `strict` therefore has no effect" — can no longer be reached through a valid
+configuration, and nor can `preflight::plan`'s skip. Both are kept. If the rule is
+ever relaxed, `warnings()` is what would have to notice, and rediscovering that
+reasoning from a deleted function is not a job to leave for somebody. The two tests
+that asserted the warning became tests that assert the refusal; `preflight`'s own
+tests still reach the skip by mutating a route after loading, which is the only way
+in now.
+
+---
+
 ## The multi-instance correction (after phase 7)
 
 ### D-061 — Quota **is** safe across instances; D-007's stated reason was wrong
+
+> **Settled 2026-08-11 by the spec's author, on all three questions.** §2.2's
+> ownership sentence is reworded to "v1 runs a single instance; the storage layer
+> is safe for more", with the row-lock reason stated; the §7.3 bound is accepted as
+> a documented property rather than a defect; and both real constraints — config
+> skew and that bound — are now written into §2.3's deployment assumptions where a
+> deployer will actually meet them. D-007's *decision* still stands: simmer runs
+> one instance and stays off the spot fleet.
 
 **What the repository said.** D-007 and `README.md`'s Deployment section both
 justified keeping simmer off the spot fleet by saying that the fleet's roll method
