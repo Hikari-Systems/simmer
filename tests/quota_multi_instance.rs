@@ -351,6 +351,7 @@ async fn send_through(
         cfg,
         &instance.store,
         &instance.frequency,
+        &simmer::preflight::Registry::new(),
         &chain,
         &[recipient.to_string()],
         "multi-instance-test",

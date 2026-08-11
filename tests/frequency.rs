@@ -340,6 +340,7 @@ async fn walk(
         cfg,
         store,
         &Frequency::new(),
+        &simmer::preflight::Registry::new(),
         &chain,
         &[recipient.to_string()],
         "test-correlation",

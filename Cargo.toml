@@ -166,6 +166,26 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # comparison and not another.
 subtle = "2"
 
+# --- phase 8 -------------------------------------------------------------
+
+# §6.7's DNS preflight, and §12.1's suggestion. `MIT OR Apache-2.0` for all 21
+# published versions — 20 spell it that way and `0.1.0` uses the deprecated
+# `MIT/Apache-2.0` slash syntax for the same two licences. No version has ever
+# been AGPL, which is the risk §12.1 flags for this corner of the ecosystem.
+# See LICENSES.md.
+#
+# `default-features = false` with the default set named explicitly, so a future
+# default change is a decision rather than a surprise. `system-config` reads
+# `/etc/resolv.conf`; `tokio` is the runtime. Deliberately **not** the `__tls`,
+# `__quic`, `__https` or `dnssec-*` features: SPF, DKIM and DMARC records are
+# public TXT lookups against the container's own resolver, so DoT/DoH/DNSSEC
+# would add a TLS stack and a trust decision to fetch data that is public by
+# design and whose failure mode is already non-blocking (§6.7).
+hickory-resolver = { version = "0.26", default-features = false, features = [
+    "system-config",
+    "tokio",
+] }
+
 [profile.release]
 strip = true
 lto = true

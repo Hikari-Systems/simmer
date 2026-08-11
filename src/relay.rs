@@ -53,6 +53,10 @@ pub struct Engine {
     /// use. Shared, because "generated once and persisted" is a property of the
     /// instance rather than of a message.
     pub frequency: Arc<Frequency>,
+    /// §6.7 — the last preflight pass's verdict per route, refreshed on a timer.
+    /// Shared and read-mostly: the walk consults it per message and only a
+    /// `strict` route can be eliminated by it.
+    pub preflight: Arc<crate::preflight::Registry>,
 }
 
 /// Why no route could be selected. Each maps to a specific reply, and the
@@ -215,6 +219,7 @@ pub async fn reserve_relay_commit(
         cfg,
         &engine.quota,
         &engine.frequency,
+        &engine.preflight,
         chain,
         message.recipients,
         correlation_id,

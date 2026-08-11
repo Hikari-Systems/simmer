@@ -218,6 +218,7 @@ async fn refresh_quota_gauges(state: &AdminState) -> Result<(), quota::QuotaErro
             route,
             states.get(&route.name).copied().unwrap_or_default(),
             &usage,
+            &state.engine.preflight,
             now,
         );
         crate::metrics::warmup_day(&route.name, projected.day_index);
@@ -290,7 +291,13 @@ async fn routes(
     let states = state.store().route_states().await?;
     let usage = state.store().usage_many(&keys_for(cfg, now)).await?;
 
-    Ok(Json(view::project_routes(cfg, &states, &usage, now)))
+    Ok(Json(view::project_routes(
+        cfg,
+        &states,
+        &usage,
+        &state.engine.preflight,
+        now,
+    )))
 }
 
 /// §9.2 `GET /routes/{name}`.
@@ -323,6 +330,7 @@ async fn route_by_name(
         route,
         states.get(&name).copied().unwrap_or_default(),
         &usage,
+        &state.engine.preflight,
         now,
     )))
 }
@@ -359,7 +367,7 @@ async fn quota_detail(
     let now = Utc::now();
     let states = state.store().route_states().await?;
     let usage = state.store().usage_many(&keys_for(cfg, now)).await?;
-    let projected = view::project_routes(cfg, &states, &usage, now);
+    let projected = view::project_routes(cfg, &states, &usage, &state.engine.preflight, now);
 
     let windows: Vec<serde_json::Value> = projected
         .routes

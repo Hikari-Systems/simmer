@@ -109,10 +109,15 @@ pub struct RouteView {
     pub downstream: DownstreamView,
     pub recipient_frequency: Option<FrequencyView>,
     pub groups: Vec<GroupWindow>,
-    /// §9.2 asks for preflight results. §6.7 is phase 8, so this is `null`
-    /// rather than absent: an operator reading it should see that the field
-    /// exists and has no answer, not conclude the checks passed.
-    pub preflight: Option<serde_json::Value>,
+    /// §9.2's preflight results (§6.7).
+    ///
+    /// Still `null` rather than absent when there is no answer, which is now a
+    /// statement about the route rather than about the phase: preflight is
+    /// disabled, or its identity domain is not a constant so nothing is checkable
+    /// (D-064), or the first pass has not completed. An operator must be able to
+    /// tell "no answer" from "passed" — reporting a pass we never established is
+    /// exactly the §9 lie the control plane must not tell.
+    pub preflight: Option<PreflightView>,
     /// §9.2 asks for pool statistics. There is no connection pool until phase 10
     /// (D-019) — one downstream connection per message has no states to report.
     pub pool: Option<serde_json::Value>,
@@ -125,6 +130,45 @@ pub struct RoutesView {
     pub routes: Vec<RouteView>,
 }
 
+/// §6.7's last verdict for one route, as §9.2 reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreflightView {
+    pub domain: String,
+    pub checked_at: DateTime<Utc>,
+    /// Whether a failure here actually makes the route ineligible. Without it an
+    /// operator cannot tell a warning from a block, and those call for different
+    /// responses at different hours of the night.
+    pub strict: bool,
+    pub ok: bool,
+    pub checks: Vec<PreflightCheckView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreflightCheckView {
+    pub check: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+fn preflight_view(route: &Route, registry: &crate::preflight::Registry) -> Option<PreflightView> {
+    let report = registry.report(&route.name)?;
+    Some(PreflightView {
+        domain: report.domain.clone(),
+        checked_at: report.checked_at,
+        strict: route.preflight.as_ref().is_some_and(|p| p.strict),
+        ok: report.all_ok(),
+        checks: report
+            .checks
+            .iter()
+            .map(|c| PreflightCheckView {
+                check: c.check.as_str().to_string(),
+                ok: c.ok,
+                detail: c.detail.clone(),
+            })
+            .collect(),
+    })
+}
+
 /// Everything the projection needs from storage, keyed the way it is read.
 pub type UsageByRoute = HashMap<(String, String), Usage>;
 
@@ -135,6 +179,7 @@ pub fn project_route(
     route: &Route,
     state: RouteState,
     usage: &UsageByRoute,
+    preflight: &crate::preflight::Registry,
     now: DateTime<Utc>,
 ) -> RouteView {
     let day_index = quota::day::for_route(route, now);
@@ -179,7 +224,7 @@ pub fn project_route(
         },
         recipient_frequency: route.recipient_frequency.as_ref().map(frequency_view),
         groups,
-        preflight: None,
+        preflight: preflight_view(route, preflight),
         pool: None,
     }
 }
@@ -229,6 +274,7 @@ pub fn project_routes(
     cfg: &Config,
     states: &HashMap<String, RouteState>,
     usage: &UsageByRoute,
+    preflight: &crate::preflight::Registry,
     now: DateTime<Utc>,
 ) -> RoutesView {
     RoutesView {
@@ -238,7 +284,7 @@ pub fn project_routes(
             .iter()
             .map(|route| {
                 let state = states.get(&route.name).copied().unwrap_or_default();
-                project_route(cfg, route, state, usage, now)
+                project_route(cfg, route, state, usage, preflight, now)
             })
             .collect(),
     }
@@ -336,7 +382,14 @@ routes:
     }
 
     fn view(cfg: &Config, route: &str, state: RouteState, usage: &UsageByRoute) -> RouteView {
-        project_route(cfg, cfg.route(route).unwrap(), state, usage, now())
+        project_route(
+            cfg,
+            cfg.route(route).unwrap(),
+            state,
+            usage,
+            &crate::preflight::Registry::new(),
+            now(),
+        )
     }
 
     fn window<'a>(v: &'a RouteView, group: &str) -> &'a GroupWindow {
@@ -502,6 +555,7 @@ routes:
             cfg.route("warming").unwrap(),
             RouteState::default(),
             &UsageByRoute::new(),
+            &crate::preflight::Registry::new(),
             earlier,
         );
         assert_eq!(v.status, RouteStatus::NotStarted);
@@ -522,6 +576,7 @@ routes:
                 graduated: false,
             },
             &UsageByRoute::new(),
+            &crate::preflight::Registry::new(),
             earlier,
         );
         assert_eq!(v.status, RouteStatus::Paused);
@@ -542,6 +597,7 @@ routes:
             cfg.route("warming").unwrap(),
             state,
             &UsageByRoute::new(),
+            &crate::preflight::Registry::new(),
             earlier,
         );
         assert!(v.graduated);
@@ -649,7 +705,14 @@ routes:
             },
         );
 
-        let json = serde_json::to_string(&project_routes(&cfg, &states, &usage, now())).unwrap();
+        let json = serde_json::to_string(&project_routes(
+            &cfg,
+            &states,
+            &usage,
+            &crate::preflight::Registry::new(),
+            now(),
+        ))
+        .unwrap();
         for forbidden in [
             "recipient_hash",
             "recipient_key",
@@ -699,7 +762,13 @@ routes:
         // Chain order is configuration order, and an operator reading /routes is
         // usually asking "what does the chain do next".
         let cfg = config();
-        let v = project_routes(&cfg, &HashMap::new(), &UsageByRoute::new(), now());
+        let v = project_routes(
+            &cfg,
+            &HashMap::new(),
+            &UsageByRoute::new(),
+            &crate::preflight::Registry::new(),
+            now(),
+        );
         let names: Vec<_> = v.routes.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["warming", "overflow"]);
     }
@@ -707,7 +776,13 @@ routes:
     #[test]
     fn a_route_with_no_state_row_reads_as_the_default() {
         let cfg = config();
-        let v = project_routes(&cfg, &HashMap::new(), &UsageByRoute::new(), now());
+        let v = project_routes(
+            &cfg,
+            &HashMap::new(),
+            &UsageByRoute::new(),
+            &crate::preflight::Registry::new(),
+            now(),
+        );
         assert!(!v.routes[0].paused);
         assert!(!v.routes[0].graduated);
         assert_eq!(v.routes[0].status, RouteStatus::Active);

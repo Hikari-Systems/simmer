@@ -1,4 +1,4 @@
-# Resume prompt — Simmer, after phase 7 and the multi-instance correction
+# Resume prompt — Simmer, after phase 8
 
 > Paste everything after the horizontal rule into a fresh Claude Code session
 > opened in `/home/rickk/git/hs/simmer`.
@@ -7,25 +7,26 @@
 
 We are building `simmer` in this directory — a Rust SMTP relay facade
 (`bookworm-slim` container) that applies a domain reputation warm-up ramp between
-an application and real SMTP providers. Phases 1–7 of ten are done and phase 9 is
-void, so §§4–7 and §9 are complete. The multi-instance correction that followed
-phase 7 is also done (D-061, `docs/MULTI_INSTANCE.md` — no code changed).
-**Phase 8, the DNS preflight, is next.**
+an application and real SMTP providers. Phases 1–8 of ten are done and phase 9 is
+void, so **§§4–7, §9 and now all of §6 are complete**. The multi-instance
+correction between phases 7 and 8 is done too (D-061, `docs/MULTI_INSTANCE.md` —
+no code changed). **What is left is phase 10: connection pooling, graceful
+shutdown under a real SIGTERM, and a real-certificate TLS test.**
 
 ## Read these first, in order
 
 1. `docs/SPEC.md` — **authoritative**. Never amend it; record divergences in
-   `DECISIONS.md`. §6.7 is phase 8's subject. §2.2 and §11 are what
-   `docs/MULTI_INSTANCE.md` diverges from.
+   `DECISIONS.md`. §2.2 and §11 are what `docs/MULTI_INSTANCE.md` diverges from;
+   §13's phase 10 is what is left.
 2. `CLAUDE.md` — the five constraints that will bite you, and the key-file map.
 3. `docs/STATE.md` — where the build has got to, what is tested, what is not.
    §6 ("Known gaps") and §7 ("Outstanding non-code items") are the honest list.
-4. `DECISIONS.md` — 61 decisions (D-001..D-061). **There are no open questions
+4. `DECISIONS.md` — 65 decisions (D-001..D-065). **There are no open questions
    left**: all twelve are closed or dissolved, O-11 last, by D-053.
 
 ## Where we are
 
-714 tests pass, plus 4 acceptance tests against a real stack.
+747 tests pass, plus 4 acceptance tests against a real stack.
 `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` and
 `cargo deny check` are clean. `docker compose up -d --build` comes up healthy.
 
@@ -42,7 +43,7 @@ API, a write API with an audit log, and `POST /dryrun`. `/health`, `/healthcheck
 and `/metrics` are open; everything else needs a bearer token, **including the
 reads** (D-055).
 
-**§6 is finished apart from §6.7's DNS preflight.** §7 and §9 are finished.
+**§6 is finished, §6.7 included.** §7 and §9 are finished.
 
 `hs-utils` is no longer a dependency (D-060) — there are **no git dependencies at
 all**, and `deny.toml` has no `allow-git` entry. Do not reintroduce one to reach
@@ -50,8 +51,8 @@ for a helper; copy what you need and record why.
 
 Committed and pushed on `main` (remote `origin`): phase 1, then phases 2–3, then
 five commits of planning and CI work, then phase 4, then phases 5–6, then phase 7
-together with D-060 and the multi-instance correction. The working tree is clean.
-Do not commit or push unless asked.
+together with D-060 and the multi-instance correction. **Phase 8 is in the working
+tree, uncommitted.** Do not commit or push unless asked.
 
 ---
 
@@ -88,49 +89,51 @@ since Postgres owns it.
 
 ---
 
-## Phase 8 — the DNS preflight (§6.7)
+## Done in phase 8 — the DNS preflight (§6.7), and what it left open
 
-The last of §6. `SPEC.md` §6.7 is one table and two paragraphs; read it whole.
+§6 is finished. `src/preflight/` holds the three checks, a results registry the
+chain walk reads, and a 15-minute interval task on the shutdown token; the three
+sites that were shaped for it since phase 3 are filled in — `SkipReason::Preflight`
+is constructed, `/routes` reports a real block, and `simmer_preflight_ok` has an
+emitter. `tests/preflight.rs` is 13 tests.
 
-Three checks against the outbound identity's domain, per route with
-`preflight.enabled: true`: SPF (a `v=spf1` TXT containing the configured
-`spf_include`), DKIM (`<selector>._domainkey.<domain>` resolving to a TXT with a
-non-empty `p=`), and DMARC (`_dmarc.<domain>` with `v=DMARC1`, only when
-`require_dmarc: true`). At startup and on an interval, default 15 minutes.
+**The design is non-blocking and stays that way.** A failing check is a `WARN` and
+a `0` gauge. Only `strict: true` makes a route ineligible, and then the message
+*steers* to the next link; a chain with none left is §10.3's `451` on the wire,
+which `tests/preflight.rs` asserts through a real client rather than through the
+walk's return value. **A route with no verdict yet is eligible** — fail open, so a
+slow resolver at boot cannot empty a chain (D-064).
 
-**Everything phase 8 needs is already shaped for it:**
+Four things to know before touching it:
 
-- `config::Preflight` exists with `enabled`, `spf_include`, `dkim_selector`,
-  `require_dmarc` and `strict`. An absent block means disabled, and when the block
-  is present `spf_include` and `dkim_selector` are required — D-009.
-- `chain::SkipReason::Preflight` has existed **unconstructed** since phase 3, with
-  the metric label `"preflight"` already pinned by a test.
-- `src/admin/view.rs` reports `"preflight": null` per route, deliberately, so an
-  operator can see the field exists and has no answer. Phase 8 fills it in.
-- `simmer_preflight_ok{route,check}` is the one §9.1 metric with no emitter;
-  `src/metrics.rs`'s module comment lists it as absent by dependency.
-- §12.1 suggests `hickory-resolver`. **Check its licence across every published
-  version before adopting it** and record the finding in `LICENSES.md` §8 — that
-  is a standing requirement, not a formality.
+- **The interval is a constant** (D-063). §4.1 defines no key for it and every
+  config struct is `deny_unknown_fields`, so adding one is a schema divergence.
+- **Preflight is evaluated above §7.3** in both walks (D-065) — an in-memory read
+  before a high-cardinality database one. It displaces §3.2 3b's "first" by a
+  position. Change `walk_and_reserve` and `dry_walk` together, always;
+  `tests/admin_api.rs` pins them against each other step for step.
+- **A TXT record's character-strings are concatenated** before matching. Every
+  real DKIM key is longer than 255 bytes and therefore arrives split.
+- **An empty `p=` fails DKIM.** That is how a *revoked* key is published, and it
+  resolves — so "the selector exists" would pass while every message went
+  unsigned, which is §6.5's failure precisely.
 
-### What will bite you
+`hickory-resolver` is adopted at plain DNS (no TLS/QUIC/DNSSEC features). Licence
+checked across all 21 published versions: `MIT OR Apache-2.0` throughout, no AGPL
+ever. It brings 34 packages, all permissive — recorded in `LICENSES.md` §5. Note
+the resume prompt used to say "§8" of that file; there is no §8, the sections run
+1, 2, 4, 3.
 
-- **The default is non-blocking, and that is the whole design.** A failing check
-  is a `WARN` and a `0` gauge; it does **not** prevent startup or block mail,
-  "because a DNS blip would otherwise become an outage". Only `strict: true` makes
-  a route ineligible — and then the message *steers to the next link*, exactly like
-  §7.3, and a chain with none left is §10.3's `451`. Never a drop, never a `5xx`.
-- **`strict: true` on the last link of a chain has nothing to steer to**, so it
-  stops steering and starts refusing. D-052 made exactly this a startup `WARN` for
-  `recipient_frequency`; preflight deserves the same treatment and the same
-  reasoning.
-- **The interval loop needs the shutdown token**, like `quota::sweeper::run` and
-  `frequency::sweeper::run`, and should not be started at all when no route
-  enables preflight — the phase 6 sweeper's precedent.
-- **Resolution happens against the *rewritten* identity's domain**, not the
-  incoming one. The domain to check comes from the route's `identity`, which is a
-  template — so it may not be a constant. Decide what to check when it is not, and
-  record it.
+**What it left open, and it is the more interesting half.** §6.3's grammar lets
+`identity.envelope_from` have a non-constant domain — `bounce@{{original.envelope_from.domain}}`
+— and §6.6 does not rule it out, because applied twice it is stable. Phase 8
+declines to preflight such a route and warns, saying outright that `strict` has no
+effect there (D-064). But the deeper point is that **a warming route whose identity
+domain varies per message is incoherent regardless of preflight**: the ramp, the
+allowance and reputation accrual all exist to build reputation for *one* domain, so
+such a route warms nothing and its quota counts a mixture. That argues for a §4.2
+rule on `envelope_from` for every route — beyond phase 8, and the spec author's
+call.
 
 ---
 
@@ -186,8 +189,7 @@ docker compose up -d --build      # not optional
 ```
 
 And the acceptance tier, which is not in `cargo test`. Worth running if anything
-in `src/relay.rs`, `src/routing/` or `src/rewrite/` changes — **which phase 8
-does**, since preflight adds a skip reason to the chain walk:
+in `src/relay.rs`, `src/routing/` or `src/rewrite/` changes:
 
 ```sh
 docker compose --profile acceptance up -d --build
@@ -199,7 +201,8 @@ compose silently re-creates `app` at the default warm-up instant mid-test and th
 suite measures the wrong day while appearing to pass.
 
 `DATABASE_URL` is needed only by `tests/quota*.rs`, `tests/frequency.rs`,
-`tests/admin_api.rs` and `tests/metrics_endpoint.rs` (D-031). It does not affect
+`tests/preflight.rs`, `tests/admin_api.rs` and `tests/metrics_endpoint.rs`
+(D-031). It does not affect
 the Docker build.
 
 `tests/metrics_endpoint.rs` is its own binary and every test in it takes a mutex:
@@ -216,11 +219,18 @@ its labels. If you add a metrics test, take the mutex.
   designed and not built. Reverses four `SPEC.md` passages.
 - **`docs/MULTI_INSTANCE.md`** (D-061) — quota is cross-instance safe and §2.2's
   wording assumes it is not. Three questions at the end, for the same author.
+- **A non-constant `identity.envelope_from` domain should probably be a §4.2
+  error for every route**, not just declined by preflight (D-064). See the phase 8
+  section above for why the ramp makes no sense otherwise.
 - The `smtp/auth.rs` timing defect, still unfixed and still separable: the
   unknown-username decoy hash is minted at fixed argon2 parameters while
   verification is parameter-agnostic, so an operator minting with different
   parameters silently reopens the oracle the decoy exists to close.
-- Decide whether to keep the cargo-deny licence gate (analysis in `LICENSES.md`).
+- ~~Decide whether to keep the cargo-deny licence gate.~~ Settled by D-062: it
+  stays, at Apache-2.0 compatibility, enforced by an allow-list so copyleft fails
+  by omission. Any new dependency must clear `cargo deny check` — and note the
+  `r-efi` `OR`-expression noise documented in `LICENSES.md` before reporting a
+  false positive.
 - `hs-utils` — and every hikari-systems Rust service — declares no `license`
   field. One line upstream fixes it estate-wide. No longer affects simmer, which
   dropped the dependency in phase 7 (D-060).

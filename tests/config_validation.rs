@@ -297,6 +297,85 @@ fn rejects_an_empty_admin_token() {
     rejected_for(&yaml, "must not be empty");
 }
 
+// -- §6.7: preflight warnings (phase 8) ----------------------------------
+
+#[test]
+fn warns_when_a_preflighted_route_has_no_constant_identity_domain() {
+    // The domain is only knowable per message, so there is nothing to check on an
+    // interval and the route is silently never checked (D-064). Silence is the
+    // failure mode: the block is present and looks like it is doing something.
+    let yaml = BASE.replace(
+        r#"envelope_from: "bounce@newbrand.com""#,
+        r#"envelope_from: "bounce@{{original.envelope_from.domain}}""#,
+    );
+    let cfg = load(&yaml).expect("a warning, never a startup failure (§6.7)");
+    let warnings = config::validate::warnings(&cfg);
+
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.path == "routes.warming.preflight" && w.message.contains("will not run")),
+        "expected a preflight-cannot-run warning, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn the_warning_says_outright_that_strict_has_no_effect() {
+    // The half that matters. Without this sentence an operator sets strict: true,
+    // sees no error, and believes a gate is protecting them that never runs.
+    let yaml = BASE
+        .replace(
+            r#"envelope_from: "bounce@newbrand.com""#,
+            r#"envelope_from: "bounce@{{original.envelope_from.domain}}""#,
+        )
+        .replace(
+            "require_dmarc: true",
+            "require_dmarc: true\n      strict: true",
+        );
+    let cfg = load(&yaml).expect("still only a warning");
+    let warnings = config::validate::warnings(&cfg);
+
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.path == "routes.warming.preflight" && w.message.contains("NO EFFECT")),
+        "expected the warning to name the consequence for strict, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn warns_when_preflight_strict_is_on_the_last_link_of_a_chain() {
+    // D-052's reasoning applied to §6.7: on the last link there is nothing to
+    // steer to, so a failing check answers 451 instead of routing around itself —
+    // the one outcome §6.7's non-blocking default exists to avoid.
+    let yaml = BASE.replace(
+        "  - name: overflow\n    overflow: true",
+        "  - name: overflow\n    overflow: true\n    preflight: { enabled: true, spf_include: \"a.b\", dkim_selector: \"s1\", strict: true }",
+    );
+    let cfg = load(&yaml).expect("a warning, not a violation");
+    let warnings = config::validate::warnings(&cfg);
+
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.message.contains("preflight.strict") && w.message.contains("451")),
+        "expected a last-link strict warning naming the consequence, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn a_preflighted_route_with_a_constant_domain_warns_about_nothing() {
+    // The base fixture already preflights `newbrand.com`, which is the ordinary
+    // case: no warning should be produced for it, or the two above are noise.
+    let cfg = load(BASE).expect("valid");
+    let warnings = config::validate::warnings(&cfg);
+
+    assert!(
+        !warnings.iter().any(|w| w.path.contains("preflight")),
+        "the ordinary case must be silent, got: {warnings:?}"
+    );
+}
+
 #[test]
 fn warns_about_a_short_admin_token_without_refusing_it() {
     // A judgement rather than a rule: §4.1 sets no length, and the base fixture

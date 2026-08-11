@@ -214,7 +214,56 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
         }
     }
 
+    // §6.7's `strict` on the last link, for D-052's reason exactly: with no next
+    // link the rule stops steering and starts refusing, so a DNS problem answers
+    // 451 rather than routing around itself. That is the one outcome §6.7's
+    // non-blocking default exists to avoid, and it is invisible in the config.
+    for chain in cfg.chains() {
+        let Some(last) = chain.routes.last() else {
+            continue;
+        };
+        if cfg
+            .route(last)
+            .is_some_and(|r| r.preflight.as_ref().is_some_and(|p| p.enabled && p.strict))
+        {
+            out.push(Warning {
+                path: format!("{}: {last}", chain.path),
+                message: "is the last route in this chain and sets preflight.strict, so a \
+                          failing DNS check has nothing to fall through to and the message is \
+                          answered 451 rather than steered (§6.7, §10.3)"
+                    .to_string(),
+            });
+        }
+    }
+
     for route in &cfg.routes {
+        // §6.7 — the route whose identity domain is not a constant, so there is
+        // no single domain to check on a timer (D-064).
+        //
+        // The second sentence is the point of the warning. Silence here would let
+        // an operator set `strict: true`, see no error, and believe a gate is
+        // protecting them that is not running at all.
+        if route.preflight_enabled()
+            && crate::preflight::literal_domain(&route.identity.envelope_from).is_none()
+        {
+            let strict = route.preflight.as_ref().is_some_and(|p| p.strict);
+            out.push(Warning {
+                path: format!("routes.{}.preflight", route.name),
+                message: format!(
+                    "is enabled, but identity.envelope_from ('{}') has no constant domain, so \
+                     there is nothing to check on an interval and preflight will not run for \
+                     this route (§6.7).{}",
+                    route.identity.envelope_from,
+                    if strict {
+                        " strict: true therefore has NO EFFECT here: the route is never made \
+                         ineligible, because no check ever produces a verdict"
+                    } else {
+                        ""
+                    }
+                ),
+            });
+        }
+
         // §6.6: "Startup logs a WARN naming each declared header and the route."
         for header in &route.identity.unstable_headers {
             if !is_identity_header(header) {

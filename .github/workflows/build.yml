@@ -14,8 +14,11 @@ jobs:
   # is a property test — the SPEC.md §6.6 rewrite-stability check — and a
   # property test that never runs is decoration.
   #
-  # `--locked` throughout: hs-utils is a git-tag dependency, so a silent lock
-  # bump would be a silent dependency bump.
+  # `--locked` throughout, so a silent lock bump cannot become a silent
+  # dependency bump. This was written when hs-utils was a git-tag dependency;
+  # D-060 removed it and there are no git dependencies at all now, but the
+  # reason holds for crates.io too — `cargo deny check` is only a gate on the
+  # graph that actually resolves.
   check:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 25

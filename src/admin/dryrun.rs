@@ -304,6 +304,7 @@ async fn evaluate_one(
         cfg,
         state.store(),
         &state.engine.frequency,
+        &state.engine.preflight,
         chain,
         recipient,
         now,

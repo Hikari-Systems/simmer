@@ -8,6 +8,40 @@ recorded here.
 Two checks are recorded below: the mail crates specifically (the risk the prompt
 names), and the whole resolved graph (what actually ships).
 
+## Settled: the gate stays, and it is Apache-compatible-only
+
+**Decided 2026-08-11 by the repository's owner (D-062).** This file previously
+left "whether to keep the cargo-deny licence gate" as an open question. It is
+closed: the gate stays, and the bar is that **nothing incompatible with Apache-2.0
+may enter the graph**.
+
+`deny.toml`'s `[licenses] allow` list is what enforces it, and it is an
+allow-list, not a deny-list — a licence that is not named cannot resolve, so
+GPL, AGPL, LGPL, MPL and anything else copyleft fails **by omission** rather than
+by anyone remembering to add it. Every entry on the list is permissive and
+Apache-2.0-compatible: `MIT`, `Apache-2.0`, `Apache-2.0 WITH LLVM-exception`,
+`BSD-2-Clause`, `BSD-3-Clause`, `ISC`, `0BSD`, `Zlib`, `Unicode-3.0`,
+`CDLA-Permissive-2.0`, `BSL-1.0`, `Unlicense`. CI runs `cargo deny check` on every
+push to every branch, so this is a build failure rather than a discovery.
+
+**One thing that will look like a violation and is not.** `cargo deny list`
+reports:
+
+```
+LGPL-2.1-or-later (2): r-efi@5.3.0, r-efi@6.0.0
+```
+
+`r-efi` is licensed `MIT OR Apache-2.0 OR LGPL-2.1-or-later`. It is an **`OR`**:
+we take MIT or Apache-2.0, and the LGPL option is never exercised. `cargo deny
+list` prints every licence *named in an expression*, including the branches not
+taken, which is why it appears; `cargo deny check licenses` resolves the
+expression against the allow list and passes. Verified 2026-08-11 against
+crates.io for both pinned versions. No crate in the graph imposes a copyleft
+obligation.
+
+The reasoning below predates that decision and is kept because it explains *why*
+the risk was judged low. It is no longer the operative policy — the allow list is.
+
 ## How much does copyleft actually matter here?
 
 Less than the amount of ceremony in this file implies, and it is worth being
@@ -355,6 +389,35 @@ unmaintained and published as `0.9.34+deprecated`. `serde_yaml_ng` is the
 maintained continuation and carries the same `MIT` terms.
 
 ---
+
+## 5. Phase 8 — `hickory-resolver` (§6.7's DNS preflight)
+
+§12.1 suggests it by name and requires the licence be checked **for every
+published version**, because this corner of the ecosystem is where the AGPL
+changes have happened. Checked against crates.io on 2026-08-11:
+
+| | |
+|---|---|
+| Published versions | 21 |
+| `MIT OR Apache-2.0` | 20 |
+| `MIT/Apache-2.0` | 1 — `0.1.0`, the deprecated slash spelling of the same two licences |
+| AGPL, GPL or LGPL in any version | **none** |
+
+Adopted at `0.26`, `default-features = false` with the default set named
+explicitly (`system-config`, `tokio`) so a future change to the crate's defaults
+is a decision rather than a surprise. The TLS, QUIC, HTTPS and DNSSEC features are
+deliberately off — see `DECISIONS.md` phase 8.
+
+**It brings 34 packages into the lock file**, which is the largest single
+dependency addition since phase 1 and worth recording as such. Every one is
+permissive and Apache-2.0-compatible: 25 `MIT OR Apache-2.0`, 2 `MIT`, 1
+`Apache-2.0 OR MIT`, 2 `MIT/Apache-2.0`, 3 offering `Unlicense` alongside MIT, and
+`moka` at `(MIT OR Apache-2.0) AND Apache-2.0` — an `AND`, so Apache-2.0 applies
+either way, which is inside the bar D-062 sets. A large part of the 34 never
+compiles in the shipped image at all: `jni`/`jni-sys`/`ndk-context` are Android,
+`ipconfig`/`winapi-util`/`windows-registry`/`widestring` are Windows, and
+`system-configuration` is macOS. On Linux the resolver reads `/etc/resolv.conf`
+via `resolv-conf`.
 
 ## How to re-check
 

@@ -130,6 +130,10 @@ src/rewrite/charset.rs   four charsets, by hand. Anything else is "unknown" (D-0
 src/rewrite/stability.rs §6.6's property; `validate.rs` runs it at startup. The
                          body half is `body::Rules::fixed_point_violation` (D-046)
 src/relay.rs             decide → reserve → rewrite → relay → commit/release (§7.4)
+src/preflight/mod.rs     §6.7 — the three checks, the registry, the interval loop.
+                         A route with NO report is eligible: fail open (D-064)
+src/preflight/resolver.rs  the DNS leg, behind a trait. A TXT record's strings are
+                         CONCATENATED — every real DKIM key arrives split
 src/frequency/mod.rs     §7.3 — normalisation, the keyed hash, the rolling window
 src/frequency/sweeper.rs §7.3's eviction. Hourly; not started if nothing needs it
 src/quota/postgres.rs    the §7.4 protocol. The row lock is what makes it correct
@@ -150,6 +154,8 @@ tests/rewrite_stability.rs  §6.6 as a proptest. It found two real bugs; keep it
 tests/frequency.rs       §7.3 against real Postgres, and through the relay
 tests/quota_multi_instance.rs  TWO pools, one database. Why D-007's reason was
                          wrong, and what the §7.3 race actually costs (D-061)
+tests/preflight.rs       §6.7 through the walk. A strict failure STEERS; a chain
+                         with none left is 451 on the wire, never a 5xx
 tests/admin_api.rs       §9. Pins dry run against the REAL walk, step for step
 tests/metrics_endpoint.rs  §9.1. Its own binary — one global recorder per process
 tests/acceptance.rs      §12.3 against real mail servers; behind --ignored

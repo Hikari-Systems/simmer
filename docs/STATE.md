@@ -1,7 +1,6 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-08-11, at the end of phase 7 and the multi-instance
-correction that followed it.** This is a session-handover
+**Snapshot taken 2026-08-11, at the end of phase 8.** This is a session-handover
 document, not a maintained one: `README.md` describes the service, `DECISIONS.md`
 records why it is the way it is, and `docs/SPEC.md` is authoritative over both. If
 this file disagrees with any of them, they win.
@@ -10,7 +9,7 @@ this file disagrees with any of them, they win.
 
 ## 1. Where the build has got to
 
-`SPEC.md` §13 lists ten phases. Seven are done, and one is void.
+`SPEC.md` §13 lists ten phases. Eight are done, and one is void.
 
 | Phase | | Status |
 |---|---|---|
@@ -21,7 +20,7 @@ this file disagrees with any of them, they win.
 | 5 | Body rewriting with decode/re-encode | **done** |
 | 6 | Recipient frequency: hashing, normalisation, sweeper | **done** |
 | 7 | Admin API, metrics exporter, dry-run | **done** |
-| 8 | DNS preflight | next |
+| 8 | DNS preflight | **done** |
 | 9 | Multi-recipient splitting and result collapse | **void** — D-047 refuses multi-recipient transactions outright; `docs/RECIPIENTS.md` |
 | 10 | Hardening: pooling, graceful shutdown, acceptance suite, README | acceptance suite **built in phase 4** (D-032, D-042); pooling, shutdown and real-certificate TLS outstanding |
 | 11 | *(new, beyond §13)* Listeners on 25/465/587, inbound TLS, sender ACL | **designed** — `docs/INGRESS.md`, D-033. Reverses four SPEC.md passages; needs the spec author |
@@ -31,8 +30,9 @@ this file disagrees with any of them, they win.
 Accepts a message on port 25 from a client inside `allowed_cidrs`, authenticates
 it against argon2id hashes, refuses a second `RCPT TO` (D-047), buffers the body
 (memory to 1 MiB, then an unlinked tmpfs file), matches a sender rule, resolves the
-recipient's domain group, walks the chain — **skipping a route whose
-recipient-frequency window is full** and then reserving quota under a row lock —
+recipient's domain group, walks the chain — **skipping a route whose §6.7
+preflight is failing under `strict`, or whose recipient-frequency window is
+full** and then reserving quota under a row lock —
 **rewrites the message to the selected route's identity**, forwards to that route's
 downstream over TLS, and maps the downstream's verdict back on the same
 connection — committing the quota, and recording the frequency event, only on a
@@ -73,7 +73,13 @@ Three things about it that are not obvious from §9:
   the two things that can make every message on a chain fail without anyone
   meaning it.
 
-**§6 is now complete apart from §6.7's DNS preflight**, which §13 puts in phase 8.
+**§6 is now complete.** Since phase 8 a route with a `preflight` block has its
+outbound identity's domain checked for SPF, DKIM and DMARC at startup and every
+fifteen minutes. A failure is a `WARN` and a `0` gauge and nothing else; only
+`strict: true` makes the route ineligible, and then the message *steers* to the
+next link exactly as §7.3 does. A route with no verdict yet is eligible — fail
+open, so a slow resolver at boot cannot empty a chain (D-064).
+
 Body rewriting decodes each `text/*` part's transfer encoding and charset, applies
 the route's patterns in order, and writes the part back in the encoding and charset
 it arrived with — never changing either (D-045). A part nothing matched is not
@@ -84,10 +90,10 @@ re-encoded at all, so a body with no match is forwarded as the bytes it arrived 
 
 ## 2. Verification status
 
-Everything below was run on 2026-08-11 against the phase 7 tree.
+Everything below was run on 2026-08-11 against the phase 8 tree.
 
 ```
-cargo test                                    714 passed, 0 failed
+cargo test                                    747 passed, 0 failed
 cargo clippy --all-targets -- -D warnings     clean
 cargo fmt --all -- --check                    clean
 cargo deny check                              advisories ok, bans ok, licenses ok, sources ok
@@ -103,11 +109,12 @@ cargo test --test acceptance -- --ignored --test-threads=1     4 passed, 0 faile
 
 | Suite | Tests | What it covers |
 |---|---:|---|
-| `src/` unit tests | 458 | Everything logic-heavy, in place |
+| `src/` unit tests | 474 | Everything logic-heavy, in place |
 | `tests/admin_api.rs` | 47 | §9 against the real router and real Postgres |
 | `tests/smtp_ingress.rs` | 44 | §5 ingress end to end |
-| `tests/config_validation.rs` | 46 | §4.2, one test per rule |
+| `tests/config_validation.rs` | 50 | §4.2, one test per rule |
 | `tests/quota.rs` | 30 | §7 against real Postgres |
+| `tests/preflight.rs` | 13 | §6.7 through the chain walk and onto the wire |
 | `tests/quota_multi_instance.rs` | 5 | Two independent pools, one database (D-061) |
 | `tests/relay_mapping.rs` | 28 | §10.1 against a scripted downstream, plus §6 through the relay |
 | `tests/frequency.rs` | 21 | §7.3 against real Postgres, and through the relay |
@@ -219,6 +226,9 @@ src/rewrite/         §6 the rewriting engine
   charset.rs           UTF-8, US-ASCII, ISO-8859-1, Windows-1252 (D-044)
   mod.rs               §6.1's order of operations
   stability.rs         §6.6's property, against a synthetic probe
+src/preflight/       §6.7 the DNS preflight
+  mod.rs               the three checks, the registry, the interval loop
+  resolver.rs          the DNS leg behind a trait; TXT strings concatenated
 src/models/          runtime sqlx over &PgPool, house pattern
   quota.rs             the §7.4 statements
   route_state.rs       §9.3 admin state
@@ -239,6 +249,7 @@ src/bin/loadgen.rs   the acceptance suite's bulk sender; not in the shipped imag
 tests/support/       the scripted fake downstream (§12.3)
 tests/admin_api.rs   §9 against the real router and real Postgres
 tests/quota_multi_instance.rs  two independent pools against one database (D-061)
+tests/preflight.rs   §6.7 through the walk, and 451 on the wire
 tests/metrics_endpoint.rs  §9.1 against a real recorder; its own binary
 migrations/          three: baseline (instance_config), quota (three tables),
                      recipient_event (D-048)
@@ -286,7 +297,7 @@ And two about `recipient_event`:
 
 ## 5. Decisions on record
 
-61 entries, `D-001` to `D-061`. The ones a new reader most needs:
+65 entries, `D-001` to `D-065`. The ones a new reader most needs:
 
 | | |
 |---|---|
@@ -318,6 +329,9 @@ And two about `recipient_event`:
 | **D-058** | `POST /quota/reset` recomputes `reserved` from the live reservations rather than zeroing it — an in-flight send still owns its headroom. |
 | **D-059** | §9.4's dry run runs the real engine and the real chain order, and increments no counter. `tests/admin_api.rs` pins it against `walk_and_reserve`. |
 | **D-060** | `hs-utils` is not a dependency. There are no git dependencies at all, and adding one is a decision rather than a Cargo.toml line. |
+| **D-063** | §6.7's 15-minute interval is a constant, not config: §4.1 defines no key for it. |
+| **D-064** | A route whose identity domain is not a literal is **not preflighted** — a startup `WARN` that says outright that `strict` has no effect there, never a startup error. |
+| **D-065** | Preflight is evaluated **above** §7.3 in the walk: an in-memory read before a high-cardinality database one. Displaces §3.2 3b's "first" by a position. |
 | **D-061** | **Quota *is* safe across instances**, by the row lock — D-007's stated reason was wrong from phase 3 onward. The real constraints are config skew (D-026) and §7.3's race, whose bound is `threshold + (C - 1)`, not one message. |
 
 **All twelve original open questions are now closed.** O-8 and O-9 were
@@ -333,8 +347,9 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 **Functional**
 
 - No connection pool — one downstream connection per message (D-019, phase 10).
-- No DNS preflight (phase 8), so `/routes` reports `"preflight": null` and
-  `SkipReason::Preflight` is still never constructed.
+- ~~No DNS preflight~~ — built in phase 8. `/routes` still reports
+  `"preflight": null` for a route that is not checked, which is now a statement
+  about the route rather than the phase (D-064).
 - **No scopes on admin tokens.** Every token can do everything; a token that
   could read but not mutate is a plausible next ask and is not built.
 - **Multi-recipient transactions are refused**, by policy rather than by
@@ -342,6 +357,16 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 
 **Test coverage**
 
+- **No test resolves real DNS.** Every preflight test drives
+  `preflight::resolver::Fake`, which is the right call for the record-parsing
+  logic — a test depending on somebody else's zone file is slow and flaky — but it
+  means `resolver::Hickory` itself, the one piece that talks to a network, is
+  exercised only by `docker compose up`. That gate does exercise it, against the
+  shipped config's placeholder `newbrand.com`: three checks, three `WARN`s, three
+  `0` gauges, container healthy.
+- **The preflight interval loop is not tested** — `check_once` is, `run` is not.
+  Exactly the gap the quota sweeper's `run` has; the §7.3 sweeper's loop *is*
+  covered, so these two are now the odd ones out together.
 - **No real-certificate TLS test.** `required_verify` is asserted only through its
   failure modes; the acceptance traps are plaintext. Still open, and still what
   `docs/ACCEPTANCE.md` §5 describes — the stack it needs now exists.
@@ -408,6 +433,19 @@ code, independent of D-033, and worth fixing on its own. See `DECISIONS.md`
 
 ## 7. Outstanding non-code items
 
+**New in phase 8, and needing the spec's author:**
+
+- **A route's `identity.envelope_from` can have a non-constant domain**, and
+  arguably should not be able to (D-064). §6.3's template grammar permits
+  `bounce@{{original.envelope_from.domain}}`, and §6.6 does not rule it out because
+  applying it twice is stable. Phase 8 handles it by declining to preflight such a
+  route and warning. But the deeper point is that *a warming route whose identity
+  domain varies per message is incoherent regardless of preflight*: the ramp, the
+  daily allowance and reputation accrual all exist to build reputation for one
+  domain, so the route warms nothing and its quota counts a mixture. That argues
+  for a §4.2 rule on `envelope_from` for **every** route, which is beyond phase 8
+  and is the spec author's call.
+
 **Done since phase 7, and now needing the spec's author:**
 
 - **`docs/MULTI_INSTANCE.md`** (D-061). The multi-instance claim the repository
@@ -432,9 +470,11 @@ code, independent of D-033, and worth fixing on its own. See `DECISIONS.md`
 
 Carried since phase 1, none blocking:
 
-- **Decide whether to keep the cargo-deny licence gate.** `LICENSES.md` concludes
-  copyleft is a low risk for an internal container and no crate we want is
-  copyleft. The advisories check is worth keeping regardless.
+- ~~**Decide whether to keep the cargo-deny licence gate.**~~ Closed 2026-08-11 by
+  D-062: it stays, and the bar is that nothing incompatible with Apache-2.0 enters
+  the graph. Already in that shape and enforced in CI; verified, including the
+  `r-efi` `OR`-expression that makes `cargo deny list` print `LGPL-2.1-or-later`
+  without any LGPL obligation being taken.
 - ~~**`hs-utils` declares no `license` field**, and nor does any hikari-systems
   Rust service.~~ No longer simmer's problem: D-060 removed the dependency, and
   with it `deny.toml`'s `ignore-sources` exemption *and* its `allow-git` list.
@@ -459,8 +499,18 @@ Committed so far:
 | `Phase 4: the rewriting engine, and the acceptance harness` | 452 tests + 4 acceptance |
 | `Phases 5 and 6: body rewriting, one recipient, recipient frequency` | 593 tests + 4 acceptance |
 | `Phase 7 and the multi-instance correction: the control plane, and D-007's reason` | 714 tests + 4 acceptance |
+| `Phase 8: the DNS preflight, and the licence gate settled` | 747 tests + 4 acceptance |
 
-`main` is pushed through the phase 7 commit.
+**`main` is pushed through the phase 7 commit; the phase 8 commit is local.** The
+working agreement is to commit only when asked, and pushing was not asked for.
+
+**Phase 8 is one commit and did not need to be more.** Unlike every other
+boundary in this table it was built from a clean tree — phase 7 and the
+multi-instance correction went in first — so there was no interleaving to
+untangle. It carries D-062 (the licence gate) alongside D-063..D-065 because
+D-062 is what authorised the `hickory-resolver` adoption the phase depends on:
+the gate was verified *before* the dependency was added, and separating them would
+put the dependency in a commit whose licence policy was still an open question.
 
 **Why phase 7 and the multi-instance correction share a commit.** The same reason
 as phases 5 and 6. The correction changed no code — it added

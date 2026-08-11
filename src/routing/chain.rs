@@ -104,10 +104,19 @@ pub enum Walk<'a> {
 }
 
 /// §3.2 step 3, for real: walk and reserve.
+///
+/// `smtp::mod::handle`'s precedent on the argument count. The four collaborators
+/// — store, frequency, preflight, and the evaluation buffer — are passed
+/// explicitly rather than bundled because that is what lets a test drive the walk
+/// with a real store and a synthetic registry, which is most of how §6.7 and §7.3
+/// are tested at all. A `Deps` struct would move the same four values behind one
+/// name and buy nothing.
+#[allow(clippy::too_many_arguments)]
 pub async fn walk_and_reserve<'a>(
     cfg: &'a Config,
     store: &Arc<dyn QuotaStore>,
     frequency: &Frequency,
+    preflight: &crate::preflight::Registry,
     chain: &[String],
     recipients: &[String],
     correlation_id: &str,
@@ -142,6 +151,20 @@ pub async fn walk_and_reserve<'a>(
         // (a) paused.
         if state.paused {
             record(evaluation, name, Err(SkipReason::Paused));
+            continue;
+        }
+
+        // (a2) §6.7 preflight, when `strict: true`. An in-memory read of the last
+        // interval's result, so it sits above §7.3's indexed database read — the
+        // cheapest check that can eliminate a route goes first. §3.2 3b calls
+        // frequency "evaluated first", which this displaces by one position; the
+        // two never disagree, because a route eliminated here is eliminated
+        // whatever §7.3 would have said (D-065).
+        //
+        // Non-strict routes never reach `blocks`, and a route with no report
+        // fails open — a slow resolver at boot must not empty a chain.
+        if preflight.blocks(route) {
+            record(evaluation, name, Err(SkipReason::Preflight));
             continue;
         }
 
@@ -248,8 +271,8 @@ pub async fn walk_and_reserve<'a>(
 /// §9.4 — walk a chain and report what *would* happen, reserving nothing.
 ///
 /// The order of the checks below is `walk_and_reserve`'s order, deliberately and
-/// fragilely: paused, then §7.3 frequency, then §7.2's start instant, then
-/// headroom. A dry run that evaluated them in a different order would report a
+/// fragilely: paused, then §6.7 preflight, then §7.3 frequency, then §7.2's start
+/// instant, then headroom. A dry run that evaluated them in a different order would report a
 /// different reason for the same route, and the reason is the entire product —
 /// "why did this message not go via the warming route" is the question the
 /// endpoint exists to answer. `tests/admin_api.rs` asserts the two agree rather
@@ -268,6 +291,7 @@ pub async fn dry_walk(
     cfg: &Config,
     store: &Arc<dyn QuotaStore>,
     frequency: &Frequency,
+    preflight: &crate::preflight::Registry,
     chain: &[String],
     recipient: &str,
     now: chrono::DateTime<Utc>,
@@ -289,6 +313,12 @@ pub async fn dry_walk(
 
         if state.paused {
             evaluation.push(step(name, Err(SkipReason::Paused)));
+            continue;
+        }
+
+        // §6.7, in `walk_and_reserve`'s position. See that function's (a2).
+        if preflight.blocks(route) {
+            evaluation.push(step(name, Err(SkipReason::Preflight)));
             continue;
         }
 

@@ -340,6 +340,17 @@ impl Simmer {
     }
 
     pub async fn start_with_quota(yaml: &str, quota: Arc<dyn QuotaStore>) -> Simmer {
+        Simmer::start_with(yaml, quota, Arc::new(simmer::preflight::Registry::new())).await
+    }
+
+    /// With a §6.7 preflight registry already populated, so `tests/preflight.rs`
+    /// can drive a `strict` route's failure all the way to the client reply
+    /// rather than stopping at the chain walk.
+    pub async fn start_with(
+        yaml: &str,
+        quota: Arc<dyn QuotaStore>,
+        preflight: Arc<simmer::preflight::Registry>,
+    ) -> Simmer {
         let config = simmer::config::from_str(yaml, "test-config").unwrap_or_else(|e| {
             panic!("test config is invalid:\n{e}");
         });
@@ -355,6 +366,7 @@ impl Simmer {
             registry: ReservationRegistry::new(),
             rewriters: Arc::new(rewriters),
             frequency: Arc::new(Frequency::new()),
+            preflight,
         };
 
         let listener = smtp::Listener::bind(engine).await.expect("bind simmer");

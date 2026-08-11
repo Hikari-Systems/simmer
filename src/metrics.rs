@@ -17,7 +17,6 @@
 //!
 //! - `simmer_pool_connections{route,state}` — there is no connection pool until
 //!   phase 10 (D-019). One connection per message has no states to report.
-//! - `simmer_preflight_ok{route,check}` — §6.7's DNS preflight is phase 8.
 //! - `simmer_partial_delivery_total` — void. It counts a transaction whose
 //!   recipients did not all share an outcome, and D-047 makes that unreachable.
 
@@ -323,6 +322,24 @@ pub fn quota_reserved(route: &str, domain_group: &str, reserved: f64) {
         "domain_group" => domain_group.to_string(),
     )
     .set(reserved);
+}
+
+/// §9.1 `simmer_preflight_ok{route,check}` — §6.7's three checks, as 1 or 0.
+///
+/// A gauge rather than a counter because it is a *state*: "SPF is currently
+/// wrong for this route" is the thing worth alerting on, and it stays wrong until
+/// somebody edits a DNS zone. `check` is one of `spf`, `dkim`, `dmarc`.
+///
+/// Only routes preflight actually checks ever emit this. A route with the block
+/// absent, disabled, or with a non-constant identity domain (D-064) publishes no
+/// series at all rather than a misleading `1`.
+pub fn preflight_ok(route: &str, check: &str, ok: bool) {
+    metrics::gauge!(
+        "simmer_preflight_ok",
+        "route" => route.to_string(),
+        "check" => check.to_string(),
+    )
+    .set(if ok { 1.0 } else { 0.0 });
 }
 
 /// §9.1 `simmer_warmup_day{route}`.

@@ -152,6 +152,33 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // §6.7 — "checks run at startup and on an interval". The startup pass is
+    // here, before the listener binds, so that a `strict` route is never selected
+    // on the strength of an answer nobody has looked up yet.
+    //
+    // Everything about this is non-blocking by construction: a resolver that
+    // cannot even be built is a WARN and an empty registry, and an empty registry
+    // blocks nothing (§6.7 — "a DNS blip would otherwise become an outage").
+    let preflight = Arc::new(simmer::preflight::Registry::new());
+    let preflight_plans = simmer::preflight::plan(&config);
+    let mut preflight_resolver = None;
+    if preflight_plans.is_empty() {
+        info!("no route has a checkable preflight block; DNS preflight not started");
+    } else {
+        match simmer::preflight::resolver::Hickory::from_system() {
+            Ok(r) => {
+                let r: Arc<dyn simmer::preflight::resolver::TxtResolver> = Arc::new(r);
+                simmer::preflight::check_once(&preflight_plans, r.as_ref(), &preflight).await;
+                preflight_resolver = Some(r);
+            }
+            Err(e) => warn!(
+                error = %e,
+                "DNS resolver unavailable; preflight will not run. Routes are unaffected \
+                 — a route with no preflight result is eligible (§6.7)"
+            ),
+        }
+    }
+
     let engine = relay::Engine {
         config: Arc::clone(&config),
         tls: Arc::new(tls),
@@ -159,6 +186,7 @@ async fn run() -> anyhow::Result<()> {
         registry: quota::ReservationRegistry::new(),
         rewriters: Arc::new(rewriters),
         frequency,
+        preflight: Arc::clone(&preflight),
     };
 
     // §5.1 — bind before announcing readiness, so a port clash is a startup
@@ -205,6 +233,17 @@ async fn run() -> anyhow::Result<()> {
         ))
     });
 
+    // §6.7's interval. Not started when nothing is checkable, or when the
+    // resolver could not be built — the phase 6 sweeper's precedent.
+    let preflight_task = preflight_resolver.map(|resolver| {
+        tokio::spawn(simmer::preflight::run(
+            preflight_plans,
+            resolver,
+            Arc::clone(&preflight),
+            stop_accepting.clone(),
+        ))
+    });
+
     let admin_task = {
         let stop = stop_accepting.clone();
         tokio::spawn(async move {
@@ -238,6 +277,9 @@ async fn run() -> anyhow::Result<()> {
     let _ = smtp_task.await;
     let _ = sweeper.await;
     if let Some(task) = frequency_sweeper {
+        let _ = task.await;
+    }
+    if let Some(task) = preflight_task {
         let _ = task.await;
     }
     let _ = admin_task.await;

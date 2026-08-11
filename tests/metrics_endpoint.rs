@@ -105,6 +105,7 @@ fn state(pool: PgPool) -> AdminState {
             frequency: Arc::new(simmer::frequency::Frequency::with_salt(
                 b"test salt".to_vec(),
             )),
+            preflight: Arc::new(simmer::preflight::Registry::new()),
         },
         metrics: Some(handle()),
     }
@@ -314,6 +315,7 @@ async fn a_route_that_has_not_started_reports_a_ceiling_of_zero_not_infinity(poo
             frequency: Arc::new(simmer::frequency::Frequency::with_salt(
                 b"test salt".to_vec(),
             )),
+            preflight: Arc::new(simmer::preflight::Registry::new()),
         },
         metrics: Some(handle()),
     };

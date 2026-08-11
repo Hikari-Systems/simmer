@@ -116,6 +116,7 @@ fn state_from(pool: PgPool, cfg: Config) -> AdminState {
             frequency: Arc::new(simmer::frequency::Frequency::with_salt(
                 b"test salt".to_vec(),
             )),
+            preflight: Arc::new(simmer::preflight::Registry::new()),
         },
         // No recorder: `metrics` allows exactly one per process and installing it
         // here would fail in whichever test ran second.
@@ -522,6 +523,7 @@ async fn a_paused_route_is_skipped_by_the_real_chain_walk(pool: PgPool) {
         &state.engine.config,
         &store(&state),
         &state.engine.frequency,
+        &state.engine.preflight,
         &["warming".to_string(), "overflow".to_string()],
         &["someone@gmail.com".to_string()],
         "test",
@@ -1141,6 +1143,7 @@ async fn compare_walks(state: &AdminState, recipient: &str) -> (String, String) 
         cfg,
         &store(state),
         &state.engine.frequency,
+        &state.engine.preflight,
         &chain,
         recipient,
         Utc::now(),
@@ -1153,6 +1156,7 @@ async fn compare_walks(state: &AdminState, recipient: &str) -> (String, String) 
         cfg,
         &store(state),
         &state.engine.frequency,
+        &state.engine.preflight,
         &chain,
         &[recipient.to_string()],
         "compare",

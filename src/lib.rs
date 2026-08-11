@@ -19,6 +19,7 @@ pub mod healthcheck;
 pub mod logging;
 pub mod metrics;
 pub mod models;
+pub mod preflight;
 pub mod quota;
 pub mod relay;
 pub mod rewrite;

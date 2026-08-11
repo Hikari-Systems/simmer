@@ -1372,6 +1372,116 @@ exists rather than that this crate declines to call it.
 
 ---
 
+## Phase 8 — the DNS preflight
+
+### D-063 — The preflight interval is a constant, not configuration
+
+**Spec:** §6.7 — "Checks run at startup and on an interval (default 15 minutes)."
+§4.1's `preflight:` block lists `enabled`, `spf_include`, `dkim_selector` and
+`require_dmarc`, and no interval key. §6.7's prose also names `strict`, which
+§4.1 omits but which the schema has carried since phase 1.
+
+**Decision:** 15 minutes as a `const` in `src/preflight/mod.rs`. No config key.
+
+**Why:** "default 15 minutes" implies an override, but §4.1 is the schema and it
+defines nowhere to put one. Every config struct is `deny_unknown_fields`, so
+inventing `preflight.interval` would be a schema divergence — and for a value with
+no reader: the thing being observed is a DNS zone somebody edits by hand, and
+nothing about SPF or DKIM provisioning changes on a timescale where 15 minutes
+versus 5 matters. `strict` is the opposite case and is kept, because §6.7's prose
+specifies its *behaviour* in detail; an interval has no behaviour to specify.
+
+If an override is ever wanted, it belongs in §4.1 first.
+
+### D-064 — A route whose identity domain is not a constant is not preflighted
+
+**Spec:** §6.7 checks "the outbound identity's domain". §6.3 makes
+`identity.envelope_from` a **template**.
+
+**The problem, which the spec does not anticipate.** A template's domain need not
+be a constant: `bounce@{{original.envelope_from.domain}}` means "whatever domain
+the message arrived with", and there is then no single domain to check on a timer.
+§6.6 does not rule this out — applied twice that template gives the same answer,
+which is exactly the property §6.6 tests — so it is reachable configuration.
+
+**Decision:** `preflight::literal_domain` takes the domain when the template's
+domain part contains no `{{`. When it does not, the route is **not planned**:
+preflight never runs for it, `/routes` reports `preflight: null`, no
+`simmer_preflight_ok` series is published, and `config::validate::warnings` emits a
+startup `WARN`. **Never a startup error**, including with `strict: true`.
+
+**Why not check a rendered sample.** Rendering the template against the synthetic
+probe `validate.rs` already uses would always produce an answer — about a domain no
+real message uses. A check reporting confidently on the wrong domain is worse than
+one that declines, particularly for a feature whose entire purpose (§6.5) is to
+catch a discrepancy nothing else reveals.
+
+**Why not a fatal error, which was the first proposal.** Two reasons, and the
+second is the real one. §6.7's whole posture is that preflight must not be able to
+stop the service — a config quirk is a poor exception to that. And the deeper
+observation, raised while settling this: a *warming route whose identity domain
+varies per message is incoherent regardless of preflight*. The ramp, the daily
+allowance and reputation accrual all exist to build reputation for one domain, so
+such a route is not warming anything and its quota counts a mixture. That argues
+for a §4.2 rule on `envelope_from` itself, applying to every route rather than only
+preflighted ones — a bigger change than phase 8, and one for the spec's author,
+since §6.3's grammar permits the template today. **Recorded as an open item rather
+than built.**
+
+**The warning names the consequence for `strict` explicitly**, in those words:
+
+> strict: true therefore has NO EFFECT here: the route is never made ineligible,
+> because no check ever produces a verdict
+
+Silence there was the failure mode. An operator sets `strict: true`, sees no error,
+and believes a gate is protecting them that is not running at all — a §9-shaped lie
+told by the config layer instead of the control plane.
+
+### D-065 — Preflight is evaluated above §7.3 in the chain walk
+
+**Spec:** §3.2 3b calls the recipient-frequency check "evaluated **first** — it can
+eliminate routes outright". §6.7 says a failing `strict` check "makes the route
+ineligible for selection" without saying where in the order.
+
+**Decision:** `paused → preflight → frequency → not started → quota`, in both
+`walk_and_reserve` and `dry_walk`. Confirmed with the repository's owner.
+
+**Why:** preflight is an in-memory read of the last interval's result; §7.3 is a
+high-cardinality indexed read against Postgres per recipient. The cheapest check
+that can eliminate a route goes first, and the two can never disagree — a route
+eliminated by preflight is eliminated whatever §7.3 would have said, so the order
+changes cost and not outcome. It displaces §3.2 3b's "first" by one position, which
+is why it is written down.
+
+The `dry_walk` half is not optional: §9.4's whole product is *which reason* a route
+was skipped for, and `tests/admin_api.rs` pins the two walks against each other
+step for step.
+
+### What phase 8 also decided, without needing an entry
+
+- **Fail open when nothing is known.** A `strict` route with no report yet — the
+  first pass has not finished, or the resolver could not be built at all — is
+  **eligible**. Treating "not yet checked" as a failure would turn a slow resolver
+  at boot into a chain-wide outage, the exact outcome §6.7's non-blocking default
+  exists to prevent. `tests/preflight.rs` asserts it.
+- **`strict: true` on the last link of a chain is a startup `WARN`**, D-052's
+  reasoning transplanted: with no next link the rule stops steering and starts
+  refusing, so a DNS problem answers `451` instead of routing around itself.
+- **A TXT record's character-strings are concatenated** before matching. Not
+  pedantry: a 2048-bit DKIM key does not fit in one 255-byte string, so *every*
+  real DKIM record arrives split, and a resolver returning them separately would
+  find `p=` truncated and report a working selector as broken.
+- **An empty `p=` fails the DKIM check.** That is precisely how a *revoked* key is
+  published, and it resolves — so a test for mere existence would pass while every
+  message went unsigned, which is §6.5's failure exactly.
+- **`hickory-resolver` is taken at plain DNS**, with `__tls`, `__quic`, `__https`
+  and `dnssec-*` all off. SPF, DKIM and DMARC records are public TXT lookups
+  against the container's own resolver; DoT/DoH/DNSSEC would add a TLS stack and a
+  trust decision to fetch data that is public by design, whose failure mode is
+  already non-blocking.
+
+---
+
 ## Phase 10 (partly built in phase 4)
 
 ### D-032 — The acceptance harness is a compose profile with two Mailpit traps
@@ -1613,6 +1723,40 @@ That exercise also corrected the mechanism test itself, twice.
   after it has already decided it has headroom from a stale read. The assertion
   with the teeth is the one about *what it decided*, not the one about whether it
   waited.
+
+### D-062 — The cargo-deny licence gate stays, at Apache-2.0 compatibility
+
+**Open since phase 1**, as "decide whether to keep the cargo-deny licence gate".
+`LICENSES.md` concluded copyleft was a low risk for an internal container that is
+never distributed, which made the gate arguably ceremony.
+
+**Decided 2026-08-11 by the repository's owner: keep it, and the bar is that
+nothing incompatible with Apache-2.0 enters the graph.**
+
+Nothing needed building — the gate was already in this shape — so this entry
+records the decision and the verification rather than a change:
+
+- `deny.toml`'s `[licenses] allow` is an **allow-list**, so copyleft fails by
+  omission rather than by anyone remembering to add a rule. Every entry is
+  permissive and Apache-2.0-compatible.
+- CI runs `cargo deny check` on every push to every branch, and it is the same
+  bare command the README tells a developer to run.
+- `[licenses.private] ignore = true` covers exactly one crate — `simmer` itself,
+  which sets `publish = false`. A third-party crate with no `license` field still
+  fails, and since D-060 removed the `ignore-sources` exemption there is no
+  crate in the graph relying on one.
+
+**The one finding worth writing down.** `cargo deny list` reports
+`LGPL-2.1-or-later (2): r-efi@5.3.0, r-efi@6.0.0`, which reads as a violation and
+is not: `r-efi` is `MIT OR Apache-2.0 OR LGPL-2.1-or-later`, an `OR`, so the LGPL
+branch is never taken. `cargo deny list` prints every licence *named* in an
+expression including branches not taken; `cargo deny check licenses` resolves it
+and passes. Verified against crates.io for both pinned versions. It is recorded in
+`LICENSES.md` because the next person to run `list` will otherwise re-derive it in
+a hurry.
+
+Also fixed while here: `.github/workflows/build.yml`'s `--locked` comment still
+justified itself by hs-utils being a git-tag dependency, which D-060 removed.
 
 ---
 
