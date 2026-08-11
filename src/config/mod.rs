@@ -164,7 +164,7 @@ impl fmt::Debug for User {
 #[serde(deny_unknown_fields)]
 pub struct Database {
     /// A libpq-style URL. §4.1 specifies a URL rather than the discrete fields
-    /// `hs_utils::db::DbConfig` wants, so the pool is built directly — see
+    /// the house `DbConfig` wants, so the pool is built directly — see
     /// `DECISIONS.md` D-005.
     pub url: String,
     #[serde(default = "default_db_max_connections")]
@@ -197,7 +197,60 @@ impl fmt::Debug for Database {
 #[serde(deny_unknown_fields)]
 pub struct Admin {
     pub listen: String,
-    pub auth_token: String,
+    /// §4.1's single shared token. Still the ordinary spelling, and still what
+    /// the example configuration uses; it is the token named
+    /// [`Admin::DEFAULT_TOKEN_NAME`].
+    #[serde(default)]
+    pub auth_token: Option<String>,
+    /// O-11 — §9.3 logs every mutation "with the acting token's identifier",
+    /// which a single scalar cannot supply. Named tokens give that line a name
+    /// an operator recognises without changing anything else about the
+    /// mechanism. See `DECISIONS.md` D-053.
+    #[serde(default)]
+    pub tokens: Vec<AdminToken>,
+}
+
+/// One named §9.3 credential.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminToken {
+    /// What the audit log calls whoever presents this token.
+    pub name: String,
+    pub token: String,
+}
+
+impl fmt::Debug for AdminToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdminToken")
+            .field("name", &self.name)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Admin {
+    /// The name `auth_token` is logged under. Chosen rather than `admin` so that
+    /// an audit trail makes the difference between "the shared token" and a
+    /// named one visible at a glance.
+    pub const DEFAULT_TOKEN_NAME: &'static str = "default";
+
+    /// Every configured credential as `(name, token)`, `auth_token` first.
+    ///
+    /// §4.2 guarantees this is non-empty, that the names are unique, and that no
+    /// two entries share a secret — without that last rule the audit line would
+    /// be a coin flip between two names.
+    pub fn credentials(&self) -> Vec<(&str, &str)> {
+        let mut out = Vec::with_capacity(self.tokens.len() + 1);
+        if let Some(token) = self.auth_token.as_deref() {
+            out.push((Self::DEFAULT_TOKEN_NAME, token));
+        }
+        out.extend(
+            self.tokens
+                .iter()
+                .map(|t| (t.name.as_str(), t.token.as_str())),
+        );
+        out
+    }
 }
 
 impl fmt::Debug for Admin {
@@ -205,6 +258,7 @@ impl fmt::Debug for Admin {
         f.debug_struct("Admin")
             .field("listen", &self.listen)
             .field("auth_token", &"<redacted>")
+            .field("tokens", &self.tokens)
             .finish()
     }
 }
@@ -682,6 +736,13 @@ pub fn from_str(text: &str, origin: &str) -> Result<Config, LoadError> {
     Ok(config)
 }
 
+/// One chain, with a path naming where in the document it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedChain<'a> {
+    pub path: String,
+    pub routes: &'a [String],
+}
+
 impl Config {
     pub fn route(&self, name: &str) -> Option<&Route> {
         self.routes.iter().find(|r| r.name == name)
@@ -693,6 +754,33 @@ impl Config {
 
     pub fn catchall_group(&self) -> Option<&DomainGroup> {
         self.domain_groups.iter().find(|g| g.is_catchall())
+    }
+
+    /// Every chain in the configuration: one per sender rule, plus the default.
+    ///
+    /// §4.2 uses it to check each chain's shape; §9.3 uses it to work out which
+    /// chains a mutation has just left with nothing eligible, which is the
+    /// difference between an operator pausing a route and an operator answering
+    /// every message `451` without meaning to.
+    pub fn chains(&self) -> Vec<NamedChain<'_>> {
+        let mut out: Vec<NamedChain<'_>> = self
+            .senders
+            .iter()
+            .enumerate()
+            .map(|(i, rule)| NamedChain {
+                path: format!("senders[{i}] (match '{}').chain", rule.pattern),
+                routes: &rule.chain,
+            })
+            .collect();
+
+        if let Some(default) = self.default_chain.as_deref() {
+            out.push(NamedChain {
+                path: "default_chain".to_string(),
+                routes: default,
+            });
+        }
+
+        out
     }
 
     /// Every route a message could actually be sent through: the union of all

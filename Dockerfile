@@ -28,8 +28,11 @@ COPY simmer.yaml simmer.acceptance.yaml ./
 RUN find src -name '*.rs' -exec touch {} + \
     && cargo build --release --locked
 
-# --locked throughout: hs-utils is a git-tag dependency, so a silent lock bump
-# would be a silent dependency bump.
+# --locked throughout. The original reason was that hs-utils was a git-tag
+# dependency, and a git tag is mutable — but D-060 removed it and the flag stays:
+# an image is meant to be reproducible from a commit, and a build that is allowed
+# to rewrite Cargo.lock is not. Without it the resolver would silently pick up
+# whatever a semver-compatible release brought that morning.
 
 FROM debian:bookworm-slim AS runtime
 

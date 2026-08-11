@@ -28,18 +28,15 @@ confidence-threshold = 0.9
 # warn about the ones nothing has matched.
 unused-allowed-license = "allow"
 
-# Crates with no `license` field at all. Two of them, both in-house:
+# Crates with no `license` field at all. Exactly one now: `simmer` itself, which
+# sets `publish = false` to say so deliberately.
 #
-#   * `simmer` itself, which sets `publish = false`.
-#   * `hs-utils`, consumed by git tag from a private repository. Every
-#     hikari-systems Rust service has this gap; it is a metadata omission rather
-#     than a licensing risk, and the fix belongs upstream in hs-utils-rs.
-#
-# Scoped to that one git source rather than switching the check off, so a third
-# -party crate with no licence still fails. See LICENSES.md §2.
+# `hs-utils` used to be the other, and needed an `ignore-sources` exemption for
+# the git source it came from. D-060 removed that dependency — its one used
+# module is stdlib-only and now lives in `src/healthcheck.rs` — so the exemption
+# is gone and a third-party crate with no licence still fails. See LICENSES.md §2.
 [licenses.private]
 ignore = true
-ignore-sources = ["https://github.com/Hikari-Systems/hs-utils-rs"]
 
 [bans]
 # Any copyleft licence fails by omission from the allow list above — there is no
@@ -53,6 +50,9 @@ yanked = "deny"
 
 [sources]
 unknown-registry = "deny"
+# No `allow-git` list, deliberately: since D-060 there are no git dependencies at
+# all, so this now denies *every* one of them. Adding a git dependency is a
+# decision, and it should have to be made here rather than in a Cargo.toml line
+# nobody reviews — a git tag is mutable, which is the whole reason the Dockerfile
+# builds `--locked`.
 unknown-git = "deny"
-# hs-utils is consumed by git tag, per the house convention.
-allow-git = ["https://github.com/Hikari-Systems/hs-utils-rs"]

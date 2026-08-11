@@ -39,7 +39,8 @@ kept because:
 
 The genuinely useful thing the check surfaced was not copyleft at all: it was
 that `hs-utils`, and by extension every hikari-systems Rust service, declares no
-`license` field (§2 below).
+`license` field (§2 below). Simmer no longer depends on it (D-060), so that is
+now an upstream note rather than a finding about this crate.
 
 **If you would rather not carry a licence gate in CI, say so** — deleting the
 `cargo deny check` step and `deny.toml` costs nothing and loses nothing that the
@@ -93,45 +94,58 @@ required before adopting them, not after.
 
 ## 2. The whole resolved graph
 
-241 third-party packages. **No copyleft licence appears anywhere** — no GPL, no
-AGPL, no LGPL, no MPL, no SSPL, no EPL, no CDDL.
+Re-counted 2026-08-11, after phase 7's additions and D-060's removal:
+**293 third-party packages** including dev-dependencies, up from 241 at phase 1.
+**No copyleft licence is imposed on anything here.**
 
 | Count | Licence |
 |---|---|
-| 135 | `MIT OR Apache-2.0` |
-| 38 | `MIT` |
-| 19 | `Apache-2.0 OR MIT` |
+| 161 | `MIT OR Apache-2.0` |
+| 44 | `MIT` |
+| 25 | `Apache-2.0 OR MIT` |
 | 18 | `Unicode-3.0` |
-| 7 | `MIT/Apache-2.0` (deprecated SPDX slash syntax) |
+| 12 | `MIT/Apache-2.0` (deprecated SPDX slash syntax) |
+| 5 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` |
 | 3 | `Unlicense OR MIT` |
-| 2 | `ISC` |
-| 2 | `Apache-2.0 OR BSL-1.0 OR MIT` |
-| 2 | `CDLA-Permissive-2.0` |
-| 2 | `BSD-2-Clause OR Apache-2.0 OR MIT` |
-| 1 each | `Apache-2.0`, `Apache-2.0/MIT`, `Apache-2.0 AND ISC`, `Apache-2.0 OR ISC OR MIT`, `Apache-2.0 OR BSL-1.0`, `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`, `BSD-3-Clause`, `MIT AND BSD-3-Clause`, `MIT OR Apache-2.0 OR Zlib`, `Zlib`, `Zlib OR Apache-2.0 OR MIT`, `(MIT OR Apache-2.0) AND Unicode-3.0` |
-| 1 | **none declared** — see below |
+| 2 each | `ISC`, `Apache-2.0`, `Zlib`, `CDLA-Permissive-2.0`, `Apache-2.0 OR ISC OR MIT`, `Apache-2.0 OR BSL-1.0 OR MIT`, `BSD-2-Clause OR Apache-2.0 OR MIT`, `MIT OR Apache-2.0 OR LGPL-2.1-or-later` |
+| 1 each | `Apache-2.0/MIT`, `Apache-2.0 AND ISC`, `Apache-2.0 OR BSL-1.0`, `BSD-3-Clause`, `MIT AND BSD-3-Clause`, `MIT AND Apache-2.0`, `MIT OR Apache-2.0 OR Zlib`, `Zlib OR Apache-2.0 OR MIT`, `(MIT OR Apache-2.0) AND Unicode-3.0` |
+| 0 | **none declared** — see below |
 
-### The finding: two crates declare no licence, both in-house
+**One nuance the phase 1 wording got wrong, and it is worth stating precisely.**
+That earlier text claimed "no LGPL appears anywhere". Two packages — `r-efi`
+5.3.0 and 6.0.0 — are `MIT OR Apache-2.0 OR LGPL-2.1-or-later`. That is an `OR`,
+so the LGPL is an *option we decline*: we take it under MIT, and no copyleft
+obligation attaches. `cargo-deny` accepts it for the same reason. `r-efi` is UEFI
+target support reached through `getrandom`'s target-specific dependencies and is
+never compiled for `x86_64-unknown-linux-gnu`, so it is not in the shipped binary
+either. Both facts are true; only the second is load-bearing, and the first is
+enough on its own.
 
-`cargo deny check licenses` initially failed on two, and both are ours:
+### The finding: two crates declared no licence, both in-house — now one
+
+`cargo deny check licenses` initially failed on two, and both were ours:
 
 - **`simmer` itself.** Fixed by `publish = false` in `Cargo.toml`, which is
   accurate — this is a service, not a library, and it never goes to crates.io.
   (Amusingly, `cargo-deny` had also picked up *this file* as a candidate licence
   text and scored it 0.03. `publish = false` settles that too.)
-- **`hs-utils 0.31.2`**, which has no `license` field. It is the in-house shared
-  crate consumed by git tag from a private repository, so this is a metadata gap
-  rather than a licensing risk — but it means an automated check cannot
+- **`hs-utils 0.31.2`**, which has no `license` field. It was the in-house shared
+  crate consumed by git tag from a private repository, so this was a metadata gap
+  rather than a licensing risk — but it meant an automated check could not
   distinguish "in-house, fine" from "unlicensed, not fine", and **every
   hikari-systems Rust service has the same hole**.
 
-Handled in `deny.toml` by `[licenses.private]` with `ignore-sources` scoped to
-the one `hs-utils-rs` git URL, rather than by switching the unlicensed check off.
-A third-party crate with no licence still fails.
+  ~~Handled in `deny.toml` by `[licenses.private]` with `ignore-sources` scoped
+  to the one `hs-utils-rs` git URL.~~ **Resolved in phase 7 by removal.** D-060
+  drops the dependency entirely: its one used module, `healthcheck`, is
+  stdlib-only and now lives in `src/healthcheck.rs`. The `ignore-sources`
+  exemption and the `allow-git` allow-list are both gone, so `unknown-git` now
+  denies *every* git dependency rather than all but one, and the only crate in
+  the graph without a `license` field is `simmer` itself.
 
-Worth fixing upstream by adding a `license` field to `hs-utils-rs`. That is a
-one-line change that would benefit every service in the estate, and would let the
-`ignore-sources` line here be deleted.
+The upstream gap is still real and still worth fixing: a `license` field in
+`hs-utils-rs` is a one-line change that would benefit every other service in the
+estate. It no longer affects this one.
 
 ---
 
@@ -272,6 +286,46 @@ a fourth way to reach the operating system's randomness. `uuid` — already dire
 for §9.5's correlation id — carries 122 bits of `getrandom` output per v4 value,
 so two of them make the salt.
 
+### Phase 7
+
+| Crate | Pinned | Licence | Versions checked | For |
+|---|---|---|---|---|
+| `metrics-exporter-prometheus` | 0.18.3 | `MIT` | all | §9.1's Prometheus exposition |
+| `subtle` | 2.6.1 | `BSD-3-Clause` | all | §9.3's constant-time token compare |
+| `tower` *(dev)* | 0.5.3 | `MIT` | all | driving the real router in tests |
+| `http-body-util` *(dev)* | 0.1.4 | `MIT` | all | reading a test response body |
+
+`metrics-exporter-prometheus` is the same `metrics-rs` family as `metrics`, which
+has been a direct dependency since phase 2 under the same `MIT` terms.
+`BSD-3-Clause` is already on `deny.toml`'s allow list and already in the graph;
+`subtle` itself has been compiled since phase 2 as a transitive dependency of
+`argon2`/`password-hash`, so taking it directly adds nothing to the build.
+
+**`default-features = false` is load-bearing on the exporter**, and not only for
+licence surface. The default feature set pulls `hyper`, `hyper-util`,
+`hyper-rustls`, `http-body-util`, `ipnet` and a `prost`/`protobuf` push-gateway
+client so the exporter can run its *own* HTTP listener — and axum already owns
+the admin port. With no features it is a recorder plus
+`PrometheusHandle::render()`.
+
+What it does still bring in, all permissive and all verified 2026-08-10:
+
+| Crate | Version | Licence |
+|---|---|---|
+| `metrics-util` | 0.20.4 | `MIT` |
+| `quanta` | 0.12.6 | `MIT` |
+| `sketches-ddsketch` | 0.3.1 | `Apache-2.0` |
+| `hashbag` | 0.1.13 | `MIT OR Apache-2.0` |
+| `evmap` | 11.0.0 | `MIT OR Apache-2.0` |
+| `left-right` | 0.11.8 | `MIT OR Apache-2.0` |
+
+`cargo deny check` reports `licenses ok` over the whole graph with these in it,
+which is the check that actually enforces the table above.
+
+`tower` and `http-body-util` are dev-dependencies only and are already in the
+graph via `axum`, so they add nothing to the shipped image — which contains
+neither, since it is built from `--target runtime`.
+
 ---
 
 ## 3. Direct dependencies, as resolved
@@ -282,14 +336,15 @@ so two of them make the salt.
 | `axum` | 0.8.9 | `MIT` |
 | `chrono` | 0.4.45 | `MIT OR Apache-2.0` |
 | `hmac` | 0.12.1 | `MIT OR Apache-2.0` |
-| `hs-utils` | 0.31.2 | *(none declared — see above)* |
 | `ipnet` | 2.12.1 | `MIT OR Apache-2.0` |
+| `metrics-exporter-prometheus` | 0.18.3 | `MIT` |
 | `regex` | 1.13.1 | `MIT OR Apache-2.0` |
 | `serde` | 1.0.229 | `MIT OR Apache-2.0` |
 | `serde_json` | 1.0.151 | `MIT OR Apache-2.0` |
 | `serde_yaml_ng` | 0.10.0 | `MIT` |
 | `sha2` | 0.10.9 | `MIT OR Apache-2.0` |
 | `sqlx` | 0.8.6 | `MIT OR Apache-2.0` |
+| `subtle` | 2.6.1 | `BSD-3-Clause` |
 | `thiserror` | 2.0.19 | `MIT OR Apache-2.0` |
 | `tokio` | 1.53.1 | `MIT` |
 | `tracing` | 0.1.44 | `MIT` |
@@ -312,8 +367,9 @@ cargo deny check bans sources advisories
 ```
 
 The policy lives in `deny.toml`: permissive licences are allow-listed, anything
-outside the list fails, and `hs-utils`'s git source is the one allow-listed
-non-registry origin.
+outside the list fails, and there is **no** allow-listed non-registry origin —
+since D-060 every dependency comes from crates.io, so `unknown-git = "deny"`
+denies all of them.
 
 For the per-version history check that this file's section 1 records — the thing
 `cargo-deny` cannot do, because it only sees the version you resolved — query

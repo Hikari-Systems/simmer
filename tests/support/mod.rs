@@ -578,11 +578,19 @@ impl Reply {
 /// reachable from tests. It does record what the relay path asked it to do, so a
 /// test can assert the §7.4 obligation that every reservation is resolved exactly
 /// once, and that a failed send commits nothing.
+/// `(route, domain_group, day_index)` to its row, as `quota_usage` is keyed.
+type UsageRows = HashMap<(String, String, i64), Usage>;
+
 #[derive(Default)]
 pub struct GrantAllQuota {
     committed: Arc<Mutex<Vec<Reservation>>>,
     released: Arc<Mutex<Vec<Reservation>>>,
     paused: Arc<Mutex<Vec<String>>>,
+    /// §9.3 — routes pinned to their final schedule value.
+    graduated: Arc<Mutex<Vec<String>>>,
+    /// §9.2/§9.3 — rows, keyed as the real table is. Empty by default, which is
+    /// what "nothing has been sent today" looks like.
+    usage: Arc<Mutex<UsageRows>>,
     /// §7.3 — every key handed to `commit`, in order. The relay's half of the
     /// §7.4 phase 3 obligation: events are recorded on a downstream `2xx` and on
     /// nothing else.
@@ -667,28 +675,102 @@ impl QuotaStore for GrantAllQuota {
         Ok(())
     }
 
-    async fn usage(&self, _: &str, _: &str, _: i64) -> Result<Usage, QuotaError> {
-        Ok(Usage::default())
+    async fn usage(&self, route: &str, group: &str, day: i64) -> Result<Usage, QuotaError> {
+        Ok(self
+            .usage
+            .lock()
+            .expect("not poisoned")
+            .get(&(route.to_string(), group.to_string(), day))
+            .copied()
+            .unwrap_or_default())
+    }
+
+    async fn usage_many(
+        &self,
+        keys: &[simmer::quota::UsageKey],
+    ) -> Result<std::collections::HashMap<(String, String), Usage>, QuotaError> {
+        let rows = self.usage.lock().expect("not poisoned");
+        Ok(keys
+            .iter()
+            .filter_map(|k| {
+                rows.get(&(k.route.clone(), k.domain_group.clone(), k.day_index))
+                    .map(|u| ((k.route.clone(), k.domain_group.clone()), *u))
+            })
+            .collect())
+    }
+
+    async fn set_paused(&self, route: &str, paused: bool) -> Result<(), QuotaError> {
+        let mut rows = self.paused.lock().expect("not poisoned");
+        rows.retain(|r| r != route);
+        if paused {
+            rows.push(route.to_string());
+        }
+        Ok(())
+    }
+
+    async fn set_graduated(&self, route: &str, graduated: bool) -> Result<(), QuotaError> {
+        let mut rows = self.graduated.lock().expect("not poisoned");
+        rows.retain(|r| r != route);
+        if graduated {
+            rows.push(route.to_string());
+        }
+        Ok(())
+    }
+
+    async fn set_allowance_override(
+        &self,
+        route: &str,
+        group: &str,
+        day: i64,
+        allowance: Option<i64>,
+        scheduled: Option<i64>,
+    ) -> Result<(), QuotaError> {
+        let mut rows = self.usage.lock().expect("not poisoned");
+        let row = rows
+            .entry((route.to_string(), group.to_string(), day))
+            .or_insert(Usage {
+                allowance: scheduled,
+                ..Usage::default()
+            });
+        row.allowance_override = allowance;
+        Ok(())
+    }
+
+    async fn reset_counters(
+        &self,
+        route: &str,
+        group: &str,
+        day: i64,
+    ) -> Result<Option<simmer::quota::Reset>, QuotaError> {
+        let mut rows = self.usage.lock().expect("not poisoned");
+        let Some(row) = rows.get_mut(&(route.to_string(), group.to_string(), day)) else {
+            return Ok(None);
+        };
+        let before = *row;
+        row.committed = 0;
+        // The fake holds no reservation rows, so "recompute from the live
+        // reservations" is zero here. The real arithmetic is asserted against
+        // Postgres in `tests/admin_api.rs`.
+        row.reserved = 0;
+        Ok(Some(simmer::quota::Reset {
+            committed_before: before.committed,
+            reserved_before: before.reserved,
+            reserved_after: 0,
+        }))
     }
 
     async fn route_states(
         &self,
     ) -> Result<std::collections::HashMap<String, RouteState>, QuotaError> {
-        Ok(self
-            .paused
-            .lock()
-            .expect("not poisoned")
-            .iter()
-            .map(|r| {
-                (
-                    r.clone(),
-                    RouteState {
-                        paused: true,
-                        graduated: false,
-                    },
-                )
-            })
-            .collect())
+        let mut out: std::collections::HashMap<String, RouteState> =
+            std::collections::HashMap::new();
+        for route in self.paused.lock().expect("not poisoned").iter() {
+            out.entry(route.clone()).or_default().paused = true;
+        }
+        for route in self.graduated.lock().expect("not poisoned").iter() {
+            out.entry(route.clone()).or_default().graduated = true;
+        }
+        Ok(out)
     }
 
     async fn sweep_expired(&self) -> Result<Vec<Expired>, QuotaError> {

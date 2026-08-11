@@ -30,7 +30,7 @@ use crate::frequency::{self, Frequency};
 use crate::metrics;
 use crate::quota::{
     self,
-    store::{QuotaError, QuotaStore, ReserveRequest, Reserved},
+    store::{QuotaError, QuotaStore, ReserveRequest, Reserved, Usage},
     Allowance, Reservation,
 };
 
@@ -243,6 +243,103 @@ pub async fn walk_and_reserve<'a>(
     }
 
     Ok(Walk::Exhausted)
+}
+
+/// §9.4 — walk a chain and report what *would* happen, reserving nothing.
+///
+/// The order of the checks below is `walk_and_reserve`'s order, deliberately and
+/// fragilely: paused, then §7.3 frequency, then §7.2's start instant, then
+/// headroom. A dry run that evaluated them in a different order would report a
+/// different reason for the same route, and the reason is the entire product —
+/// "why did this message not go via the warming route" is the question the
+/// endpoint exists to answer. `tests/admin_api.rs` asserts the two agree rather
+/// than trusting this comment.
+///
+/// It stops at the first eligible route, as the real walk does, so the routes
+/// after the selected one are absent rather than reported — they would not have
+/// been consulted either.
+///
+/// The one thing it cannot reproduce is the race: the real walk checks headroom
+/// *inside* the transaction that takes the row lock, and this reads outside any
+/// transaction. So it can say "eligible" for a route that another session
+/// empties a millisecond later. That is the same direction of error the §5.4
+/// early check makes, and harmless for the same reason — nothing acts on it.
+pub async fn dry_walk(
+    cfg: &Config,
+    store: &Arc<dyn QuotaStore>,
+    frequency: &Frequency,
+    chain: &[String],
+    recipient: &str,
+    now: chrono::DateTime<Utc>,
+) -> Result<Vec<Step>, QuotaError> {
+    let states = store.route_states().await?;
+    let group = super::domain_group::resolve(cfg, recipient)
+        .or_else(|| cfg.catchall_group())
+        .map(|g| g.name.clone())
+        .unwrap_or_else(|| "catchall".to_string());
+
+    let mut evaluation = Vec::new();
+
+    for name in chain {
+        let Some(route) = cfg.route(name) else {
+            evaluation.push(step(name, Err(SkipReason::Unknown)));
+            continue;
+        };
+        let state = states.get(name).copied().unwrap_or_default();
+
+        if state.paused {
+            evaluation.push(step(name, Err(SkipReason::Paused)));
+            continue;
+        }
+
+        if let Some(constraint) = &route.recipient_frequency {
+            let keyer = frequency.keyer(store.as_ref()).await?;
+            let key = keyer.key_for(recipient, constraint.mode, &cfg.dot_insensitive_domains);
+            let since = frequency::window_start(constraint, now);
+            if store.recipient_event_count(name, &key, since).await?
+                >= i64::from(constraint.threshold)
+            {
+                evaluation.push(step(name, Err(SkipReason::Frequency)));
+                continue;
+            }
+        }
+
+        let day_index = quota::day::for_route(route, now);
+        let allowance = quota::allowance_for(route, &group, day_index, state);
+        if allowance == Allowance::NotStarted {
+            evaluation.push(step(name, Err(SkipReason::NotStarted)));
+            continue;
+        }
+
+        let usage = store.usage(name, &group, day_index).await?;
+        // An absent row reads as all-zero, so a fresh day is eligible against the
+        // schedule's ceiling — which is what the reservation would write.
+        let effective = Usage {
+            allowance: usage.allowance.or(allowance.as_column()),
+            ..usage
+        };
+        if effective.has_headroom_for(1) {
+            evaluation.push(step(name, Ok(())));
+            return Ok(evaluation);
+        }
+
+        evaluation.push(step(name, Err(SkipReason::Quota)));
+    }
+
+    Ok(evaluation)
+}
+
+/// A [`Step`] with no metric increment.
+///
+/// `record` counts `simmer_route_skipped_total`, and a dry run must not: the
+/// counter measures messages that were steered, and an operator testing a
+/// configuration has steered nothing. Inflating it would corrupt exactly the
+/// series someone would use to decide whether the ramp is working.
+fn step(route: &str, outcome: Result<(), SkipReason>) -> Step {
+    Step {
+        route: route.to_string(),
+        outcome,
+    }
 }
 
 /// The §5.4 early check: is anything in this chain plausibly eligible?

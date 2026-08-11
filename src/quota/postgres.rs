@@ -21,7 +21,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::store::{
-    Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, RouteState, Usage,
+    Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset, RouteState,
+    Usage, UsageKey,
 };
 use crate::models;
 
@@ -155,6 +156,49 @@ impl QuotaStore for PgQuotaStore {
                 .await?
                 .unwrap_or_default(),
         )
+    }
+
+    async fn usage_many(
+        &self,
+        keys: &[UsageKey],
+    ) -> Result<std::collections::HashMap<(String, String), Usage>, QuotaError> {
+        models::quota::read_usage_many(&self.pool, keys).await
+    }
+
+    async fn set_paused(&self, route: &str, paused: bool) -> Result<(), QuotaError> {
+        models::route_state::set_paused(&self.pool, route, paused).await
+    }
+
+    async fn set_graduated(&self, route: &str, graduated: bool) -> Result<(), QuotaError> {
+        models::route_state::set_graduated(&self.pool, route, graduated).await
+    }
+
+    async fn set_allowance_override(
+        &self,
+        route: &str,
+        domain_group: &str,
+        day_index: i64,
+        allowance: Option<i64>,
+        scheduled: Option<i64>,
+    ) -> Result<(), QuotaError> {
+        models::route_state::set_allowance_override(
+            &self.pool,
+            route,
+            domain_group,
+            day_index,
+            allowance,
+            scheduled,
+        )
+        .await
+    }
+
+    async fn reset_counters(
+        &self,
+        route: &str,
+        domain_group: &str,
+        day_index: i64,
+    ) -> Result<Option<Reset>, QuotaError> {
+        models::quota::reset_counters(&self.pool, route, domain_group, day_index).await
     }
 
     async fn route_states(

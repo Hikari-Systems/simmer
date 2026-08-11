@@ -15,6 +15,7 @@ pub mod config;
 pub mod db;
 pub mod downstream;
 pub mod frequency;
+pub mod healthcheck;
 pub mod logging;
 pub mod metrics;
 pub mod models;

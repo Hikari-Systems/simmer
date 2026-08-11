@@ -59,6 +59,18 @@ emit under the wrong identity and corrupt the ramp. §7.3 is the opposite: over
 threshold makes a route ineligible so the message *steers* to the next link, and a
 chain with none left is §10.3's `451`, never a drop.
 
+And since phase 7, a fifth that is really the third applied to §9: **the control
+plane must not lie and must not leak.** A read that reported the configured
+schedule where the row says otherwise misleads an operator at the moment they are
+diagnosing (D-026, and `admin/view.rs` reports both plus a `drift` flag). A gauge
+only written by a relayed message reports yesterday under today's labels (D-056,
+so `/metrics` recomputes them). A `/routes` or `/quota` response carrying a
+recipient or a recipient key would undo §7.3's whole reason for hashing — there is
+a test asserting no read endpoint emits so much as an `@`. And a mutation cannot
+change the *class* of reply: a pause and a zero allowance both end at §10.3's
+`451`, which is the point, but they can make every message on a chain get it, so
+every mutation reports which chains it just emptied (D-057).
+
 ## Build and run
 
 ```sh
@@ -124,15 +136,22 @@ src/quota/postgres.rs    the §7.4 protocol. The row lock is what makes it corre
                          `commit` also records §7.3's events, in ONE transaction
 src/quota/day.rs         §7.2 elapsed-duration day index; NEVER calendar arithmetic
 src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve are ONE op
-src/metrics.rs           §9.1 counters; no exporter until phase 7
+src/metrics.rs           §9.1 counters, the recorder, and every `# HELP` line
 src/models/recipient_event.rs  §7.3's rows. A key is 16 bytes and never plaintext
 src/models/instance_config.rs  §7.3's salt: insert-if-absent, then read (D-050)
 src/db.rs                pool + migrations
-src/admin/               §9 control plane (phase 1: GET /health only)
+src/admin/view.rs        §9.2's projections. The row wins over the schedule (D-026)
+src/admin/auth.rs        §9.3's token. Reads need it too (D-055); named (D-053)
+src/admin/mutate.rs      §9.3. Every mutation says which chains it just emptied
+src/admin/dryrun.rs      §9.4 over the REAL engine. It reserves and counts nothing
 src/bin/loadgen.rs       the acceptance suite's sender; NOT in the shipped image
 tests/support/mod.rs     the scripted fake downstream (§12.3)
 tests/rewrite_stability.rs  §6.6 as a proptest. It found two real bugs; keep it
 tests/frequency.rs       §7.3 against real Postgres, and through the relay
+tests/quota_multi_instance.rs  TWO pools, one database. Why D-007's reason was
+                         wrong, and what the §7.3 race actually costs (D-061)
+tests/admin_api.rs       §9. Pins dry run against the REAL walk, step for step
+tests/metrics_endpoint.rs  §9.1. Its own binary — one global recorder per process
 tests/acceptance.rs      §12.3 against real mail servers; behind --ignored
 simmer.acceptance.yaml   the acceptance stack's config (D-042)
 ```
@@ -146,9 +165,17 @@ returning `anyhow::Result`, plain-SQL migrations applied by `sqlx::migrate!` at
 startup, idempotent baselines, `TIMESTAMPTZ` + `DateTime<Utc>`.
 
 It deliberately diverges elsewhere — YAML config rather than the `config.json`
-layering, axum rather than actix, JSON logging rather than
-`hs_utils::logging::init`. Each divergence is a numbered entry in `DECISIONS.md`
-with its reason. See the `hs-rust-data-service` skill for the unmodified pattern.
+layering, axum rather than actix, JSON logging rather than the house `logging::init`,
+the pool built from a URL rather than a `DbConfig`. Each divergence is a numbered
+entry in `DECISIONS.md` with its reason. See the `hs-rust-data-service` skill for
+the unmodified pattern.
+
+**`hs-utils` is not a dependency** (D-060). It was one, for a single stdlib-only
+function, which now lives in `src/healthcheck.rs` behaving identically. So the
+pattern above is followed by *convention*, not by shared code: there are **no git
+dependencies at all**, `deny.toml` has no `allow-git` entry, and adding either is
+a decision rather than a Cargo.toml line. Do not reintroduce `hs-utils` to reach
+for a helper — copy what is needed and say so in `DECISIONS.md`.
 
 ## Working agreement
 

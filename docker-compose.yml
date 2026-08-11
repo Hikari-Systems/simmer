@@ -38,7 +38,10 @@ services:
       - /tmp:rw,noexec,nosuid,size=512m
     environment:
       DATABASE_URL: "postgres://simmer:simmer@simmer-db:5432/simmer"
-      SIMMER_ADMIN_TOKEN: "local-dev-token"
+      # §9.3's bearer token. Local development only — never a real credential.
+      # Long enough not to trip §4.2's short-token warning, so that when the
+      # warning does appear it means something.
+      SIMMER_ADMIN_TOKEN: "local-dev-token-not-a-secret"
       # argon2id hash of "local-dev-password". The `$$` are compose escaping for
       # a literal `$`. Local development only — never a real credential.
       SIMMER_CFAPP_HASH: "$$argon2id$$v=19$$m=19456,t=2,p=1$$iYj0sVhRvzAWM9kzsFBKyg$$V1tnVXTGEO+BD0x9q1uccuo91w84jrz+qDKA3qElLFE"

@@ -4,9 +4,12 @@
 //! > every log line... Message bodies are never logged; recipient addresses are
 //! > logged only at `DEBUG`.
 //!
-//! This does not use `hs_utils::logging::init`, which emits human-readable text
-//! with no JSON option. See `DECISIONS.md` D-006. The `text` format exists for
-//! local development, where JSON on a terminal is unreadable.
+//! The house helper is `hs_utils::logging::init`, which emits human-readable
+//! text with no JSON option, so this calls `tracing_subscriber` directly — see
+//! `DECISIONS.md` D-006. Since D-060 the crate is not a dependency at all, so
+//! this is now simply how logging is done here rather than a divergence from a
+//! shared implementation. The `text` format exists for local development, where
+//! JSON on a terminal is unreadable.
 
 use tracing_subscriber::EnvFilter;
 

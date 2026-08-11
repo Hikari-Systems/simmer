@@ -239,6 +239,78 @@ fn rejects_allow_insecure_auth_false() {
     rejected_for(&yaml, "must be explicitly true");
 }
 
+// -- §9.3 admin credentials (D-053) --------------------------------------
+
+#[test]
+fn accepts_named_admin_tokens_alongside_the_scalar() {
+    // D-053 — `auth_token` keeps working exactly as §4.1 specifies, and named
+    // tokens are additive.
+    let yaml = BASE.replace(
+        "  auth_token: \"tok\"",
+        "  auth_token: \"tok\"\n  tokens:\n    - { name: oncall, token: \"aaaa\" }\n    - { name: deploybot, token: \"bbbb\" }",
+    );
+    let cfg = load(&yaml).expect("named tokens are valid");
+    assert_eq!(
+        cfg.admin.credentials(),
+        vec![
+            ("default", "tok"),
+            ("oncall", "aaaa"),
+            ("deploybot", "bbbb")
+        ]
+    );
+}
+
+#[test]
+fn rejects_a_configuration_with_no_admin_credential_at_all() {
+    // "No token configured" must never mean "no token required" — the direction
+    // that mistake usually goes.
+    let yaml = BASE.replace("  auth_token: \"tok\"\n", "");
+    rejected_for(&yaml, "no admin credential");
+}
+
+#[test]
+fn rejects_two_admin_tokens_sharing_a_name() {
+    let yaml = BASE.replace(
+        "  auth_token: \"tok\"",
+        "  tokens:\n    - { name: oncall, token: \"aaaa\" }\n    - { name: oncall, token: \"bbbb\" }",
+    );
+    rejected_for(&yaml, "duplicates");
+}
+
+#[test]
+fn rejects_two_admin_tokens_sharing_a_secret() {
+    // §9.3 identifies the actor by the token presented, so two names behind one
+    // secret make the audit line a coin flip.
+    let yaml = BASE.replace(
+        "  auth_token: \"tok\"",
+        "  auth_token: \"same\"\n  tokens:\n    - { name: oncall, token: \"same\" }",
+    );
+    rejected_for(&yaml, "shares its token");
+}
+
+#[test]
+fn rejects_an_empty_admin_token() {
+    let yaml = BASE.replace(
+        "  auth_token: \"tok\"",
+        "  tokens:\n    - { name: oncall, token: \"\" }",
+    );
+    rejected_for(&yaml, "must not be empty");
+}
+
+#[test]
+fn warns_about_a_short_admin_token_without_refusing_it() {
+    // A judgement rather than a rule: §4.1 sets no length, and the base fixture
+    // has been using "tok" since phase 1.
+    let cfg = load(BASE).expect("valid");
+    let warnings = config::validate::warnings(&cfg);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.path == "admin.auth_token" && w.message.contains("451")),
+        "expected a short-token warning naming the consequence, got: {warnings:?}"
+    );
+}
+
 // -- §4.2: body rewrites -------------------------------------------------
 
 #[test]

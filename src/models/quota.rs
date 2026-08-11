@@ -9,10 +9,12 @@
 //! reservation protocol is only correct if the read, the check and the write
 //! share a transaction and a row lock.
 
+use std::collections::HashMap;
+
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use crate::quota::store::{Expired, QuotaError, ReserveRequest, Usage};
+use crate::quota::store::{Expired, QuotaError, ReserveRequest, Reset, Usage, UsageKey};
 
 /// Create the `(route, domain_group, day_index)` row if absent and **lock it**,
 /// returning what it says.
@@ -85,6 +87,122 @@ pub async fn read_usage(
         })
     })
     .transpose()
+}
+
+/// §9.2 — read many rows in one query.
+///
+/// Unnest-and-join rather than a `WHERE ... IN` over tuples so that the number
+/// of rows requested does not change the statement text: the read API asks about
+/// every route times every domain group, and a per-request statement shape would
+/// defeat the prepared-statement cache for no benefit.
+pub async fn read_usage_many(
+    pool: &PgPool,
+    keys: &[UsageKey],
+) -> Result<HashMap<(String, String), Usage>, QuotaError> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let routes: Vec<&str> = keys.iter().map(|k| k.route.as_str()).collect();
+    let groups: Vec<&str> = keys.iter().map(|k| k.domain_group.as_str()).collect();
+    let days: Vec<i64> = keys.iter().map(|k| k.day_index).collect();
+
+    let rows = sqlx::query(
+        r#"
+        SELECT q.route, q.domain_group, q.allowance, q.allowance_override,
+               q.committed, q.reserved
+        FROM quota_usage q
+        JOIN UNNEST($1::text[], $2::text[], $3::bigint[]) AS k(route, domain_group, day_index)
+          ON q.route = k.route
+         AND q.domain_group = k.domain_group
+         AND q.day_index = k.day_index
+        "#,
+    )
+    .bind(&routes)
+    .bind(&groups)
+    .bind(&days)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            Ok((
+                (r.try_get("route")?, r.try_get("domain_group")?),
+                Usage {
+                    allowance: r.try_get("allowance")?,
+                    allowance_override: r.try_get("allowance_override")?,
+                    committed: r.try_get("committed")?,
+                    reserved: r.try_get("reserved")?,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// §9.3 `POST /quota/reset` — "reset counters for a route/group. Destructive."
+///
+/// Two things this deliberately does not do. It does not delete the row, because
+/// `allowance` is authoritative once written (D-026) and re-creating it would
+/// silently adopt whatever the schedule says now. And it does not zero
+/// `reserved`: it recomputes it from the reservations that are actually
+/// outstanding. Zeroing would give away headroom that an in-flight send already
+/// holds, and the resulting overshoot of the day's ceiling is the exact failure
+/// the §7.4 protocol exists to make impossible.
+///
+/// Under the row lock, so a reservation cannot be taken between the read and the
+/// write.
+pub async fn reset_counters(
+    pool: &PgPool,
+    route: &str,
+    domain_group: &str,
+    day_index: i64,
+) -> Result<Option<Reset>, QuotaError> {
+    let mut tx = pool.begin().await?;
+
+    let Some(before) = sqlx::query(
+        r#"
+        SELECT committed, reserved FROM quota_usage
+        WHERE route = $1 AND domain_group = $2 AND day_index = $3
+        FOR UPDATE
+        "#,
+    )
+    .bind(route)
+    .bind(domain_group)
+    .bind(day_index)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let row = sqlx::query(
+        r#"
+        UPDATE quota_usage q
+        SET committed = 0,
+            reserved = COALESCE((
+                SELECT SUM(r.count)::BIGINT FROM quota_reservation r
+                WHERE r.route = q.route
+                  AND r.domain_group = q.domain_group
+                  AND r.day_index = q.day_index
+            ), 0),
+            updated_at = now()
+        WHERE q.route = $1 AND q.domain_group = $2 AND q.day_index = $3
+        RETURNING q.reserved
+        "#,
+    )
+    .bind(route)
+    .bind(domain_group)
+    .bind(day_index)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(Some(Reset {
+        committed_before: before.try_get("committed")?,
+        reserved_before: before.try_get("reserved")?,
+        reserved_after: row.try_get("reserved")?,
+    }))
 }
 
 /// Increment `reserved` and record the reservation. Caller holds the row lock.

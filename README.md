@@ -45,7 +45,7 @@ deliverable recipient on a suppression list that outlives Simmer by years.
 
 ## Status
 
-Phases 1–6 of the ten in `docs/SPEC.md` §13. Phase 9 is void — see D-047 below.
+Phases 1–7 of the ten in `docs/SPEC.md` §13. Phase 9 is void — see D-047 below.
 
 **Phase 1** — configuration loading, full startup validation, structured
 logging, the container skeleton.
@@ -104,15 +104,27 @@ recorded only on a downstream `2xx`, in the same transaction that commits the
 quota, and only for routes that declare a constraint; an hourly sweeper evicts
 anything past the longest configured window plus a margin.
 
+**Phase 7** — the control plane (§9): a Prometheus exporter, a read API, a write
+API and dry run. The endpoints are below under [Control plane](#control-plane).
+
+Two things in it are worth knowing before you use it. The read API reports both
+what the *schedule* says and what the *row* says, and flags the difference,
+because `quota_usage.allowance` is authoritative once written (D-026) — a
+schedule edit plus a restart does not raise today's ceiling, and an API that
+reported the schedule would mislead you at exactly the wrong moment. And every
+mutation tells you which chains it has just left with no eligible route: pausing
+a route, or setting an allowance of zero, is a legitimate thing to do and also
+the thing most likely to make every message on a chain `451` without anyone
+meaning it.
+
 What works today: **an end-to-end relay that applies the ramp, rewrites both the
-identity and the body, and paces how often one recipient hears from a warming
-route.** What does not, yet:
+identity and the body, paces how often one recipient hears from a warming route,
+and can be inspected and steered without a restart.** What does not, yet:
 
 - **No connection pool.** One downstream connection per message (phase 10).
-- **No admin API and no metrics endpoint.** The counters are being recorded, and
-  `pause` / `graduate` / `allowance` are honoured from the database, but nothing
-  writes or exports them until phase 7.
-- No preflight (phase 8).
+- No preflight (phase 8), so `/routes` reports `"preflight": null`.
+- **No scopes on admin tokens.** Every token can do everything; a token that
+  could read but not mutate is a plausible ask and is not built.
 
 And one thing that will not arrive, because it is a decision rather than a gap:
 
@@ -211,6 +223,65 @@ With the shipped defaults the downstream budget is 10s + 30s + 120s = 160s
 against a client `data` timeout of 300s. If you raise the downstream timeouts,
 check that relationship still holds.
 
+## Control plane
+
+On `admin.listen`, port 8080 by default. `/health`, `/healthcheck` and `/metrics`
+are open; everything else needs `Authorization: Bearer <token>`, including the
+reads — `/routes` discloses every downstream hostname and the whole routing
+shape. See `DECISIONS.md` D-055.
+
+| | |
+|---|---|
+| `GET /health` | Liveness plus database reachability. `503` when the database is down |
+| `GET /metrics` | Prometheus exposition (§9.1) |
+| `GET /routes`, `GET /routes/{name}` | Configuration plus live state: warm-up day, per-group allowance and usage, paused, graduated |
+| `GET /quota?route=&group=` | The same windows, filtered. Both filters optional and independent |
+| `POST /routes/{name}/pause`, `/resume` | Make a route ineligible without a restart. Persisted |
+| `POST /routes/{name}/graduate` | Pin to the final schedule value. `{"graduated": false}` reverses it |
+| `POST /routes/{name}/allowance` | `{"domain_group": …, "allowance": N\|null}`. Expires at the route's next day boundary |
+| `POST /quota/reset` | Destructive. Needs `"confirm": "reset"` |
+| `POST /dryrun` | What *would* happen. Sends nothing, reserves nothing, writes nothing |
+
+```sh
+TOKEN=$SIMMER_ADMIN_TOKEN
+
+# Why is mail deferring for Google?
+curl -sH "Authorization: Bearer $TOKEN" localhost:8080/quota?group=google | jq
+
+# Let the warming route send more to Google, today only.
+curl -sXPOST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"domain_group":"google","allowance":500}' \
+  localhost:8080/routes/warming/allowance | jq
+
+# What would this message do?
+curl -sXPOST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"envelope_from":"jane@oldbrand.com","from_header":"Jane <jane@oldbrand.com>",
+       "recipients":["bob@gmail.com"],"body":"see https://oldbrand.com/x"}' \
+  localhost:8080/dryrun | jq
+```
+
+**Reading `/routes`.** Each domain group reports `scheduled` (what the
+configuration says today), `allowance` (what the row says, which is what the
+reservation protocol enforces), `override`, `committed`, `reserved`, `headroom`
+and `drift`. `drift: true` means the row and the schedule disagree — the expected
+state for the rest of the day after a schedule change, and the thing to look at
+first when the ramp is not doing what the YAML says. `row_exists: false` means
+nothing has been sent on that route and group today.
+
+**Dry run** is the tool for validating a configuration before it carries traffic.
+It runs the real sender match, the real chain walk and the real rewrite engine, so
+what it shows is what would go out; the tests assert its chain evaluation is
+identical to the relay's across every skip reason. It reports each
+`body_rewrites` pattern's match count **including the ones that matched nothing**,
+which is usually the answer to "why is my rewrite not firing".
+
+**Every mutation is audited** at `INFO` with the acting token's name, the target,
+and the value it replaced. Name your tokens (`admin.tokens`) and that line names
+somebody; leave `auth_token` alone and it says `default`. See D-053.
+
+**Watch `simmer_admin_auth_failures_total{reason="invalid"}`.** The write API can
+pause a route, and a run of those is somebody guessing.
+
 ## Development
 
 ```sh
@@ -222,6 +293,14 @@ cargo clippy --all-targets -- -D warnings
 cargo deny check                 # licences, advisories, sources
 docker compose up -d --build     # not optional before pushing
 ```
+
+**Every dependency comes from crates.io.** There are no git dependencies, so
+`deny.toml` has no `allow-git` allow-list and `unknown-git = "deny"` rejects all
+of them; `cargo build` needs no credentials for a private repository. `hs-utils`
+was the one exception until phase 7 — it supplied a single stdlib-only function,
+which now lives in `src/healthcheck.rs` behaving identically (D-060). If you need
+something from the estate's shared crates, copy it and record why, rather than
+taking the dependency back.
 
 The §12.3 acceptance suite runs against its own stack and is not part of
 `cargo test` — it needs Docker and about two minutes of container restarts:
@@ -262,13 +341,20 @@ src/quota/      §7 day index, allowance, the reserve/commit protocol, sweeper
 src/models/     runtime sqlx over &PgPool, house pattern
 src/rewrite/    §6 the rewriting engine: templates, headers, encoding, stability
 src/relay.rs    decide -> reserve -> rewrite -> relay -> commit/release
-src/metrics.rs  §9.1 counters; the exporter arrives in phase 7
-src/admin/      the §9 control plane; phase 1 has GET /health only
+src/metrics.rs  §9.1 counters and the Prometheus recorder
+src/admin/      the §9 control plane: reads, writes, dry run, /metrics
+  view.rs         §9.2's projections, as pure functions. D-026's drift flag
+  auth.rs         §9.3's bearer token, and O-11's answer to whose it was
+  mutate.rs       the four mutations, the audit line, §14.1's warnings
+  dryrun.rs       §9.4, over the real engine
 src/db.rs       pool construction and migrations
+src/healthcheck.rs  the `healthcheck` subcommand the container's HEALTHCHECK runs
 src/bin/loadgen.rs  the acceptance suite's bulk sender; not in the shipped image
 migrations/     plain SQL, applied at startup
 tests/support/  a scripted fake downstream (§12.3)
 tests/rewrite_stability.rs  §6.6 as a property test over generated messages
+tests/admin_api.rs   §9 against the real router and real Postgres
+tests/metrics_endpoint.rs  §9.1 against a real recorder; its own binary
 tests/acceptance.rs  §12.3 against real mail servers; behind --ignored
 simmer.acceptance.yaml  config for the acceptance stack
 docs/SPEC.md    the specification
@@ -280,11 +366,35 @@ LICENSES.md     dependency licence findings
 
 ## Deployment
 
-Simmer is **not** deployed on the hikari-systems spot fleet. That matters: the
-fleet's roll method requires target capacity ≥2 and replaces instances one at a
-time, which would run two Simmers against one database during every deploy —
-precisely the window in which quota overshoot occurs. Spec §2.2 says one instance
-owns its quota state, and that stands. See `DECISIONS.md` D-007.
+Simmer is **not** deployed on the hikari-systems spot fleet. The fleet's roll
+method requires target capacity ≥2 and replaces instances one at a time, so a
+standard deploy would run two Simmers against one database for the minutes a
+replacement takes to build.
+
+**That window is not a quota-overshoot window**, and an earlier version of this
+section said it was. The warm-up counters are safe across instances: §7.4's
+reservation does its headroom check and its write inside one transaction holding a
+row lock, and Postgres serialises contenders for that row whether they are two
+tasks in one process or two processes on different hosts. Nothing in the quota
+path is per-instance — the counters, the reservations and the route states are all
+rows. `tests/quota_multi_instance.rs` races two independent connection pools to
+show it.
+
+What the window actually costs is narrower, and neither part is fixed by a lock:
+
+- **Config skew.** `quota_usage.allowance` is authoritative once written (D-026),
+  so two instances running different schedules will have whichever writes the
+  day's first row set that day's ceiling, and the other will silently honour it.
+- **The recipient-frequency race** (D-049). §7.3's count is read outside the
+  reservation transaction, so `C` sends that all read before any of them commits
+  can take the window to `threshold + (C - 1)`. It is a reputation-shaping
+  heuristic rather than an accounting invariant, and it is already true within one
+  instance — a second instance widens the window rather than introducing the bug.
+
+Spec §2.2 says one instance owns its quota state, and simmer stays single-instance,
+but the reason is the two constraints above rather than the counters. See
+`DECISIONS.md` D-061 and D-007, and `docs/MULTI_INSTANCE.md` — which the spec's
+author needs to rule on, since §2.2 rules multi-instance out in as many words.
 
 The container publishes no ports by default. The SMTP listener is plaintext and
 accepts plaintext AUTH (spec §2.3), so it belongs on a trusted internal segment;

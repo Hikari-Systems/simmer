@@ -14,7 +14,9 @@ use crate::quota::store::RouteState;
 
 pub use postgres::PgQuotaStore;
 pub use registry::ReservationRegistry;
-pub use store::{QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Usage};
+pub use store::{
+    QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset, Usage, UsageKey,
+};
 
 /// §7.4: "Reservations carry an expiry (default: downstream timeout budget +
 /// 60s)."

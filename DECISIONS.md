@@ -129,7 +129,18 @@ quota state."
 **Context:** the house `hs-deploy` method is an AWS spot fleet that requires
 target capacity ≥2 and rolls one instance at a time, so a standard deploy would
 run two Simmers against one database for the minutes a replacement takes to
-build. That window is precisely when quota overshoot would occur.
+build. ~~That window is precisely when quota overshoot would occur.~~
+
+> **Corrected 2026-08-11 by D-061.** The struck sentence is wrong and was wrong
+> from phase 3 onward. Quota overshoot through the §7.4 path is not reachable
+> across instances: the headroom check and the write share one transaction holding
+> a row lock, and Postgres serialises contenders for that row across processes as
+> readily as across tasks. `tests/quota_multi_instance.rs` is the evidence.
+>
+> **The decision below is unchanged** — simmer still does not go on the spot fleet
+> — but it now rests on the two things that are actually true: config skew during
+> a roll under D-026, and D-049's recipient-frequency race. See D-061 and
+> `docs/MULTI_INSTANCE.md`.
 
 **Decision:** Simmer is not deployed on the spot fleet. §2.2 stands as written.
 No `instance_id` column, no sweeper advisory locks, no instance-scoped shutdown
@@ -1087,6 +1098,280 @@ unintended — D-040's distinction exactly.
 
 ---
 
+## Phase 7 — the control plane
+
+### D-053 — Admin tokens are named (settles O-11)
+
+**Spec:** §9.3 — "All require the bearer token. All mutations are logged at
+`INFO` with the acting token's identifier." §4.1's `admin.auth_token` is a single
+scalar, which has no identifier. That gap is O-11, carried since phase 1.
+
+**Decision:** `admin.tokens` — an optional list of `{name, token}` — alongside
+`auth_token`, which keeps working exactly as §4.1 specifies and is the token
+named `default`. The audit line records the name of whichever token was
+presented, never the token. §4.2 gains four rules: at least one credential must
+exist, names and secrets must each be non-empty, names must be unique, and **no
+two credentials may share a secret**. A short token is a `WARN`, not a violation.
+
+**Why not just drop §9.3's wording.** It asks for accountability, and with one
+shared credential there is none to be had — but the fix is cheap and additive,
+and the alternative is a log line that says `admin` on every mutation and
+therefore says nothing. An operator investigating "who paused the warming route
+at 02:14" needs a name.
+
+**Why the shared-secret rule.** §9.3 identifies the actor *by the token
+presented*. Two names behind one secret make the audit line a coin flip between
+them, which is worse than one honest name because it looks like evidence.
+
+**Why not a token fingerprint instead.** Hashing the presented token and logging
+eight hex characters identifies the credential rather than the person, needs no
+schema change, and was the cheaper option. It was rejected because the thing an
+operator wants from an audit trail is a name they recognise, and a fingerprint
+only becomes one after somebody writes down the mapping — which is the config
+change this decision makes, minus the tooling.
+
+**Why a length *warning* rather than a rule.** §4.1 sets no length and every test
+fixture in the repository predates this decision. The warning names the
+consequence rather than the policy: §9.3 can pause a route or zero an allowance,
+and either answers every affected message `451`.
+
+### D-054 — `simmer_messages_total` gains the `domain_group` §9.1 specifies
+
+**Spec:** §9.1 — `simmer_messages_total{route,domain_group,result}`.
+
+**Context:** D-021 said phase 7 would install a recorder and that "no call site
+changes". One did.
+
+**Decision:** `metrics::message` takes the domain group. The single call site is
+in `relay.rs`, immediately after the chain walk, which is exactly the code whose
+job is to produce the `(route, domain_group)` pair the quota is keyed on.
+
+**Why the placeholder existed:** phase 2 wrote the function before §3.2 step 2
+existed to resolve a group, and emitted `"-"` deliberately — "an empty label
+value and an absent label are different series in Prometheus, and a placeholder
+that later becomes a real value is easier to spot than a blank". It was spotted.
+Keeping it would have shipped a metric that §9.1 specifies with three labels and
+that carries two useful ones, which is the sort of thing nobody notices until
+they are trying to answer "is the Google ramp the one that is deferring".
+
+D-021's prediction was otherwise correct: every other call site is untouched, and
+`tests/metrics_endpoint.rs` asserts that the counters written in phases 2–6
+against a null recorder produce real series once one is installed.
+
+### D-055 — §9.2's reads require the bearer token; `/metrics` does not
+
+**Spec:** §9.3 says "All require the bearer token" of the *write* endpoints,
+which scopes authentication to mutations. §9.2 lists the reads with no such
+sentence. §12.2 says the container must not expose port 25 by default but says
+nothing about the admin listener.
+
+**Decision:**
+
+| Open | Token required |
+|---|---|
+| `GET /health`, `GET /healthcheck`, `GET /metrics` | everything else |
+
+So §9.2's `/routes`, `/routes/{name}` and `/quota`, and §9.4's `/dryrun`, need
+the token even though §9.3's sentence does not reach them.
+
+**Why wider than the spec.** `/routes` discloses every downstream provider
+hostname, the TLS posture of each, the whole routing shape and the live state of
+the ramp. `/dryrun` runs the real rewrite engine over attacker-chosen input.
+§2.3's trusted-segment assumption is an assumption; nothing enforces it, and the
+cost of it being wrong is asymmetric.
+
+**Why `/metrics` stays open.** A Prometheus scrape config that has to carry a
+credential usually does not, and the failure mode is a dashboard that is silently
+blind — which is its own outage, arriving at the moment the instrument is wanted.
+The exposition carries no recipient data by construction (§7.3, and
+`simmer_recipient_events_evicted_total` is unlabelled for exactly this reason).
+
+**Why `/health` stays open.** It is what Docker's `HEALTHCHECK` and a load
+balancer drive, neither of which can hold a secret usefully.
+
+The comparison is constant-time (`subtle`), and does not stop at the first match.
+An admin token that can pause a route deserves the care §5.3 already takes over
+passwords — and see the `smtp/auth.rs` defect below for what happens when that
+reasoning is applied to one comparison and not another.
+
+### D-056 — The §7 gauges are refreshed from storage on every scrape
+
+**Spec:** §9.1 lists `simmer_quota_allowance`, `_committed` and `_reserved` as
+gauges, and `simmer_quota_allowance` as "today's ceiling".
+
+**Decision:** `GET /metrics` recomputes them from the same §9.2 projection
+`/routes` uses, before rendering.
+
+**Why:** the gauges are otherwise only ever `set` by a message that relayed. A
+route that has sent nothing today would therefore export *yesterday's* numbers
+under a label set claiming to describe today — the D-026 trap, in the one place
+an operator is least likely to check because a graph looks like a measurement.
+Computing both endpoints from one projection also means `/metrics` and `/routes`
+cannot disagree.
+
+A storage failure logs and renders anyway. A metrics endpoint that fails during
+an outage removes the instrument at the moment it is wanted.
+
+### D-057 — §9.3's mutations warn rather than refuse when they exhaust a chain
+
+**Spec:** §9.3 offers pause and a per-group allowance override. §14.1: Simmer
+must never emit a reply that makes a client record permanent state.
+
+**Decision:** an allowance of `0`, and a pause that leaves a chain with nothing
+eligible, are both **allowed**. Every mutation computes which
+`(chain, domain group)` pairs it has just left with no eligible route, returns
+them in a `warnings` array, and logs each at `WARN`.
+
+**Why allowed:** an override of zero is the only way to stop one domain group
+without pausing the whole route, and §9.3 implies the capability. Refusing it
+would push an operator toward `pause`, which produces a blunter version of the
+same state with no warning at all.
+
+**Why it is not a §14.1 violation:** nothing here changes the *class* of reply. A
+paused route and a zeroed allowance both make a route ineligible; an ineligible
+chain is §10.3; §10.3's default is `451`. The answer to the client stays
+temporary however hard an operator leans on the write API. `reply.rs` is
+untouched by this phase.
+
+**What the warning deliberately does not model:** §7.3's frequency check, which
+is per recipient. "This chain is exhausted" is not a property of the
+configuration for it, and asserting one would be a guess dressed as a warning.
+
+### D-058 — `POST /quota/reset` recomputes `reserved` rather than zeroing it
+
+**Spec:** §9.3 — "reset counters for a route/group. Destructive; requires an
+explicit confirmation field in the body."
+
+**Decision:** under the row lock, set `committed` to zero and set `reserved` to
+the sum of the reservation rows that are actually outstanding for that key. The
+row is **not** deleted. The confirmation field is the literal string `"reset"`.
+
+**Why not zero `reserved`:** a reset during a send would hand away headroom that
+an in-flight message already owns, and the double-spend surfaces as an overshoot
+of the day's ceiling — the one failure the §7.4 protocol exists to make
+impossible. Recomputing repairs drift as a side effect.
+
+**Why not delete the row:** `allowance` is authoritative once written (D-026), so
+re-creating it would silently adopt whatever the schedule says *now*. A reset is
+about the counters, not about the ceiling.
+
+**Why a word rather than a boolean:** a `true` is something a script produces
+without anyone having read the sentence explaining what is about to be
+discarded.
+
+### D-059 — §9.4's dry run runs the real engine, and counts nothing
+
+**Spec:** §9.4 — "returns the routing decision… It sends nothing and takes no
+reservation… should be treated as a first-class feature rather than a debugging
+afterthought."
+
+**Decision:** the sender match is `relay::resolve_chain`, the rewrite is
+`rewrite::rewrite` with the route's compiled templates, and the chain walk is a
+new read-only `chain::dry_walk` that mirrors `walk_and_reserve`'s order exactly —
+paused, then §7.3 frequency, then §7.2's start instant, then headroom.
+`tests/admin_api.rs` asserts the two produce identical evaluations across all
+four skip reasons rather than trusting the comment that says so.
+
+`dry_walk` deliberately does **not** increment `simmer_route_skipped_total`. That
+series measures messages that were steered, and an operator testing a
+configuration has steered none; inflating it would corrupt the series someone
+would use to decide whether the ramp is working.
+
+**What it cannot reproduce:** the race. The real walk checks headroom inside the
+transaction holding the row lock; this reads outside any transaction, so it can
+say "eligible" for a route another session empties a millisecond later. Same
+direction of error as the §5.4 early check, harmless for the same reason —
+nothing acts on it.
+
+**One bug this caught in itself.** §9.4 takes "a `From:` header value", which is
+the display-name form an operator pastes — `Jane <jane@oldbrand.com>`. §5.4
+matches on the *address*, and the relay never sees anything else, because the
+session runs `first_from_address` over the header block before building
+`Senders`. Passing the header value through raw made every domain rule miss, and
+the dry run confidently reported a fall-through to `default_chain` that would not
+happen. Found by driving the endpoint against `simmer.yaml` in the running
+container, which is the argument for the container gate in one incident: every
+test in `tests/admin_api.rs` used a fixture whose rules matched on the envelope.
+The fix is to call the relay's own parser; there is now a test with four spellings
+of the same address against a `from_header` rule.
+
+**Recipients.** §9.4 asks for a list; D-047 makes a real transaction carry one.
+Each address is evaluated independently, as separate transactions would be, and
+the response says so. The request body is the only place a plaintext address
+enters the control plane; it is supplied by the operator, evaluated, and never
+stored or logged above `DEBUG`. §7.3's constraint is on what the container
+*accumulates*.
+
+**Two body views, and why both.** `body_rewrites` reports each pattern's match
+count against the sample as supplied — including the patterns that matched
+nothing, which is the single most useful thing this endpoint can say.
+`body_changed` and `skipped_parts` come from the real engine over the whole
+message. For a plain-text sample they agree; for a MIME `message` a pattern that
+fires in the first and not the second is one matching structure rather than
+content, which is worth seeing rather than hiding.
+
+### D-060 — `hs-utils` is removed; its one used module is copied in
+
+**Context:** `hs-utils` had been a dependency since phase 3, taken by git tag with
+`default-features = false`, for exactly one function:
+`healthcheck::check_subcommand`. Nothing else in the crate ever used it. Config,
+logging, the connection pool and the HTTP layer each diverge by an earlier
+decision — D-004, D-006, D-005 and D-003 respectively — so a single stdlib-only
+file was the entire coupling to the shared library.
+
+**Decision:** copy that module into `src/healthcheck.rs` and drop the dependency.
+The behaviour is identical: the same `[host] [port] [deps|--deps]` CLI surface in
+any order, the same `/healthcheck` and `/healthcheck?deps=true` paths, the same
+four-second read and write timeouts, the same `HTTP/1.1 200` prefix test, the
+same `exit(0)`/`exit(1)`, and the same no-op when `argv[1] != "healthcheck"`.
+Nothing about the Dockerfile's `HEALTHCHECK` or the compose healthcheck changes.
+
+The only difference is that argument parsing is split into a private
+`probe_from_args`, because `check_subcommand` ends in `process::exit` and a test
+cannot survive that. It is now covered by ten tests — the inherited version had
+none — including a real one-shot HTTP server asserting the exact request line for
+both paths, every non-`200` status, nothing listening, and an unresolvable host.
+
+**Why copy rather than keep the dependency.** The two are not equivalent in cost.
+The dependency was a *git* dependency, which is why `deny.toml` carried an
+`allow-git` entry and a `[licenses.private] ignore-sources` exemption, and why the
+Dockerfile's `--locked` had a load-bearing justification: a git tag is mutable, so
+without the lock a rebuild could silently pick up different code from the same
+tag. Sixty lines of standard library, versus a mutable external reference and two
+exemptions in the supply-chain gate, is not a close call for a component whose
+entire argument is that it is temporary and auditable.
+
+**What this buys:**
+
+- **No git dependencies at all.** `deny.toml`'s `unknown-git = "deny"` now has no
+  allow-list, so it denies *every* git dependency rather than all but one. Adding
+  one becomes a decision made in the gate rather than in a Cargo.toml line.
+- **One crate with no `license` field instead of two**, and that one is `simmer`
+  itself, which declares `publish = false` to say so deliberately. The
+  `ignore-sources` exemption is gone. `LICENSES.md` §2's finding shrinks to an
+  upstream note.
+- **`cargo build` needs no network access to a private repository**, so the build
+  no longer depends on credentials for `github.com/Hikari-Systems`.
+
+**What it costs.** A fix upstream in `hs-utils-rs` no longer arrives here. For
+this module that is close to meaningless — it is a stdlib TCP probe whose
+behaviour is pinned by the Dockerfile and by tests — but it is the real trade,
+and it applies to any future divergence from the estate's shared code.
+
+**What this does *not* change:** the storage layer still follows the
+hikari-systems data-service pattern in every respect that matters — runtime
+`sqlx` over `&PgPool`, `models/<entity>.rs` free functions, plain-SQL migrations
+applied at startup, `TIMESTAMPTZ` and `DateTime<Utc>`. The pattern was always the
+thing being followed; `hs-utils` was one library that happens to implement parts
+of it, and simmer used almost none of them.
+
+**Nothing was copied for config or logging**, because there was nothing to copy:
+`src/config/` and `src/logging.rs` have been independent implementations since
+phase 1 under D-004 and D-006. Their module comments now say the house helper
+exists rather than that this crate declines to call it.
+
+---
+
 ## Phase 10 (partly built in phase 4)
 
 ### D-032 — The acceptance harness is a compose profile with two Mailpit traps
@@ -1238,6 +1523,99 @@ rewriting bugs actually surface.
 
 ---
 
+## The multi-instance correction (after phase 7)
+
+### D-061 — Quota **is** safe across instances; D-007's stated reason was wrong
+
+**What the repository said.** D-007 and `README.md`'s Deployment section both
+justified keeping simmer off the spot fleet by saying that the fleet's roll method
+"would run two Simmers against one database for the minutes a replacement takes to
+build. That window is precisely when quota overshoot would occur."
+
+**That is false, and it had been false since phase 3.** §7.4's reservation does its
+headroom check and its write inside *one transaction holding a row lock*.
+`models::quota::lock_usage` uses `INSERT … ON CONFLICT DO UPDATE` rather than `DO
+NOTHING` specifically because `DO UPDATE` takes the row lock even when the row
+already exists — the reason is in that function's own doc comment. Postgres
+serialises contenders for one `(route, domain_group, day_index)` row whether they
+are two tasks in one process or two processes on different hosts. There is no
+per-instance state in the path at all: the counters, the reservations and the
+route states are all rows.
+
+Two other things were already written for concurrency and are also fine.
+`sweep_expired` is a single CTE in which only one `DELETE` can win a row and the
+decrement is derived from the rows that `DELETE` actually removed, so two sweepers
+cannot double-release. `release_by_ids` is scoped to its own reservation ids
+rather than truncating, so one instance's shutdown does not free another's
+in-flight headroom. Both were kept under D-007's own "costs nothing now, expensive
+to retrofit" clause. They turn out to have been the difference between a claim and
+a fact.
+
+**What genuinely constrains two instances** is narrower, and neither part is
+fixed by a lock:
+
+1. **D-049's frequency race.** The §7.3 recipient-event count is read *outside* the
+   reservation transaction, so sends that all read before any of them writes all
+   see room. **Settled 2026-08-10: bound it and document it, do not move it inside
+   the transaction.** §7.3 is a reputation-shaping heuristic, not an accounting
+   invariant like quota, and holding the ramp's hot row lock across a
+   high-cardinality index read on every message costs more than the messages it
+   would save. This is not a multi-instance bug — it is a concurrency bug that a
+   second instance widens the window on.
+2. **Config skew during a roll.** `quota_usage.allowance` is authoritative once
+   written (D-026), so two instances running different schedules for the minutes a
+   replacement takes will have whichever writes the day's first row set that day's
+   ceiling, and the other will silently honour it. Inherent in D-026; belongs in
+   the deployment constraints rather than in the code.
+
+**The bound on (1), stated exactly.** Not "one extra message" — that is the
+two-instance case mistaken for the general one. With `C` sends whose §7.3 reads all
+land before the first of them commits, the window reaches `threshold + (C - 1)`.
+The overshoot is one per concurrent send, bounded by peak concurrency against a
+single recipient key and by nothing else.
+`tests/quota_multi_instance.rs` asserts that figure at `C = 2` and again at
+`C = 6`, so the document and the code cannot drift apart quietly.
+
+**Decision.**
+
+- Correct D-007's reasoning (below) and `README.md`'s Deployment section. The
+  *decision* — simmer is not deployed on the spot fleet — is unchanged; only its
+  justification was wrong, and it now rests on config skew and §7.3 rather than on
+  a quota overshoot that cannot happen.
+- Evidence the row-lock guarantee with `tests/quota_multi_instance.rs`, which
+  builds **two independent pools** against one database rather than racing tasks
+  on one pool. `tests/quota.rs`'s existing concurrency test cannot distinguish the
+  row lock from a pool that happens to serialise its own contenders; this one can.
+- **Do not add a lock table or a coarser lock.** A table-level lock would serialise
+  every route and domain group against each other, which the row lock deliberately
+  does not, and would add nothing to correctness that the row lock does not already
+  provide.
+- `docs/MULTI_INSTANCE.md` for the spec's author. §2.2 says "No multi-instance
+  clustering. One Simmer instance owns its quota state" in as many words, so this
+  is a spec divergence and not merely a README fix.
+
+**A note on how the evidence was checked, because a green race test proves
+nothing on its own.** All five tests passed on their first run, so
+`lock_usage` was temporarily replaced with an unlocked read and they were re-run.
+Two failed, as they must: the N-way test granted 16 reservations against 15 slots,
+and the contender in the mechanism test was `Taken` where it must be `NoHeadroom`.
+
+That exercise also corrected the mechanism test itself, twice.
+
+- Its first version raced for a row that **did not yet exist**, where two `INSERT`s
+  collide on the unique index and Postgres serialises them whatever the conflict
+  clause says. It passed against a deliberately broken `lock_usage`. It now
+  pre-creates the row, which is the only case in which `DO UPDATE` versus `DO
+  NOTHING` is the difference — and the case the doc comment is actually about.
+- Its "the contender is still blocked" assertion turns out to be **necessary but
+  not sufficient**, and the test now says so. Against an unlocked read the
+  contender still blocks — later, on the `UPDATE` inside `insert_reservation`, and
+  after it has already decided it has headroom from a stale read. The assertion
+  with the teeth is the one about *what it decided*, not the one about whether it
+  waited.
+
+---
+
 ## Defects found, not yet fixed
 
 **Timing-based username enumeration in `smtp/auth.rs`.** `Verifier` hashes an
@@ -1275,7 +1653,7 @@ the phase that depends on each.
 | ~~O-8~~ | ***Dissolved** in phase 6 by **D-047**, not answered: there are no splits, so there is no collapse table to return `550` from.* | | |
 | ~~O-9~~ | ***Dissolved** in phase 6 by **D-047**, not answered: one recipient per transaction, so there is nothing to group and no granularity to choose between.* | | |
 | ~~O-10~~ | *Settled in phase 2 — see **D-018**. The working assumption did not survive: the route is not known at `MAIL FROM`. Replaced by a config-declared capability.* | | |
-| O-11 | §9.3 logs mutations "with the acting token's identifier", but `admin.auth_token` is a single scalar with no identity. | Either named admin tokens, or drop the wording. Currently one token, logged as `admin`. | Phase 7 |
+| ~~O-11~~ | *Settled in phase 7 — see **D-053**. Named `admin.tokens` alongside `auth_token`, which is the token named `default`. The working assumption held: named tokens, not dropped wording.* | | |
 | ~~O-12~~ | *Settled in phase 3: DST transitions both directions, a start inside a DST gap, and a future start are all tested; the leap-second case is asserted to be a no-op rather than merely argued.* | | |
 
 
@@ -1796,3 +2174,163 @@ identifier", but `admin.auth_token` is a single scalar with no identity.
 Everything the exporter needs is already recorded through `src/metrics.rs`,
 including this phase's two additions. The `smtp/auth.rs` timing defect above is
 still unfixed and still separable.
+
+---
+
+## Phase 7 summary
+
+§9 in full: the metrics exporter, the read API, the write API and dry run. O-11
+was settled first, as the working agreement asks, and it shaped the rest — the
+audit line is what named tokens exist for.
+
+### What changed
+
+| Module | § | What |
+|---|---|---|
+| `src/config/mod.rs` | 4.1, 9.3 | D-053's `admin.tokens`; `auth_token` becomes optional and is the credential named `default`; `Config::chains()` promoted out of `validate.rs`, where §9.3 now needs it too |
+| `src/config/validate.rs` | 4.2 | Four new rules over the admin credentials, and a short-token warning |
+| `src/metrics.rs` | 9.1 | `install()` — the Prometheus recorder, with real histogram buckets — and `describe()`, a `# HELP` line per metric. D-054's `domain_group` label. Two new counters for the write API |
+| `src/admin/mod.rs` | 9.1, 9.2 | The router; `/routes`, `/routes/{name}`, `/quota`, `/metrics`; the D-056 gauge refresh |
+| `src/admin/view.rs` | 9.2 | The projections, as pure functions. D-026's drift flag lives here |
+| `src/admin/auth.rs` | 9.3 | The bearer token, constant-time, as an axum extractor. D-053 and D-055 |
+| `src/admin/error.rs` | 7.5, 9 | One error shape; a storage failure is `503`, not `500` |
+| `src/admin/mutate.rs` | 9.3 | The four mutations, the audit line, and D-057's exhaustion warnings |
+| `src/admin/dryrun.rs` | 9.4 | D-059 — the real engine over a synthesised message |
+| `src/routing/chain.rs` | 3.2, 9.4 | `dry_walk`: the same order, reserving nothing and counting nothing |
+| `src/quota/store.rs`, `src/quota/postgres.rs`, `src/models/quota.rs`, `src/models/route_state.rs` | 9.2, 9.3, 11 | Five new trait methods: `usage_many`, the three setters, and D-058's `reset_counters` |
+| `src/rewrite/body.rs` | 6.4, 9.4 | `Rules::match_report` — sequential match counts, off the message path |
+| `src/rewrite/headers.rs` | 9.4 | `HeaderBlock::fields()`, a position-aware view of the block |
+| `src/relay.rs`, `src/main.rs` | 9.1 | The recorder installed before anything counts; the admin state now holds the engine |
+| `src/healthcheck.rs` | 12.2 | D-060 — `hs_utils::healthcheck` lifted in verbatim; the `hs-utils` dependency, `deny.toml`'s `allow-git` list and its `ignore-sources` exemption all removed |
+
+709 tests, from 593: 458 unit (was 405), **47 admin API (new)**, 44 ingress, 46
+config validation (was 40), 30 quota, 28 reply mapping, 21 frequency, 11 rewrite
+stability, **10 metrics endpoint (new)**, 8 quota-through-the-relay, 5 shipped
+config, 1 acceptance drift guard — plus the 4 acceptance tests behind `--ignored`,
+which still pass and which this phase does not touch.
+
+`tests/metrics_endpoint.rs` is its own binary deliberately: `metrics` permits one
+global recorder per process, so a test that needs a real one has to be alone with
+it. Every other suite builds its state with `metrics: None` and exercises the
+no-op recorder phases 2–6 ran against.
+
+**Two new direct dependencies**, plus two dev-only ones, all permissive:
+`metrics-exporter-prometheus` with `default-features = false` (the default set
+pulls hyper and a push-gateway client, and axum already owns the port) and
+`subtle`, already compiled since phase 2 via `argon2`. `LICENSES.md` §7.
+
+**And one removed.** D-060 drops `hs-utils`, which existed for a single
+stdlib-only function. Simmer now has no git dependencies at all, and the only
+crate in its graph without a `license` field is itself.
+
+### What is tested
+
+- **The §9.2 projections, without a database.** `view.rs` is pure functions, so
+  the case that matters — D-026's drift, where the row says 100 and the schedule
+  says 200 — is a unit test rather than a fixture. Then again end to end against
+  a real row.
+- **§9.4 answers about the relay, not about itself.** Five tests walk the real
+  `walk_and_reserve` and `dry_walk` over the same state and assert identical
+  evaluations: everything eligible, paused, quota exhausted, not started, and
+  over the §7.3 frequency threshold. The last two are the ones that would catch a
+  reordering, because `walk_and_reserve` checks frequency *before* the day index.
+- **A dry run writes nothing.** Asserted against the tables: no
+  `quota_reservation` row after five calls, and no `quota_usage` row after one —
+  the second being the stronger claim, since an inserted row would fix today's
+  ceiling at whatever the schedule said when somebody tested a configuration.
+- **Every protected endpoint refuses both an anonymous request and a wrong
+  token**, from one table, so a route added without authentication fails the
+  suite. A missing token and a wrong one produce byte-identical responses.
+- **The mutations reach the message path.** Pausing a route through HTTP and then
+  running the real chain walk yields `warming=paused,overflow=selected`; an
+  override of 3 over a schedule of 1 lets three reservations through.
+- **D-058's arithmetic**, with a live reservation held across the reset:
+  `committed` goes to zero and `reserved` stays at one.
+- **D-057's warnings.** Pausing one route of two produces none; pausing both
+  produces warnings naming the chains and the `451` clients will see.
+- **The gauges are right with nothing having relayed.** The scrape asserts the
+  Google override series, the default series and `+Inf` for the overflow route,
+  in a process where no message has ever been sent.
+- **D-021's claim, finally testable.** The counters written in phases 2–6 against
+  a null recorder produce real series once a recorder exists, with no change to
+  any call site but D-054's.
+- **The healthcheck subcommand**, which had no tests at all as an external
+  dependency: argument parsing in every documented form, a real one-shot HTTP
+  server asserting the exact request line for both paths, every non-`200` status,
+  nothing listening, and an unresolvable host.
+- **§7.3, applied to the control plane.** Every read endpoint is asserted to
+  contain no recipient, no recipient key, and no address-shaped value, after a
+  real recipient has been put through the system. The dry run echoes the address
+  the caller supplied and no other. The evicted-events counter is asserted to
+  carry no labels at all.
+
+### What is not tested
+
+- **No test drives the admin listener over a socket.** Everything goes through
+  `oneshot` against the router, so the bind, the graceful-shutdown wiring in
+  `main` and the real TCP path are exercised only by `docker compose up`.
+- **`/metrics` under a failing store.** The handler logs and renders anyway; that
+  branch is reasoned about, not driven.
+- **Concurrent mutations.** Two operators pausing and resuming the same route
+  interleave as last-writer-wins, and the audit line's "previous" is read before
+  the write. Correct, and unproven.
+- **The `403`-shaped case does not exist.** Every token can do everything; there
+  are no scopes. A token that could read but not mutate is a plausible next ask
+  and is not built.
+- **Nothing asserts the audit line itself.** The `INFO` record is emitted through
+  `tracing` and no test captures a subscriber to read it back, so what is proven
+  is that the mutation happened and what the response said, not what was logged.
+
+### Things the spec did not cover
+
+D-053 through D-059. The three a reader would not predict from `SPEC.md`:
+
+- **D-055** — §9.2's reads need the token, which §9.3's wording does not require.
+  The reasoning is that `/routes` discloses the entire routing shape and every
+  downstream hostname, and §2.3's trusted-segment assumption is an assumption.
+- **D-056** — the §7 gauges are recomputed on every scrape. Without it they are
+  only ever set by a message that relayed, so an idle route exports yesterday's
+  ceiling under today's label set. §9.1 does not say, and the naive reading is
+  wrong in the direction that looks fine on a dashboard.
+- **D-057** — an allowance of zero is allowed and warned about rather than
+  refused. §9.3 offers the capability and §14.1 governs the *reply*, which stays
+  `451` either way; what the spec does not provide is any way for an operator to
+  discover they have just made every message on a chain temporary-fail.
+
+Two smaller calls not worth their own entry:
+
+- **`POST /routes/{name}/graduate` accepts `{"graduated": false}`.** §9.3 names
+  only the forward direction, but graduation pins a route to its *final*
+  allowance immediately and an operator who does that to the wrong route needs a
+  way back that is not a manual `UPDATE`.
+- **Graduating an overflow route is a `400`.** §3.1 gives it no warm-up schedule,
+  so there is no final value to pin it to, and storing the flag would report
+  success for a no-op.
+
+### Carried into phase 8
+
+Phase 8 is §6.7's DNS preflight, which is the last of §6 and which supplies the
+two §9.1 metrics this phase left absent by dependency —
+`simmer_preflight_ok{route,check}` and the `preflight` skip reason, which
+`SkipReason::Preflight` has carried unconstructed since phase 3. `/routes`
+reports `"preflight": null` today, and phase 8 is what fills it in.
+
+**There are no open questions left.** All twelve are closed or dissolved.
+
+Separately, and now scheduled: the **multi-instance** question. `README.md`'s
+deployment section and D-007 say that two Simmers against one database is the
+window in which quota overshoot occurs, and reading the code says otherwise —
+§7.4's reservation takes a row lock that serialises contenders whatever process
+they are in. What genuinely blocks two instances is narrower: D-049's frequency
+race, and config skew during a roll under D-026. That correction, a two-pool
+concurrency test to evidence it, and a `docs/MULTI_INSTANCE.md` for the spec's
+author are the next piece of work after this phase.
+
+> **Done, 2026-08-11 — see D-061 and `docs/MULTI_INSTANCE.md`.** It held up:
+> quota is cross-instance safe by the row lock, evidenced by
+> `tests/quota_multi_instance.rs` racing two independent pools, and falsified
+> against an unlocked `lock_usage` to prove the tests have teeth. The D-049 bound
+> turned out to be `threshold + (C - 1)` for peak concurrency `C`, not the flat
+> "one extra message" the plan assumed. No code changed.
+
+The `smtp/auth.rs` timing defect is still unfixed and still separable.

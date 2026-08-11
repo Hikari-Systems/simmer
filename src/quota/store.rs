@@ -51,6 +51,33 @@ impl Usage {
     }
 }
 
+/// A `(route, domain_group, day_index)` address, for the §9.2 read API.
+///
+/// The day index is part of the key rather than a parameter because it is
+/// per-route: a warming route's day begins on its own `warmup.started`
+/// anniversary and an overflow route's on UTC midnight (D-024), so one request
+/// asking about every route is asking about several different days.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UsageKey {
+    pub route: String,
+    pub domain_group: String,
+    pub day_index: i64,
+}
+
+/// What §9.3's `POST /quota/reset` did, so the response and the audit line can
+/// say what was destroyed rather than only that something was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reset {
+    pub committed_before: i64,
+    pub reserved_before: i64,
+    /// `reserved` is **recomputed from the live reservation rows**, not zeroed.
+    /// A reset during a send would otherwise hand away headroom that an
+    /// in-flight message already owns, and the double-spend would only surface
+    /// as an overshoot of the day's ceiling — which is the one thing this
+    /// service exists to prevent.
+    pub reserved_after: i64,
+}
+
 /// §9.3 route-scoped admin state. Absent rows read as the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RouteState {
@@ -142,6 +169,42 @@ pub trait QuotaStore: Send + Sync + 'static {
         domain_group: &str,
         day_index: i64,
     ) -> Result<Usage, QuotaError>;
+
+    /// §9.2 — several rows in one query, for the read API.
+    ///
+    /// Keyed by `(route, domain_group)` on the way out: the day index is an
+    /// input, and a route only ever has one *current* day.
+    async fn usage_many(
+        &self,
+        keys: &[UsageKey],
+    ) -> Result<std::collections::HashMap<(String, String), Usage>, QuotaError>;
+
+    /// §9.3 `POST /routes/{name}/pause` and `/resume`.
+    async fn set_paused(&self, route: &str, paused: bool) -> Result<(), QuotaError>;
+
+    /// §9.3 `POST /routes/{name}/graduate` — pin to the final schedule value.
+    async fn set_graduated(&self, route: &str, graduated: bool) -> Result<(), QuotaError>;
+
+    /// §9.3 `POST /routes/{name}/allowance`. `allowance: None` clears the
+    /// override; `scheduled` is what to write into `allowance` if the row does
+    /// not exist yet, so that clearing an override on a fresh row leaves the
+    /// schedule's own number behind rather than a null (D-025).
+    async fn set_allowance_override(
+        &self,
+        route: &str,
+        domain_group: &str,
+        day_index: i64,
+        allowance: Option<i64>,
+        scheduled: Option<i64>,
+    ) -> Result<(), QuotaError>;
+
+    /// §9.3 `POST /quota/reset`. `None` means there was no row to reset.
+    async fn reset_counters(
+        &self,
+        route: &str,
+        domain_group: &str,
+        day_index: i64,
+    ) -> Result<Option<Reset>, QuotaError>;
 
     /// §9.3 state for every route, in one query. Read per message rather than
     /// cached: at warm-up volumes the query costs nothing, and a cache would

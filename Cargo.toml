@@ -36,8 +36,8 @@ sqlx = { version = "0.8", features = [
     "migrate",
 ] }
 
-# Config. SPEC.md §4 mandates YAML with ${ENV_VAR} interpolation, so we do NOT
-# use hs_utils::config's JSON layering here — see DECISIONS.md D-004.
+# Config. SPEC.md §4 mandates YAML with ${ENV_VAR} interpolation, so this does
+# NOT use the house config.json layering — see DECISIONS.md D-004.
 # serde_yaml is unmaintained (it is literally published as "0.9.34+deprecated");
 # serde_yaml_ng is the maintained continuation.
 serde = { version = "1", features = ["derive"] }
@@ -119,11 +119,14 @@ metrics = "0.24"
 # trait is not yet dyn-compatible. `MIT OR Apache-2.0`, every published version.
 async-trait = "0.1"
 
-# Only for healthcheck::check_subcommand, which makes
-# `HEALTHCHECK CMD ["/app/server","healthcheck"]` work in a runtime image with
-# no curl. No features: the db/web features pull in the actix + JSON-config
-# machinery this service deliberately does not use.
-hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.31.2", default-features = false }
+# `hs-utils` was here, for `healthcheck::check_subcommand` alone. Removed in
+# phase 7 (D-060): that module is stdlib-only and now lives in
+# `src/healthcheck.rs`, behaving identically. Nothing else in this crate ever
+# used it — config, logging, the pool and the HTTP layer all diverge by
+# decision (D-003 through D-006), so one small file was the entire coupling.
+#
+# Simmer now has **no git dependencies at all**, which is why `deny.toml` has no
+# `allow-git` entry and no `ignore-sources` exemption.
 
 # --- phase 6 -------------------------------------------------------------
 
@@ -142,6 +145,27 @@ hs-utils = { git = "https://github.com/Hikari-Systems/hs-utils-rs", tag = "v0.31
 sha2 = "0.10"
 hmac = "0.12"
 
+# --- phase 7 -------------------------------------------------------------
+
+# §9.1 "Prometheus exposition on the admin listener". `default-features = false`
+# is load-bearing: the default set pulls hyper, hyper-util, http-body-util and a
+# push-gateway client so the exporter can run its *own* HTTP listener, and axum
+# already owns the admin port. With no features it is a recorder plus
+# `PrometheusHandle::render()`, which is exactly what `GET /metrics` needs.
+# `MIT`, every published version — see LICENSES.md §5.
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
+# §9.3's bearer token, compared in constant time. Already in the graph via
+# argon2/password-hash, so this takes a direct dependency on a crate that is
+# already being compiled. `BSD-3-Clause`.
+#
+# The comparison has to be constant-time for the same reason §5.3's does: an
+# admin token is a shared secret compared against attacker-supplied bytes, and
+# `==` on a byte slice returns as soon as it finds a difference. See the
+# `smtp/auth.rs` defect for what happens when that reasoning is applied to one
+# comparison and not another.
+subtle = "2"
+
 [profile.release]
 strip = true
 lto = true
@@ -155,3 +179,10 @@ opt-level = "s"
 # rusty-fork, wait-timeout and quick-error for a process-isolation harness the
 # stability property does not need.
 proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+
+# §9 — drives the real `admin::router` in-process, so the tests exercise the
+# actual middleware stack, extractors and status codes rather than a
+# reimplementation of them. Both crates are already in the graph via axum, so
+# this adds nothing to the build.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

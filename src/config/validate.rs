@@ -27,6 +27,11 @@ use crate::rewrite::{stability, RouteRewrite};
 /// with no override, and naming one in `unstable_headers` is itself a violation.
 pub const IDENTITY_HEADERS: [&str; 3] = ["From", "Sender", "Message-ID"];
 
+/// Below this, an admin token gets a startup `WARN` (D-053). 16 characters of
+/// base64 is 96 bits, which is well past guessable and short enough that no
+/// reasonable secret manager produces less by accident.
+const MIN_ADMIN_TOKEN_LEN: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {
     /// Where in the document, in a form the reader can search for.
@@ -131,6 +136,7 @@ pub fn validate(cfg: &Config) -> ViolationList {
     check_listeners(cfg, &mut v);
     check_cidrs(cfg, &mut v);
     check_auth(cfg, &mut v);
+    check_admin_tokens(cfg, &mut v);
     check_domain_groups(cfg, &mut v);
     check_route_uniqueness(cfg, &mut v);
     check_routes(cfg, &mut v);
@@ -160,6 +166,29 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
         });
     }
 
+    // §9.3's write API can pause a route or set an allowance of zero, and either
+    // one turns into `451` on every message that steers there. A short token is
+    // the difference between "an operator did that" and "anyone who could reach
+    // the admin port did that". Not a violation, because a length threshold is a
+    // judgement rather than a rule and §4.1 sets none.
+    for (name, token) in cfg.admin.credentials() {
+        if !token.is_empty() && token.len() < MIN_ADMIN_TOKEN_LEN {
+            out.push(Warning {
+                path: if name == super::Admin::DEFAULT_TOKEN_NAME {
+                    "admin.auth_token".to_string()
+                } else {
+                    format!("admin.tokens ('{name}')")
+                },
+                message: format!(
+                    "is {} characters; §9.3 can pause a route or zero an allowance, either of \
+                     which answers every affected message 451. Use at least {} random characters",
+                    token.len(),
+                    MIN_ADMIN_TOKEN_LEN
+                ),
+            });
+        }
+    }
+
     // §7.3 is a *steering* rule: over threshold means "try the next link". A
     // constraint on the last link of a chain has no next link to steer to, so it
     // stops steering and starts refusing — the message gets §10.3's `451` instead
@@ -167,7 +196,7 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
     // how "never mail this person more than twice a day, full stop" is spelled),
     // but it is much more often a mistake, and it is invisible until the day a
     // recipient reaches the threshold.
-    for chain in chains(cfg) {
+    for chain in cfg.chains() {
         let Some(last) = chain.routes.last() else {
             continue;
         };
@@ -371,6 +400,72 @@ fn check_auth(cfg: &Config, v: &mut ViolationList) {
             v.push(
                 format!("server.auth.users[{i}].username"),
                 format!("'{}' duplicates users[{prev}]", user.username),
+            );
+        }
+    }
+}
+
+/// §9.3's credentials (D-053).
+///
+/// Not one of §4.2's enumerated rules, because §4.1 has a single scalar and a
+/// scalar cannot be inconsistent with itself. Named tokens can be, and every way
+/// they can be wrong here ends with the write API either unusable or logging an
+/// identifier that does not identify anything.
+fn check_admin_tokens(cfg: &Config, v: &mut ViolationList) {
+    let credentials = cfg.admin.credentials();
+
+    if credentials.is_empty() {
+        v.push(
+            "admin.auth_token",
+            "no admin credential is configured; §9.3's write API would be \
+             permanently unusable. Set admin.auth_token, or list one or more \
+             admin.tokens",
+        );
+        return;
+    }
+
+    let mut names: BTreeMap<&str, String> = BTreeMap::new();
+    let mut secrets: BTreeMap<&str, String> = BTreeMap::new();
+
+    for (i, (name, token)) in credentials.iter().enumerate() {
+        // `auth_token` is credentials[0] whenever it is set, and it has no index
+        // in the document.
+        let path = if *name == super::Admin::DEFAULT_TOKEN_NAME && i == 0 {
+            "admin.auth_token".to_string()
+        } else {
+            let idx = if cfg.admin.auth_token.is_some() {
+                i - 1
+            } else {
+                i
+            };
+            format!("admin.tokens[{idx}]")
+        };
+
+        if name.trim().is_empty() {
+            v.push(
+                &path,
+                "name must not be empty; it is what §9.3's audit log records as the actor",
+            );
+        }
+        if token.is_empty() {
+            v.push(&path, "token must not be empty");
+            continue;
+        }
+
+        if let Some(previous) = names.insert(name, path.clone()) {
+            v.push(
+                &path,
+                format!("name '{name}' duplicates {previous}; an audit line naming it would be ambiguous"),
+            );
+        }
+        if let Some(previous) = secrets.insert(token, path.clone()) {
+            v.push(
+                &path,
+                format!(
+                    "shares its token with {previous}; §9.3 identifies the actor by the \
+                     token presented, so two names behind one secret make the audit log a \
+                     coin flip"
+                ),
             );
         }
     }
@@ -704,34 +799,6 @@ fn stability_path(field: &str) -> String {
     } else {
         format!("set_headers.{field}")
     }
-}
-
-/// One chain, with a path naming where in the document it came from.
-struct NamedChain<'a> {
-    path: String,
-    routes: &'a [String],
-}
-
-/// Every chain in the configuration: one per sender rule, plus the default.
-fn chains(cfg: &Config) -> Vec<NamedChain<'_>> {
-    let mut out: Vec<NamedChain<'_>> = cfg
-        .senders
-        .iter()
-        .enumerate()
-        .map(|(i, rule)| NamedChain {
-            path: format!("senders[{i}] (match '{}').chain", rule.pattern),
-            routes: &rule.chain,
-        })
-        .collect();
-
-    if let Some(default) = cfg.default_chain.as_deref() {
-        out.push(NamedChain {
-            path: "default_chain".to_string(),
-            routes: default,
-        });
-    }
-
-    out
 }
 
 fn check_chains(cfg: &Config, v: &mut ViolationList) {

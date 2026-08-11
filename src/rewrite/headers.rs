@@ -178,6 +178,20 @@ impl HeaderBlock {
         self.fields.iter().map(Field::name).collect()
     }
 
+    /// Every field in order as `(name, logical value)`.
+    ///
+    /// Position-aware, which [`get`](Self::get) and [`get_all`](Self::get_all)
+    /// are not: §9.4 has to show the header block as it would leave, and a
+    /// message's `Received:` chain is several fields whose order is the whole
+    /// meaning. Values are unfolded, so this is a view of the block rather than
+    /// the bytes — [`render`](Self::render) is what produces those.
+    pub fn fields(&self) -> impl Iterator<Item = (&str, String)> {
+        self.fields.iter().map(|f| match f {
+            Field::Original { name, raw } => (name.as_str(), unfold(raw)),
+            Field::Written { name, value } => (name.as_str(), value.clone()),
+        })
+    }
+
     /// §6.2 `remove_headers`, and §6.5's unconditional strip. Removes **every**
     /// instance — a message with three `DKIM-Signature` headers must leave with
     /// none.

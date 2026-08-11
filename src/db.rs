@@ -3,7 +3,7 @@
 //! Follows the hikari-systems data-service pattern for *organisation* — a
 //! concrete `AppState`-style pool handle, plain-SQL migrations in `migrations/`
 //! applied by `sqlx::migrate!` at startup, and runtime queries in `models/` — but
-//! builds the pool directly rather than through `hs_utils::db::build_pool`.
+//! builds the pool directly rather than through the house `build_pool`.
 //!
 //! The reason is that `SPEC.md` §4.1 specifies `database.url`, a single
 //! connection URL, whereas `build_pool` takes a `DbConfig` of discrete

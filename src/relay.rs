@@ -391,7 +391,7 @@ pub async fn reserve_relay_commit(
         }
     }
 
-    metrics::message(&selected.route.name, outcome.result);
+    metrics::message(&selected.route.name, &selected.domain_group, outcome.result);
     outcome.reply
 }
 

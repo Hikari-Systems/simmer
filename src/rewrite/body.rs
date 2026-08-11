@@ -121,6 +121,16 @@ struct Rule {
     replacement: String,
 }
 
+/// One rule's verdict against a sample, for §9.4.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuleMatch {
+    /// Position in `body_rewrites`, which is also application order (§6.4).
+    pub index: usize,
+    pub pattern: String,
+    pub replacement: String,
+    pub count: usize,
+}
+
 impl Rules {
     /// `Err` names the index of each pattern that does not compile, so §4.2 can
     /// report all of them at once rather than the first.
@@ -175,6 +185,45 @@ impl Rules {
 
         // A rule can match and replace with what was already there.
         (current != text).then_some(current)
+    }
+
+    /// §9.4 — which rules match this text, and how many times, changing nothing.
+    ///
+    /// Sequential, exactly as [`apply`](Self::apply) is: each rule is counted
+    /// against the text the rules before it produced, because that is the text
+    /// it will actually be shown. Counting every rule against the original would
+    /// over-report a rule whose input an earlier rule consumes, and dry run
+    /// exists to answer "will my rewrite fire", not "would it have fired first".
+    ///
+    /// Every rule is reported, including the ones that matched nothing — a
+    /// pattern with a zero count is the single most useful thing this endpoint
+    /// can tell an operator, and omitting it would leave them reading a list to
+    /// work out what is not on it.
+    ///
+    /// Deliberately not folded into `apply`: `apply` is on the message path and
+    /// counting costs a second scan per rule.
+    pub fn match_report(&self, text: &str) -> Vec<RuleMatch> {
+        let mut current = std::borrow::Cow::Borrowed(text);
+        let mut out = Vec::with_capacity(self.rules.len());
+
+        for (index, rule) in self.rules.iter().enumerate() {
+            let count = rule.pattern.find_iter(&current).count();
+            out.push(RuleMatch {
+                index,
+                pattern: rule.pattern.as_str().to_string(),
+                replacement: rule.replacement.clone(),
+                count,
+            });
+            if count > 0 {
+                current = std::borrow::Cow::Owned(
+                    rule.pattern
+                        .replace_all(&current, rule.replacement.as_str())
+                        .into_owned(),
+                );
+            }
+        }
+
+        out
     }
 
     /// §6.6 applied to the body: does running the rules over their own output

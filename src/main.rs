@@ -14,7 +14,7 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use simmer::{admin, config, db, logging, quota, relay, smtp};
+use simmer::{admin, config, db, healthcheck, logging, quota, relay, smtp};
 use tracing::{error, info, warn};
 
 /// Where the §4 YAML lives. Overridable so the compose stack can mount an
@@ -33,7 +33,7 @@ async fn main() -> ExitCode {
     // runtime image has no curl. Falls back to the §4.1 default admin port when
     // the config cannot be read, so a broken config still fails the healthcheck
     // rather than panicking inside it.
-    hs_utils::healthcheck::check_subcommand(
+    healthcheck::check_subcommand(
         config::load(config_path())
             .ok()
             .and_then(|c| c.admin.listen.parse::<std::net::SocketAddr>().ok())
@@ -61,6 +61,20 @@ async fn run() -> anyhow::Result<()> {
     let config = Arc::new(config::load(&path)?);
 
     logging::init(&config.logging.level, config.logging.format);
+
+    // §9.1 — install the Prometheus recorder before anything that counts. Every
+    // `metrics::` call before this point is a no-op against a null recorder
+    // (D-021), and there are none: nothing has relayed a message yet. A failure
+    // here means a recorder is already installed, which cannot happen in a
+    // process with one `main`, so it is reported and the service carries on
+    // without an exporter rather than refusing to relay mail over it.
+    let metrics_handle = match simmer::metrics::install() {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            warn!(error = %e, "could not install the Prometheus recorder; /metrics will be empty");
+            None
+        }
+    };
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -154,8 +168,11 @@ async fn run() -> anyhow::Result<()> {
     info!(addr = %smtp.local_addr()?, "SMTP listener bound");
 
     let admin_state = admin::AdminState {
-        config: Arc::clone(&config),
-        pool: pool.clone(),
+        // The same engine the SMTP listener has. §9.4's dry run is only worth
+        // having if what it reports is what would actually happen, and sharing
+        // the engine makes that true by construction.
+        engine: engine.clone(),
+        metrics: metrics_handle,
     };
     let admin_listener = tokio::net::TcpListener::bind(&config.admin.listen)
         .await

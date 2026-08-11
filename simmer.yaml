@@ -43,9 +43,23 @@ database:
   # guarantee at all. Leave this true.
   fail_closed: true
 
+# §9 control plane. /health, /healthcheck and /metrics are open; every other
+# endpoint — including §9.2's reads and §9.4's dry run — needs a bearer token
+# (D-055).
 admin:
   listen: "0.0.0.0:8080"
+  # The shared token of §4.1. §9.3 logs every mutation with "the acting token's
+  # identifier", and this one is logged as `default`.
   auth_token: "${SIMMER_ADMIN_TOKEN}"
+  # Named tokens, so that identifier names somebody (O-11, D-053). Issue one per
+  # human or per system and the audit line stops saying `default`. Optional, and
+  # additive: `auth_token` above keeps working either way. Names and secrets must
+  # both be unique — two names behind one secret would make the audit log a coin
+  # flip, and §4.2 refuses to start on it.
+  #
+  # tokens:
+  #   - { name: oncall,    token: "${SIMMER_TOKEN_ONCALL}" }
+  #   - { name: deploybot, token: "${SIMMER_TOKEN_DEPLOY}" }
 
 logging:
   level: info
