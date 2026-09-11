@@ -22,14 +22,15 @@ fn config(warming_port: u16, overflow_port: u16) -> String {
     format!(
         r#"
 server:
-  listen: "127.0.0.1:0"
+  listeners:
+    - address: "127.0.0.1:0"
   hostname: "simmer.test"
   max_message_bytes: 100000
   max_recipients: 5
   max_concurrent_sessions: 16
   allowed_cidrs: ["127.0.0.0/8"]
   timeouts: {{ command: 5s, data: 5s, session: 60s }}
-  auth: {{ required: false, allow_insecure_auth: true }}
+  auth: {{ allow_insecure_auth: true }}
 database:
   url: "postgres://u:p@localhost/simmer"
   connect_timeout: 5s

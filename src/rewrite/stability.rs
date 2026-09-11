@@ -95,6 +95,7 @@ pub fn probe(route: &RouteRewrite) -> Report {
                     peer: "127.0.0.1",
                     by: "probe",
                     authenticated: false,
+                    tls: false,
                 },
                 now,
                 uuid: &uuid,

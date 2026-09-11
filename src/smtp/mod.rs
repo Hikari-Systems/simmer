@@ -1,10 +1,16 @@
-//! §5 ingress: the listener, and the §5.2 state machine it drives.
+//! §5 ingress: the listeners, and the §5.2 state machine they drive.
+//!
+//! Since D-070 there is one listener per configured port, each with its own TLS
+//! and AUTH [`Policy`], sharing one `max_concurrent_sessions` bound and one
+//! `allowed_cidrs` check — the limits are about the process, not the port.
 
+pub mod acl;
 pub mod auth;
 pub mod buffer;
 pub mod command;
 pub mod reply;
 pub mod session;
+pub mod tls;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -12,9 +18,12 @@ use std::sync::Arc;
 use ipnet::IpNet;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio_rustls::TlsAcceptor;
 
+use crate::config::{IngressAuth, IngressTls};
+use crate::downstream::stream::Stream;
 use crate::relay::Engine;
-use crate::{metrics, smtp::auth::Verifier};
+use crate::{metrics, smtp::acl::Acl, smtp::auth::Verifier};
 
 /// A minimal cancellation primitive.
 ///
@@ -56,19 +65,50 @@ mod tokio_util_shim {
 
 pub use tokio_util_shim::CancellationToken as Shutdown;
 
-/// The SMTP listener (§5.1).
-pub struct Listener {
-    listener: TcpListener,
+/// What a session needs to know about the port it arrived on (D-070).
+#[derive(Clone)]
+pub struct Policy {
+    pub tls: IngressTls,
+    pub auth: IngressAuth,
+    /// Present exactly when `tls` is not `off`: §4.2 refuses a TLS listener
+    /// without a certificate, so a session never has to wonder.
+    pub acceptor: Option<TlsAcceptor>,
+}
+
+impl Policy {
+    /// Whether `STARTTLS` is on offer here at all. Never on an implicit-TLS
+    /// port: RFC 8314 §3.3 forbids advertising it there.
+    pub fn offers_starttls(&self) -> bool {
+        matches!(
+            self.tls,
+            IngressTls::Starttls | IngressTls::StarttlsRequired
+        )
+    }
+}
+
+/// State every session shares, whichever port it arrived on.
+struct Shared {
     engine: Engine,
     verifier: Arc<Verifier>,
-    allowed: Arc<Vec<IpNet>>,
-    /// §5.1 `max_concurrent_sessions`. A permit is held for the whole session.
+    acl: Arc<Acl>,
+    allowed: Vec<IpNet>,
+    /// §5.1 `max_concurrent_sessions`. A permit is held for the whole session,
+    /// and one pool serves every listener.
     sessions: Arc<Semaphore>,
 }
 
+/// The SMTP listeners (§5.1).
+pub struct Listener {
+    bound: Vec<(TcpListener, Arc<Policy>)>,
+    shared: Arc<Shared>,
+    certificate: Option<tls::Loaded>,
+}
+
 impl Listener {
-    /// Bind and prepare. Separate from [`Listener::serve`] so `main` can report a
-    /// bind failure before announcing itself as started.
+    /// Bind every listener and prepare. Separate from [`Listener::serve`] so
+    /// `main` can report a bind failure before announcing itself as started — a
+    /// port clash on 587 is a startup failure, not a service that is deaf on one
+    /// port.
     pub async fn bind(engine: Engine) -> anyhow::Result<Self> {
         let cfg = &engine.config;
 
@@ -81,102 +121,220 @@ impl Listener {
             .filter_map(|c| c.parse().ok())
             .collect();
 
-        let listener = TcpListener::bind(&cfg.server.listen)
-            .await
-            .map_err(|e| anyhow::anyhow!("binding SMTP listener {}: {e}", cfg.server.listen))?;
+        // §4.2 has already loaded this once, so a failure here means the file
+        // changed between validation and now. Refusing to start is still right.
+        let certificate = match &cfg.server.tls {
+            Some(t) => Some(tls::load(t).map_err(|problems| {
+                let detail: Vec<String> = problems
+                    .iter()
+                    .map(|p| format!("{}: {}", p.path, p.message))
+                    .collect();
+                anyhow::anyhow!("loading the TLS certificate: {}", detail.join("; "))
+            })?),
+            None => None,
+        };
 
-        let verifier = Arc::new(Verifier::new(&cfg.server.auth));
-        let sessions = Arc::new(Semaphore::new(cfg.server.max_concurrent_sessions));
+        let mut bound = Vec::with_capacity(cfg.server.listeners.len());
+        for l in &cfg.server.listeners {
+            let listener = TcpListener::bind(&l.address)
+                .await
+                .map_err(|e| anyhow::anyhow!("binding SMTP listener {}: {e}", l.address))?;
+            let tls = l.tls_mode();
+            let policy = Policy {
+                tls,
+                auth: l.auth_mode(),
+                acceptor: tls
+                    .can_encrypt()
+                    .then(|| certificate.as_ref().map(|c| c.acceptor.clone()))
+                    .flatten(),
+            };
+            if tls.can_encrypt() && policy.acceptor.is_none() {
+                // Unreachable through `config::load`, which refuses a TLS
+                // listener with no certificate. A listener that advertised
+                // STARTTLS and could not perform it would be worse than none.
+                anyhow::bail!(
+                    "listener {} has tls: {} but no certificate",
+                    l.address,
+                    tls.as_str()
+                );
+            }
+            bound.push((listener, Arc::new(policy)));
+        }
+
+        let shared = Shared {
+            verifier: Arc::new(Verifier::new(&cfg.server.auth)),
+            acl: Arc::new(Acl::new(&cfg.server.auth)),
+            sessions: Arc::new(Semaphore::new(cfg.server.max_concurrent_sessions)),
+            allowed,
+            engine,
+        };
 
         Ok(Self {
-            listener,
-            engine,
-            verifier,
-            allowed: Arc::new(allowed),
-            sessions,
+            bound,
+            shared: Arc::new(shared),
+            certificate,
         })
     }
 
+    /// The first listener's address — the only one, in every configuration
+    /// before D-070.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.bound
+            .first()
+            .ok_or_else(|| std::io::Error::other("no listeners"))?
+            .0
+            .local_addr()
+    }
+
+    /// Every listener, in configuration order, with its effective policy.
+    pub fn local_addrs(&self) -> std::io::Result<Vec<(SocketAddr, IngressTls, IngressAuth)>> {
+        self.bound
+            .iter()
+            .map(|(l, p)| Ok((l.local_addr()?, p.tls, p.auth)))
+            .collect()
+    }
+
+    /// The loaded certificate, so startup can log its expiry and name coverage.
+    pub fn certificate(&self) -> Option<&tls::Loaded> {
+        self.certificate.as_ref()
     }
 
     /// A handle for waiting on in-flight sessions during §10.4 shutdown.
     pub fn sessions(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.sessions)
+        Arc::clone(&self.shared.sessions)
     }
 
-    /// Accept until `stop_accepting` fires.
+    /// Accept on every listener until `stop_accepting` fires.
     ///
     /// §10.4 is two-phase and both phases are needed: `stop_accepting` breaks the
-    /// accept loop, and `hard_stop` — fired by the caller once the grace period
+    /// accept loops, and `hard_stop` — fired by the caller once the grace period
     /// has elapsed — is what makes a session still running at that point emit
     /// `421` rather than being cut off mid-reply.
     pub async fn serve(self, stop_accepting: Shutdown, hard_stop: Shutdown) {
-        loop {
-            let accepted = tokio::select! {
-                biased;
-                _ = stop_accepting.cancelled() => break,
-                a = self.listener.accept() => a,
-            };
-
-            let (stream, peer) = match accepted {
-                Ok(v) => v,
-                Err(e) => {
-                    // A per-connection accept error (EMFILE, a peer that
-                    // vanished) must not take the listener down.
-                    tracing::warn!(error = %e, "accept failed");
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-            };
-
-            let engine = self.engine.clone();
-            let verifier = Arc::clone(&self.verifier);
-            let allowed = Arc::clone(&self.allowed);
-            let sessions = Arc::clone(&self.sessions);
-            let hard_stop = hard_stop.clone();
-
-            tokio::spawn(async move {
-                handle(stream, peer, engine, verifier, allowed, sessions, hard_stop).await;
-            });
+        let loops: Vec<_> = self
+            .bound
+            .into_iter()
+            .map(|(listener, policy)| {
+                tokio::spawn(accept_loop(
+                    listener,
+                    policy,
+                    Arc::clone(&self.shared),
+                    stop_accepting.clone(),
+                    hard_stop.clone(),
+                ))
+            })
+            .collect();
+        for l in loops {
+            let _ = l.await;
         }
 
-        tracing::info!("SMTP listener stopped accepting");
+        tracing::info!("SMTP listeners stopped accepting");
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+async fn accept_loop(
+    listener: TcpListener,
+    policy: Arc<Policy>,
+    shared: Arc<Shared>,
+    stop_accepting: Shutdown,
+    hard_stop: Shutdown,
+) {
+    loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = stop_accepting.cancelled() => break,
+            a = listener.accept() => a,
+        };
+
+        let (stream, peer) = match accepted {
+            Ok(v) => v,
+            Err(e) => {
+                // A per-connection accept error (EMFILE, a peer that
+                // vanished) must not take the listener down.
+                tracing::warn!(error = %e, "accept failed");
+                tokio::task::yield_now().await;
+                continue;
+            }
+        };
+
+        let policy = Arc::clone(&policy);
+        let shared = Arc::clone(&shared);
+        let hard_stop = hard_stop.clone();
+        tokio::spawn(async move {
+            handle(stream, peer, policy, shared, hard_stop).await;
+        });
+    }
+}
+
 async fn handle(
     mut stream: TcpStream,
     peer: SocketAddr,
-    engine: Engine,
-    verifier: Arc<Verifier>,
-    allowed: Arc<Vec<IpNet>>,
-    sessions: Arc<Semaphore>,
+    policy: Arc<Policy>,
+    shared: Arc<Shared>,
     hard_stop: Shutdown,
 ) {
+    // On an implicit-TLS port the first bytes belong to a TLS handshake, so a
+    // plaintext refusal would arrive as garbage in the client's ClientHello
+    // response. §5.1 permits a bare TCP close, and that is the honest answer
+    // there.
+    let implicit = policy.tls == IngressTls::Implicit;
+
     // §5.1 — the CIDR check comes before anything else, including the permit, so
     // a disallowed peer cannot consume a session slot.
-    if !is_allowed(peer.ip(), &allowed) {
+    if !is_allowed(peer.ip(), &shared.allowed) {
         tracing::warn!(peer = %peer, "connection from outside allowed_cidrs");
         metrics::connection_refused("cidr");
-        let _ = write_and_close(&mut stream, &reply::access_denied()).await;
+        if !implicit {
+            let _ = write_and_close(&mut stream, &reply::access_denied()).await;
+        }
         return;
     }
 
     // §5.1 — "reply 421 4.3.2 too many connections".
-    let Ok(_permit) = Arc::clone(&sessions).try_acquire_owned() else {
+    let Ok(_permit) = Arc::clone(&shared.sessions).try_acquire_owned() else {
         tracing::warn!(peer = %peer, "refused: max_concurrent_sessions reached");
         metrics::connection_refused("max_sessions");
-        let _ = write_and_close(&mut stream, &reply::too_many_connections()).await;
+        if !implicit {
+            let _ = write_and_close(&mut stream, &reply::too_many_connections()).await;
+        }
         return;
     };
 
     let _ = stream.set_nodelay(true);
+    let cfg = &shared.engine.config;
 
-    let session_timeout = engine.config.server.timeouts.session;
-    let mut session = session::Session::new(stream, peer, engine, verifier);
+    // RFC 8314 — TLS from the first byte. Inside the permit, so a handshake
+    // counts against max_concurrent_sessions like any other session, and bounded
+    // by the per-command budget, so a peer that opens a socket and sends nothing
+    // holds a slot for no longer than an idle plaintext one would.
+    let stream = if implicit {
+        let acceptor = policy.acceptor.clone().expect("Listener::bind checked");
+        match tokio::time::timeout(cfg.server.timeouts.command, acceptor.accept(stream)).await {
+            Ok(Ok(tls)) => Stream::Tls(Box::new(tls.into())),
+            Ok(Err(e)) => {
+                tracing::info!(peer = %peer, error = %e, "implicit TLS handshake failed");
+                metrics::inbound_tls_failure("implicit", "handshake");
+                return;
+            }
+            Err(_) => {
+                tracing::info!(peer = %peer, "implicit TLS handshake timed out");
+                metrics::inbound_tls_failure("implicit", "handshake");
+                return;
+            }
+        }
+    } else {
+        Stream::Plain(stream)
+    };
+
+    let session_timeout = cfg.server.timeouts.session;
+    let mut session = session::Session::new(
+        stream,
+        peer,
+        shared.engine.clone(),
+        Arc::clone(&shared.verifier),
+        Arc::clone(&shared.acl),
+        policy,
+    );
 
     let end = tokio::select! {
         end = session.run() => end,
@@ -199,6 +357,7 @@ async fn handle(
         }
     };
 
+    session.close().await;
     tracing::debug!(peer = %peer, ?end, "session ended");
 }
 
@@ -231,8 +390,8 @@ mod tests {
 
     #[test]
     fn refuses_addresses_outside_them() {
-        // §2.3: the listener is plaintext and accepts plaintext AUTH, so this is
-        // the only thing standing between it and an untrusted network.
+        // §2.3: TLS and AUTH do not make Simmer a public MX. An `auth: optional`
+        // listener lets an unauthenticated client send as anyone this admits.
         let allowed = nets(&["10.0.0.0/8", "172.16.0.0/12"]);
         assert!(!is_allowed("192.168.1.1".parse().unwrap(), &allowed));
         assert!(!is_allowed("172.32.0.1".parse().unwrap(), &allowed));

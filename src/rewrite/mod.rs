@@ -263,6 +263,8 @@ pub struct Received<'a> {
     /// Whether the client authenticated — the difference between RFC 3848's
     /// `ESMTP` and `ESMTPA`.
     pub authenticated: bool,
+    /// Whether the session was encrypted (D-070) — RFC 3848's `S`.
+    pub tls: bool,
 }
 
 /// What to send.
@@ -446,8 +448,16 @@ fn sanitise_address(value: &str) -> String {
 /// `X-Simmer-*` headers — which, per the phase 4 decision, Simmer does not emit
 /// at all. One added header is the smallest honest cost of being in the path.
 fn received_value(r: &Received<'_>, inbound: &Inbound<'_>) -> String {
-    // RFC 3848: `ESMTPA` when the session authenticated, `ESMTP` when not.
-    let with = if r.authenticated { "ESMTPA" } else { "ESMTP" };
+    // RFC 3848: `ESMTP`, plus `S` for a TLS session and `A` for an
+    // authenticated one — `ESMTPSA` when both. Neither names *who*
+    // authenticated, which keeps D-071's "two users permitted the same identity
+    // produce the same output" true of this header too, bar its id and date.
+    let with = match (r.tls, r.authenticated) {
+        (false, false) => "ESMTP",
+        (false, true) => "ESMTPA",
+        (true, false) => "ESMTPS",
+        (true, true) => "ESMTPSA",
+    };
     format!(
         "from {} ({}) by {} with {} id {}; {}",
         encode::sanitise(r.helo),
@@ -491,6 +501,7 @@ mod tests {
                 peer: "10.1.2.3",
                 by: "simmer.test",
                 authenticated: true,
+                tls: false,
             },
             now: at("2026-08-10T12:30:00Z"),
             uuid,
@@ -692,6 +703,32 @@ unstable_headers: ["Reply-To"]
             out.starts_with("Received: from app.internal (10.1.2.3) by simmer.test with ESMTP id"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn a_tls_session_is_recorded_with_rfc_3848s_s() {
+        // D-070. All four combinations, because the two flags are independent
+        // and a match that swapped them would still pass a test of one.
+        let route = compile(r#"envelope_from: "b@new.com""#);
+        let rcpt = ["bob@example.net".to_string()];
+        let uuid = || String::new();
+        for (tls, authenticated, want) in [
+            (false, false, "ESMTP"),
+            (false, true, "ESMTPA"),
+            (true, false, "ESMTPS"),
+            (true, true, "ESMTPSA"),
+        ] {
+            let mut inb = inbound(MESSAGE, Some("a@old.com"), &rcpt, &uuid);
+            inb.received.tls = tls;
+            inb.received.authenticated = authenticated;
+            let out = String::from_utf8(rewrite(&route, &inb).raw).unwrap();
+            assert!(
+                out.starts_with(&format!(
+                    "Received: from app.internal (10.1.2.3) by simmer.test with {want} id"
+                )),
+                "tls={tls} auth={authenticated}: {out}"
+            );
+        }
     }
 
     #[test]

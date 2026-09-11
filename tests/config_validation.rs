@@ -11,7 +11,9 @@ use simmer::config::{self, LoadError};
 /// A minimal configuration that passes every rule. Tests mutate one thing.
 const BASE: &str = r#"
 server:
-  listen: "127.0.0.1:25"
+  listeners:
+    - address: "127.0.0.1:25"
+      auth: required
   hostname: "simmer.test"
   max_message_bytes: 26214400
   max_recipients: 100
@@ -19,12 +21,12 @@ server:
   allowed_cidrs: ["10.0.0.0/8"]
   timeouts: { command: 30s, data: 300s, session: 600s }
   auth:
-    required: true
     allow_insecure_auth: true
     mechanisms: [PLAIN, LOGIN]
     users:
       - username: "cfapp"
         password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        grants: { send_as: ["oldbrand.com"] }
 database:
   url: "postgres://simmer:simmer@localhost/simmer"
   max_connections: 10
@@ -220,23 +222,228 @@ fn rejects_an_override_naming_an_undefined_domain_group() {
 
 // -- §4.2: auth ----------------------------------------------------------
 
+const USER: &str = r#"    users:
+      - username: "cfapp"
+        password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        grants: { send_as: ["oldbrand.com"] }"#;
+
 #[test]
 fn rejects_auth_required_with_no_users() {
-    let yaml = BASE.replace(
-        r#"    users:
-      - username: "cfapp"
-        password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa""#,
-        "    users: []",
-    );
+    assert!(BASE.contains(USER), "fixture drifted from USER");
+    let yaml = BASE.replace(USER, "    users: []");
     rejected_for(&yaml, "no client could ever authenticate");
 }
 
 #[test]
-fn rejects_allow_insecure_auth_false() {
-    // There is no inbound TLS (§5.1), so AUTH is only usable over plaintext and
-    // that has to be an acknowledged choice rather than a default.
+fn rejects_auth_required_where_auth_could_never_be_used() {
+    // The inversion of the rule this replaced (D-070). §4.2 used to *require*
+    // allow_insecure_auth: true, because without inbound TLS nothing else could
+    // work. Now false is the default, and the mistake worth catching is the
+    // listener that requires AUTH, cannot encrypt, and refuses plaintext AUTH —
+    // one that would refuse every message.
     let yaml = BASE.replace("allow_insecure_auth: true", "allow_insecure_auth: false");
-    rejected_for(&yaml, "must be explicitly true");
+    rejected_for(&yaml, "AUTH could never be used");
+}
+
+#[test]
+fn accepts_insecure_auth_false_when_the_listener_does_not_require_auth() {
+    // `optional` on a plaintext port with plaintext AUTH refused is coherent:
+    // unauthenticated clients may send, and nobody's password crosses in clear.
+    let yaml = BASE
+        .replace("allow_insecure_auth: true", "allow_insecure_auth: false")
+        .replace("      auth: required\n", "      auth: optional\n");
+    load(&yaml).expect("optional auth needs no usable AUTH");
+}
+
+#[test]
+fn a_removed_key_says_what_replaced_it() {
+    // `deny_unknown_fields` would refuse both anyway, with serde's bare "unknown
+    // field". A config that worked yesterday deserves the reason.
+    let yaml = BASE.replace(
+        "  listeners:\n    - address: \"127.0.0.1:25\"\n      auth: required\n",
+        "  listen: \"127.0.0.1:25\"\n",
+    );
+    rejected_for(&yaml, "replaced by server.listeners");
+
+    let yaml = BASE.replace(
+        "    allow_insecure_auth: true",
+        "    required: true\n    allow_insecure_auth: true",
+    );
+    rejected_for(&yaml, "replaced by each listener's");
+}
+
+// -- §5.1 listeners (D-070) ------------------------------------------------
+
+#[test]
+fn rejects_no_listeners() {
+    let yaml = BASE.replace(
+        "  listeners:\n    - address: \"127.0.0.1:25\"\n      auth: required\n",
+        "  listeners: []\n",
+    );
+    rejected_for(&yaml, "accept no mail at all");
+}
+
+#[test]
+fn rejects_an_invalid_or_duplicated_listener_address() {
+    let yaml = BASE.replace("- address: \"127.0.0.1:25\"", "- address: \"nonsense\"");
+    rejected_for(&yaml, "not a valid host:port");
+
+    let yaml = BASE.replace(
+        "    - address: \"127.0.0.1:25\"\n      auth: required\n",
+        "    - address: \"127.0.0.1:25\"\n      auth: required\n    - address: \"127.0.0.1:25\"\n",
+    );
+    rejected_for(&yaml, "duplicates server.listeners[0]");
+}
+
+#[test]
+fn an_unknown_listener_mode_is_a_parse_failure() {
+    let yaml = BASE.replace(
+        "      auth: required\n",
+        "      auth: required\n      tls: sometimes\n",
+    );
+    assert!(matches!(load(&yaml), Err(LoadError::Parse { .. })));
+}
+
+#[test]
+fn rejects_a_tls_listener_with_no_certificate() {
+    let yaml = BASE.replace(
+        "      auth: required\n",
+        "      auth: required\n      tls: starttls\n",
+    );
+    rejected_for(&yaml, "server.tls names no certificate");
+}
+
+#[test]
+fn port_defaults_follow_the_rfcs_and_are_checked_like_explicit_values() {
+    // 587 with nothing else said is RFC 6409 submission: starttls_required and
+    // auth required. Without a certificate that is a violation, and the message
+    // says the value came from the default, which is the part an operator would
+    // otherwise not guess.
+    let yaml = BASE.replace(
+        "- address: \"127.0.0.1:25\"",
+        "- address: \"127.0.0.1:587\"",
+    );
+    rejected_for(&yaml, "starttls_required (the default for this port)");
+
+    let cfg = load(BASE).unwrap();
+    let l = &cfg.server.listeners[0];
+    assert_eq!(l.tls_mode(), config::IngressTls::Off);
+    assert_eq!(l.auth_mode(), config::IngressAuth::Required);
+}
+
+#[test]
+fn defaults_by_port() {
+    use config::{IngressAuth as A, IngressTls as T, ListenerConfig};
+    let at = |address: &str| ListenerConfig {
+        address: address.to_string(),
+        tls: None,
+        auth: None,
+    };
+    assert_eq!(
+        (at("0.0.0.0:25").tls_mode(), at("0.0.0.0:25").auth_mode()),
+        (T::Off, A::Optional)
+    );
+    assert_eq!(
+        (at("0.0.0.0:587").tls_mode(), at("0.0.0.0:587").auth_mode()),
+        (T::StarttlsRequired, A::Required)
+    );
+    assert_eq!(
+        (at("0.0.0.0:465").tls_mode(), at("0.0.0.0:465").auth_mode()),
+        (T::Implicit, A::Required)
+    );
+    assert_eq!(
+        (
+            at("0.0.0.0:2525").tls_mode(),
+            at("0.0.0.0:2525").auth_mode()
+        ),
+        (T::Off, A::Optional)
+    );
+    // An explicit value always wins over the port.
+    let explicit = ListenerConfig {
+        address: "0.0.0.0:465".into(),
+        tls: Some(T::Off),
+        auth: Some(A::Disabled),
+    };
+    assert_eq!(
+        (explicit.tls_mode(), explicit.auth_mode()),
+        (T::Off, A::Disabled)
+    );
+}
+
+#[test]
+fn a_missing_certificate_file_is_reported_with_everything_else() {
+    // §4.2's "report all violations": the certificate problem arrives in the
+    // same list as an unrelated routing fault, not after fixing it.
+    let yaml = BASE
+        .replace("      auth: required\n", "      auth: required\n      tls: starttls\n")
+        .replace(
+            "  auth:\n    allow_insecure_auth",
+            "  tls: { certificate: \"/nonexistent/c.pem\", private_key: \"/nonexistent/k.pem\" }\n  auth:\n    allow_insecure_auth",
+        )
+        .replace("chain: [warming, overflow]", "chain: [warming, nonesuch]");
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            assert!(v.mentions("server.tls.certificate"), "{v}");
+            assert!(v.mentions("server.tls.private_key"), "{v}");
+            assert!(v.mentions("nonesuch"), "{v}");
+        }
+        other => panic!("expected violations, got {:?}", other.map(|_| ())),
+    }
+}
+
+// -- §5.3 grants (D-071) ---------------------------------------------------
+
+#[test]
+fn a_user_without_grants_is_a_parse_failure() {
+    // Required, not defaulted: default deny with no grants is a user who can log
+    // in and send nothing.
+    let yaml = BASE.replace("        grants: { send_as: [\"oldbrand.com\"] }\n", "");
+    assert!(matches!(load(&yaml), Err(LoadError::Parse { .. })));
+}
+
+#[test]
+fn rejects_an_empty_grant_list() {
+    let yaml = BASE.replace("send_as: [\"oldbrand.com\"]", "send_as: []");
+    rejected_for(&yaml, "could authenticate and then send nothing");
+}
+
+#[test]
+fn an_unknown_capability_is_refused_not_ignored() {
+    // Where Simmer differs from Slater on purpose (D-071): read once at startup,
+    // a misspelt grant that silently grants nothing is D-013's failure mode.
+    let yaml = BASE.replace(
+        "grants: { send_as: [\"oldbrand.com\"] }",
+        "grants: { send_as: [\"oldbrand.com\"], sendas: [\"x.com\"] }",
+    );
+    assert!(matches!(load(&yaml), Err(LoadError::Parse { .. })));
+}
+
+#[test]
+fn rejects_grant_patterns_that_can_never_mean_what_they_say() {
+    for (pattern, needle) in [
+        ("\"\"", "is empty"),
+        ("\"old brand.com\"", "whitespace"),
+        ("\"*\"", "every sender identity"),
+        ("\"*.x@y.com\"", "not a pattern"),
+        ("\"sales*@x.com\"", "'*' somewhere other than"),
+        ("\"@x.com\"", "not a full address"),
+        ("\"sales@\"", "not a full address"),
+    ] {
+        let yaml = BASE.replace(
+            "send_as: [\"oldbrand.com\"]",
+            &format!("send_as: [\"oldbrand.com\", {pattern}]"),
+        );
+        rejected_for(&yaml, needle);
+    }
+}
+
+#[test]
+fn accepts_all_three_section_5_4_forms_as_grants() {
+    let yaml = BASE.replace(
+        "send_as: [\"oldbrand.com\"]",
+        "send_as: [\"oldbrand.com\", \"*.oldbrand.com\", \"marketing@newbrand.com\"]",
+    );
+    load(&yaml).expect("§5.4's three forms are all valid grants");
 }
 
 // -- §9.3 admin credentials (D-053) --------------------------------------

@@ -46,7 +46,7 @@ deliverable recipient on a suppression list that outlives Simmer by years.
 ## Status
 
 All ten phases of `docs/SPEC.md` §13, except phase 9, which is void — see D-047
-below.
+below — plus phase 11, which came after them.
 
 **Phase 1** — configuration loading, full startup validation, structured
 logging, the container skeleton.
@@ -138,15 +138,26 @@ the cost of a failed login now takes its parameters from the credentials actuall
 configured, rather than from a fixed guess that only matched them by coincidence
 (`DECISIONS.md` D-066).
 
+**Phase 11** — listeners on 25, 587 and 465, inbound TLS, and a sender ACL
+(`docs/INGRESS.md`, D-070, D-071). Each listener has its own `tls` and `auth`
+policy, defaulting to what its port's RFC says. `STARTTLS` and implicit TLS use one
+PEM certificate read at startup. Each user carries `grants.send_as`, the sender
+identities it may present, and an authenticated message whose envelope or `From:`
+falls outside them is refused `550 5.7.1`. Details under
+[Listeners and TLS](#listeners-and-tls) and [Sender grants](#sender-grants).
+
 What works today: **an end-to-end relay that applies the ramp, rewrites both the
 identity and the body, paces how often one recipient hears from a warming route,
-pools its downstream connections, and can be inspected and steered without a
-restart.** What does not:
+pools its downstream connections, accepts submissions over verified TLS from
+applications limited to their own sender identities, and can be inspected and
+steered without a restart.** What does not:
 
 - **No scopes on admin tokens.** Every token can do everything; a token that
   could read but not mutate is a plausible ask and is not built.
-- **No inbound TLS and no listener on 465 or 587.** Designed in `docs/INGRESS.md`
-  (D-033), approved, and not yet built — it is the next piece of work.
+- **No pre-authentication limits.** A client that never authenticates is bounded
+  by `max_concurrent_sessions` and the timeouts like any other, but there is no
+  separate, tighter budget for it (D-072). That matters only once Simmer listens
+  somewhere `allowed_cidrs` cannot be tight.
 
 And one thing that will not arrive, because it is a decision rather than a gap:
 
@@ -161,8 +172,8 @@ And one thing that will not arrive, because it is a decision rather than a gap:
   and `docs/RECIPIENTS.md`.
 
 ```sh
-$ printf 'EHLO me\r\nMAIL FROM:<jane@oldbrand.com>\r\nRCPT TO:<bob@gmail.com>\r\nDATA\r\n' | nc simmer 25
-220 simmer.internal simmer ESMTP ready
+$ openssl s_client -quiet -starttls smtp -connect simmer:587 -servername simmer.internal
+EHLO me
 250-simmer.internal greets me
 250-PIPELINING
 250-8BITMIME
@@ -213,6 +224,95 @@ discover that in six weeks of unchanged deliverability. See `DECISIONS.md` D-069
 
 See `simmer.yaml`, which is commented throughout, and `.env.example` for the
 variables it expects.
+
+### Listeners and TLS
+
+`server.listeners` has one entry per port. An entry that names only an address
+takes its port's RFC defaults, and startup logs each listener's effective policy:
+
+| Port | `tls` | `auth` | |
+|---|---|---|---|
+| 25 | `off` | `optional` | RFC 5321 transfer — what Simmer did before listeners existed |
+| 587 | `starttls_required` | `required` | RFC 6409 submission |
+| 465 | `implicit` | `required` | RFC 8314 submissions |
+| any other | `off` | `optional` | |
+
+`tls` is one of `off`, `starttls` (offered, a client may decline), `starttls_required`
+(nothing but `EHLO`, `NOOP`, `RSET`, `QUIT` and `STARTTLS` until the handshake) and
+`implicit`. `auth` is one of `disabled`, `optional` and `required`.
+
+```yaml
+server:
+  listeners:
+    - address: "0.0.0.0:25"
+      auth: required
+    - address: "0.0.0.0:587"
+    - address: "0.0.0.0:465"
+  tls:
+    certificate: "/etc/simmer/tls/fullchain.pem"   # leaf first
+    private_key: "/etc/simmer/tls/privkey.pem"
+  auth:
+    allow_insecure_auth: false
+```
+
+Four things worth knowing:
+
+- **`allow_insecure_auth` means what it says, and defaults false.** AUTH over an
+  unencrypted session is refused `538 5.7.11` and is not advertised there. Before
+  phase 11 this key had to be *true*, because there was no TLS to use instead; a
+  config carried over will still work, but you probably want it false now.
+- **The certificate is checked at startup as the listener will load it.** A
+  missing, unreadable, unparseable or mismatched file refuses to start, alongside
+  every other violation. The container runs as **UID 1000**, so mount the key
+  readable by that user — the error says so if you do not. A certificate that
+  does not cover `server.hostname`, or that expires within fourteen days, is a
+  startup warning rather than a failure, because refusing to start would take the
+  plaintext listeners down too. Rotation is a restart.
+- **Plaintext pipelined behind `STARTTLS` drops the connection.** Bytes sent in the
+  same packet as `STARTTLS` came from whoever is on the wire, not the TLS peer.
+- **TLS does not make Simmer a public MX** (spec §2.3). It lets Simmer sit on a
+  segment where cleartext credentials are unacceptable, which is a much smaller
+  claim. `allowed_cidrs` still applies to every listener, and so does one shared
+  `max_concurrent_sessions`.
+
+`server.listen` and `server.auth.required` were removed; a config using either
+fails to start with a message saying what replaced it.
+
+### Sender grants
+
+Every user in `server.auth.users` carries the sender identities it may present,
+in the same pattern grammar as `senders`: an exact domain, `*.subdomain`, or a full
+address.
+
+```yaml
+    users:
+      - username: "cfapp"
+        password_hash: "${SIMMER_CFAPP_HASH}"
+        grants:
+          send_as: ["oldbrand.com", "*.oldbrand.com", "newbrand.com"]
+```
+
+For an authenticated session, the `MAIL FROM` address is checked at `MAIL FROM` and
+the first `From:` address at the final dot; either outside the grants is `550 5.7.1
+sender not permitted`, and so is a message with no parseable `From:`. Anything not
+granted is refused. Watch `simmer_sender_not_permitted_total`: it means either a
+misconfigured application or somebody else's credentials.
+
+**The grants decide whether a message is accepted, never where it goes.** Routing
+is still `senders`, exactly as before, and the username still plays no part in it.
+Two users granted the same identity send byte-identical mail.
+
+**They apply only to sessions that authenticated.** A listener with `auth:
+optional` — port 25's default — accepts unauthenticated mail with any sender from
+any address in `allowed_cidrs`, and startup warns about each such listener once
+users exist. Set `auth: required` wherever that is too much trust.
+
+To mint a password hash, pipe the password in; it is never taken as an argument,
+where it would land in shell history:
+
+```sh
+printf '%s' "$PASSWORD" | docker run -i --rm simmer:local hash-password
+```
 
 ### The ramp
 
@@ -372,7 +472,9 @@ cargo test --test acceptance -- --ignored --test-threads=1
 
 It walks a warm-up across simulated days by moving `warmup.started` and
 re-creating the container, and it is the only tier that proves both arrangements
-of the cutover invariant (§1.1) produce byte-equal output. `docs/ACCEPTANCE.md`
+of the cutover invariant (§1.1) produce byte-equal output. It also submits over
+587 with `STARTTLS`, verifying the certificate a one-shot `tls-init` service mints
+for each run. `docs/ACCEPTANCE.md`
 explains the topology; `DECISIONS.md` D-042 explains what will bite.
 
 `DATABASE_URL` is needed only by `tests/quota*.rs`, which use `#[sqlx::test]` to
@@ -395,7 +497,9 @@ platform root store the §8.2 `required_verify` mode needs.
 ```
 src/config/     the §4.1 schema, ${ENV_VAR} interpolation, §4.2 validation
 src/routing/    sender matching (§5.4), domain groups (§3.2.2), the chain walk
-src/smtp/       §5 ingress: listener, state machine, AUTH, DATA buffer, replies
+src/smtp/       §5 ingress: listeners, state machine, AUTH, DATA buffer, replies
+  tls.rs          §5.1's certificate: loaded once, checked by §4.2 the same way
+  acl.rs          §5.3's sender grants. Gates acceptance, never routing (D-071)
 src/downstream/ §8 outbound: TLS, the SMTP client, the §10.1 reply mapping
   pool.rs         §8.3's per-route pool. max_connections is a bound, not a hint
 src/quota/      §7 day index, allowance, the reserve/commit protocol, sweeper
@@ -412,12 +516,14 @@ src/admin/      the §9 control plane: reads, writes, dry run, /metrics
   dryrun.rs       §9.4, over the real engine
 src/db.rs       pool construction and migrations
 src/healthcheck.rs  the `healthcheck` subcommand the container's HEALTHCHECK runs
+src/hash_password.rs  `server hash-password`: argon2id from stdin, never argv
 src/bin/loadgen.rs  the acceptance suite's bulk sender; not in the shipped image
 migrations/     plain SQL, applied at startup
 tests/support/  a scripted fake downstream (§12.3)
 tests/rewrite_stability.rs  §6.6 as a property test over generated messages
 tests/admin_api.rs   §9 against the real router and real Postgres
 tests/pool.rs        §8.3 from the downstream's side: connections, not intentions
+tests/ingress_tls.rs §5.1 and §5.3 end to end: STARTTLS, implicit TLS, the ACL
 tests/metrics_endpoint.rs  §9.1 against a real recorder; its own binary
 tests/acceptance.rs  §12.3 against real mail servers; behind --ignored
 simmer.acceptance.yaml  config for the acceptance stack
@@ -460,6 +566,9 @@ but the reason is the two constraints above rather than the counters. See
 `DECISIONS.md` D-061 and D-007, and `docs/MULTI_INSTANCE.md` — which the spec's
 author needs to rule on, since §2.2 rules multi-instance out in as many words.
 
-The container publishes no ports by default. The SMTP listener is plaintext and
-accepts plaintext AUTH (spec §2.3), so it belongs on a trusted internal segment;
-exposing port 25 to a host interface must be a deliberate act.
+The container publishes no ports by default. Simmer belongs on a trusted internal
+segment (spec §2.3) whatever its listeners are configured to do: inbound TLS lets it
+sit where cleartext credentials are unacceptable, not where hostile peers can reach
+it. Exposing an SMTP port to a host interface must be a deliberate act. To serve
+587 or 465, mount a certificate and key readable by UID 1000 and name them in
+`server.tls`; see [Listeners and TLS](#listeners-and-tls).

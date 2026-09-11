@@ -84,9 +84,12 @@ pub enum ExhaustedChainReply {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
-    /// §5.1. `host:port`; validated as a `SocketAddr` in §4.2.
-    pub listen: String,
-    /// Used in the EHLO banner and `Received:` headers (§6.1 step 8).
+    /// §5.1. One entry per port, each with its own TLS and AUTH policy — 25, 465
+    /// and 587 have genuinely different rules and one switch cannot express them
+    /// (D-070). Replaced `listen`, which `validate::removed_keys` still names.
+    pub listeners: Vec<ListenerConfig>,
+    /// Used in the EHLO banner and `Received:` headers (§6.1 step 8), and the
+    /// name the §5.1 certificate is expected to cover.
     pub hostname: String,
     pub max_message_bytes: u64,
     /// §5.5's recipient ceiling. Vestigial since D-047: a transaction may carry
@@ -96,7 +99,121 @@ pub struct Server {
     pub max_concurrent_sessions: usize,
     pub allowed_cidrs: Vec<String>,
     pub timeouts: ServerTimeouts,
+    /// §5.1's certificate. Required when any listener's `tls` is not `off`.
+    #[serde(default)]
+    pub tls: Option<ServerTls>,
     pub auth: Auth,
+}
+
+/// One inbound listener (§5.1).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenerConfig {
+    /// `host:port`; validated as a `SocketAddr` in §4.2.
+    pub address: String,
+    /// Absent means the port's RFC default — see [`ListenerConfig::tls_mode`].
+    #[serde(default)]
+    pub tls: Option<IngressTls>,
+    /// Absent means the port's RFC default — see [`ListenerConfig::auth_mode`].
+    #[serde(default)]
+    pub auth: Option<IngressAuth>,
+}
+
+/// §5.1 inbound TLS, per listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressTls {
+    /// Plaintext only; `STARTTLS` is not advertised.
+    Off,
+    /// `STARTTLS` advertised and accepted; a client may decline it.
+    Starttls,
+    /// `STARTTLS` advertised; nothing but `EHLO`, `NOOP`, `RSET`, `QUIT` and
+    /// `STARTTLS` itself is served until the handshake completes (RFC 3207 §4).
+    StarttlsRequired,
+    /// TLS from the first byte. Never advertises `STARTTLS` (RFC 8314 §3.3).
+    Implicit,
+}
+
+impl IngressTls {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IngressTls::Off => "off",
+            IngressTls::Starttls => "starttls",
+            IngressTls::StarttlsRequired => "starttls_required",
+            IngressTls::Implicit => "implicit",
+        }
+    }
+
+    /// Whether a session on this listener can ever be encrypted.
+    pub fn can_encrypt(self) -> bool {
+        self != IngressTls::Off
+    }
+}
+
+/// §5.3, per listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressAuth {
+    /// `AUTH` is not advertised, and the command is `503`.
+    Disabled,
+    /// Advertised when usable; an unauthenticated session may still send.
+    Optional,
+    /// `MAIL FROM` before a successful `AUTH` is `530 5.7.0`.
+    Required,
+}
+
+impl IngressAuth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IngressAuth::Disabled => "disabled",
+            IngressAuth::Optional => "optional",
+            IngressAuth::Required => "required",
+        }
+    }
+}
+
+impl ListenerConfig {
+    fn port(&self) -> Option<u16> {
+        self.address
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|a| a.port())
+    }
+
+    /// The effective TLS mode: the configured one, or the port's RFC default.
+    ///
+    /// 465 is RFC 8314 submissions, implicit TLS. 587 is RFC 6409 submission,
+    /// which with a certificate available means `STARTTLS` before anything else.
+    /// Everything else — 25 included — defaults to `off`, which is what Simmer
+    /// did before listeners existed, so a config naming only an address keeps
+    /// its old meaning.
+    pub fn tls_mode(&self) -> IngressTls {
+        self.tls.unwrap_or(match self.port() {
+            Some(465) => IngressTls::Implicit,
+            Some(587) => IngressTls::StarttlsRequired,
+            _ => IngressTls::Off,
+        })
+    }
+
+    /// The effective AUTH mode: the configured one, or the port's RFC default.
+    /// 465 and 587 are submission ports and require it; 25 is transfer, where
+    /// RFC 5321 makes it optional (D-070).
+    pub fn auth_mode(&self) -> IngressAuth {
+        self.auth.unwrap_or(match self.port() {
+            Some(465) | Some(587) => IngressAuth::Required,
+            _ => IngressAuth::Optional,
+        })
+    }
+}
+
+/// §5.1's certificate and key, PEM, read once at startup. No ACME, and no
+/// reload: rotation is a restart (§2.2).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerTls {
+    /// The chain, leaf first.
+    pub certificate: String,
+    pub private_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,9 +230,14 @@ pub struct ServerTimeouts {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
-    pub required: bool,
-    /// §4.2 requires this to be explicitly true: there is no inbound TLS (§5.1),
-    /// so AUTH would otherwise be unusable.
+    /// Whether `AUTH` may be used on a session that is not encrypted. Default
+    /// false: plaintext credentials are refused unless this says otherwise.
+    ///
+    /// Before D-070 §4.2 required this to be *true*, because there was no
+    /// inbound TLS and AUTH was otherwise unusable. It now means what its name
+    /// says. Whether AUTH is required at all is per listener
+    /// ([`ListenerConfig::auth_mode`]); the global `required` key it replaced is
+    /// named by `validate::removed_keys`.
     #[serde(default)]
     pub allow_insecure_auth: bool,
     #[serde(default = "default_mechanisms")]
@@ -142,6 +264,10 @@ pub struct User {
     pub username: String,
     /// argon2id (§5.3). Never logged — see the `Debug` impl below.
     pub password_hash: String,
+    /// §5.3's sender ACL (D-071). Required: a user with no grants could
+    /// authenticate and then send nothing, which is a configuration mistake
+    /// better caught at startup than at the first refused message.
+    pub grants: Grants,
 }
 
 // A derived Debug would put a password hash into any error or trace that
@@ -152,8 +278,25 @@ impl fmt::Debug for User {
         f.debug_struct("User")
             .field("username", &self.username)
             .field("password_hash", &"<redacted>")
+            .field("grants", &self.grants)
             .finish()
     }
+}
+
+/// What an authenticated user may do (D-071), shaped after Slater's
+/// per-resource capability lists. Default deny: anything not granted is refused.
+///
+/// `deny_unknown_fields` is deliberate and is where this differs from Slater,
+/// which ignores an unrecognised capability. Slater's file is reloaded at runtime
+/// and a bad edit must not take it down; this one is read once at startup, and a
+/// misspelt grant that silently grants nothing is D-013's worst failure mode.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Grants {
+    /// Sender identities this user may present, in §5.4's pattern grammar:
+    /// exact domain, `*.subdomain`, or full address. Checked against the
+    /// envelope sender at `MAIL FROM` and the `From:` header at the final dot.
+    pub send_as: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------

@@ -5,16 +5,13 @@
 //! always be exactly expressible as application-side configuration, and it must
 //! never write permanent state into the systems around it.
 //!
-//! Phases 1–3 (§13). No rewriting yet: a message is forwarded byte for byte,
-//! under the identity it arrived with.
-//!
 //! Everything of substance lives in the library; this is startup wiring and
 //! shutdown ordering only.
 
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use simmer::{admin, config, db, healthcheck, logging, quota, relay, smtp};
+use simmer::{admin, config, db, hash_password, healthcheck, logging, quota, relay, smtp};
 use tracing::{error, info, warn};
 
 /// Where the §4 YAML lives. Overridable so the compose stack can mount an
@@ -28,6 +25,11 @@ fn config_path() -> String {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // No-op unless argv[1] == "hash-password" (D-071). First, and before the
+    // config is read: minting a credential must not need a valid config, since
+    // the config is what needs the credential.
+    hash_password::check_subcommand();
+
     // No-op unless argv[1] == "healthcheck". Must run before anything else: it is
     // what `HEALTHCHECK CMD ["/app/server","healthcheck"]` invokes, and the
     // runtime image has no curl. Falls back to the §4.1 default admin port when
@@ -82,7 +84,7 @@ async fn run() -> anyhow::Result<()> {
         routes = config.routes.len(),
         senders = config.senders.len(),
         domain_groups = config.domain_groups.len(),
-        listen = %config.server.listen,
+        listeners = config.server.listeners.len(),
         admin = %config.admin.listen,
         strict_senders = config.strict_senders,
         "starting simmer"
@@ -199,7 +201,29 @@ async fn run() -> anyhow::Result<()> {
     // failure rather than a service that is up but deaf.
     let smtp = smtp::Listener::bind(engine.clone()).await?;
     let sessions = smtp.sessions();
-    info!(addr = %smtp.local_addr()?, "SMTP listener bound");
+    for (addr, tls, auth) in smtp.local_addrs()? {
+        // The *effective* policy, defaults resolved: a listener that names only
+        // an address takes its port's RFC defaults (D-070), and that is exactly
+        // the thing an operator needs to see rather than infer.
+        info!(%addr, tls = tls.as_str(), auth = auth.as_str(), "SMTP listener bound");
+    }
+
+    // §5.1 — "log the not-after date", and warn about what would otherwise be
+    // discovered from refused handshakes: an expired certificate, one about to
+    // expire, one for a different name. Warnings, not failures — refusing to
+    // start would take the plaintext listeners down with the TLS ones.
+    if let Some(cert) = smtp.certificate() {
+        info!(
+            not_after = cert
+                .not_after
+                .map_or_else(|| "unknown".to_string(), |t| t.to_rfc3339()),
+            hostname = %config.server.hostname,
+            "TLS certificate loaded"
+        );
+        for w in smtp::tls::advisories(cert, &config.server.hostname, chrono::Utc::now()) {
+            warn!("{w}");
+        }
+    }
 
     let admin_state = admin::AdminState {
         // The same engine the SMTP listener has. §9.4's dry run is only worth

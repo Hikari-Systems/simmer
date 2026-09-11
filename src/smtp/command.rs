@@ -37,6 +37,9 @@ pub enum Command {
     /// ("I know this command and refuse it") rather than `500` ("I have never
     /// heard of it"), which is what a client needs to fall back correctly.
     Bdat,
+    /// RFC 3207, since D-070. Takes no parameters: RFC 3207 §4 makes
+    /// `STARTTLS` with one a `501`.
+    StartTls,
     Unknown(String),
 }
 
@@ -115,6 +118,12 @@ pub fn parse(line: &str) -> Result<Command, ParseError> {
         "VRFY" => Ok(Command::Vrfy),
         "EXPN" => Ok(Command::Expn),
         "BDAT" => Ok(Command::Bdat),
+        "STARTTLS" => {
+            if !rest.is_empty() {
+                return Err(ParseError::Syntax("STARTTLS takes no parameters"));
+            }
+            Ok(Command::StartTls)
+        }
         _ => Ok(Command::Unknown(upper)),
     }
 }
@@ -305,6 +314,10 @@ mod tests {
         // is known and unavailable, which is what drives the fallback to DATA.
         assert_eq!(ok("BDAT 1024"), Command::Bdat);
         assert_eq!(ok("BDAT 1024 LAST"), Command::Bdat);
+        assert_eq!(ok("STARTTLS"), Command::StartTls);
+        assert_eq!(ok("starttls"), Command::StartTls);
+        // RFC 3207 §4: "a publicly-referenced SMTP server MUST NOT" accept one.
+        assert!(parse("STARTTLS now").is_err());
     }
 
     #[test]

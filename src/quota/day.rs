@@ -199,14 +199,15 @@ mod tests {
     fn config() -> crate::config::Config {
         let yaml = r#"
 server:
-  listen: "127.0.0.1:25"
+  listeners:
+    - address: "127.0.0.1:25"
   hostname: simmer.test
   max_message_bytes: 1024
   max_recipients: 10
   max_concurrent_sessions: 4
   allowed_cidrs: ["10.0.0.0/8"]
   timeouts: { command: 30s, data: 300s, session: 600s }
-  auth: { required: false, allow_insecure_auth: true }
+  auth: { allow_insecure_auth: true }
 database:
   url: "postgres://u:p@localhost/simmer"
   connect_timeout: 5s

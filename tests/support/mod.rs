@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use simmer::downstream::stream::Stream;
 use simmer::frequency::{Frequency, Key};
 use simmer::quota::store::{
     Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, RouteState, Usage,
@@ -365,7 +366,10 @@ fn strip_eol(line: &[u8]) -> &[u8] {
 // ---------------------------------------------------------------------------
 
 pub struct Simmer {
+    /// The first listener — the only one in every fixture but D-070's.
     pub addr: SocketAddr,
+    /// Every listener, in configuration order.
+    pub addrs: Vec<SocketAddr>,
     /// §8.3's pools, so a test can read the statistics §9.2 reports and drive
     /// §10.4's drain without a process to signal.
     pub pools: Arc<simmer::downstream::Pool>,
@@ -424,6 +428,12 @@ impl Simmer {
 
         let listener = smtp::Listener::bind(engine).await.expect("bind simmer");
         let addr = listener.local_addr().expect("addr");
+        let addrs = listener
+            .local_addrs()
+            .expect("addrs")
+            .into_iter()
+            .map(|(a, _, _)| a)
+            .collect();
 
         let stop = smtp::Shutdown::new();
         let hard = smtp::Shutdown::new();
@@ -431,6 +441,7 @@ impl Simmer {
 
         Simmer {
             addr,
+            addrs,
             pools,
             stop,
             hard,
@@ -463,7 +474,8 @@ pub fn config_for(addr: SocketAddr, overrides: &str) -> String {
     format!(
         r#"
 server:
-  listen: "127.0.0.1:0"
+  listeners:
+    - address: "127.0.0.1:0"
   hostname: "simmer.test"
   max_message_bytes: 100000
   max_recipients: 5
@@ -471,7 +483,6 @@ server:
   allowed_cidrs: ["127.0.0.0/8"]
   timeouts: {{ command: 5s, data: 5s, session: 60s }}
   auth:
-    required: false
     allow_insecure_auth: true
     mechanisms: [PLAIN, LOGIN]
 database:
@@ -510,7 +521,9 @@ routes:
 // ---------------------------------------------------------------------------
 
 pub struct Client {
-    io: BufReader<TcpStream>,
+    /// The library's own client-or-server stream, so `STARTTLS` upgrades in
+    /// place exactly as the outbound leg does.
+    io: BufReader<Stream>,
 }
 
 impl Client {
@@ -518,8 +531,60 @@ impl Client {
         let stream = TcpStream::connect(addr).await.expect("connect to simmer");
         stream.set_nodelay(true).ok();
         Client {
-            io: BufReader::new(stream),
+            io: BufReader::new(Stream::Plain(stream)),
         }
+    }
+
+    /// RFC 8314 implicit TLS: the handshake before the banner, verifying the
+    /// server's certificate against `pki`'s CA for `simmer.test`.
+    pub async fn connect_implicit_tls(addr: SocketAddr, pki: &TestPki) -> Client {
+        let stream = TcpStream::connect(addr).await.expect("connect to simmer");
+        stream.set_nodelay(true).ok();
+        let tls = pki
+            .connector()
+            .connect(pki.server_name(), stream)
+            .await
+            .expect("implicit TLS handshake");
+        Client {
+            io: BufReader::new(Stream::Tls(Box::new(tls.into()))),
+        }
+    }
+
+    /// A handshake over a fresh connection that is expected to *fail* — for
+    /// asserting that a bad certificate or a plaintext port is refused.
+    pub async fn implicit_tls_error(addr: SocketAddr, pki: &TestPki) -> std::io::Error {
+        let stream = TcpStream::connect(addr).await.expect("connect to simmer");
+        match pki.connector().connect(pki.server_name(), stream).await {
+            Ok(_) => panic!("the TLS handshake succeeded"),
+            Err(e) => e,
+        }
+    }
+
+    /// Issue `STARTTLS`, and upgrade if the server says `220`. Returns the reply
+    /// either way, so a test can assert a refusal.
+    pub async fn starttls(&mut self, pki: &TestPki) -> Reply {
+        let r = self.command("STARTTLS").await;
+        if r.code != 220 {
+            return r;
+        }
+        assert!(
+            self.io.buffer().is_empty(),
+            "server sent bytes after 220 to STARTTLS"
+        );
+        let Stream::Plain(tcp) = std::mem::replace(self.io.get_mut(), Stream::Taken) else {
+            panic!("STARTTLS on a stream that is not plaintext");
+        };
+        let tls = pki
+            .connector()
+            .connect(pki.server_name(), tcp)
+            .await
+            .expect("STARTTLS handshake");
+        self.io = BufReader::new(Stream::Tls(Box::new(tls.into())));
+        r
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        self.io.get_ref().is_encrypted()
     }
 
     /// Read one complete reply, following `250-` continuations.
@@ -877,5 +942,92 @@ impl QuotaStore for GrantAllQuota {
 
     async fn is_available(&self) -> bool {
         true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Certificates for §5.1's inbound TLS (D-070)
+// ---------------------------------------------------------------------------
+
+/// A throwaway CA and a leaf it issued, written to a temporary directory.
+///
+/// A real two-level chain rather than a self-signed leaf, so the client side of
+/// every test *verifies* the server — webpki refuses a CA certificate presented
+/// as an end entity, and a test that skipped verification would prove only that
+/// bytes were encrypted, not that the right certificate was served.
+pub struct TestPki {
+    dir: tempfile::TempDir,
+    ca: rustls::pki_types::CertificateDer<'static>,
+    server_name: String,
+}
+
+impl TestPki {
+    /// A leaf for `names`, issued by a fresh CA. The first name is the one the
+    /// client verifies against.
+    pub fn new(names: &[&str]) -> TestPki {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "simmer test CA");
+        let ca_key = rcgen::KeyPair::generate().expect("ca key");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+
+        let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+        let leaf =
+            rcgen::CertificateParams::new(names.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .expect("leaf params")
+                .signed_by(&leaf_key, &issuer)
+                .expect("leaf cert");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Leaf first, then the CA: the order §5.1's `certificate` documents.
+        std::fs::write(
+            dir.path().join("cert.pem"),
+            format!("{}{}", leaf.pem(), ca_cert.pem()),
+        )
+        .expect("write cert");
+        std::fs::write(dir.path().join("key.pem"), leaf_key.serialize_pem()).expect("write key");
+
+        TestPki {
+            dir,
+            ca: ca_cert.der().clone(),
+            server_name: names[0].to_string(),
+        }
+    }
+
+    pub fn cert_path(&self) -> String {
+        self.dir.path().join("cert.pem").display().to_string()
+    }
+
+    pub fn key_path(&self) -> String {
+        self.dir.path().join("key.pem").display().to_string()
+    }
+
+    /// The `server.tls` block for a config.
+    pub fn yaml(&self) -> String {
+        format!(
+            "  tls:\n    certificate: \"{}\"\n    private_key: \"{}\"\n",
+            self.cert_path(),
+            self.key_path()
+        )
+    }
+
+    fn server_name(&self) -> rustls::pki_types::ServerName<'static> {
+        rustls::pki_types::ServerName::try_from(self.server_name.clone()).expect("server name")
+    }
+
+    /// A verifying client that trusts this CA and nothing else.
+    fn connector(&self) -> tokio_rustls::TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(self.ca.clone()).expect("add CA");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
     }
 }

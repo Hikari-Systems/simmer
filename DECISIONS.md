@@ -1547,7 +1547,7 @@ outcome this ordering avoids.
 now or waits; whether the acceptance config is its own file; and whether CI runs
 the suite on every push.
 
-### D-033 — Inbound listeners on 25/465/587, inbound TLS, and a sender ACL (planned)
+### D-033 — Inbound listeners on 25/465/587, inbound TLS, and a sender ACL (planned; built in phase 11 as D-070 and D-071)
 
 **Spec:** this contradicts `SPEC.md` in four places rather than diverging from one.
 §2.2 "**No inbound TLS**"; §5.1 "Plaintext TCP, default port 25. No STARTTLS, no
@@ -1556,9 +1556,10 @@ AUTH"; §5.2 "`EHLO` advertises **exactly** … Nothing else". And §4.2 current
 makes it a *violation* for `allow_insecure_auth` to be false, a rule that has to
 invert.
 
-**Decision:** designed in full in `docs/INGRESS.md`. Planned only — nothing is
-built, and §1 of that document is a question for the spec's author before anything
-is.
+**Decision:** designed in full in `docs/INGRESS.md`. Approved by the spec's author
+on 2026-08-11 and **built in phase 11** — D-070 is the listeners and TLS, D-071 the
+ACL. What follows is the design as approved; where the build departed from it, the
+phase 11 entries say so.
 
 The load-bearing calls:
 
@@ -2021,6 +2022,162 @@ Live in phase 2 code and independent of D-033. Worth fixing on its own rather th
 inside a feature.
 
 ---
+
+## Phase 11 — listeners, inbound TLS, and the sender ACL
+
+D-033, built. Beyond §13's ten phases; the spec's author approved it on 2026-08-11
+and `SPEC.md` §2.1, §2.2, §2.3, §4.1, §4.2, §5.1, §5.2, §5.3 and §13 are amended by
+this phase, each with a marker saying what it used to say — the passages the spec
+settlements deliberately left alone until the capability existed.
+
+`docs/INGRESS.md`'s five open questions, all closed:
+
+| # | Question | Answer |
+|---|---|---|
+| 1 | Amend `SPEC.md`, or let D-033 override it? | Amended, by this phase (the spec settlements' rule) |
+| 2 | Before or after phase 4? | Moot — after phase 10 |
+| 3 | What replaces `server.listen`? | `server.listeners`, required; `listen` is named by `removed_keys` (D-070) |
+| 4 | Should the ACL grant anything besides `send_as`? | No — a capability nobody uses is a capability nobody tests (D-071) |
+| 5 | Does `auth: optional` on port 25 earn its place? | Yes, as the RFC default, with a startup warning once users exist (D-071) |
+
+### D-070 — Listeners, inbound TLS, and the `allow_insecure_auth` inversion
+
+**Spec:** §5.1 said "Plaintext TCP, default port 25. No STARTTLS, no implicit TLS,
+no ACME"; §5.2 listed exactly five extensions; §4.2 required `allow_insecure_auth`
+to be true. All amended.
+
+**Decision:** `server.listeners` replaces `server.listen`, one entry per port, each
+with `tls: off | starttls | starttls_required | implicit` and `auth: disabled |
+optional | required`. Absent values take the port's RFC default — 465 implicit and
+required, 587 `starttls_required` and required, everything else `off` and
+`optional` — so `listeners: [{ address: "0.0.0.0:25" }]` means exactly what
+`listen: "0.0.0.0:25"` meant. `server.auth.required` is gone too: whether AUTH is
+required is a property of a port, and two switches for one thing would disagree.
+Both removed keys fail with a message naming the replacement.
+
+`allow_insecure_auth` now means what its name says and defaults false. The §4.2
+rule it inverts becomes: `auth: required` on a `tls: off` listener with plaintext
+AUTH refused is a violation, because that listener would refuse every message.
+
+The load-bearing details, several of which the design left open or got slightly
+wrong:
+
+- **Certificate loading goes through one function** (`smtp::tls::load`), called by
+  §4.2 validation and again by the listener, so the check and the listener cannot
+  disagree — §6.6's reasoning, again. A missing, unreadable, unparseable or
+  mismatched file is a violation reported with everything else; a permission
+  failure names the process uid, the file's owner and mode, and UID 1000.
+- **`rustls-pki-types` parses PEM, not `rustls-pemfile`.** The design named
+  `rustls-pemfile`; it has been archived since August 2025 and is
+  RUSTSEC-2025-0134 (unmaintained), which `cargo deny check` would fail on. The
+  replacement is the code `rustls-pemfile` had become a wrapper for, already in
+  the graph. **No new runtime crate**: `rustls-webpki` becomes a direct
+  dependency, but it was already compiled as rustls's verifier.
+- **Name coverage and expiry are warnings, not violations.** Refusing to start
+  over either would take the plaintext listeners down with the TLS ones. Coverage
+  uses `rustls-webpki`'s own name matching — what a verifying client runs. The
+  expiry date is read by a forty-line DER walk (`tls::not_after`) rather than
+  `x509-parser`, whose tree is not worth one field; it is fuzzed by truncation in
+  its tests and returns `None` rather than guessing. Warned at fourteen days.
+- **The injection check is the outbound one, mirrored.** Bytes already buffered
+  behind `STARTTLS` drop the connection before `220` is sent. It is the one place
+  RFC 2920's never-discard-buffered-input rule is overridden, and the session's
+  module comment says so.
+- **The reset keeps `auth_failures`.** RFC 3207 §4.2 has the server forget the
+  greeting, authentication and transaction; §5.3's three strikes are per
+  connection and survive, or a handshake would buy unlimited guesses.
+- **`530` and `538` are split by cause, not as the design put it.** INGRESS.md §3
+  gave `538 5.7.11` to "AUTH before TLS where the listener requires it". On a
+  `starttls_required` listener RFC 3207 §4 already answers *every* command but a
+  few with `530 5.7.0 must issue a STARTTLS command first`, AUTH included, and
+  that is what is built. `538` is for AUTH over plaintext where plaintext
+  credentials are refused — a `starttls` or `off` listener with
+  `allow_insecure_auth: false` — which is exactly RFC 4954 §6's meaning. RSET
+  joins RFC 3207's permitted list, since no transaction can exist to reset.
+- **AUTH is not advertised where it could not succeed.** Before the handshake on a
+  `starttls_required` port, or over plaintext with plaintext AUTH refused.
+  Advertising it there invites a password in clear only to refuse it.
+- **A failed handshake gets no reply.** The plan said `454`; that code is for a
+  server that cannot *start* TLS, which a certificate loaded at startup rules
+  out. Once `220` has gone and the handshake fails, the TLS layer owns the socket
+  and there is no channel left to reply on. The close is the answer.
+- **An implicit-TLS listener refuses with a TCP close**, never a plaintext `554`
+  or `421`, which would arrive in place of a ServerHello. §5.1 already permitted
+  the bare close.
+- **Sessions end with `close_notify`.** Found by the tests: a session over TLS was
+  being dropped without one, which rustls reports to the client as an unexpected
+  EOF — indistinguishable from truncation — so a `221` after `QUIT` arrived
+  followed by an error. `Session::close` now shuts the stream down, bounded at
+  two seconds so a peer that has stopped reading cannot hold a permit.
+- **One session bound and one CIDR check for every listener.** The limits are
+  about the process, and a test holds a session on one port and gets `421` on
+  the other.
+- **`Received:` gains RFC 3848's `S`** — `ESMTPS`, `ESMTPSA`. D-002 already
+  excludes the header from §12.3's comparison, so the cutover invariant is
+  unaffected.
+- **The inbound stream is `downstream::stream::Stream`**, generalised to hold
+  tokio-rustls's client-or-server `TlsStream`, so there is one `Taken` state
+  rather than two — as the design asked.
+
+**Metric:** `simmer_inbound_tls_failures_total{mode,reason}`, `reason` being
+`handshake` or `plaintext_after_starttls`.
+
+### D-071 — The sender ACL: `grants.send_as`, default deny, gating acceptance only
+
+**Spec:** §5.3 said the username "plays no part in route selection" and nothing
+about what an authenticated user may send as. Amended; the sentence stands.
+
+**Decision:** each user carries `grants: { send_as: [...] }` in §5.4's pattern
+grammar, via `routing::sender_match::Pattern`. For an authenticated session the
+envelope sender is checked at `MAIL FROM` and the first `From:` address at the final
+dot; either outside the grant is `550 5.7.1 sender not permitted`.
+
+- **`grants` is required, and an empty `send_as` is a violation.** Default deny
+  with no grants is a user who can log in and send nothing, which is never meant.
+- **Patterns that can match nothing are refused** — whitespace, a bare `*`, a `*`
+  anywhere but a leading `*.`, `@x.com`, `sales@`. `Pattern::parse` is total,
+  which suits routing, where a rule that never matches shows up in
+  `simmer_unmatched_sender_total`; a grant that never matches shows up only as
+  refusals.
+- **Unknown capability keys are refused**, by `deny_unknown_fields`, where Slater
+  ignores them — D-013's reasoning, as the design said.
+- **The null sender passes `MAIL FROM`** and is judged by its `From:`. A bounce has
+  no envelope identity to grant.
+- **A message with no parseable `From:` is refused** for an authenticated user.
+  Default deny: an identity that cannot be found is not inside the grant.
+- **Unauthenticated sessions are not subject to the ACL.** On an `auth: optional`
+  listener a client that never authenticates may present any identity
+  `allowed_cidrs` admits — the pre-ACL trust model. Rather than change port 25's
+  RFC default, §4.2 warns once per `optional` listener whenever users exist, and
+  §2.3 now says it outright.
+- **It never routes.** The ACL answers "may this user present this identity?" and
+  can only refuse. A test sends the same message as two users granted the same
+  identity and asserts the downstream received byte-identical bodies, and that
+  `Received:` names neither user.
+- **`550`, under §10.3's carve-out** for `strict_senders`: a statement about the
+  sender, which cannot put a recipient on a suppression list, and loud because it
+  means a misconfigured application or somebody else's credentials.
+
+**Metric:** `simmer_sender_not_permitted_total{stage}`, `stage` being `mail_from`
+or `from_header`. Deliberately not labelled by user or address: the log line names
+both, and a label per address is §7.3's high-cardinality series.
+
+**Also:** `server hash-password` reads a password from stdin — never argv, which
+lands in shell history and `ps` — and prints an argon2id PHC string at argon2's
+defaults, `m=19456,t=2,p=1`. Uniform parameters are the case D-066's decoy is exact
+for. It runs before the config is read, since the config is what needs the hash.
+
+### D-072 — Pre-authentication limits are not built
+
+**Spec:** silent. `docs/INGRESS.md` §6 suggested a tighter session cap and a byte
+ceiling that apply until `AUTH` succeeds.
+
+**Decision:** deferred. Each would be a new §4.1 key, and nothing forces them yet:
+Simmer still sits behind `allowed_cidrs` on a trusted segment (§2.3), and the pieces
+that exist — `max_concurrent_sessions`, D-020's line caps, `timeouts.command`,
+which also bounds an implicit-TLS handshake — already stop a peer that never
+authenticates from holding a slot indefinitely. It becomes worth building the day
+Simmer listens somewhere `allowed_cidrs` cannot be tight.
 
 ## Still open — to settle at the start of the phase that needs them
 
@@ -2807,3 +2964,88 @@ reader would not predict from `SPEC.md`:
   manufactures deferrals out of Simmer's own optimisation. The retry's three
   conditions are each there to stop it becoming the other failure mode, which is a
   duplicate message.
+
+## Phase 11 summary
+
+`docs/INGRESS.md`, built: listeners on 25, 587 and 465 with per-port TLS and AUTH
+policy, `STARTTLS` and implicit TLS on one certificate, and a sender ACL. The four
+`SPEC.md` passages the spec settlements left alone until the capability existed
+are amended, with §2.1, §4.1, §4.2 and §13 alongside them.
+
+### What changed
+
+| Module | § | What |
+|---|---|---|
+| `src/config/mod.rs` | 4.1, 5.1 | `server.listeners` with `IngressTls`/`IngressAuth` and per-port defaults; `server.tls`; `grants` on each user. `listen` and `auth.required` removed |
+| `src/config/validate.rs` | 4.2 | Listener, certificate and grant rules; the inverted plaintext-AUTH rule; removed-key messages; two warnings (unused certificate, `optional` listener with users) |
+| `src/smtp/tls.rs` | 5.1 | **New.** One `load` for §4.2 and the listener; permission errors that name the uid; name coverage via `rustls-webpki`; `notAfter` by hand; startup advisories |
+| `src/smtp/acl.rs` | 5.3 | **New.** `grants.send_as` over §5.4's `Pattern`, default deny |
+| `src/smtp/mod.rs` | 5.1 | One accept loop per listener sharing one `Shared`; implicit TLS on accept, inside the permit and the command budget; bare close on a TLS port |
+| `src/smtp/session.rs` | 5.1–5.3 | Over `Stream`; `STARTTLS` with the injection check and the RFC 3207 reset; the `starttls_required` gate; `538`; the ACL at `MAIL FROM` and the dot; `close_notify` on every exit |
+| `src/smtp/command.rs`, `reply.rs` | 5.2 | `STARTTLS`; `Capabilities`; six new replies, five of them `5xx` and each argued in the §14.1 audit test |
+| `src/downstream/stream.rs` | 8.2 | `Stream::Tls` holds tokio-rustls's client-or-server enum, so ingress reuses it |
+| `src/rewrite/mod.rs`, `src/relay.rs` | 6.1 | `Received:` carries RFC 3848's `S` |
+| `src/metrics.rs` | 9.1 | `simmer_inbound_tls_failures_total`, `simmer_sender_not_permitted_total` |
+| `src/hash_password.rs`, `src/main.rs` | 5.3 | **New** subcommand; per-listener startup lines; certificate expiry and coverage logged |
+| `src/bin/loadgen.rs` | 12.3 | `--starttls`, verifying against `--ca` |
+| `docker-compose.yml` | 12.3 | `tls-init` and the `acceptance-tls` volume |
+
+830 tests, from 772: 509 unit (was 485), **20 inbound TLS (new)**, 65 config
+validation (was 51), and every other suite unchanged in count — plus 5 acceptance
+tests behind `--ignored` (was 4). The existing suites changed only in their
+fixtures, mechanically: `listen:` became a one-entry `listeners:`, and
+`auth: { required: false, … }` lost the key.
+
+### What is tested
+
+- **Every handshake is verified.** `tests/support::TestPki` mints a CA and a leaf
+  per test, and the client trusts that CA alone. A second CA's client failing the
+  handshake is what proves the configured certificate is the one served.
+- **The injection check.** `STARTTLS` and a `MAIL FROM` in one write get no reply
+  at all — not `220`, not anything.
+- **The reset, both halves.** After the handshake the greeting and the
+  authentication are gone (`503`, then `530`); the failed-password count is not (a
+  third failure after two pre-TLS ones is `421`).
+- **RFC 3207 §4's gate**, command by command, and `538` for plaintext AUTH — which
+  does not spend a strike.
+- **The ACL at both points**, the null sender, the missing `From:`, the
+  unauthenticated exemption, and **two users producing byte-identical output**
+  with no username in `Received:`.
+- **One session bound across listeners.**
+- **Certificate loading**: a mismatched pair named as such, both missing files
+  reported together, swapped files diagnosed, an unreadable key naming the uid and
+  mode; `notAfter` for both ASN.1 time forms, the 1950 pivot, and every truncation
+  of a real certificate without a panic.
+- **In the shipped image**: the grants refusing at both stages through the real
+  container, the metric counting them, `hash-password`'s three exits, a verified
+  `STARTTLS` submission on 587 arriving at a real mail server as `ESMTPSA`, and a
+  real `SIGTERM` draining both listeners.
+
+### What is not tested
+
+- **A handshake that stalls.** Both TLS paths are bounded by `timeouts.command`;
+  the failures driven are a wrong CA and plaintext on the implicit port.
+- **The outbound half of real-certificate TLS**, as before. `tls-init` now mints
+  the CA `docs/ACCEPTANCE.md` §5's trap-side design needs.
+- **`advisories` from `main`.** The expiry and coverage warnings are unit-tested
+  against fixed clocks; `main`'s logging of them was observed in the container
+  (the expiry warning fired on the first run's seven-day certificate, which is why
+  `tls-init` now mints thirty) but no test captures the log.
+
+### Things the spec did not cover
+
+D-070 through D-072. The ones a reader would not predict from `SPEC.md` or from
+`docs/INGRESS.md`:
+
+- **`close_notify`** — nothing said sessions must end with one, and dropping the
+  stream made every clean TLS close look like truncation to the client. Found by
+  the tests, not the design.
+- **`530` vs `538`** — the design gave `538` to AUTH before a required handshake;
+  RFC 3207 §4 already answers that with `530`, and `538` went to the case RFC 4954
+  §6 defines it for.
+- **No `454` after a failed handshake** — the plan said `454`, but once `220` has
+  gone there is no channel left to send it on.
+- **The unauthenticated exemption** — a legitimate reading of "auth optional", and
+  the one most likely to surprise an operator, so it is a startup warning and a
+  sentence in §2.3 rather than only a line here.
+

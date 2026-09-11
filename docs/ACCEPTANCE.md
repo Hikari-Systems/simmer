@@ -5,7 +5,11 @@
 `docker-compose.yml`'s `acceptance` profile are the build. §7's phasing table
 records what is deliberately still outstanding — real-certificate TLS and failure
 injection — and §8's three open questions were settled as `DECISIONS.md` D-042.
-§4.3's body-rewrite row landed in phase 5 with §6.4.
+§4.3's body-rewrite row landed in phase 5 with §6.4. Phase 11 added the **inbound**
+half of real-certificate TLS: a one-shot `tls-init` service mints a CA and a leaf
+into a volume, and the loadgen submits over 587 with `STARTTLS`, verifying the
+leaf against that CA (D-070). The outbound half — a trap requiring STARTTLS with
+`required_verify` — is still outstanding.
 
 ```sh
 docker compose --profile acceptance up -d --build
@@ -300,7 +304,8 @@ trade.
 | Header rewrite assertions (§4.3 less the body row) | **landed, phase 4** | the rewriting engine |
 | Body rewrite assertion | **landed, phase 5** | §6.4 |
 | **Cutover invariant** (§4.4) | **landed, phase 4** | the rewriting engine |
-| Real-certificate TLS (§5) | phase 10 | nothing; deferred for scope |
+| Real-certificate TLS (§5), inbound | **landed, phase 11** | D-070's listeners |
+| Real-certificate TLS (§5), outbound | not yet | nothing; deferred for scope |
 | Failure injection (`fail_closed`, `SIGTERM`) | phase 10 | nothing; deferred for scope |
 
 The first row is genuinely available today: the ramp works, and *which container

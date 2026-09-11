@@ -283,12 +283,17 @@ const HASH: &str =
 
 async fn auth_stack() -> (FakeDownstream, Simmer) {
     let down = FakeDownstream::start(Script::default()).await;
-    let cfg = config_for(down.addr, "").replace(
-        "    required: false\n    allow_insecure_auth: true",
-        &format!(
-            "    required: true\n    allow_insecure_auth: true\n    users:\n      - username: \"cfapp\"\n        password_hash: \"{HASH}\""
-        ),
-    );
+    let cfg = config_for(down.addr, "")
+        .replace(
+            "    - address: \"127.0.0.1:0\"",
+            "    - address: \"127.0.0.1:0\"\n      auth: required",
+        )
+        .replace(
+            "    allow_insecure_auth: true",
+            &format!(
+                "    allow_insecure_auth: true\n    users:\n      - username: \"cfapp\"\n        password_hash: \"{HASH}\"\n        grants: {{ send_as: [\"oldbrand.com\"] }}"
+            ),
+        );
     let simmer = Simmer::start(&cfg).await;
     (down, simmer)
 }

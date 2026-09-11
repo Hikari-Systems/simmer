@@ -276,6 +276,13 @@ fn decode_utf8(b64: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Grants play no part in verification; any will do.
+    fn grants() -> crate::config::Grants {
+        crate::config::Grants {
+            send_as: vec!["oldbrand.com".into()],
+        }
+    }
+
     fn b64(s: &str) -> String {
         B64.encode(s.as_bytes())
     }
@@ -476,12 +483,12 @@ mod tests {
 
     fn verifier() -> Verifier {
         Verifier::new(&crate::config::Auth {
-            required: true,
             allow_insecure_auth: true,
             mechanisms: both(),
             users: vec![crate::config::User {
                 username: "cfapp".into(),
                 password_hash: REAL_HASH.into(),
+                grants: grants(),
             }],
         })
     }
@@ -533,7 +540,6 @@ mod tests {
 
     fn verifier_over(users: &[(&str, String)]) -> Verifier {
         Verifier::new(&crate::config::Auth {
-            required: true,
             allow_insecure_auth: true,
             mechanisms: both(),
             users: users
@@ -541,6 +547,7 @@ mod tests {
                 .map(|(u, h)| crate::config::User {
                     username: (*u).into(),
                     password_hash: h.clone(),
+                    grants: grants(),
                 })
                 .collect(),
         })
@@ -619,12 +626,12 @@ mod tests {
     #[test]
     fn an_unparseable_stored_hash_authenticates_nobody() {
         let v = Verifier::new(&crate::config::Auth {
-            required: true,
             allow_insecure_auth: true,
             mechanisms: both(),
             users: vec![crate::config::User {
                 username: "broken".into(),
                 password_hash: "$argon2id$not-actually-a-hash".into(),
+                grants: grants(),
             }],
         });
         assert!(!v.verify_blocking("broken", "anything"));

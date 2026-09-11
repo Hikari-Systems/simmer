@@ -284,6 +284,7 @@ pub async fn reserve_relay_commit(
                 peer: message.peer,
                 by: &cfg.server.hostname,
                 authenticated: message.authenticated,
+                tls: message.tls,
             },
             now: chrono::Utc::now(),
             uuid: &|| uuid::Uuid::new_v4().to_string(),
@@ -419,6 +420,8 @@ pub struct Message<'a> {
     pub peer: &'a str,
     /// §6.1 step 8 — RFC 3848's `ESMTPA` versus `ESMTP`.
     pub authenticated: bool,
+    /// §6.1 step 8 — RFC 3848's `S`, for a session that was encrypted (D-070).
+    pub tls: bool,
 }
 
 /// §10.4 — release whatever this process is still holding.
@@ -451,14 +454,15 @@ mod tests {
 
     const CFG: &str = r#"
 server:
-  listen: "127.0.0.1:25"
+  listeners:
+    - address: "127.0.0.1:25"
   hostname: simmer.test
   max_message_bytes: 1024
   max_recipients: 10
   max_concurrent_sessions: 4
   allowed_cidrs: ["10.0.0.0/8"]
   timeouts: { command: 30s, data: 300s, session: 600s }
-  auth: { required: false, allow_insecure_auth: true }
+  auth: { allow_insecure_auth: true }
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
 admin: { listen: "127.0.0.1:8080", auth_token: "t" }
 domain_groups:

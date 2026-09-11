@@ -53,6 +53,7 @@ fn pass(route: &RouteRewrite, raw: &[u8], envelope_from: Option<&str>) -> Rewrit
                 peer: "10.1.2.3",
                 by: "simmer.test",
                 authenticated: true,
+                tls: false,
             },
             now: chrono::DateTime::from_timestamp(1_767_225_600, 0).expect("valid instant"),
             uuid: &uuid,

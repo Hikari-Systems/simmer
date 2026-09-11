@@ -30,14 +30,15 @@ const TOKEN: &str = "0123456789abcdef-default";
 
 const CFG: &str = r#"
 server:
-  listen: "127.0.0.1:0"
+  listeners:
+    - address: "127.0.0.1:0"
   hostname: simmer.test
   max_message_bytes: 100000
   max_recipients: 1
   max_concurrent_sessions: 16
   allowed_cidrs: ["127.0.0.0/8"]
   timeouts: { command: 5s, data: 5s, session: 60s }
-  auth: { required: false, allow_insecure_auth: true }
+  auth: { allow_insecure_auth: true }
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
 admin: { listen: "127.0.0.1:0", auth_token: "0123456789abcdef-default" }
 logging: { level: warn, format: text }

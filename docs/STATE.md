@@ -1,6 +1,6 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-08-11, at the end of phase 10 — the last phase.** This is a session-handover
+**Snapshot taken 2026-09-11, at the end of phase 11.** This is a session-handover
 document, not a maintained one: `README.md` describes the service, `DECISIONS.md`
 records why it is the way it is, and `docs/SPEC.md` is authoritative over both. If
 this file disagrees with any of them, they win.
@@ -9,8 +9,9 @@ this file disagrees with any of them, they win.
 
 ## 1. Where the build has got to
 
-`SPEC.md` §13 lists ten phases. **Nine are done and one is void**, so the build
-order is complete. Phase 11 below is new work beyond §13, designed and not built.
+`SPEC.md` §13 lists ten phases. **Nine are done and one is void**, so the original
+build order is complete. Phase 11, added to §13 after them, is done too. Nothing is
+scheduled after it.
 
 | Phase | | Status |
 |---|---|---|
@@ -24,12 +25,15 @@ order is complete. Phase 11 below is new work beyond §13, designed and not buil
 | 8 | DNS preflight | **done** |
 | 9 | Multi-recipient splitting and result collapse | **void** — D-047 refuses multi-recipient transactions outright; `docs/RECIPIENTS.md` |
 | 10 | Hardening: pooling, graceful shutdown, acceptance suite, README | **done** — §8.3's pool (D-067, D-068), §10.4's drain, the README, and D-066's auth fix. The acceptance suite landed in phase 4 (D-032, D-042); real-certificate TLS is still untested |
-| 11 | *(new, beyond §13)* Listeners on 25/465/587, inbound TLS, sender ACL | **approved, not built** — `docs/INGRESS.md`, D-033. The spec's author said yes on 2026-08-11; three of its five open questions are settled. This is the next phase |
+| 11 | Listeners on 25/465/587, inbound TLS, sender ACL | **done** — D-070 (listeners, TLS), D-071 (grants), D-072 (pre-auth limits deferred). `docs/INGRESS.md` is the design; `SPEC.md` §2, §4, §5 and §13 are amended |
 
 ### What the service actually does today
 
-Accepts a message on port 25 from a client inside `allowed_cidrs`, authenticates
-it against argon2id hashes, refuses a second `RCPT TO` (D-047), buffers the body
+Accepts a message on any configured listener — 25, 587 and 465 by convention, each
+with its own `tls` and `auth` policy — from a client inside `allowed_cidrs`,
+optionally over `STARTTLS` or implicit TLS, authenticates it against argon2id
+hashes, checks the sender identities against the user's grants (D-071), refuses a
+second `RCPT TO` (D-047), buffers the body
 (memory to 1 MiB, then an unlinked tmpfs file), matches a sender rule, resolves the
 recipient's domain group, walks the chain — **skipping a route whose §6.7
 preflight is failing under `strict`, or whose recipient-frequency window is
@@ -95,6 +99,19 @@ open, so a slow resolver at boot cannot empty a chain (D-064). Since D-069 a rou
 with no constant domain is refused at startup rather than quietly left unchecked,
 so preflight's own handling of that case is now defence rather than a live path.
 
+**Since phase 11 it has listeners, inbound TLS and a sender ACL** (§5.1, §5.3).
+`server.listeners` replaced `server.listen`; an entry naming only an address takes
+its port's RFC defaults (25 `off`/`optional`, 587 `starttls_required`/`required`,
+465 `implicit`/`required`). One PEM certificate is loaded at startup by the same
+function §4.2 validation calls. `allow_insecure_auth` now means what it says and
+defaults false: AUTH over plaintext is `538 5.7.11` and not advertised. Each user
+carries `grants.send_as`; for an authenticated session the envelope sender at
+`MAIL FROM` and the `From:` at the final dot must both fall inside it, or the
+message is `550 5.7.1`. The ACL never routes — two users granted one identity send
+byte-identical mail — and does not apply to unauthenticated sessions on an
+`optional` listener, which startup warns about. `server hash-password` mints the
+hashes.
+
 Body rewriting decodes each `text/*` part's transfer encoding and charset, applies
 the route's patterns in order, and writes the part back in the encoding and charset
 it arrived with — never changing either (D-045). A part nothing matched is not
@@ -105,10 +122,10 @@ re-encoded at all, so a body with no match is forwarded as the bytes it arrived 
 
 ## 2. Verification status
 
-Everything below was run on 2026-08-11 against the phase 10 tree.
+Everything below was run on 2026-09-11 against the phase 11 tree.
 
 ```
-cargo test                                    772 passed, 0 failed
+cargo test                                    830 passed, 0 failed
 cargo clippy --all-targets -- -D warnings     clean
 cargo fmt --all -- --check                    clean
 cargo deny check                              advisories ok, bans ok, licenses ok, sources ok
@@ -119,15 +136,16 @@ Plus the acceptance tier, which needs its own stack and is not in `cargo test`:
 
 ```
 docker compose --profile acceptance up -d --build
-cargo test --test acceptance -- --ignored --test-threads=1     4 passed, 0 failed
+cargo test --test acceptance -- --ignored --test-threads=1     5 passed, 0 failed
 ```
 
 | Suite | Tests | What it covers |
 |---|---:|---|
-| `src/` unit tests | 485 | Everything logic-heavy, in place |
+| `src/` unit tests | 509 | Everything logic-heavy, in place |
 | `tests/admin_api.rs` | 48 | §9 against the real router and real Postgres |
 | `tests/smtp_ingress.rs` | 44 | §5 ingress end to end |
-| `tests/config_validation.rs` | 51 | §4.2, one test per rule |
+| `tests/ingress_tls.rs` | 20 | §5.1 and §5.3: STARTTLS, implicit TLS, per-listener AUTH, the ACL. Every handshake verified |
+| `tests/config_validation.rs` | 65 | §4.2, one test per rule |
 | `tests/quota.rs` | 30 | §7 against real Postgres |
 | `tests/preflight.rs` | 13 | §6.7 through the chain walk and onto the wire |
 | `tests/pool.rs` | 11 | §8.3 from the downstream's side: connections, not intentions |
@@ -138,7 +156,7 @@ cargo test --test acceptance -- --ignored --test-threads=1     4 passed, 0 faile
 | `tests/metrics_endpoint.rs` | 11 | §9.1 against a real recorder — its own binary, deliberately |
 | `tests/quota_relay.rs` | 8 | §7.4 through the whole stack |
 | `tests/shipped_config.rs` | 5 | `simmer.yaml` round-trips |
-| `tests/acceptance.rs` | 1 + 4 | Config drift guard; the rest behind `--ignored` |
+| `tests/acceptance.rs` | 1 + 5 | Config drift guard; the rest behind `--ignored` |
 
 `tests/metrics_endpoint.rs` is a separate binary because `metrics` permits
 exactly one global recorder per process, and every test in it takes a mutex
@@ -152,10 +170,13 @@ phases 2–6 ran against.
 `docs/ACCEPTANCE.md`, built in phase 4 rather than phase 10 (D-042). Two Mailpit
 traps, a loadgen container and `simmer.acceptance.yaml`, driven by a host test
 that walks the ramp by moving `warmup.started` and re-creating the container. It
-proves four things nothing else can: the ramp carrying exactly its allowance
+proves five things nothing else can: the ramp carrying exactly its allowance
 across three simulated days, the excess reaching a *different provider*, the
 rewrite as a real mail server receives it — headers and, since phase 5, the body
-link — and **both arrangements of §1.1 producing byte-equal output**.
+link — **both arrangements of §1.1 producing byte-equal output**, and, since phase
+11, a submission over 587 with `STARTTLS` whose certificate the loadgen *verifies*
+against a CA the `tls-init` service mints per run, arriving recorded as `ESMTPSA`
+— with a plaintext AUTH on 587 refused `530`.
 
 ### The container gate
 
@@ -205,6 +226,17 @@ is what found the `From:` display-name bug (D-059): every test in
 `bounce@newbrand.com` and the `From:` to `Jane <sales@newbrand.com>` — display
 name preserved — and reports the body pattern matching once.
 
+**And re-driven for phase 11**, dev stack and acceptance stack both. The dev image
+logs `SMTP listener bound addr=0.0.0.0:25 tls=off auth=required`; through it, an
+envelope outside the grant is `550 5.7.1 sender not permitted`, a `From:` outside
+it is the same at the final dot, `STARTTLS` on the plaintext port is `502`, and
+`simmer_sender_not_permitted_total` counts both refusals by stage. `hash-password`
+in the image mints `$argon2id$v=19$m=19456,t=2,p=1$…` from stdin, exits `2` on an
+argument and `1` on an empty password. The acceptance stack binds 25 and 587, logs
+the certificate's not-after date, and drains both listeners on a real `SIGTERM`.
+`tls-init`'s leaf verifies against its CA with `openssl verify`, and the key lands
+`0600` owned by UID 1000.
+
 ### Running the tests
 
 ```sh
@@ -227,9 +259,11 @@ src/smtp/            §5 ingress
   command.rs           the grammar, as a pure function
   reply.rs             EVERY reply Simmer can emit, in one file
   auth.rs              §5.3 PLAIN/LOGIN over argon2id
+  acl.rs               §5.3's grants (D-071). Refuses; never routes
+  tls.rs               §5.1's certificate, loaded once; notAfter read by hand
   buffer.rs            §8.1 transient buffer, dot transparency
-  session.rs           the §5.2 state machine
-  mod.rs               listener, CIDR check, session cap, shutdown token
+  session.rs           the §5.2 state machine, STARTTLS and its reset
+  mod.rs               listeners, their Policy, CIDR check, session cap, shutdown
 src/downstream/      §8 outbound leg
   stream.rs            the four TLS modes over rustls
   client.rs            the SMTP conversation, per-stage timeouts, D-068's retry
@@ -266,6 +300,7 @@ src/models/          runtime sqlx over &PgPool, house pattern
 src/routing/         §5.4 sender match, §3.2.2 domain group, §3.2.3 chain walk
 src/relay.rs         decide -> reserve -> rewrite -> relay -> commit/release
 src/healthcheck.rs   the `healthcheck` subcommand. Stdlib only (D-060)
+src/hash_password.rs `server hash-password`: argon2id from stdin
 src/metrics.rs       §9.1 counters, and the Prometheus recorder
 src/admin/           §9 control plane
   view.rs              §9.2's projections, pure. D-026's drift flag lives here
@@ -280,12 +315,13 @@ tests/admin_api.rs   §9 against the real router and real Postgres
 tests/quota_multi_instance.rs  two independent pools against one database (D-061)
 tests/preflight.rs   §6.7 through the walk, and 451 on the wire
 tests/metrics_endpoint.rs  §9.1 against a real recorder; its own binary
+tests/ingress_tls.rs §5.1/§5.3 against the real listener, verified handshakes
 migrations/          three: baseline (instance_config), quota (three tables),
                      recipient_event (D-048)
 simmer.acceptance.yaml   the acceptance stack's config (D-042)
 ```
 
-Roughly 25,000 lines including tests and comments.
+Roughly 27,000 lines including tests and comments.
 
 ---
 
@@ -326,7 +362,7 @@ And two about `recipient_event`:
 
 ## 5. Decisions on record
 
-69 entries, `D-001` to `D-069`. The ones a new reader most needs:
+72 entries, `D-001` to `D-072`. The ones a new reader most needs:
 
 | | |
 |---|---|
@@ -365,6 +401,9 @@ And two about `recipient_event`:
 | **D-066** | The unknown-user decoy hash borrows the ACL's costliest argon2 parameters. Closes the timing oracle a fixed decoy only appeared to close. |
 | **D-067** | `max_connections` is a **semaphore**, not a socket cache — §8.3's last sentence is the clause that decides the shape. An exhausted pool is `451 4.4.5`, its own class. |
 | **D-068** | A dead pooled connection is retried **once**, only on a reused connection, only on a protocol error, and **never past the final dot** — which is §10.2's window. |
+| **D-070** | **Listeners, inbound TLS, and the `allow_insecure_auth` inversion.** Per-port policy with RFC defaults; one certificate loaded by the function §4.2 also calls; `530` before a required handshake, `538` for plaintext AUTH; plaintext behind `STARTTLS` drops the connection; sessions end with `close_notify`. |
+| **D-071** | **The sender ACL gates acceptance, never routing.** `grants.send_as` in §5.4's grammar, required, default deny; envelope at `MAIL FROM`, `From:` at the dot; unauthenticated sessions exempt, and warned about. |
+| **D-072** | Pre-authentication limits are **not built**. Nothing forces them while `allowed_cidrs` is tight. |
 | **D-061** | **Quota *is* safe across instances**, by the row lock — D-007's stated reason was wrong from phase 3 onward. The real constraints are config skew (D-026) and §7.3's race, whose bound is `threshold + (C - 1)`, not one message. |
 
 **All twelve original open questions are now closed.** O-8 and O-9 were
@@ -386,6 +425,11 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
   about the route rather than the phase (D-064).
 - **No scopes on admin tokens.** Every token can do everything; a token that
   could read but not mutate is a plausible next ask and is not built.
+- **No pre-authentication limits** (D-072). A client that never authenticates is
+  bounded by `max_concurrent_sessions` and the timeouts, with no tighter budget of
+  its own.
+- **The ACL does not cover unauthenticated sessions** on an `auth: optional`
+  listener — by design (D-071), and warned about at startup.
 - **Multi-recipient transactions are refused**, by policy rather than by
   omission — D-047, and `docs/RECIPIENTS.md`.
 
@@ -401,9 +445,19 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 - **The preflight interval loop is not tested** — `check_once` is, `run` is not.
   Exactly the gap the quota sweeper's `run` has; the §7.3 sweeper's loop *is*
   covered, so these two are now the odd ones out together.
-- **No real-certificate TLS test.** `required_verify` is asserted only through its
-  failure modes; the acceptance traps are plaintext. Still open, and still what
-  `docs/ACCEPTANCE.md` §5 describes — the stack it needs now exists.
+- **No real-certificate TLS test on the *outbound* leg.** `required_verify` is
+  asserted only through its failure modes; the acceptance traps are plaintext.
+  The **inbound** half closed in phase 11: `tests/ingress_tls.rs` verifies every
+  handshake against a per-test CA, and the acceptance loadgen verifies the
+  container's certificate. `docs/ACCEPTANCE.md` §5's trap-side design still
+  stands for the outbound half, and `tls-init` now provides the CA it needs.
+- **The STARTTLS and implicit-TLS handshake timeouts are not driven.** Both are
+  bounded by `timeouts.command`; the failure paths driven are a bad certificate
+  and plaintext on the implicit port, not a peer that stalls mid-handshake.
+- **The injection test depends on one write arriving as one read.** It sends
+  `STARTTLS` and a `MAIL FROM` in a single write on loopback, which the kernel
+  delivers together in practice; were it ever split, the server would correctly
+  answer `220` and the test would fail rather than pass wrongly.
 - ~~**No clock movement.**~~ Closed: the acceptance suite walks three simulated
   days by moving `warmup.started` and re-creating the container.
 - ~~**No test proves a message reaches a real mail server under the rewritten
@@ -479,6 +533,14 @@ login runs. Four tests pin it. See `DECISIONS.md` D-066.
 
 ## 7. Outstanding non-code items
 
+**Phase 11 closed the one scheduled item below**, and `SPEC.md` is amended to match
+(D-070, D-071). Nothing is waiting on the spec's author.
+
+A dependency note from the same day: `chacha20 0.10.1`, reached through
+`hickory-resolver`'s `rand`, was yanked upstream after 2026-08-11, so
+`cargo deny check` failed on the committed phase 10 lockfile. Bumped to `0.10.2`
+in its own commit, ahead of phase 11.
+
 **Everything that was waiting on the spec's author was answered on 2026-08-11**, and
 `SPEC.md` was amended for the first time. `DECISIONS.md`, "The spec settlements
 (after phase 10)", is the record; the short version:
@@ -491,7 +553,7 @@ login runs. Four tests pin it. See `DECISIONS.md` D-066.
 | §2.2's ownership wording (D-061) | Reword, and record the two real constraints | §2.2 and §2.3 amended |
 | Inbound TLS, ports 465/587, the sender ACL (D-033) | Yes — build it | **The next phase.** See below |
 
-**The one open item, and it is now scheduled work rather than a question:**
+**The one open item then — built since, as phase 11:**
 
 - **`docs/INGRESS.md` (D-033) is approved to build.** Two of its five open
   questions were settled at the same time: `server.listen` is **replaced** by
@@ -537,9 +599,12 @@ Committed so far:
 | `Phase 7 and the multi-instance correction: the control plane, and D-007's reason` | 714 tests + 4 acceptance |
 | `Phase 8: the DNS preflight, and the licence gate settled` | 747 tests + 4 acceptance |
 | `Phase 10: the connection pool, the drain, and the auth timing defect` | 771 tests + 4 acceptance |
+| `The spec settlements: five open questions answered, and SPEC.md amended` | 772 tests + 4 acceptance |
+| `Cargo.lock: bump chacha20 0.10.1 -> 0.10.2, which was yanked` | 772 tests + 4 acceptance |
+| `Phase 11: listeners on 25/465/587, inbound TLS, and the sender ACL` | 830 tests + 5 acceptance |
 
-**`main` is pushed through the phase 10 commit** — phase 8 had been sitting local
-and went up alongside it.
+**`main` is pushed through the spec-settlements commit.** The two phase 11 commits
+are local and not pushed.
 
 **Phase 10 is one commit**, for the same reason phase 8 was: it was built from a
 clean tree, so there is no interleaving to untangle. It carries D-066's auth fix

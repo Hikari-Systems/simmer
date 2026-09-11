@@ -21,9 +21,20 @@
 //! the reply codes. `swaks` or a shell loop would work too, but this way the
 //! sender and the service under test are built from one `cargo build` and cannot
 //! drift apart in the image.
+//!
+//! ## `--starttls` (D-070)
+//!
+//! Submits over RFC 3207 instead of plaintext, **verifying** the server's
+//! certificate against `--ca` — the CA the compose `tls-init` service minted —
+//! for `--tls-name`. Verification is the point: an unverified handshake would
+//! show the bytes were encrypted, not that Simmer served the certificate it was
+//! configured with. The upgrade reuses the library's own [`Stream`], as the
+//! outbound leg does.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use simmer::downstream::stream::Stream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -43,6 +54,10 @@ struct Args {
     /// Distinguishes one run's recipients from the next in the same trap.
     tag: String,
     subject: String,
+    /// RFC 3207 before AUTH, verifying against `ca` for `tls_name`.
+    starttls: bool,
+    ca: String,
+    tls_name: String,
 }
 
 fn args() -> Args {
@@ -57,6 +72,9 @@ fn args() -> Args {
         recipient_domain: "example.net".to_string(),
         tag: "run".to_string(),
         subject: "Your order has shipped".to_string(),
+        starttls: false,
+        ca: "/tls/ca.pem".to_string(),
+        tls_name: "simmer.acceptance".to_string(),
     };
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -67,6 +85,12 @@ fn args() -> Args {
                 .unwrap_or_else(|| panic!("{} needs a value", argv[i]))
                 .clone()
         };
+        // The one flag that takes no value.
+        if argv[i] == "--starttls" {
+            a.starttls = true;
+            i += 1;
+            continue;
+        }
         match argv[i].as_str() {
             "--host" => a.host = value(),
             "--port" => a.port = value().parse().expect("--port"),
@@ -78,6 +102,8 @@ fn args() -> Args {
             "--recipient-domain" => a.recipient_domain = value(),
             "--tag" => a.tag = value(),
             "--subject" => a.subject = value(),
+            "--ca" => a.ca = value(),
+            "--tls-name" => a.tls_name = value(),
             other => panic!("unknown argument {other}"),
         }
         i += 2;
@@ -92,11 +118,12 @@ fn args() -> Args {
 #[tokio::main]
 async fn main() {
     let args = args();
+    let tls = args.starttls.then(|| connector(&args.ca));
     let mut results = Vec::with_capacity(args.count);
 
     for n in 0..args.count {
         let recipient = format!("{}-{n}@{}", args.tag, args.recipient_domain);
-        let outcome = send_one(&args, &recipient).await;
+        let outcome = send_one(&args, tls.as_ref(), &recipient).await;
         let (code, text) = match outcome {
             Ok((code, text)) => (code, text),
             // A transport failure is reported as a code of 0 rather than
@@ -117,7 +144,11 @@ async fn main() {
 /// One connection per message. Slower than reusing one, and the point: it is
 /// what an application sending in bulk through a pool actually looks like to
 /// Simmer, and it exercises the §5.1 session cap.
-async fn send_one(args: &Args, recipient: &str) -> Result<(u16, String), String> {
+async fn send_one(
+    args: &Args,
+    tls: Option<&tokio_rustls::TlsConnector>,
+    recipient: &str,
+) -> Result<(u16, String), String> {
     let stream = tokio::time::timeout(
         Duration::from_secs(10),
         TcpStream::connect((args.host.as_str(), args.port)),
@@ -126,11 +157,29 @@ async fn send_one(args: &Args, recipient: &str) -> Result<(u16, String), String>
     .map_err(|_| "connect timed out".to_string())?
     .map_err(|e| format!("connect: {e}"))?;
 
-    let mut io = BufReader::new(stream);
+    let mut io = BufReader::new(Stream::Plain(stream));
     expect(&mut io, 220).await?;
 
     write(&mut io, "EHLO loadgen.acceptance\r\n").await?;
     read_multiline(&mut io, 250).await?;
+
+    if let Some(connector) = tls {
+        write(&mut io, "STARTTLS\r\n").await?;
+        expect(&mut io, 220).await?;
+        let Stream::Plain(tcp) = std::mem::replace(io.get_mut(), Stream::Taken) else {
+            return Err("STARTTLS on a stream that is not plaintext".to_string());
+        };
+        let name = rustls::pki_types::ServerName::try_from(args.tls_name.clone())
+            .map_err(|e| format!("--tls-name: {e}"))?;
+        let upgraded = connector
+            .connect(name, tcp)
+            .await
+            .map_err(|e| format!("TLS handshake: {e}"))?;
+        io = BufReader::new(Stream::Tls(Box::new(upgraded.into())));
+        // RFC 3207 §4.2: everything learned before the handshake is void.
+        write(&mut io, "EHLO loadgen.acceptance\r\n").await?;
+        read_multiline(&mut io, 250).await?;
+    }
 
     if !args.password.is_empty() {
         // AUTH PLAIN: NUL authzid, NUL-separated (RFC 4616).
@@ -166,6 +215,23 @@ async fn send_one(args: &Args, recipient: &str) -> Result<(u16, String), String>
     Ok((code, text))
 }
 
+/// A client that trusts the CA in `path` and nothing else. A panic rather than
+/// a reported error: without the CA there is no run to report on.
+fn connector(path: &str) -> tokio_rustls::TlsConnector {
+    use rustls::pki_types::pem::PemObject;
+    let ca = rustls::pki_types::CertificateDer::from_pem_file(path)
+        .unwrap_or_else(|e| panic!("reading --ca {path}: {e}"));
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca).expect("--ca is not a usable trust anchor");
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+}
+
 /// The message body, carrying one of everything the §4.3 assertions look for.
 fn message(args: &Args, recipient: &str) -> String {
     format!(
@@ -195,14 +261,14 @@ fn message(args: &Args, recipient: &str) -> String {
 // a very small SMTP client
 // ---------------------------------------------------------------------------
 
-async fn write(io: &mut BufReader<TcpStream>, s: &str) -> Result<(), String> {
+async fn write(io: &mut BufReader<Stream>, s: &str) -> Result<(), String> {
     io.get_mut()
         .write_all(s.as_bytes())
         .await
         .map_err(|e| format!("write: {e}"))
 }
 
-async fn read_line(io: &mut BufReader<TcpStream>) -> Result<String, String> {
+async fn read_line(io: &mut BufReader<Stream>) -> Result<String, String> {
     let mut line = String::new();
     match tokio::time::timeout(Duration::from_secs(30), io.read_line(&mut line)).await {
         Err(_) => Err("read timed out".to_string()),
@@ -213,7 +279,7 @@ async fn read_line(io: &mut BufReader<TcpStream>) -> Result<String, String> {
 }
 
 /// Read one reply, following multi-line continuations.
-async fn read_reply(io: &mut BufReader<TcpStream>) -> Result<(u16, String), String> {
+async fn read_reply(io: &mut BufReader<Stream>) -> Result<(u16, String), String> {
     loop {
         let line = read_line(io).await?;
         let trimmed = line.trim_end();
@@ -231,7 +297,7 @@ async fn read_reply(io: &mut BufReader<TcpStream>) -> Result<(u16, String), Stri
     }
 }
 
-async fn read_multiline(io: &mut BufReader<TcpStream>, want: u16) -> Result<(), String> {
+async fn read_multiline(io: &mut BufReader<Stream>, want: u16) -> Result<(), String> {
     let (code, text) = read_reply(io).await?;
     if code != want {
         return Err(format!("expected {want}, got {code} {text}"));
@@ -239,7 +305,7 @@ async fn read_multiline(io: &mut BufReader<TcpStream>, want: u16) -> Result<(), 
     Ok(())
 }
 
-async fn expect(io: &mut BufReader<TcpStream>, want: u16) -> Result<(), String> {
+async fn expect(io: &mut BufReader<Stream>, want: u16) -> Result<(), String> {
     read_multiline(io, want).await
 }
 

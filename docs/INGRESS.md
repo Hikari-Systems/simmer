@@ -1,6 +1,11 @@
 # Inbound listeners, TLS, and the sender ACL — design
 
-**Status: planned, not built.** Nothing in this document exists in the repository.
+**Status: built in phase 11** (2026-09-11) as `DECISIONS.md` D-070 (listeners and
+TLS) and D-071 (the ACL). This is the design as approved; the phase 11 entries
+record where the build departed from it — `rustls-pki-types` rather than
+`rustls-pemfile`, the `530`/`538` split, no `454` after a failed handshake — and
+§8's five questions are answered there. §5's defect was fixed separately, in phase
+10 (D-066). §6's pre-authentication limits were not built (D-072).
 
 This is new capability, not a divergence in how something already specified gets
 implemented. `SPEC.md` rules all three of these out explicitly, so §1 below is the

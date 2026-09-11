@@ -294,6 +294,65 @@ fn both_arrangements_of_the_cutover_invariant_produce_the_same_output() {
     assert_eq!(a, b, "the two arrangements of §1.1 produced different mail");
 }
 
+// ---------------------------------------------------------------------------
+// inbound TLS (D-070)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the acceptance compose profile"]
+fn submission_on_587_is_verified_tls_and_refuses_plaintext_auth() {
+    // The inbound half of the "no real-certificate TLS test" gap. The loadgen
+    // verifies the served certificate against the CA `tls-init` minted for this
+    // stack, by name, so a pass means the configured certificate was the one
+    // presented — through the image's own certificate loading, in the container
+    // it ships in, as UID 1000 against a volume-mounted key.
+    restart_app_at_day(0);
+    reset_quota();
+    reset_traps();
+
+    let replies = loadgen(&[
+        "--count",
+        "1",
+        "--tag",
+        "tls",
+        "--port",
+        "587",
+        "--starttls",
+    ]);
+    assert!(
+        replies.iter().all(|r| r.code == 250),
+        "submission over STARTTLS failed: {replies:?}"
+    );
+    assert_eq!(
+        wait_for_count(TRAP_WARMING, 1),
+        1,
+        "the message never arrived"
+    );
+    let raw = raw_messages(TRAP_WARMING).remove(0);
+    // RFC 3848, as the real mail server received it: encrypted and
+    // authenticated. The top Received: is Simmer's; the trap prepends its own
+    // above it, so look for Simmer's by its `by`.
+    let ours = raw
+        .lines()
+        .find(|l| l.starts_with("Received: from loadgen.acceptance"))
+        .unwrap_or_else(|| panic!("no Received: from Simmer:\n{raw}"));
+    assert!(
+        ours.contains("by simmer.acceptance with ESMTPSA id"),
+        "{ours}"
+    );
+
+    // And 587's defaults hold: starttls_required means AUTH before the
+    // handshake is 530, so a plaintext submission never gets as far as sending
+    // its password.
+    let refused = loadgen(&["--count", "1", "--tag", "plain587", "--port", "587"]);
+    assert!(
+        refused
+            .iter()
+            .all(|r| r.code == 0 && r.text.contains("530")),
+        "plaintext AUTH on 587 was not refused with 530: {refused:?}"
+    );
+}
+
 /// Strip everything D-002 excludes from §12.3's comparison, plus what the
 /// receiving server added.
 ///
@@ -364,6 +423,22 @@ fn warming_schedule() -> Vec<i64> {
 }
 
 fn load_acceptance_config() -> Config {
+    // §4.2 reads `server.tls`'s files, which in the stack live in the
+    // `acceptance-tls` volume. A certificate minted here stands in for them, so
+    // the drift guard needs no Docker. Leaked deliberately: the `Config` it
+    // validates does not outlive the process, and neither should the files.
+    if std::env::var("SIMMER_TLS_DIR").is_err() {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let key = rcgen::KeyPair::generate().expect("key");
+        let cert = rcgen::CertificateParams::new(vec!["simmer.acceptance".to_string()])
+            .expect("params")
+            .self_signed(&key)
+            .expect("cert");
+        std::fs::write(dir.join("cert.pem"), cert.pem()).expect("write cert");
+        std::fs::write(dir.join("key.pem"), key.serialize_pem()).expect("write key");
+        std::env::set_var("SIMMER_TLS_DIR", dir);
+    }
+
     // The interpolated values do not matter for reading the schedule, but they
     // have to resolve or §4 refuses to load the file at all.
     for (k, v) in [
@@ -457,7 +532,6 @@ struct LoadgenReply {
     #[allow(dead_code)]
     recipient: String,
     code: u16,
-    #[allow(dead_code)]
     text: String,
 }
 

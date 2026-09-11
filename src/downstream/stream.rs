@@ -8,6 +8,10 @@
 //! | `required_verify` | `STARTTLS` mandatory with full chain and hostname validation |
 //!
 //! `rustls` with the platform root store, per §8.2.
+//!
+//! [`Stream`] is also the inbound session's stream since D-070 (§5.1): the
+//! `STARTTLS` upgrade is the same move-out-and-back from either end, so there is
+//! one type with one `Taken` state rather than two.
 
 use std::sync::Arc;
 
@@ -16,11 +20,13 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsStream;
 
 use crate::config::TlsMode;
 
-/// A downstream connection, before or after `STARTTLS`.
+/// An SMTP connection, before or after `STARTTLS` — downstream (§8.2) or
+/// inbound (§5.1). `TlsStream` is tokio-rustls's client-or-server enum, so the
+/// one variant serves both ends.
 ///
 /// An enum rather than `Box<dyn AsyncRead + AsyncWrite>`: the conversation code
 /// is written once against this type, and upgrading in place is a `mem::replace`
@@ -183,7 +189,7 @@ impl TlsConfigs {
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(Stream::Tls(Box::new(stream)))
+        Ok(Stream::Tls(Box::new(stream.into())))
     }
 }
 

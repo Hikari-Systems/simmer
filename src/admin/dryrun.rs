@@ -386,6 +386,7 @@ fn render(
                 peer: "127.0.0.1",
                 by: &cfg.server.hostname,
                 authenticated: true,
+                tls: false,
             },
             now,
             uuid: &|| uuid::Uuid::new_v4().to_string(),

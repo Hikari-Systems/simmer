@@ -103,6 +103,18 @@ checkout rather than a socket cache (D-067): a cache satisfies three of §8.3's
 four clauses and leaves the downstream unprotected, which is the clause worth
 having.
 
+And a seventh, from phase 11, which is §5.3 and §1.1 together: **the sender ACL
+gates acceptance and never routing** (D-071). `smtp::acl` answers "may this user
+present this identity?" and can only refuse; nothing it knows reaches
+`routing::`. If a grant ever picked a chain, the outbound identity would depend on
+who authenticated, which no application-side config can express. There is a test
+that two users granted one identity produce byte-identical output — keep it
+passing. Alongside it, the `STARTTLS` injection check in `session::starttls` is the
+**one** place the pipelining rule above is overridden: bytes buffered behind
+`STARTTLS` drop the connection rather than being answered. Do not "fix" it to keep
+the session in step, and do not reset `auth_failures` in the handshake reset
+(D-070).
+
 ## Build and run
 
 ```sh
@@ -146,7 +158,12 @@ src/config/mod.rs        the §4.1 schema; every struct is deny_unknown_fields
 src/config/validate.rs   §4.2 — accumulates ALL violations, never short-circuits
 src/config/interpolate.rs  ${ENV_VAR}, over the parsed tree not the raw text
 src/routing/sender_match.rs  §5.4 — wildcard precedence, first match wins
-src/smtp/session.rs      §5.2 state machine; PIPELINING means never drop buffered input
+src/smtp/session.rs      §5.2 state machine; PIPELINING means never drop buffered input —
+                         except behind STARTTLS, where it means drop the connection (D-070)
+src/smtp/mod.rs          §5.1 listeners: one per port, one shared session bound and CIDR check
+src/smtp/tls.rs          §5.1's certificate. `load` is what §4.2 AND the listener call —
+                         one function, so they cannot disagree. notAfter read by hand
+src/smtp/acl.rs          §5.3's grants (D-071). Refuses; never routes
 src/smtp/reply.rs        EVERY reply Simmer can emit. Adding a 5xx here is a decision
 src/smtp/buffer.rs       §8.1 — transient, tmpfs above 1 MiB. Not a spool
 src/downstream/outcome.rs  §10.1 + D-008, as data. The §14.1 test lives in its tests
@@ -178,6 +195,7 @@ src/metrics.rs           §9.1 counters, the recorder, and every `# HELP` line
 src/models/recipient_event.rs  §7.3's rows. A key is 16 bytes and never plaintext
 src/models/instance_config.rs  §7.3's salt: insert-if-absent, then read (D-050)
 src/db.rs                pool + migrations
+src/hash_password.rs     `server hash-password`. Reads stdin, never argv
 src/admin/view.rs        §9.2's projections. The row wins over the schedule (D-026)
 src/admin/auth.rs        §9.3's token. Reads need it too (D-055); named (D-053)
 src/admin/mutate.rs      §9.3. Every mutation says which chains it just emptied
@@ -192,6 +210,8 @@ tests/preflight.rs       §6.7 through the walk. A strict failure STEERS; a chai
                          with none left is 451 on the wire, never a 5xx
 tests/pool.rs            §8.3 counted from the DOWNSTREAM's side — accepted
                          connections and command lines, never the pool's own view
+tests/ingress_tls.rs     §5.1/§5.3 end to end. Every handshake VERIFIES against a
+                         per-test CA (support::TestPki); an unverified one proves little
 tests/admin_api.rs       §9. Pins dry run against the REAL walk, step for step
 tests/metrics_endpoint.rs  §9.1. Its own binary — one global recorder per process
 tests/acceptance.rs      §12.3 against real mail servers; behind --ignored

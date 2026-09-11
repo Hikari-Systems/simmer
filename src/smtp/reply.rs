@@ -156,25 +156,41 @@ pub fn greeting(hostname: &str) -> Reply {
 }
 
 /// §5.2 — `EHLO` advertises **exactly** `PIPELINING`, `8BITMIME`, `SMTPUTF8`,
-/// `SIZE`, and `AUTH` when enabled. Nothing else.
+/// `SIZE`, `STARTTLS` and `AUTH`, the last two when they apply. Nothing else.
 ///
 /// `SMTPUTF8` is conditional rather than unconditional, which is a divergence:
 /// see `DECISIONS.md` D-018 and [`crate::config::Config::advertise_smtputf8`].
-pub fn ehlo(hostname: &str, client: &str, max_size: u64, auth: bool, smtputf8: bool) -> Reply {
+/// `STARTTLS` arrived with D-070, and is advertised only on a listener that
+/// offers it and only until the handshake — RFC 3207 §4.2 has the client
+/// re-issue `EHLO` afterwards, and offering it again invites a loop.
+pub fn ehlo(hostname: &str, client: &str, caps: Capabilities) -> Reply {
     let mut lines = vec![format!("{hostname} greets {client}")];
     lines.push("PIPELINING".into());
     lines.push("8BITMIME".into());
-    if smtputf8 {
+    if caps.smtputf8 {
         lines.push("SMTPUTF8".into());
     }
-    lines.push(format!("SIZE {max_size}"));
-    if auth {
+    lines.push(format!("SIZE {}", caps.max_size));
+    if caps.starttls {
+        lines.push("STARTTLS".into());
+    }
+    if caps.auth {
         // Both forms: RFC 4954's `AUTH PLAIN LOGIN`, and the historical
         // `AUTH=PLAIN LOGIN` that pre-RFC clients (still shipping) look for.
         lines.push("AUTH PLAIN LOGIN".into());
         lines.push("AUTH=PLAIN LOGIN".into());
     }
     Reply::multiline(250, lines)
+}
+
+/// What one `EHLO` reply advertises. A struct rather than a row of booleans
+/// because the row had reached five and two of them were adjacent `bool`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capabilities {
+    pub max_size: u64,
+    pub smtputf8: bool,
+    pub starttls: bool,
+    pub auth: bool,
 }
 
 pub fn helo(hostname: &str) -> Reply {
@@ -269,6 +285,51 @@ pub fn auth_too_many_failures() -> Reply {
 /// no enhanced status code.
 pub fn auth_challenge(b64: &str) -> Reply {
     Reply::new(334, b64.to_string())
+}
+
+/// D-070 — `AUTH` on a listener configured `auth: disabled`. `503` as the design
+/// specifies: the command exists and is refused in this state, which is not the
+/// same claim as `504`'s "no such mechanism".
+pub fn auth_not_available() -> Reply {
+    Reply::new(503, "5.5.1 authentication not available on this port")
+}
+
+/// RFC 4954 §6 — `AUTH` over plaintext where plaintext credentials are refused
+/// (`allow_insecure_auth: false`, D-070). Not `530`, which means "you have not
+/// authenticated"; the client needs to know encryption is what is missing.
+pub fn encryption_required_for_auth() -> Reply {
+    Reply::new(
+        538,
+        "5.7.11 encryption required for requested authentication mechanism",
+    )
+}
+
+/// D-071 — an authenticated user presenting a sender identity outside its
+/// `grants.send_as`, at `MAIL FROM` or at the final dot.
+///
+/// `550`, under §10.3's carve-out for `strict_senders` and for the same reason:
+/// it is a statement about the *sender*, it cannot put a deliverable recipient
+/// on a suppression list, and it should be loud because it means either a
+/// misconfigured application or a stolen credential.
+pub fn sender_not_permitted() -> Reply {
+    Reply::new(550, "5.7.1 sender not permitted")
+}
+
+// -- inbound TLS (§5.1, RFC 3207, D-070) --
+
+pub fn starttls_ready() -> Reply {
+    Reply::new(220, "2.0.0 ready to start TLS")
+}
+
+/// RFC 3207 §4 — anything but `EHLO`, `NOOP`, `RSET`, `QUIT` and `STARTTLS` on
+/// a `starttls_required` listener before the handshake.
+pub fn must_starttls_first() -> Reply {
+    Reply::new(530, "5.7.0 must issue a STARTTLS command first")
+}
+
+/// `STARTTLS` on a session already encrypted — implicit TLS, or a second one.
+pub fn tls_already_active() -> Reply {
+    Reply::new(503, "5.5.1 TLS already active")
 }
 
 // -- limits (§5.1, §5.5, §5.6) --
@@ -374,22 +435,43 @@ mod tests {
 
     #[test]
     fn ehlo_advertises_exactly_the_spec_list() {
-        let wire = ehlo("simmer.test", "client.example", 1024, true, true).to_wire();
-        // §5.2: PIPELINING, 8BITMIME, SMTPUTF8, SIZE, AUTH. "Nothing else."
+        let caps = Capabilities {
+            max_size: 1024,
+            smtputf8: true,
+            starttls: true,
+            auth: true,
+        };
+        let wire = ehlo("simmer.test", "client.example", caps).to_wire();
+        // §5.2: PIPELINING, 8BITMIME, SMTPUTF8, SIZE, STARTTLS, AUTH. "Nothing
+        // else."
         assert!(wire.contains("250-PIPELINING\r\n"));
         assert!(wire.contains("250-8BITMIME\r\n"));
         assert!(wire.contains("250-SMTPUTF8\r\n"));
         assert!(wire.contains("250-SIZE 1024\r\n"));
+        assert!(wire.contains("250-STARTTLS\r\n"));
         assert!(wire.contains("AUTH PLAIN LOGIN"));
-        for banned in ["STARTTLS", "CHUNKING", "BDAT", "DSN", "ENHANCEDSTATUSCODES"] {
+        for banned in [
+            "CHUNKING",
+            "BDAT",
+            "DSN",
+            "ENHANCEDSTATUSCODES",
+            "REQUIRETLS",
+        ] {
             assert!(!wire.contains(banned), "{banned} must not be advertised");
         }
     }
 
     #[test]
-    fn ehlo_omits_auth_and_smtputf8_when_disabled() {
-        let wire = ehlo("h", "c", 10, false, false).to_wire();
+    fn ehlo_omits_auth_starttls_and_smtputf8_when_disabled() {
+        let caps = Capabilities {
+            max_size: 10,
+            smtputf8: false,
+            starttls: false,
+            auth: false,
+        };
+        let wire = ehlo("h", "c", caps).to_wire();
         assert!(!wire.contains("AUTH"));
+        assert!(!wire.contains("STARTTLS"));
         assert!(!wire.contains("SMTPUTF8"));
         // ...and the last line still terminates the reply properly.
         assert!(wire.ends_with("250 SIZE 10\r\n"));
@@ -477,6 +559,16 @@ mod tests {
             ("auth_failed", auth_failed()),
             ("auth_cancelled", auth_cancelled()),
             ("auth_bad_encoding", auth_bad_encoding()),
+            // D-070. About the session's security, never a recipient.
+            ("auth_not_available", auth_not_available()),
+            (
+                "encryption_required_for_auth",
+                encryption_required_for_auth(),
+            ),
+            ("must_starttls_first", must_starttls_first()),
+            ("tls_already_active", tls_already_active()),
+            // D-071. About the sender, under §10.3's strict_senders carve-out.
+            ("sender_not_permitted", sender_not_permitted()),
             ("access_denied", access_denied()),
             ("message_too_large", message_too_large()),
             ("malformed_from_header", malformed_from_header()),

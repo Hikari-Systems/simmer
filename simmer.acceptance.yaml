@@ -8,7 +8,8 @@
 #      moves backwards to walk the ramp across simulated day boundaries (§12.3,
 #      `ACCEPTANCE.md` §3).
 #   2. The downstreams are the two Mailpit traps on the compose network, in
-#      plaintext. Real-certificate TLS is `ACCEPTANCE.md` §5 and phase 10.
+#      plaintext. Inbound, the loadgen submits over 587 with STARTTLS against a
+#      certificate `tls-init` mints per run (D-070, `ACCEPTANCE.md` §5).
 #   3. The schedule is three short days rather than eight long ones, because
 #      every day costs a container restart.
 #
@@ -17,7 +18,22 @@
 # changes what the suite expects, with nothing else to keep in step.
 
 server:
-  listen: "0.0.0.0:25"
+  listeners:
+    # The ramp tests' port: plaintext with AUTH required, which is what the
+    # suite measured before listeners existed.
+    - address: "0.0.0.0:25"
+      auth: required
+    # RFC 6409 submission with its port defaults — starttls_required, auth
+    # required. The loadgen's --starttls runs verify the certificate against
+    # tls-init's CA, so this is a real, verified handshake.
+    - address: "0.0.0.0:587"
+  # Written by the compose `tls-init` service into the `acceptance-tls` volume,
+  # mounted at /tls. A variable rather than a literal only so that
+  # `tests/acceptance.rs`'s drift guard can load this file on the host, where
+  # §4.2 reads the files too, against a certificate it mints itself.
+  tls:
+    certificate: "${SIMMER_TLS_DIR}/cert.pem"
+    private_key: "${SIMMER_TLS_DIR}/key.pem"
   hostname: "simmer.acceptance"
   max_message_bytes: 26214400
   # D-047 and `ACCEPTANCE.md` §6: one recipient per transaction, so the loadgen
@@ -32,14 +48,18 @@ server:
     data: 300s
     session: 600s
   auth:
-    # Kept on. The loadgen authenticates, so the suite exercises §5.3 against the
-    # real listener rather than only against the in-process tests.
-    required: true
+    # The loadgen authenticates, so the suite exercises §5.3 against the real
+    # listener rather than only against the in-process tests. Plaintext AUTH is
+    # allowed for port 25's sake; 587 is encrypted before AUTH is possible.
     allow_insecure_auth: true
     mechanisms: [PLAIN, LOGIN]
     users:
       - username: "cfapp"
         password_hash: "${SIMMER_CFAPP_HASH}"
+        # Both arrangements of §1.1: the application before (oldbrand) and after
+        # (newbrand) it is reconfigured.
+        grants:
+          send_as: ["oldbrand.com", "newbrand.com"]
 
 database:
   url: "${DATABASE_URL}"

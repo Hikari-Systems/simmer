@@ -58,7 +58,9 @@ applies to the domain, not to whether Simmer altered the message.
 
 ### 2.1 In scope
 
-- SMTP ingress on port 25, plaintext, for trusted internal clients.
+- SMTP ingress for trusted internal clients: port 25, and optionally 587 and 465, each with
+  its own TLS and AUTH policy (§5.1). *(Amended — was "on port 25, plaintext". See
+  `DECISIONS.md` D-070.)*
 - Route selection driven by incoming identity, warm-up quota state, and per-recipient
   frequency state.
 - Header, envelope, and `text/*` body rewriting per route.
@@ -77,7 +79,9 @@ Simmer is **not an MTA**. It does not own messages.
 - **No DSN or bounce generation.** Simmer never composes mail.
 - **No inbound mail handling, no bounce processing, no reply routing.**
 - **No DKIM signing and no key material.** Downstreams sign. See §6.5.
-- **No inbound TLS.** See §5.1.
+- **No ACME and no certificate reload.** Inbound TLS uses one PEM certificate and key read at
+  startup (§5.1); rotation is a restart, like any other configuration change. *(Amended — was
+  "No inbound TLS". See `DECISIONS.md` D-070 and `docs/INGRESS.md`.)*
 - **No `CHUNKING`/`BDAT`, no `DSN` extension.**
 - **No multi-instance clustering.** v1 runs a single instance; the storage layer is safe for
   more. Quota state is owned by Postgres, not by a process: §7.4's reservation performs its
@@ -90,9 +94,18 @@ Simmer is **not an MTA**. It does not own messages.
 
 ### 2.3 Deployment assumption
 
-Simmer runs on a trusted internal network segment. The listener is plaintext and accepts
-plaintext AUTH. The container must not be exposed to an untrusted network. Bind defaults to
-a private interface; publishing port 25 to a host interface must be a deliberate act.
+Simmer runs on a trusted internal network segment. It is a submission relay for our own
+applications, and TLS and AUTH do not change that: there is no inbound mail handling, no
+bounce processing, no defence against hostile peers, and no rate limiting beyond §5.5. What
+inbound TLS buys is the ability to sit on a segment where *cleartext credentials* are
+unacceptable, which is a much smaller claim than "internet-facing". The container must not be
+exposed to an untrusted network. Bind defaults to a private interface; publishing an SMTP port
+to a host interface must be a deliberate act.
+
+A listener with `auth: optional` (port 25's default) accepts unauthenticated mail from any
+address in `allowed_cidrs`, and the §5.3 sender ACL does not apply to such a session. On a
+segment where that is too much trust, set `auth: required` on every listener. *(Amended — was
+"The listener is plaintext and accepts plaintext AUTH". See `DECISIONS.md` D-070, D-071.)*
 
 **Two operational constraints on running more than one instance**, which §2.2 defers to here.
 Neither is fixed by a lock, and neither is a quota-overshoot window:
@@ -178,8 +191,15 @@ startup and the process refuses to start on any violation (§4.2).
 
 ```yaml
 server:
-  listen: "127.0.0.1:25"
-  hostname: "simmer.internal"          # used in EHLO banner and Received headers
+  listeners:                           # one per port; see §5.1 for the per-port defaults
+    - address: "127.0.0.1:25"
+      auth: required                   # port 25 defaults to optional
+    - address: "127.0.0.1:587"         # starttls_required, auth required
+    - address: "127.0.0.1:465"         # implicit TLS, auth required
+  tls:
+    certificate: "/etc/simmer/tls/fullchain.pem"   # leaf first; should cover hostname
+    private_key: "/etc/simmer/tls/privkey.pem"     # readable by the container's user
+  hostname: "simmer.internal"          # EHLO banner, Received headers, certificate name
   max_message_bytes: 26214400          # 25 MiB
   max_recipients: 100                  # a transaction carries ONE recipient; see §5.6
   max_concurrent_sessions: 64
@@ -189,12 +209,13 @@ server:
     data: 300s
     session: 600s
   auth:
-    required: true
-    allow_insecure_auth: true          # must be explicitly true; no TLS on ingress
+    allow_insecure_auth: true          # AUTH on an unencrypted session; default false
     mechanisms: [PLAIN, LOGIN]
     users:
       - username: "cfapp"
-        password_hash: "${SIMMER_CFAPP_HASH}"   # argon2id
+        password_hash: "${SIMMER_CFAPP_HASH}"   # argon2id; `server hash-password` mints one
+        grants:
+          send_as: ["oldbrand.com", "*.oldbrand.com", "newbrand.com"]   # §5.3
 
 database:
   url: "${DATABASE_URL}"
@@ -319,8 +340,19 @@ not just the first.
 - A `warmup.schedule` array is empty, or contains a negative value.
 - An `overrides` key names a nonexistent domain group.
 - `${ENV_VAR}` interpolation cannot be resolved.
-- `auth.required: true` with an empty user list.
-- `allow_insecure_auth` is false (there is no inbound TLS, so AUTH would be unusable).
+- `server.listeners` is empty, or two listeners share an address.
+- A listener's `tls` is not `off` and `server.tls` is absent.
+- `server.tls` names a certificate or key that is missing, unreadable, unparseable, or that do
+  not belong together.
+- A listener's `auth` is `required` and the user list is empty.
+- A listener's `auth` is `required`, its `tls` is `off`, and `allow_insecure_auth` is false —
+  AUTH could never succeed there, so every message would be refused.
+- A user's `grants.send_as` is empty, or contains a pattern that can match nothing (§5.3).
+
+*(Amended — the two auth rules replace "`auth.required: true` with an empty user list" and
+"`allow_insecure_auth` is false (there is no inbound TLS, so AUTH would be unusable)", which
+this inverts: plaintext AUTH is now refused unless allowed. The rest are new. See
+`DECISIONS.md` D-070, D-071.)*
 - A `body_rewrites.pattern` fails to compile.
 - Any route's **identity field** (`envelope_from`, `From:`, `Sender:`, `Message-ID:`) fails the
   stability property (§6.6) against a synthetic probe message. Not overridable.
@@ -352,23 +384,59 @@ label. It also cannot be preflighted (§6.7), because there is no name to look u
 
 ## 5. Ingress
 
-### 5.1 Listener
+### 5.1 Listeners
 
-Plaintext TCP, default port 25. No STARTTLS, no implicit TLS, no ACME. The deployment
-assumption in §2.3 governs.
+One or more listeners, each with its own `tls` and `auth` mode. The deployment assumption in
+§2.3 governs all of them.
+
+| `tls` | Behaviour |
+|---|---|
+| `off` | Plaintext only. `STARTTLS` is not advertised |
+| `starttls` | `STARTTLS` advertised and accepted (RFC 3207); a client may decline it |
+| `starttls_required` | `STARTTLS` advertised; every command but `EHLO`, `NOOP`, `RSET`, `QUIT` and `STARTTLS` is `530 5.7.0` until the handshake completes |
+| `implicit` | TLS from the first byte (RFC 8314). `STARTTLS` is never advertised |
+
+| `auth` | Behaviour |
+|---|---|
+| `disabled` | `AUTH` is not advertised; the command is `503` |
+| `optional` | Advertised where usable; an unauthenticated session may still send |
+| `required` | `MAIL FROM` before a successful `AUTH` is `530 5.7.0` |
+
+A listener that names only an address takes its port's RFC defaults: 465 is `implicit` and
+`required` (RFC 8314), 587 is `starttls_required` and `required` (RFC 6409), and every other
+port, 25 included, is `off` and `optional` (RFC 5321).
+
+One certificate and key, PEM, read at startup. No ACME. A certificate that does not cover
+`server.hostname`, or that has expired or expires within fourteen days, is a startup warning
+rather than a failure — refusing to start would take the plaintext listeners down with it.
+
+Bytes pipelined behind `STARTTLS` — sent in cleartext after the command and before the
+handshake — drop the connection rather than being processed (RFC 3207 §6). The handshake
+discards the greeting, any authentication and any transaction, and keeps the §5.3 failure
+count, which is per connection.
 
 Connections are refused (TCP close, or `554` then close) if the peer address is not within
 `allowed_cidrs`, or if `max_concurrent_sessions` is reached (reply `421 4.3.2 too many
-connections`).
+connections`). Both limits are shared by every listener. On an `implicit` listener the refusal
+is a bare TCP close, since a plaintext reply there would arrive in place of a TLS handshake.
+
+*(Amended — was "Plaintext TCP, default port 25. No STARTTLS, no implicit TLS, no ACME." See
+`DECISIONS.md` D-070 and `docs/INGRESS.md`.)*
 
 ### 5.2 ESMTP surface
 
 `EHLO` advertises exactly: `PIPELINING`, `8BITMIME`, `SMTPUTF8`, `SIZE <max_message_bytes>`,
-and `AUTH PLAIN LOGIN` when auth is enabled. Nothing else. `HELO` is accepted.
+`STARTTLS` on a listener that offers it until the handshake completes, and `AUTH PLAIN LOGIN`
+when AUTH could succeed on this session right now — the listener allows it, there are users,
+and the session is encrypted or `allow_insecure_auth` is true. Nothing else. `HELO` is
+accepted.
 
 Commands supported: `EHLO`, `HELO`, `AUTH`, `MAIL FROM`, `RCPT TO`, `DATA`, `RSET`, `NOOP`,
-`QUIT`, `VRFY` (always `252`), `EXPN` (always `502`). `BDAT` is `502 5.5.1 command not
-implemented`.
+`QUIT`, `STARTTLS`, `VRFY` (always `252`), `EXPN` (always `502`). `BDAT` is `502 5.5.1 command
+not implemented`, and so is `STARTTLS` on a listener that does not offer it. `AUTH` on an
+unencrypted session where plaintext AUTH is not allowed is `538 5.7.11`.
+
+*(Amended — `STARTTLS` and the conditions on `AUTH` are new. See `DECISIONS.md` D-070.)*
 
 The SMTP state machine is hand-rolled rather than delegated to a server crate. The reason is
 that quota-aware responses need to be emitted at specific points in the conversation, and the
@@ -382,6 +450,21 @@ and disconnect).
 
 Authentication is **authentication only**. The authenticated username plays no part in route
 selection.
+
+Each user carries `grants.send_as`: the sender identities it may present, in §5.4's pattern
+grammar. For an authenticated session, the `MAIL FROM` address and the first `From:` address
+must both match one of the user's patterns, or the message is refused with `550 5.7.1 sender
+not permitted` — at `MAIL FROM` for the envelope, at the final dot for the header, and at the
+final dot for a message with no parseable `From:`. The null sender passes `MAIL FROM` and is
+judged by its `From:`. Default deny: nothing outside the grants is permitted.
+
+The ACL **gates acceptance and never routing**, which is why the sentence above still holds: a
+message it admits is routed by §5.4 exactly as it would be without it, and two users granted
+the same identity produce byte-identical output. It applies only to sessions that
+authenticated; see §2.3 for `auth: optional`. `550` is safe here for the reason §10.3 gives
+for `strict_senders`: it is a statement about the sender, not the recipient.
+
+*(Amended — the ACL is new. See `DECISIONS.md` D-071.)*
 
 ### 5.4 Sender matching
 
@@ -975,6 +1058,8 @@ Each phase should end in a working, testable artefact.
 9. ~~Multi-recipient splitting and result collapse.~~ **Void** — §5.6 refuses multi-recipient
    transactions outright, so there is nothing to split and no collapse rule to implement.
 10. Hardening: pooling refinements, graceful shutdown, acceptance suite, README.
+11. Inbound listeners on 25/465/587, inbound TLS, and the sender ACL (§5.1, §5.3).
+    *(Added — beyond the original ten. See `DECISIONS.md` D-070, D-071 and `docs/INGRESS.md`.)*
 
 ---
 

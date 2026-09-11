@@ -14,10 +14,16 @@ services:
     ports:
       # §12.2 and §2.3: port 25 is deliberately not published to a host
       # interface by default. Uncomment to test against a local MUA — note it
-      # binds loopback only, and that the listener is plaintext with plaintext
-      # AUTH, so it must never be bound to a routable interface.
+      # binds loopback only, and that the local listener is plaintext with
+      # plaintext AUTH, so it must never be bound to a routable interface.
       # - '127.0.0.1:2525:25'
       - '127.0.0.1:8080:8080'   # admin API (§9)
+    volumes:
+      # §5.1's certificate for the acceptance stack (D-070), minted per run by
+      # `tls-init`. Mounted in local development too, where it is empty and
+      # unused: `simmer.yaml` configures no TLS, and a mount that differed by
+      # profile would make compose re-create `app` between the two.
+      - acceptance-tls:/tls:ro
     read_only: true
     # The container runs as non-root (UID 1000), and §5.1 defaults the listener
     # to port 25 — a privileged port. Without this the SMTP bind fails with
@@ -56,6 +62,9 @@ services:
       # since §2.2 rules out a hot reload.
       SIMMER_CONFIG: "${SIMMER_CONFIG:-/app/simmer.yaml}"
       SIMMER_WARMUP_STARTED: "${SIMMER_WARMUP_STARTED:-2026-08-01T09:00:00Z}"
+      # Where `simmer.acceptance.yaml` finds its certificate. Unused by
+      # `simmer.yaml`.
+      SIMMER_TLS_DIR: "/tls"
     healthcheck:
       # Must match the Dockerfile HEALTHCHECK exactly.
       test: ["CMD", "/app/server", "healthcheck"]
@@ -66,6 +75,12 @@ services:
     depends_on:
       simmer-db:
         condition: service_healthy
+      # Acceptance only. `required: false` is what keeps plain `docker compose
+      # up -d` working: without the profile `tls-init` does not exist, and a
+      # required dependency on it would refuse to start `app` at all.
+      tls-init:
+        condition: service_completed_successfully
+        required: false
 
   simmer-db:
     image: postgres:18
@@ -136,6 +151,48 @@ services:
       timeout: 5s
       retries: 20
 
+  # §5.1's certificate for the acceptance stack (D-070): a throwaway CA and a
+  # leaf for `simmer.acceptance` it issued, written to the `acceptance-tls`
+  # volume. A real two-level chain rather than a self-signed leaf, because the
+  # loadgen *verifies* — and webpki refuses a CA certificate presented as an end
+  # entity. Minted on every `up`, so nothing in the repository is a private key
+  # and nothing expires between runs. Thirty days rather than one so that §5.1's
+  # fourteen-day expiry warning stays quiet: in this log it would mean nothing.
+  #
+  # The runtime image rather than a separate one: Debian's ca-certificates
+  # depends on openssl, so the shipped image already carries the CLI, and
+  # building this from it means nothing extra to pull or pin. Root only to write
+  # the volume; the files are then handed to UID 1000, which is who reads them.
+  tls-init:
+    profiles: ["acceptance"]
+    build:
+      context: .
+      target: runtime
+    user: "0"
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        cd /tls
+        openssl req -x509 -new -noenc -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+          -keyout /tmp/ca.key -out ca.pem -days 30 -subj /CN=simmer-acceptance-ca 2>/dev/null
+        openssl req -new -noenc -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+          -keyout key.pem -out /tmp/leaf.csr -subj /CN=simmer.acceptance 2>/dev/null
+        printf '%s\n' 'subjectAltName=DNS:simmer.acceptance' \
+          'basicConstraints=critical,CA:FALSE' \
+          'keyUsage=critical,digitalSignature' \
+          'extendedKeyUsage=serverAuth' > /tmp/leaf.ext
+        openssl x509 -req -in /tmp/leaf.csr -CA ca.pem -CAkey /tmp/ca.key \
+          -CAserial /tmp/ca.srl -CAcreateserial -days 30 -extfile /tmp/leaf.ext \
+          -out cert.pem 2>/dev/null
+        cat ca.pem >> cert.pem
+        chown 1000:1000 ca.pem cert.pem key.pem
+        chmod 0644 ca.pem cert.pem
+        chmod 0600 key.pem
+    volumes:
+      - acceptance-tls:/tls
+    healthcheck:
+      disable: true
+
   # Built from the Dockerfile's `acceptance` stage, which adds the loadgen binary
   # on top of the runtime image. Never started by `up`: the host test invokes it
   # with `docker compose run --rm loadgen …` and reads its stdout.
@@ -146,6 +203,13 @@ services:
       target: acceptance
     environment:
       SIMMER_PASSWORD: "local-dev-password"
+    volumes:
+      # For `--starttls`: the CA the loadgen verifies Simmer's certificate
+      # against.
+      - acceptance-tls:/tls:ro
     depends_on:
       app:
         condition: service_healthy
+
+volumes:
+  acceptance-tls:

@@ -102,6 +102,18 @@ fn describe() {
         "Connections refused before a session began: outside allowed_cidrs, or over \
          max_concurrent_sessions (§5.1)"
     );
+    describe_counter!(
+        "simmer_inbound_tls_failures_total",
+        "Inbound TLS that did not complete (§5.1, D-070), by listener mode and reason: \
+         handshake, or plaintext_after_starttls — bytes pipelined behind STARTTLS, the \
+         command-injection shape, which drops the connection"
+    );
+    describe_counter!(
+        "simmer_sender_not_permitted_total",
+        "Messages refused because the authenticated user's grants do not cover the \
+         sender (D-071), by stage: mail_from or from_header. ALERT ON THIS: it is a \
+         misconfigured application or somebody else's credentials"
+    );
     describe_gauge!(
         "simmer_quota_allowance",
         "Today's ceiling for a route and domain group; +Inf for an overflow route (§7.2, D-024)"
@@ -293,6 +305,26 @@ pub fn downstream_latency(route: &str, seconds: f64) {
 /// in the metrics at all.
 pub fn connection_refused(reason: &'static str) {
     counter!("simmer_connections_refused_total", "reason" => reason).increment(1);
+}
+
+/// D-070 — an inbound TLS session that did not start. `mode` is the listener's
+/// (`implicit` or `starttls`), `reason` is `handshake` or
+/// `plaintext_after_starttls`.
+pub fn inbound_tls_failure(mode: &'static str, reason: &'static str) {
+    counter!(
+        "simmer_inbound_tls_failures_total",
+        "mode" => mode,
+        "reason" => reason
+    )
+    .increment(1);
+}
+
+/// D-071 — an authenticated sender outside its grants. `stage` is `mail_from` or
+/// `from_header`. Unlabelled by user or address on purpose: the log line names
+/// both, and a label per address would be the high-cardinality series §7.3's
+/// hashing exists to avoid.
+pub fn sender_not_permitted(stage: &'static str) {
+    counter!("simmer_sender_not_permitted_total", "stage" => stage).increment(1);
 }
 
 /// §9.1 `simmer_pool_connections{route,state}` — `state` is `idle` or `active`.

@@ -20,18 +20,32 @@
 //! Both fall out of reading through one [`BufReader`] for the whole session and
 //! never reaching past it — which is also why the `DATA` payload is read from the
 //! same reader rather than from the raw socket.
+//!
+//! ## STARTTLS (D-070)
+//!
+//! RFC 3207 inverts the pipelining rule at exactly one point. Bytes already
+//! buffered behind a `STARTTLS` were sent in cleartext by whoever is on the
+//! wire, and accepting them would let an attacker inject commands that appear to
+//! have arrived over the encrypted channel (CVE-2011-0411 and its descendants).
+//! So there, and only there, buffered input is **not** kept: the connection is
+//! dropped. It is the same check `downstream::client` makes on the way out — the
+//! same defect, seen from the other end.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+use super::acl::Acl;
 use super::auth::{self, AuthState, AuthStep, Verifier};
 use super::buffer::{self, MessageBuffer};
 use super::command::{self, Command, MailParams, ParseError};
 use super::reply::{self, Reply};
-use crate::config::Config;
+use super::Policy;
+use crate::config::{Config, IngressAuth, IngressTls};
+use crate::downstream::stream::Stream;
+use crate::metrics;
 use crate::relay::{self, Engine};
 use crate::routing::sender_match::Senders;
 
@@ -49,18 +63,29 @@ const MAX_DATA_LINE: usize = 65_536;
 /// How much of a message's head to scan for `From:` (§5.4).
 const MAX_HEADER_SCAN: usize = 256 * 1024;
 
+/// How long [`Session::close`] waits for a `close_notify` to flush.
+const CLOSE_BUDGET: Duration = Duration::from_secs(2);
+
 /// Per-connection state.
-pub struct Session<S> {
-    io: BufReader<S>,
+pub struct Session {
+    io: BufReader<Stream>,
     peer: SocketAddr,
     engine: Engine,
     verifier: Arc<Verifier>,
+    acl: Arc<Acl>,
+    /// The listener's TLS and AUTH policy (D-070).
+    policy: Arc<Policy>,
 
     /// `None` until `EHLO`/`HELO`.
     greeted: Option<String>,
     /// Whether the client used `EHLO` (so extensions are in play) or `HELO`.
     esmtp: bool,
-    authenticated: bool,
+    /// The authenticated username, once `AUTH` succeeds. Consulted by the D-071
+    /// ACL and never by routing (§5.3).
+    user: Option<String>,
+    /// §5.3's three strikes. Per *connection*, so it deliberately survives the
+    /// `STARTTLS` reset: clearing it would sell unlimited password guesses for
+    /// one extra round trip.
     auth_failures: u32,
     /// Set while an `AUTH` exchange is mid-flight.
     auth_state: Option<AuthState>,
@@ -88,21 +113,29 @@ pub enum SessionEnd {
     AuthAbuse,
     IoError,
     ShuttingDown,
+    /// The `STARTTLS` handshake failed, or plaintext was pipelined behind it.
+    TlsFailed,
 }
 
-impl<S> Session<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    pub fn new(io: S, peer: SocketAddr, engine: Engine, verifier: Arc<Verifier>) -> Self {
+impl Session {
+    pub fn new(
+        io: Stream,
+        peer: SocketAddr,
+        engine: Engine,
+        verifier: Arc<Verifier>,
+        acl: Arc<Acl>,
+        policy: Arc<Policy>,
+    ) -> Self {
         Self {
             io: BufReader::new(io),
             peer,
             engine,
             verifier,
+            acl,
+            policy,
             greeted: None,
             esmtp: false,
-            authenticated: false,
+            user: None,
             auth_failures: 0,
             auth_state: None,
             transaction: None,
@@ -112,6 +145,25 @@ where
 
     fn config(&self) -> &Config {
         &self.engine.config
+    }
+
+    fn encrypted(&self) -> bool {
+        self.io.get_ref().is_encrypted()
+    }
+
+    /// Whether `AUTH` can succeed on this session *right now* (D-070): the
+    /// listener allows it, there is somebody to authenticate as, and either the
+    /// channel is encrypted or plaintext credentials are explicitly allowed.
+    fn auth_usable(&self) -> bool {
+        self.policy.auth != IngressAuth::Disabled
+            && !self.verifier.is_empty()
+            && (self.encrypted() || self.config().server.auth.allow_insecure_auth)
+    }
+
+    /// Whether the RFC 3207 §4 gate is closed: a `starttls_required` listener
+    /// before its handshake.
+    fn awaiting_required_tls(&self) -> bool {
+        self.policy.tls == IngressTls::StarttlsRequired && !self.encrypted()
     }
 
     /// Drive the session to completion.
@@ -180,6 +232,24 @@ where
             }
         };
 
+        // RFC 3207 §4: on a listener that requires TLS, "the server SHOULD reply
+        // to every command other than NOOP, EHLO, STARTTLS, or QUIT with the
+        // reply code 530". RSET joins them because it changes nothing a client
+        // could exploit — there can be no transaction to reset — and clients send
+        // it in unexpected places.
+        if self.awaiting_required_tls()
+            && !matches!(
+                cmd,
+                Command::Ehlo(_)
+                    | Command::Noop
+                    | Command::Rset
+                    | Command::Quit
+                    | Command::StartTls
+            )
+        {
+            return self.reply(reply::must_starttls_first()).await;
+        }
+
         match cmd {
             Command::Quit => {
                 let hostname = self.config().server.hostname.clone();
@@ -193,13 +263,19 @@ where
                 self.esmtp = true;
 
                 let cfg = self.config();
-                let r = reply::ehlo(
-                    &cfg.server.hostname,
-                    &domain,
-                    cfg.server.max_message_bytes,
-                    cfg.server.auth.required || !cfg.server.auth.users.is_empty(),
-                    cfg.advertise_smtputf8(),
-                );
+                let caps = reply::Capabilities {
+                    max_size: cfg.server.max_message_bytes,
+                    smtputf8: cfg.advertise_smtputf8(),
+                    // D-070: offered until the handshake, then never again.
+                    starttls: self.policy.offers_starttls() && !self.encrypted(),
+                    // Not advertised where it could not succeed — before the
+                    // handshake on a port that requires it, or over plaintext
+                    // when plaintext credentials are refused. Advertising AUTH
+                    // there invites a client to send its password in the clear
+                    // only to be told no.
+                    auth: self.auth_usable() && !self.awaiting_required_tls(),
+                };
+                let r = reply::ehlo(&cfg.server.hostname, &domain, caps);
                 self.send(&r).await.map_err(|_| ())?;
                 Ok(None)
             }
@@ -234,7 +310,83 @@ where
             Command::Mail { from, params } => self.mail_from(from, params).await,
             Command::Rcpt { to } => self.rcpt_to(to).await,
             Command::Data => self.data().await,
+            Command::StartTls => self.starttls().await,
         }
+    }
+
+    // -- STARTTLS (RFC 3207, D-070) --------------------------------------
+
+    async fn starttls(&mut self) -> Result<Option<SessionEnd>, ()> {
+        if self.encrypted() {
+            return self.reply(reply::tls_already_active()).await;
+        }
+        if !self.policy.offers_starttls() {
+            // Recognised and refused, like BDAT: 502 rather than 500 tells the
+            // client to carry on without it rather than that it misspoke.
+            return self.reply(reply::not_implemented()).await;
+        }
+        if self.transaction.is_some() || self.auth_state.is_some() {
+            return self.reply(reply::bad_sequence()).await;
+        }
+
+        // The injection check. Anything already buffered arrived in cleartext
+        // *after* the STARTTLS line and before we have said yes, so it cannot
+        // have come from the TLS peer. RFC 2920 would have us keep it and answer
+        // it; RFC 3207 §6 is the exception, and it wins. Dropped, not drained:
+        // draining would mean deciding which of an attacker's bytes to believe.
+        let buffered = self.io.buffer().len();
+        if buffered > 0 {
+            tracing::warn!(
+                peer = %self.peer,
+                bytes = buffered,
+                "plaintext pipelined behind STARTTLS; dropping the connection"
+            );
+            metrics::inbound_tls_failure("starttls", "plaintext_after_starttls");
+            return Ok(Some(SessionEnd::TlsFailed));
+        }
+
+        self.send(&reply::starttls_ready()).await.map_err(|_| ())?;
+
+        let acceptor = self
+            .policy
+            .acceptor
+            .clone()
+            .expect("offers_starttls implies a certificate (Listener::bind)");
+        let Stream::Plain(tcp) = std::mem::replace(self.io.get_mut(), Stream::Taken) else {
+            // `encrypted()` was false and nothing else takes the stream, so
+            // this is Plain. `Taken` reports itself on next use rather than
+            // panicking a live session, which is why the variant exists.
+            return Ok(Some(SessionEnd::TlsFailed));
+        };
+
+        let timeout = self.config().server.timeouts.command;
+        match tokio::time::timeout(timeout, acceptor.accept(tcp)).await {
+            Ok(Ok(tls)) => *self.io.get_mut() = Stream::Tls(Box::new(tls.into())),
+            // There is no channel left to report on: the TLS layer owns the
+            // socket and the handshake did not produce one. The close is the
+            // answer, and it is what RFC 3207 §4.1 expects.
+            Ok(Err(e)) => {
+                tracing::info!(peer = %self.peer, error = %e, "STARTTLS handshake failed");
+                metrics::inbound_tls_failure("starttls", "handshake");
+                return Ok(Some(SessionEnd::TlsFailed));
+            }
+            Err(_) => {
+                tracing::info!(peer = %self.peer, "STARTTLS handshake timed out");
+                metrics::inbound_tls_failure("starttls", "handshake");
+                return Ok(Some(SessionEnd::TlsFailed));
+            }
+        }
+
+        // RFC 3207 §4.2: "the server MUST discard any knowledge obtained from the
+        // client, such as the argument to the EHLO command, which was not obtained
+        // from the TLS negotiation itself." The client re-issues EHLO.
+        // `auth_failures` is kept — see its field comment.
+        self.greeted = None;
+        self.esmtp = false;
+        self.user = None;
+        self.auth_state = None;
+        self.transaction = None;
+        Ok(None)
     }
 
     async fn reply(&mut self, r: Reply) -> Result<Option<SessionEnd>, ()> {
@@ -253,7 +405,10 @@ where
         if self.greeted.is_none() {
             return self.reply(reply::bad_sequence()).await;
         }
-        if self.authenticated {
+        if self.policy.auth == IngressAuth::Disabled {
+            return self.reply(reply::auth_not_available()).await;
+        }
+        if self.user.is_some() {
             return self.reply(reply::auth_already_done()).await;
         }
         if self.transaction.is_some() {
@@ -262,6 +417,13 @@ where
         }
         if self.config().server.auth.users.is_empty() {
             return self.reply(reply::auth_mechanism_unsupported()).await;
+        }
+        // D-070: plaintext credentials are refused unless allowed outright. Before
+        // the exchange starts, so the password is never sent at all — PLAIN with
+        // an initial response has already crossed the wire by now, which is the
+        // client's choice and the reason AUTH is not advertised here.
+        if !self.encrypted() && !self.config().server.auth.allow_insecure_auth {
+            return self.reply(reply::encryption_required_for_auth()).await;
         }
 
         let mechanisms = self.config().server.auth.mechanisms.clone();
@@ -315,8 +477,13 @@ where
                         .unwrap_or(false);
 
                 if ok {
-                    self.authenticated = true;
-                    tracing::info!(peer = %self.peer, username = %username, "authenticated");
+                    tracing::info!(
+                        peer = %self.peer,
+                        username = %username,
+                        tls = self.encrypted(),
+                        "authenticated"
+                    );
+                    self.user = Some(username);
                     self.reply(reply::auth_succeeded()).await
                 } else {
                     self.auth_failures += 1;
@@ -348,7 +515,7 @@ where
         if self.greeted.is_none() {
             return self.reply(reply::bad_sequence()).await;
         }
-        if self.config().server.auth.required && !self.authenticated {
+        if self.policy.auth == IngressAuth::Required && self.user.is_none() {
             return self.reply(reply::auth_required()).await;
         }
         if self.transaction.is_some() {
@@ -372,6 +539,24 @@ where
         let utf8_needed = params.smtputf8 || from.as_deref().is_some_and(command::needs_smtputf8);
         if utf8_needed && !self.config().advertise_smtputf8() {
             return self.reply(reply::smtputf8_unsupported()).await;
+        }
+
+        // D-071 — the envelope half of the ACL, here where it is cheap and
+        // before a body is transferred. The null sender has no identity to
+        // grant: a bounce is permitted to anyone who authenticated, and its
+        // `From:` is still checked at the final dot.
+        if let (Some(user), Some(sender)) = (self.user.as_deref(), from.as_deref()) {
+            if !self.acl.permits(user, sender) {
+                tracing::warn!(
+                    peer = %self.peer,
+                    username = %user,
+                    sender = %sender,
+                    stage = "mail_from",
+                    "sender not permitted by the user's grants"
+                );
+                metrics::sender_not_permitted("mail_from");
+                return self.reply(reply::sender_not_permitted()).await;
+            }
         }
 
         self.correlation_id = new_correlation_id();
@@ -497,6 +682,28 @@ where
             }
         };
 
+        // D-071 — the header half of the ACL. `From:` first exists here, which is
+        // the same split §5.4 lives with. A message with no parseable `From:` has
+        // no identity to find inside the grant, and default deny means it is
+        // refused rather than waved through on the envelope alone.
+        if let Some(user) = self.user.as_deref() {
+            let permitted = from_header
+                .as_deref()
+                .is_some_and(|from| self.acl.permits(user, from));
+            if !permitted {
+                tracing::warn!(
+                    correlation_id = %self.correlation_id,
+                    peer = %self.peer,
+                    username = %user,
+                    from_header = from_header.as_deref().unwrap_or("<absent or unparseable>"),
+                    stage = "from_header",
+                    "sender not permitted by the user's grants"
+                );
+                metrics::sender_not_permitted("from_header");
+                return reply::sender_not_permitted();
+            }
+        }
+
         let senders = Senders::new(tx.mail_from.as_deref(), from_header.as_deref());
 
         let bytes = match body.read_all().await {
@@ -534,7 +741,8 @@ where
                 body_8bitmime: tx.params.body_8bitmime,
                 helo: &helo,
                 peer: &peer,
-                authenticated: self.authenticated,
+                authenticated: self.user.is_some(),
+                tls: self.encrypted(),
             },
             &self.correlation_id,
         )
@@ -657,6 +865,18 @@ where
     /// already be gone, and there is nothing useful to do if it is.
     pub async fn refuse(&mut self, r: &Reply) {
         let _ = self.send(r).await;
+    }
+
+    /// End the connection cleanly: TLS `close_notify` then a TCP FIN on an
+    /// encrypted session, a FIN on a plaintext one.
+    ///
+    /// Dropping a TLS stream sends no `close_notify`, and a client cannot tell
+    /// that from a truncation attack — rustls reports it as an unexpected EOF
+    /// rather than a close, so a `221` after `QUIT` would arrive followed by an
+    /// error (D-070). Bounded, because a peer that has stopped reading must not
+    /// hold the session's permit while the alert fails to flush.
+    pub async fn close(&mut self) {
+        let _ = tokio::time::timeout(CLOSE_BUDGET, self.io.get_mut().shutdown()).await;
     }
 }
 

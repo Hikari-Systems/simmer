@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 
-use super::{Config, Identity, Route};
+use super::{Config, Identity, IngressAuth, Route};
 use crate::rewrite::{stability, RouteRewrite};
 
 /// The identity fields of §6.6. A stability violation in one of these is fatal
@@ -113,18 +113,36 @@ impl fmt::Display for Warning {
 /// Removing an entry from this table is safe once nobody is upgrading across it;
 /// the `deny_unknown_fields` refusal remains either way.
 pub fn removed_keys(tree: &serde_yaml_ng::Value) -> ViolationList {
-    const REMOVED: [(&str, &str, &str); 1] = [(
-        "server",
-        "single_recipient_only",
-        "removed: a transaction may carry exactly one recipient and a second \
-         RCPT TO is always refused, so the switch has nothing to select. Delete \
-         the key. See DECISIONS.md D-047 and docs/RECIPIENTS.md",
-    )];
+    const REMOVED: [(&[&str], &str); 3] = [
+        (
+            &["server", "single_recipient_only"],
+            "removed: a transaction may carry exactly one recipient and a second \
+             RCPT TO is always refused, so the switch has nothing to select. Delete \
+             the key. See DECISIONS.md D-047 and docs/RECIPIENTS.md",
+        ),
+        (
+            &["server", "listen"],
+            "replaced by server.listeners, a list with one entry per port, each with \
+             its own tls and auth policy. `listen: \"0.0.0.0:25\"` becomes \
+             `listeners: [{ address: \"0.0.0.0:25\" }]`, which keeps the old meaning. \
+             See DECISIONS.md D-070",
+        ),
+        (
+            &["server", "auth", "required"],
+            "replaced by each listener's `auth: disabled | optional | required`. Port \
+             25 defaults to optional and 465/587 to required; to keep `required: true` \
+             on port 25, set `auth: required` on that listener. See DECISIONS.md D-070",
+        ),
+    ];
 
     let mut v = ViolationList::default();
-    for (section, key, message) in REMOVED {
-        if tree.get(section).and_then(|s| s.get(key)).is_some() {
-            v.push(format!("{section}.{key}"), message);
+    for (path, message) in REMOVED {
+        let mut node = Some(tree);
+        for key in path {
+            node = node.and_then(|n| n.get(*key));
+        }
+        if node.is_some() {
+            v.push(path.join("."), message);
         }
     }
     v
@@ -134,6 +152,7 @@ pub fn validate(cfg: &Config) -> ViolationList {
     let mut v = ViolationList::default();
 
     check_listeners(cfg, &mut v);
+    check_server_tls(cfg, &mut v);
     check_cidrs(cfg, &mut v);
     check_auth(cfg, &mut v);
     check_admin_tokens(cfg, &mut v);
@@ -164,6 +183,42 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
                 cfg.server.max_recipients
             ),
         });
+    }
+
+    // D-070 — a certificate nothing presents. Not a violation: it is loaded and
+    // checked either way, and a staged rollout may add the TLS listener later.
+    if cfg.server.tls.is_some()
+        && !cfg
+            .server
+            .listeners
+            .iter()
+            .any(|l| l.tls_mode().can_encrypt())
+    {
+        out.push(Warning {
+            path: "server.tls".to_string(),
+            message: "names a certificate, but every listener has tls: off, so it is never \
+                      presented"
+                .to_string(),
+        });
+    }
+
+    // D-071 — the ACL gates *authenticated* sessions. An `optional` listener lets
+    // an unauthenticated client send as anyone `allowed_cidrs` admits, which is
+    // the pre-ACL trust model and a legitimate choice on port 25, but one worth
+    // saying out loud once there is an ACL that looks like it covers everything.
+    if !cfg.server.auth.users.is_empty() {
+        for (i, l) in cfg.server.listeners.iter().enumerate() {
+            if l.auth_mode() == IngressAuth::Optional {
+                out.push(Warning {
+                    path: format!("server.listeners[{i}] ({})", l.address),
+                    message: "has auth: optional, so a client that does not authenticate may \
+                              present any sender identity; the grants in server.auth.users \
+                              apply only to sessions that do. allowed_cidrs is the only \
+                              control there"
+                        .to_string(),
+                });
+            }
+        }
     }
 
     // §9.3's write API can pause a route or set an allowance of zero, and either
@@ -355,12 +410,80 @@ fn is_identity_header(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn check_listeners(cfg: &Config, v: &mut ViolationList) {
-    if cfg.server.listen.parse::<SocketAddr>().is_err() {
+    if cfg.server.listeners.is_empty() {
         v.push(
-            "server.listen",
-            format!("'{}' is not a valid host:port address", cfg.server.listen),
+            "server.listeners",
+            "is empty, so Simmer would accept no mail at all",
         );
     }
+    let mut seen: BTreeMap<SocketAddr, usize> = BTreeMap::new();
+    for (i, l) in cfg.server.listeners.iter().enumerate() {
+        let path = format!("server.listeners[{i}]");
+        match l.address.parse::<SocketAddr>() {
+            Err(_) => v.push(
+                format!("{path}.address"),
+                format!("'{}' is not a valid host:port address", l.address),
+            ),
+            // Port 0 is "any free port", which tests bind several of; two of
+            // them never collide.
+            Ok(addr) if addr.port() != 0 => {
+                if let Some(prev) = seen.insert(addr, i) {
+                    v.push(
+                        format!("{path}.address"),
+                        format!("'{addr}' duplicates server.listeners[{prev}]"),
+                    );
+                }
+            }
+            Ok(_) => {}
+        }
+
+        let tls = l.tls_mode();
+        if tls.can_encrypt() && cfg.server.tls.is_none() {
+            v.push(
+                format!("{path}.tls"),
+                format!(
+                    "is {} (the {} for this port) but server.tls names no certificate",
+                    tls.as_str(),
+                    if l.tls.is_some() {
+                        "configured value"
+                    } else {
+                        "default"
+                    },
+                ),
+            );
+        }
+
+        let auth = &cfg.server.auth;
+        if l.auth_mode() == IngressAuth::Required {
+            // §4.2: "auth.required: true with an empty user list", per listener.
+            if auth.users.is_empty() {
+                v.push(
+                    format!("{path}.auth"),
+                    "is required but server.auth.users is empty, so no client could ever \
+                     authenticate and this listener would accept nothing",
+                );
+            } else if auth.mechanisms.is_empty() {
+                v.push(
+                    format!("{path}.auth"),
+                    "is required but server.auth.mechanisms is empty",
+                );
+            }
+            // The inversion of the old §4.2 rule. With TLS impossible here and
+            // plaintext AUTH refused, AUTH can never succeed on this listener,
+            // so `required` would mean "refuse everything".
+            if !tls.can_encrypt() && !auth.allow_insecure_auth {
+                v.push(
+                    format!("{path}.auth"),
+                    "is required on a listener with tls: off, but \
+                     server.auth.allow_insecure_auth is false, so AUTH could never be \
+                     used and every message would be refused. Enable TLS on this \
+                     listener, or set allow_insecure_auth: true to accept plaintext \
+                     credentials on a trusted segment",
+                );
+            }
+        }
+    }
+
     if cfg.admin.listen.parse::<SocketAddr>().is_err() {
         v.push(
             "admin.listen",
@@ -403,33 +526,26 @@ fn check_cidrs(cfg: &Config, v: &mut ViolationList) {
     }
 }
 
+/// §5.1's certificate, loaded exactly as the listener will load it, so a file
+/// that is missing, unreadable, unparseable or paired with the wrong key is a
+/// startup violation rather than a listener that fails its first handshake.
+fn check_server_tls(cfg: &Config, v: &mut ViolationList) {
+    let Some(tls) = &cfg.server.tls else {
+        return;
+    };
+    if let Err(errors) = crate::smtp::tls::load(tls) {
+        for e in errors {
+            v.push(e.path, e.message);
+        }
+    }
+}
+
 fn check_auth(cfg: &Config, v: &mut ViolationList) {
     let auth = &cfg.server.auth;
 
-    // §4.2: "auth.required: true with an empty user list."
-    if auth.required && auth.users.is_empty() {
-        v.push(
-            "server.auth.users",
-            "is empty but auth.required is true, so no client could ever authenticate",
-        );
-    }
-
-    // §4.2: "allow_insecure_auth is false (there is no inbound TLS, so AUTH
-    // would be unusable)."
-    if auth.required && !auth.allow_insecure_auth {
-        v.push(
-            "server.auth.allow_insecure_auth",
-            "must be explicitly true: there is no inbound TLS (§5.1), so AUTH is only \
-             usable over plaintext and this has to be an acknowledged choice",
-        );
-    }
-
-    if auth.required && auth.mechanisms.is_empty() {
-        v.push(
-            "server.auth.mechanisms",
-            "is empty but auth.required is true",
-        );
-    }
+    // The listener-level rules — `auth: required` with nobody to authenticate,
+    // or with AUTH unusable — are in `check_listeners`, because since D-070
+    // "required" is a property of a port rather than of the server.
 
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
     for (i, user) in auth.users.iter().enumerate() {
@@ -458,7 +574,62 @@ fn check_auth(cfg: &Config, v: &mut ViolationList) {
                 format!("'{}' duplicates users[{prev}]", user.username),
             );
         }
+
+        // D-071. An empty grant list is default deny taken to its conclusion —
+        // a user who can log in and send nothing — and is never what was meant.
+        if user.grants.send_as.is_empty() {
+            v.push(
+                format!("server.auth.users[{i}].grants.send_as"),
+                "is empty, so this user could authenticate and then send nothing. List \
+                 the sender identities it may present (§5.4's patterns)",
+            );
+        }
+        for (j, pattern) in user.grants.send_as.iter().enumerate() {
+            if let Some(problem) = grant_pattern_problem(pattern) {
+                v.push(
+                    format!("server.auth.users[{i}].grants.send_as[{j}]"),
+                    format!("'{pattern}' {problem}"),
+                );
+            }
+        }
     }
+}
+
+/// Why a `send_as` entry cannot be what its author meant, if it cannot.
+///
+/// §5.4's `Pattern::parse` is total — every string is *some* pattern — which is
+/// right for routing, where a sender rule that never matches is visible in
+/// `simmer_unmatched_sender_total`. A grant that never matches is visible only as
+/// refusals, so the shapes that can never match anything are refused here.
+fn grant_pattern_problem(pattern: &str) -> Option<&'static str> {
+    let p = pattern.trim();
+    if p.is_empty() {
+        return Some("is empty");
+    }
+    if p.chars().any(char::is_whitespace) {
+        return Some("contains whitespace, so it can never match an address");
+    }
+    if p == "*" || p == "*." {
+        return Some(
+            "would grant every sender identity, which is the absence of an ACL rather \
+             than one. List the domains instead",
+        );
+    }
+    if let Some(rest) = p.strip_prefix("*.") {
+        if rest.contains('@') || rest.contains('*') {
+            return Some("is not a pattern §5.4 recognises (`*.domain` takes a bare domain)");
+        }
+    } else if p.contains('*') {
+        return Some("uses '*' somewhere other than a leading `*.`, which §5.4 does not support");
+    }
+    // The *last* `@`, as §5.4's matcher splits it: a quoted local part may carry
+    // one of its own.
+    if let Some((local, domain)) = p.rsplit_once('@') {
+        if local.is_empty() || domain.is_empty() {
+            return Some("is not a full address (`local@domain`)");
+        }
+    }
+    None
 }
 
 /// §9.3's credentials (D-053).

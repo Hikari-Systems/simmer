@@ -419,6 +419,32 @@ compiles in the shipped image at all: `jni`/`jni-sys`/`ndk-context` are Android,
 `system-configuration` is macOS. On Linux the resolver reads `/etc/resolv.conf`
 via `resolv-conf`.
 
+## 6. Phase 11 — inbound TLS and the test certificates
+
+| Crate | Pinned | Licence | For |
+|---|---|---|---|
+| `rustls-webpki` | 0.103.13 | `ISC` | §5.1 — whether the certificate covers `server.hostname` (D-070) |
+| `rcgen` | 0.14.10 | `MIT OR Apache-2.0` | **dev only** — per-test CAs and leaves |
+
+**`rustls-webpki` adds nothing to the build.** It was already compiled as rustls's
+own certificate verifier, at the version rustls pins; phase 11 names it as a direct
+dependency only to call its name matching. `ISC` is on the allow-list and
+permissive.
+
+**Nothing parses PEM that was not already there.** The design named
+`rustls-pemfile`; it has been archived since August 2025 and is
+RUSTSEC-2025-0134 (unmaintained), which `cargo deny check`'s advisories would
+refuse. `rustls-pki-types`, already in the graph, has carried the same parser since
+1.9 and is what is used.
+
+**`rcgen` is a dev-dependency and never reaches the shipped image.** With its
+`ring` backend it compiles eight crates the build did not already have — `pem`
+(`MIT`), and `base64` 0.23, `time`, `time-core`, `deranged`, `num-conv`, `powerfmt`
+and `yasna` (all `MIT OR Apache-2.0`). The lockfile also lists `x509-parser` and its
+ASN.1 tree, because Cargo records a crate's optional dependencies whether or not
+they are enabled; `rcgen`'s `x509-parser` feature is off, and `cargo tree` confirms
+none of them is compiled.
+
 ## How to re-check
 
 `cargo-deny` is the gate in CI:

@@ -11,12 +11,33 @@
 # variables it expects.
 
 server:
-  # §2.3: Simmer runs on a trusted internal segment. The listener is plaintext
-  # and accepts plaintext AUTH, so binding it anywhere reachable from an
-  # untrusted network must be a deliberate act. 0.0.0.0 here is safe only
-  # because the container does not publish port 25 (see docker-compose.yml).
-  listen: "0.0.0.0:25"
-  hostname: "simmer.internal"        # EHLO banner and Received headers
+  # §5.1 (D-070): one entry per port, each with its own tls and auth policy.
+  # An entry naming only an address takes its port's RFC defaults:
+  #
+  #   port   tls                 auth
+  #   25     off                 optional     (RFC 5321 transfer)
+  #   587    starttls_required   required     (RFC 6409 submission)
+  #   465    implicit            required     (RFC 8314 submissions)
+  #   other  off                 optional
+  #
+  # §2.3: TLS and AUTH do not make Simmer a public MX. It is a submission relay
+  # for our own applications, and 0.0.0.0 here is safe only because the
+  # container publishes no SMTP port (see docker-compose.yml).
+  listeners:
+    # Plaintext, as the local stack has no certificate. `auth: required`
+    # overrides port 25's default of optional, so every local message is
+    # checked against the grants below; with allow_insecure_auth that means a
+    # password in clear, which only a trusted segment can justify.
+    - address: "0.0.0.0:25"
+      auth: required
+    # With a certificate mounted and `tls:` below uncommented, these two need
+    # no more than their addresses:
+    # - address: "0.0.0.0:587"
+    # - address: "0.0.0.0:465"
+  # tls:
+  #   certificate: "/etc/simmer/tls/fullchain.pem"   # leaf first; must cover hostname
+  #   private_key: "/etc/simmer/tls/privkey.pem"     # readable by UID 1000
+  hostname: "simmer.internal"        # EHLO banner, Received headers, certificate name
   max_message_bytes: 26214400        # 25 MiB, advertised via SIZE
   max_recipients: 1                  # D-047 — one recipient per transaction, always
   max_concurrent_sessions: 64
@@ -26,14 +47,26 @@ server:
     data: 300s
     session: 600s
   auth:
-    required: true
-    # Must be explicitly true: there is no inbound TLS (§5.1), so this is an
-    # acknowledgement rather than a default.
+    # Whether AUTH may be used on an unencrypted session. Default false. True
+    # here only because the local listener above has no TLS; with a certificate
+    # configured, set this false and plaintext credentials are refused with
+    # 538 5.7.11 (D-070).
     allow_insecure_auth: true
     mechanisms: [PLAIN, LOGIN]
     users:
       - username: "cfapp"
-        password_hash: "${SIMMER_CFAPP_HASH}"   # argon2id PHC string
+        # argon2id PHC string. Mint one with:
+        #   printf '%s' "$PASSWORD" | docker run -i --rm <image> hash-password
+        password_hash: "${SIMMER_CFAPP_HASH}"
+        # D-071 — the sender identities this user may present, in §5.4's
+        # pattern grammar, checked against MAIL FROM and the From: header.
+        # Default deny: anything not listed is 550 5.7.1. Gates acceptance
+        # only; which chain a message takes is still §5.4's `senders` below.
+        grants:
+          send_as:
+            - "oldbrand.com"
+            - "*.oldbrand.com"
+            - "newbrand.com"                     # the app-updated arrangement (§1.1)
 
 database:
   url: "${DATABASE_URL}"
