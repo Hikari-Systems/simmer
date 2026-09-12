@@ -123,6 +123,8 @@ fn state_from(pool: PgPool, cfg: Config) -> AdminState {
         // No recorder: `metrics` allows exactly one per process and installing it
         // here would fail in whichever test ran second.
         metrics: None,
+        sessions: None,
+        db: None,
     }
 }
 

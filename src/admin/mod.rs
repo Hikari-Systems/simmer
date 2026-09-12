@@ -60,6 +60,13 @@ pub struct AdminState {
     /// ask for one: `metrics` allows exactly one global recorder per process, so
     /// installing it per test would fail on the second.
     pub metrics: Option<PrometheusHandle>,
+    /// §5.1's session semaphore — the one every listener shares — for
+    /// `simmer_sessions_active` (D-075). `None` in tests that do not run a
+    /// listener; the gauge is then not written.
+    pub sessions: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    /// The Postgres pool, for `simmer_db_pool_*` (D-075). `engine.quota` is a
+    /// `dyn QuotaStore` and deliberately says nothing about connections.
+    pub db: Option<sqlx::PgPool>,
 }
 
 impl AdminState {
@@ -185,6 +192,7 @@ async fn metrics_endpoint(State(state): State<AdminState>) -> Response {
     // read straight off the pool. A route nothing has sent through publishes
     // `0`, which is the answer — not silence.
     refresh_pool_gauges(&state);
+    refresh_runtime_gauges(&state);
 
     if let Err(e) = refresh_quota_gauges(&state).await {
         tracing::warn!(error = %e, "could not refresh quota gauges for /metrics");
@@ -210,6 +218,35 @@ async fn metrics_endpoint(State(state): State<AdminState>) -> Response {
             "no metrics recorder is installed in this process",
         )
         .into_response(),
+    }
+}
+
+/// D-075 — the process, the session bound, the §10.4 registry, the Postgres
+/// pool and the tokio runtime, read on the scrape like everything else here. No
+/// storage, so nothing can fail.
+fn refresh_runtime_gauges(state: &AdminState) {
+    crate::metrics::process(crate::metrics::ProcessStats::read());
+
+    if let Some(sessions) = &state.sessions {
+        let max = state.config().server.max_concurrent_sessions;
+        let active = max.saturating_sub(sessions.available_permits());
+        crate::metrics::sessions(active, max);
+    }
+
+    crate::metrics::reservations_in_flight(state.engine.registry.len());
+
+    if let Some(db) = &state.db {
+        let size = u64::from(db.size());
+        let idle = db.num_idle() as u64;
+        crate::metrics::db_pool(
+            size.saturating_sub(idle),
+            idle,
+            u64::from(db.options().get_max_connections()),
+        );
+    }
+
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        crate::metrics::tasks_alive(runtime.metrics().num_alive_tasks());
     }
 }
 

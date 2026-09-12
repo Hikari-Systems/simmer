@@ -453,6 +453,18 @@ somebody; leave `auth_token` alone and it says `default`. See D-053.
 **Watch `simmer_admin_auth_failures_total{reason="invalid"}`.** The write API can
 pause a route, and a run of those is somebody guessing.
 
+### Process and runtime gauges
+
+`/metrics` also reports the process and runtime on every scrape (D-075):
+`process_resident_memory_bytes`, `process_open_fds`, `process_max_fds`,
+`process_threads` and `process_start_time_seconds` under their standard names;
+`simmer_sessions_active` against `simmer_sessions_max`;
+`simmer_reservations_in_flight`, which should be 0 whenever the instance is idle;
+`simmer_db_pool_connections{state}` against `simmer_db_pool_max`, where `in_use`
+pinned at the maximum comes before `451 4.3.0`; and `simmer_tasks_alive`. The
+exporter's buffered histogram samples are drained every 5 s whether or not anything
+scrapes (D-076).
+
 ## Development
 
 ```sh

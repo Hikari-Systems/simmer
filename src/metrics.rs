@@ -18,8 +18,16 @@
 //! - `simmer_partial_delivery_total` — void. It counts a transaction whose
 //!   recipients did not all share an outcome, and D-047 makes that unreachable.
 
+use std::sync::OnceLock;
+
 use metrics::counter;
 use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
+
+/// When the recorder was installed, as Unix seconds — `process_start_time_seconds`
+/// (D-075). Installation is the first thing `main` does after reading its config,
+/// so this is the process start to within milliseconds, without parsing
+/// `/proc/self/stat` against the boot time.
+static STARTED: OnceLock<f64> = OnceLock::new();
 
 /// Install the §9.1 Prometheus recorder and return the handle `GET /metrics`
 /// renders.
@@ -39,6 +47,12 @@ pub fn install() -> Result<PrometheusHandle, BuildError> {
         .install_recorder()?;
 
     describe();
+    let _ = STARTED.set(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0),
+    );
     Ok(handle)
 }
 
@@ -173,6 +187,51 @@ fn describe() {
         "simmer_admin_auth_failures_total",
         "Admin requests refused for authentication (§9.3). ALERT ON reason=\"invalid\": \
          the write API can pause a route or zero an allowance"
+    );
+
+    // D-075 — the process and runtime, read on every scrape. The process_* names
+    // are the Prometheus client libraries' standard ones, so existing dashboards
+    // and alerts work unchanged.
+    describe_gauge!(
+        "process_resident_memory_bytes",
+        Unit::Bytes,
+        "Resident set size (VmRSS). Excludes the tmpfs the §8.1 buffer spills to"
+    );
+    describe_gauge!("process_open_fds", "Open file descriptors");
+    describe_gauge!("process_max_fds", "The soft limit on open file descriptors");
+    describe_gauge!(
+        "process_threads",
+        "OS threads, including tokio's blocking pool"
+    );
+    describe_gauge!(
+        "process_start_time_seconds",
+        Unit::Seconds,
+        "When the process started, as Unix time"
+    );
+    describe_gauge!(
+        "simmer_sessions_active",
+        "SMTP sessions holding a §5.1 permit right now, across every listener. At \
+         simmer_sessions_max, new connections are refused 421 4.3.2"
+    );
+    describe_gauge!(
+        "simmer_sessions_max",
+        "server.max_concurrent_sessions (§5.1)"
+    );
+    describe_gauge!(
+        "simmer_reservations_in_flight",
+        "§7.4 reservations this process is holding in its §10.4 registry. Nonzero on an \
+         idle instance means a reservation was stranded"
+    );
+    describe_gauge!(
+        "simmer_db_pool_connections",
+        "Postgres connections this process holds, by state: in_use or idle. in_use \
+         pinned at simmer_db_pool_max precedes 451 4.3.0 (§7.5)"
+    );
+    describe_gauge!("simmer_db_pool_max", "database.max_connections");
+    describe_gauge!(
+        "simmer_tasks_alive",
+        "Live tokio tasks: one per session plus the accept loops, sweepers and admin \
+         server. Growth at a flat session count is a task leak"
     );
 }
 
@@ -325,6 +384,85 @@ pub fn inbound_tls_failure(mode: &'static str, reason: &'static str) {
 /// hashing exists to avoid.
 pub fn sender_not_permitted(stage: &'static str) {
     counter!("simmer_sender_not_permitted_total", "stage" => stage).increment(1);
+}
+
+/// What `/proc/self` says about this process (D-075). Each field is `None` when
+/// its source cannot be read — not Linux, or procfs unavailable — and the gauge
+/// is then simply not written, rather than written as a misleading zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessStats {
+    pub resident_bytes: Option<u64>,
+    pub open_fds: Option<u64>,
+    pub max_fds: Option<u64>,
+    pub threads: Option<u64>,
+}
+
+impl ProcessStats {
+    pub fn read() -> ProcessStats {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let field = |name: &str| -> Option<u64> {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        };
+        let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
+        ProcessStats {
+            resident_bytes: field("VmRSS:").map(|kb| kb * 1024),
+            threads: field("Threads:"),
+            open_fds: std::fs::read_dir("/proc/self/fd")
+                .ok()
+                .map(|d| d.count() as u64),
+            // "Max open files            1048576              1048576              files"
+            max_fds: limits
+                .lines()
+                .find_map(|l| l.strip_prefix("Max open files"))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|soft| soft.parse().ok()),
+        }
+    }
+}
+
+/// D-075's process gauges, from one [`ProcessStats`] reading.
+pub fn process(stats: ProcessStats) {
+    let set = |name: &'static str, v: Option<u64>| {
+        if let Some(v) = v {
+            metrics::gauge!(name).set(v as f64);
+        }
+    };
+    set("process_resident_memory_bytes", stats.resident_bytes);
+    set("process_open_fds", stats.open_fds);
+    set("process_max_fds", stats.max_fds);
+    set("process_threads", stats.threads);
+    if let Some(started) = STARTED.get() {
+        metrics::gauge!("process_start_time_seconds").set(*started);
+    }
+}
+
+/// D-075 — §5.1's session bound as it stands.
+pub fn sessions(active: usize, max: usize) {
+    metrics::gauge!("simmer_sessions_active").set(active as f64);
+    metrics::gauge!("simmer_sessions_max").set(max as f64);
+}
+
+/// D-075 — the §10.4 registry's size.
+pub fn reservations_in_flight(n: usize) {
+    metrics::gauge!("simmer_reservations_in_flight").set(n as f64);
+}
+
+/// D-075 — the Postgres pool.
+pub fn db_pool(in_use: u64, idle: u64, max: u64) {
+    metrics::gauge!("simmer_db_pool_connections", "state" => "in_use").set(in_use as f64);
+    metrics::gauge!("simmer_db_pool_connections", "state" => "idle").set(idle as f64);
+    metrics::gauge!("simmer_db_pool_max").set(max as f64);
+}
+
+/// D-075 — live tokio tasks.
+pub fn tasks_alive(n: usize) {
+    metrics::gauge!("simmer_tasks_alive").set(n as f64);
 }
 
 /// §9.1 `simmer_pool_connections{route,state}` — `state` is `idle` or `active`.

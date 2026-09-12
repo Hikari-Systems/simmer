@@ -230,7 +230,9 @@ async fn run() -> anyhow::Result<()> {
         // having if what it reports is what would actually happen, and sharing
         // the engine makes that true by construction.
         engine: engine.clone(),
-        metrics: metrics_handle,
+        metrics: metrics_handle.clone(),
+        sessions: Some(Arc::clone(&sessions)),
+        db: Some(pool.clone()),
     };
     let admin_listener = tokio::net::TcpListener::bind(&config.admin.listen)
         .await
@@ -272,6 +274,24 @@ async fn run() -> anyhow::Result<()> {
             Arc::clone(&preflight),
             stop_accepting.clone(),
         ))
+    });
+
+    // D-076 (finding F8). Histogram samples accumulate in the exporter until
+    // `run_upkeep` drains them, and `install_recorder` starts no task to call it
+    // — only a scrape did. An instance nobody scrapes therefore grew with every
+    // message. This is the task the exporter's own `install()` would have
+    // started; `/metrics` still calls it too, which is harmless.
+    let upkeep_task = metrics_handle.map(|handle| {
+        let stop = stop_accepting.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(METRICS_UPKEEP);
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = every.tick() => handle.run_upkeep(),
+                }
+            }
+        })
     });
 
     let admin_task = {
@@ -318,6 +338,9 @@ async fn run() -> anyhow::Result<()> {
     if let Some(task) = preflight_task {
         let _ = task.await;
     }
+    if let Some(task) = upkeep_task {
+        let _ = task.await;
+    }
     let _ = admin_task.await;
 
     info!("shutdown complete");
@@ -327,6 +350,10 @@ async fn run() -> anyhow::Result<()> {
 /// §10.4 — "allow in-flight sessions to complete up to a grace period (default
 /// 30s)". Not in the §4.1 schema, so not configurable.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// D-076 — how often the metrics exporter's buffered samples are drained. The
+/// exporter's own `install()` default.
+const METRICS_UPKEEP: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};

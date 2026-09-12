@@ -2249,6 +2249,45 @@ genuinely is not 8-bit clean); fixing only the 7-bit case.
 Three tests in `tests/smtp_ingress.rs` pin the three cases against a fake downstream
 with Postal's `EHLO`.
 
+### D-075 — Process, session, reservation, pool and task gauges on `/metrics`
+
+**Spec:** not in §9.1's list. Added because the test programme's stress and soak
+tiers need these to be assertable — and because production needs them for the same
+reasons: a session bound that is only visible through refusals, a stranded
+reservation that is visible only as a sweeper count seven minutes later, and a
+Postgres pool that is visible only as `451 4.3.0`.
+
+**Decision:** eleven gauges, each read when `/metrics` is scraped, like D-056's
+quota gauges and phase 10's pool gauges:
+
+- `process_resident_memory_bytes`, `process_open_fds`, `process_max_fds`,
+  `process_threads`, `process_start_time_seconds` — the standard Prometheus client
+  names, read from `/proc/self` with no new dependency. A field procfs cannot supply
+  is left unwritten rather than written as zero. The start time is taken when the
+  recorder is installed, the first thing `main` does after reading its config.
+- `simmer_sessions_active` / `simmer_sessions_max` — the shared §5.1 semaphore.
+- `simmer_reservations_in_flight` — the §10.4 registry. Nonzero on an idle instance
+  means stranded reservations (finding F2's symptom).
+- `simmer_db_pool_connections{state="in_use"|"idle"}` / `simmer_db_pool_max`.
+- `simmer_tasks_alive` — tokio's live-task count, stable since 1.39.
+
+`AdminState` gains the session semaphore and the Postgres pool, both optional so a
+test that runs no listener still builds one.
+
+### D-076 — The metrics exporter's upkeep runs every 5 s (finding F8)
+
+**Found:** by the test programme's resource map. `metrics::install` uses
+`install_recorder()`, which — unlike the exporter's own `install()` — starts no
+upkeep task, and histogram samples (`simmer_downstream_latency_seconds`) sit in the
+exporter's buffer until `run_upkeep` drains them. Only the `/metrics` handler called
+it. An instance nobody scrapes therefore grew with every message relayed.
+
+**Decision:** `main` spawns the task `install()` would have: `run_upkeep` every
+5 s (the exporter's default), stopped with the other background tasks at shutdown.
+The scrape handler keeps its own call, which is harmless. Verified by the soak's A/B
+comparison of a scraped and a never-scraped instance, which is the only place it is
+observable; there is no cheap deterministic test for it.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

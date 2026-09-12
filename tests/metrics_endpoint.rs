@@ -112,6 +112,8 @@ fn state(pool: PgPool) -> AdminState {
             preflight: Arc::new(simmer::preflight::Registry::new()),
         },
         metrics: Some(handle()),
+        sessions: None,
+        db: None,
     }
 }
 
@@ -323,6 +325,8 @@ async fn a_route_that_has_not_started_reports_a_ceiling_of_zero_not_infinity(poo
             preflight: Arc::new(simmer::preflight::Registry::new()),
         },
         metrics: Some(handle()),
+        sessions: None,
+        db: None,
     };
 
     let (_, body) = scrape(&state).await;
@@ -533,6 +537,67 @@ async fn no_scrape_exposes_a_recipient(pool: PgPool) {
 /// nothing. Capping the label is a divergence from §9.1, which names it, so the
 /// fix needs the spec author; until then this stays pinned. See
 /// `tests/findings.rs` for how `xfail` works.
+#[sqlx::test]
+async fn the_runtime_gauges_are_exported_on_every_scrape(pool: PgPool) {
+    // D-075. What the stress and soak tiers read, and what production alerts on:
+    // the session bound, the §10.4 registry, the Postgres pool, the process and
+    // the runtime — each driven here to a known value and read back.
+    let _serialised = exclusive().await;
+    let mut state = state(pool.clone());
+
+    // One session permit held, against the config's cap of 16.
+    let sessions = Arc::new(tokio::sync::Semaphore::new(16));
+    let _held = Arc::clone(&sessions).try_acquire_owned().expect("a permit");
+    state.sessions = Some(sessions);
+    state.db = Some(pool.clone());
+
+    // One reservation the process is holding.
+    state
+        .engine
+        .registry
+        .insert(&simmer::quota::store::Reservation {
+            id: uuid::Uuid::new_v4(),
+            route: "warming".into(),
+            domain_group: "catchall".into(),
+            day_index: 0,
+            count: 1,
+        });
+
+    let (_, body) = scrape(&state).await;
+    let number = |name: &str, labels: &[(&str, &str)]| -> f64 {
+        value(&body, name, labels).parse().expect("a number")
+    };
+
+    assert_eq!(number("simmer_sessions_active", &[]), 1.0);
+    assert_eq!(number("simmer_sessions_max", &[]), 16.0);
+    assert_eq!(number("simmer_reservations_in_flight", &[]), 1.0);
+    assert_eq!(
+        number("simmer_db_pool_max", &[]),
+        f64::from(pool.options().get_max_connections())
+    );
+    let in_use = number("simmer_db_pool_connections", &[("state", "in_use")]);
+    let idle = number("simmer_db_pool_connections", &[("state", "idle")]);
+    // Bounded rather than equal to `pool.size()`: the gauges are a snapshot
+    // taken early in the scrape, and the quota refresh that follows opens
+    // connections of its own, so the pool can have grown by the time the test
+    // looks.
+    assert!(
+        (1.0..=number("simmer_db_pool_max", &[])).contains(&(in_use + idle)),
+        "in_use {in_use} + idle {idle} should be between 1 and the pool's maximum"
+    );
+
+    // The process, as procfs reports it — plausible rather than exact.
+    assert!(number("process_resident_memory_bytes", &[]) > 1024.0 * 1024.0);
+    assert!(number("process_open_fds", &[]) >= 3.0);
+    assert!(number("process_max_fds", &[]) >= number("process_open_fds", &[]));
+    assert!(number("process_threads", &[]) >= 1.0);
+    assert!(number("simmer_tasks_alive", &[]) >= 1.0);
+    assert!(
+        body.contains("# HELP simmer_sessions_active"),
+        "the new gauges carry help text"
+    );
+}
+
 #[tokio::test]
 async fn f7_unmatched_sender_series_are_bounded() {
     let _serial = exclusive().await;
