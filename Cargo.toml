@@ -196,6 +196,22 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
     "tokio",
 ] }
 
+# --- the test programme ----------------------------------------------------
+
+# The server's global allocator (D-078, finding F15). glibc's malloc kept
+# argon2's freed 19 MiB AUTH blocks resident: past the first free its dynamic
+# mmap threshold rises, later blocks come from per-thread arenas — up to eight
+# per host CPU — and stay there, so one login per message drove the server to a
+# 1 GiB limit in seconds. jemalloc, chosen over mimalloc on measurement (D-078):
+# peaks a quarter to three-fifths as high on bulk-sending loads, at the cost of
+# slower one-login-per-message traffic. Set in `src/main.rs` only, so it is the
+# server binary's choice and not
+# the library's. `MIT/Apache-2.0` for every published version of both crates; the
+# jemalloc C library they vendor is `BSD-2-Clause` (LICENSES.md §7). Default
+# features, which include `background_threads_runtime_support`: the purge thread
+# can be turned on through `_RJEM_MALLOC_CONF` without a rebuild.
+tikv-jemallocator = "0.7"
+
 [profile.release]
 strip = true
 lto = true

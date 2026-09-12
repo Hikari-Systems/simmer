@@ -2308,6 +2308,78 @@ it. Tested in-process (`tests/pool.rs`: every `EHLO` the fake downstream receive
 and live (`tests/e2e_matrix.rs`: Postfix's `Received:` on a plaintext route and on
 a `STARTTLS` route, where the name that counts is the second `EHLO`).
 
+### D-078 — The server's global allocator is jemalloc (finding F15)
+
+**Found:** by the stress tier's first smoke scenario (T3 S0): 32 clients, one
+connection and one `AUTH` per message, small bodies, no faults. `app` was
+OOM-killed at its 1 GiB limit within seconds. Measured rather than guessed, and
+memory tracked the *number* of logins, not how many overlapped: one login per
+100-message session peaked at 196 MiB and fell back to 5 MiB; one per message at
+concurrency 1 sat at 156 MiB; at concurrency 8 it plateaued at ~1015 MiB; at 32
+it was killed.
+
+glibc's malloc is the cause. Once the first 19 MiB argon2 block (§4.1's
+`m=19456`) is freed, the dynamic mmap threshold rises past that size, so later
+blocks come from per-thread arenas — up to eight per CPU the *host* has, not the
+cgroup's quota — and stay resident when freed. `MALLOC_ARENA_MAX=2` did not help.
+Pinning the threshold (`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072`) did —
+concurrency 32 peaked at 213 MiB and returned to 6 MiB — which confirms the
+mechanism.
+
+**Decision:** the server binary uses jemalloc (`tikv-jemallocator`, default
+features) as its global allocator. A different allocator was the user's choice
+over the environment tunable, which would cover only the shipped image, and a
+`mallopt` call at startup, which needs a direct `libc` dependency and `unsafe`.
+It is set in `src/main.rs`, so the library, the tests and the loadgen/sink keep
+the system allocator. `MIT/Apache-2.0` in every published version of both crates;
+the vendored C library is `BSD-2-Clause` (`LICENSES.md` §7).
+
+mimalloc was adopted first, on priors — `MIT`, a C-compiler-only build — and it
+fixed F15, but it had not been compared with anything. The user asked for the
+comparison before either was pushed, and this entry records it.
+
+**Measured** on the stress stack (`app` at 2 CPUs and 1 GiB, the counting sink as
+downstream), each case twice on a freshly started `app`: the mean, with the range
+across the two runs in brackets. B1 is 32 clients × 2,000 messages with one login
+per message; B2 is 32 × 20,000 with one login per 100; B3 is 16 × 400 messages of
+2 MiB with one login per 4. "After" is cgroup anon memory once the load stopped.
+Every run delivered every message; none was OOM-killed.
+
+| Case | Allocator | msg/s | p99 ms | Peak MiB | After 5 s | After 30 s |
+|---|---|---|---|---|---|---|
+| B1 | mimalloc | 43.5 (42–45) | 1433 | 630 | 499 | 18 |
+| B1 | **jemalloc** | 32.4 (32–33) | 1865 | 296 (242–351) | 12 | 10 |
+| B2 | mimalloc | 217 (172–263) | 324 | 651 | 18 | 16 |
+| B2 | **jemalloc** | 166 (156–176) | 531 | 151 (122–179) | 10 | 9 |
+| B3 | mimalloc | 1.6 | 11345 | 344 | 87 | 71 |
+| B3 | **jemalloc** | 1.8 | 10749 | 202 | 175 | 21 |
+
+Idle, jemalloc holds 4.2 MiB against mimalloc's 14.5. A clean image build takes
+106 s against 101 s, and the binary is 7,450,288 bytes against 7,265,032. The
+host was shared with other workloads: one mimalloc B2 run moved from 263 to 172
+msg/s between identical runs, so throughput differences inside that spread are not
+read as real.
+
+**What the choice costs.** jemalloc is about 25% slower on B1, consistently across
+both runs. By default it sends allocations above `oversize_threshold` (8 MiB) to
+an arena that returns them to the OS at once, so every login faults and zeroes
+argon2's 19 MiB block afresh. Raising the threshold to 32 MiB
+(`_RJEM_MALLOC_CONF=oversize_threshold:33554432`, no rebuild needed) recovered
+39–41 msg/s on B1 — but put its peak back at 600–695 MiB, mimalloc's figure. The
+login speed and the memory are one trade, not two separate wins.
+
+**Why the trade is accepted** (the user's judgement): one login per message is an
+outlier in real use. Bulk sending looks like B2 and B3 — long sessions, many
+messages per login, larger bodies — and there throughput is within the host's
+noise (B2's mean is lower but its range overlaps; B3 is level), while jemalloc's
+peak is a quarter (B2) to three-fifths (B3) of mimalloc's and returns to baseline
+within seconds. Memory is what F15 was about, and headroom under the container's
+limit is what that needs. A deployment that really is login-bound has one knob,
+`oversize_threshold`, and turning it gives the memory back.
+
+F3a — the *concurrent* peak, 64 sessions × 19 MiB — is untouched by this and
+stays open: it wants a bound on concurrent verifications, proposed separately.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

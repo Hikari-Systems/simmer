@@ -445,6 +445,30 @@ ASN.1 tree, because Cargo records a crate's optional dependencies whether or not
 they are enabled; `rcgen`'s `x509-parser` feature is off, and `cargo tree` confirms
 none of them is compiled.
 
+## 7. The test programme — `tikv-jemallocator` (finding F15)
+
+The server binary's global allocator, adopted when the stress tier found glibc's
+malloc holding argon2's AUTH blocks resident until the container was OOM-killed
+(`DECISIONS.md` D-078). Checked against crates.io on 2026-09-13:
+
+| | `tikv-jemallocator` | `tikv-jemalloc-sys` |
+|---|---|---|
+| Published versions | 8 | 13 |
+| Licence | `MIT/Apache-2.0`, every version | `MIT/Apache-2.0`, every version |
+| AGPL, GPL or LGPL in any version | **none** | **none** |
+
+`MIT/Apache-2.0` is the deprecated slash spelling of `MIT OR Apache-2.0`, as
+`hickory-resolver`'s `0.1.0` uses (§5); `cargo deny` reads it as such. The
+jemalloc C library that `tikv-jemalloc-sys` vendors and builds at compile time is
+`BSD-2-Clause`, already on the allow list. Its configure-and-make build needs
+nothing the `rust:1-bookworm` builder image lacks. Adopted at `0.7` with default
+features. Set in `src/main.rs` only: the library, the tests and the test binaries
+keep the system allocator.
+
+mimalloc (`MIT` in all 53 and 50 published versions of `mimalloc` and
+`libmimalloc-sys`) was adopted first and replaced after the measured comparison in
+D-078, before either was pushed. It is not in the graph.
+
 ## How to re-check
 
 `cargo-deny` is the gate in CI:

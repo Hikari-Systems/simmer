@@ -14,6 +14,12 @@ use std::sync::Arc;
 use simmer::{admin, config, db, hash_password, healthcheck, logging, quota, relay, smtp};
 use tracing::{error, info, warn};
 
+/// D-078 (finding F15): not glibc's malloc, which kept every AUTH's 19 MiB
+/// argon2 block resident in a per-thread arena until the container hit its
+/// memory limit.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 /// Where the §4 YAML lives. Overridable so the compose stack can mount an
 /// environment-specific file without rebuilding the image.
 const DEFAULT_CONFIG_PATH: &str = "simmer.yaml";
