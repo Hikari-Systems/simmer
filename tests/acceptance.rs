@@ -348,7 +348,10 @@ fn submission_on_587_is_verified_tls_and_refuses_plaintext_auth() {
     assert!(
         refused
             .iter()
-            .all(|r| r.code == 0 && r.text.contains("530")),
+            // The loadgen records the reply it got, so a refusal at AUTH is that
+            // refusal's code and text — not the transport failure the first
+            // loadgen reported it as.
+            .all(|r| r.code == 530 && r.text.contains("STARTTLS")),
         "plaintext AUTH on 587 was not refused with 530: {refused:?}"
     );
 }

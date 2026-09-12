@@ -87,6 +87,9 @@ ENTRYPOINT ["/app/server"]
 FROM runtime AS acceptance
 
 COPY --from=builder /app/target/release/loadgen /app/loadgen
+# The load tiers' counting SMTP sink (src/bin/sink.rs). Test tooling like the
+# loadgen: in this stage only, never in `runtime`.
+COPY --from=builder /app/target/release/sink /app/sink
 
 # No HEALTHCHECK: the loadgen is a one-shot command, not a service. Compose runs
 # it with `run --rm` and reads its stdout.

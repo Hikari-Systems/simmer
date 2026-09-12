@@ -1,4 +1,5 @@
-//! The acceptance suite's bulk sender (`docs/ACCEPTANCE.md` §2).
+//! The test programme's load generator (`docs/ACCEPTANCE.md` §2, and the load
+//! tiers of `docs/TESTING.md`).
 //!
 //! **Not part of the shipped image.** `Dockerfile`'s `acceptance` stage adds it;
 //! the `runtime` stage does not, and only the `acceptance` compose profile
@@ -9,55 +10,102 @@
 //! publish it. Sending from a container is also the realistic topology: an
 //! application talking to a relay over a private network.
 //!
-//! Deliberately dumb. It sends, it records `(recipient, code, text)`, and it
-//! writes that to stdout as JSON. **It asserts nothing** — every assertion lives
-//! in `tests/acceptance.rs`, where a failure is legible and where the expected
-//! numbers come from `simmer.acceptance.yaml` rather than from here.
+//! Deliberately dumb. It sends, and records what it was told. **It asserts
+//! nothing** — every assertion lives in the tests, where a failure is legible and
+//! where the expected numbers come from the config under test rather than from
+//! here.
+//!
+//! ## Two ways to run it
+//!
+//! **As the acceptance suite always has:** one connection per message, one at a
+//! time, and one JSON array of `{recipient, code, text}` printed at the end. With
+//! no new flags the bytes it sends are exactly what they were, which matters: the
+//! §1.1 cutover test compares two runs byte for byte.
+//!
+//! **As a load generator:** `--concurrency`, an open-loop `--rate`, a
+//! `--duration`, size distributions, TLS modes, persistent sessions, and a
+//! streaming `--jsonl` record of every message. For load, `--stamp` gives every
+//! message a test id — in the RCPT local part and an `X-Test-Id` header — which
+//! `tests/compose/reconcile.rs` joins with the sink's record of the same id. It is
+//! opt-in precisely because an extra header would break the cutover comparison.
+//!
+//! **Latency in open-loop mode is measured from the scheduled send time**, not
+//! from when the send actually began. A server that stalls delays the sends
+//! queued behind it, and measuring from the actual start would hide exactly the
+//! latency the stall caused (coordinated omission).
+//!
+//! A refusal is recorded as the reply it was — `530` at AUTH is code 530 with
+//! stage `auth` — and code 0 is kept for transport failures, where there was no
+//! reply at all. The first loadgen folded both into code 0.
 //!
 //! ## Why it speaks SMTP by hand
 //!
-//! The same reason `src/downstream/client.rs` does (D-022): the client crates
-//! normalise the reply into an error type, and this harness's entire output is
-//! the reply codes. `swaks` or a shell loop would work too, but this way the
-//! sender and the service under test are built from one `cargo build` and cannot
-//! drift apart in the image.
-//!
-//! ## `--starttls` (D-070)
-//!
-//! Submits over RFC 3207 instead of plaintext, **verifying** the server's
-//! certificate against `--ca` — the CA the compose `tls-init` service minted —
-//! for `--tls-name`. Verification is the point: an unverified handshake would
-//! show the bytes were encrypted, not that Simmer served the certificate it was
-//! configured with. The upgrade reuses the library's own [`Stream`], as the
-//! outbound leg does.
+//! The same reason `src/downstream/client.rs` does (D-022): client crates
+//! normalise the reply into an error type, and this tool's entire output is the
+//! reply codes. It reuses the library's own [`Stream`] for STARTTLS and implicit
+//! TLS, verifying against `--ca` (a PEM file, or `os` for the platform store) —
+//! an unverified handshake would show the bytes were encrypted, not that Simmer
+//! served the certificate it was configured with.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use simmer::downstream::stream::Stream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::sync::{mpsc, Semaphore};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Plain,
+    Starttls,
+    Implicit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthMech {
+    Plain,
+    Login,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Charset {
+    Utf8,
+    Latin1,
+    Cp1252,
+}
+
+#[derive(Debug, Clone)]
 struct Args {
     host: String,
     port: u16,
     username: String,
     password: String,
-    count: usize,
-    /// Envelope sender, which is what §5.4 matches on in the acceptance config.
+    count: Option<u64>,
+    duration: Option<Duration>,
+    concurrency: usize,
+    rate: Option<f64>,
+    per_session: usize,
     from: String,
-    /// `From:` header, so the harness can send arrangement A and arrangement B
-    /// of §1.1 through the same binary.
     from_header: String,
     recipient_domain: String,
-    /// Distinguishes one run's recipients from the next in the same trap.
     tag: String,
     subject: String,
-    /// RFC 3207 before AUTH, verifying against `ca` for `tls_name`.
-    starttls: bool,
+    mode: Mode,
     ca: String,
     tls_name: String,
+    auth: AuthMech,
+    wrong_password_pct: f64,
+    pipelining: bool,
+    stamp: bool,
+    sink_script: Option<String>,
+    sink_script_pct: f64,
+    sizes: Vec<(usize, f64)>,
+    charset: Charset,
+    jsonl: Option<String>,
+    seed: u64,
 }
 
 fn args() -> Args {
@@ -66,44 +114,105 @@ fn args() -> Args {
         port: 25,
         username: "cfapp".to_string(),
         password: String::new(),
-        count: 1,
+        count: None,
+        duration: None,
+        concurrency: 1,
+        rate: None,
+        per_session: 1,
         from: "jane@oldbrand.com".to_string(),
         from_header: "Jane Smith <jane@oldbrand.com>".to_string(),
         recipient_domain: "example.net".to_string(),
         tag: "run".to_string(),
         subject: "Your order has shipped".to_string(),
-        starttls: false,
+        mode: Mode::Plain,
         ca: "/tls/ca.pem".to_string(),
         tls_name: "simmer.acceptance".to_string(),
+        auth: AuthMech::Plain,
+        wrong_password_pct: 0.0,
+        pipelining: false,
+        stamp: false,
+        sink_script: None,
+        sink_script_pct: 100.0,
+        sizes: Vec::new(),
+        charset: Charset::Utf8,
+        jsonl: None,
+        seed: 1,
     };
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < argv.len() {
+        // The flags that take no value.
+        match argv[i].as_str() {
+            "--starttls" => {
+                a.mode = Mode::Starttls;
+                i += 1;
+                continue;
+            }
+            "--pipelining" => {
+                a.pipelining = true;
+                i += 1;
+                continue;
+            }
+            "--stamp" => {
+                a.stamp = true;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
         let value = || {
             argv.get(i + 1)
                 .unwrap_or_else(|| panic!("{} needs a value", argv[i]))
                 .clone()
         };
-        // The one flag that takes no value.
-        if argv[i] == "--starttls" {
-            a.starttls = true;
-            i += 1;
-            continue;
-        }
         match argv[i].as_str() {
             "--host" => a.host = value(),
             "--port" => a.port = value().parse().expect("--port"),
             "--username" => a.username = value(),
             "--password" => a.password = value(),
-            "--count" => a.count = value().parse().expect("--count"),
+            "--count" => a.count = Some(value().parse().expect("--count")),
+            "--duration" => a.duration = Some(parse_duration(&value())),
+            "--concurrency" => a.concurrency = value().parse().expect("--concurrency"),
+            "--rate" => a.rate = Some(value().parse().expect("--rate")),
+            "--per-session" => a.per_session = value().parse().expect("--per-session"),
             "--from" => a.from = value(),
             "--from-header" => a.from_header = value(),
             "--recipient-domain" => a.recipient_domain = value(),
             "--tag" => a.tag = value(),
             "--subject" => a.subject = value(),
+            "--mode" => {
+                a.mode = match value().as_str() {
+                    "plain" => Mode::Plain,
+                    "starttls" => Mode::Starttls,
+                    "implicit" => Mode::Implicit,
+                    other => panic!("--mode {other}: plain, starttls or implicit"),
+                }
+            }
             "--ca" => a.ca = value(),
             "--tls-name" => a.tls_name = value(),
+            "--auth" => {
+                a.auth = match value().as_str() {
+                    "plain" => AuthMech::Plain,
+                    "login" => AuthMech::Login,
+                    "none" => AuthMech::None,
+                    other => panic!("--auth {other}: plain, login or none"),
+                }
+            }
+            "--wrong-password-pct" => a.wrong_password_pct = value().parse().expect("a percentage"),
+            "--sink-script" => a.sink_script = Some(value()),
+            "--sink-script-pct" => a.sink_script_pct = value().parse().expect("a percentage"),
+            "--size" => a.sizes = parse_sizes(&value()),
+            "--charset" => {
+                a.charset = match value().as_str() {
+                    "utf8" | "utf-8" => Charset::Utf8,
+                    "latin1" | "iso-8859-1" => Charset::Latin1,
+                    "cp1252" | "windows-1252" => Charset::Cp1252,
+                    other => panic!("--charset {other}: utf8, latin1 or cp1252"),
+                }
+            }
+            "--jsonl" => a.jsonl = Some(value()),
+            "--seed" => a.seed = value().parse().expect("--seed"),
             other => panic!("unknown argument {other}"),
         }
         i += 2;
@@ -112,117 +221,613 @@ fn args() -> Args {
     if a.password.is_empty() {
         a.password = std::env::var("SIMMER_PASSWORD").unwrap_or_default();
     }
+    if a.count.is_none() && a.duration.is_none() {
+        a.count = Some(1);
+    }
+    assert!(a.concurrency >= 1, "--concurrency must be at least 1");
+    assert!(a.per_session >= 1, "--per-session must be at least 1");
     a
+}
+
+/// `90s`, `10m`, `1h`, `1500ms`, or bare seconds.
+fn parse_duration(s: &str) -> Duration {
+    let s = s.trim();
+    let (n, unit) = s
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .map(|i| s.split_at(i))
+        .unwrap_or((s, "s"));
+    let n: f64 = n.parse().unwrap_or_else(|_| panic!("duration {s}"));
+    Duration::from_secs_f64(match unit {
+        "ms" => n / 1000.0,
+        "s" => n,
+        "m" => n * 60.0,
+        "h" => n * 3600.0,
+        other => panic!("duration unit {other}"),
+    })
+}
+
+/// `4096`, `2m`, or a weighted distribution `dist:4k:80,100k:15,2m:4,15m:1`.
+fn parse_sizes(s: &str) -> Vec<(usize, f64)> {
+    let bytes = |v: &str| -> usize {
+        let v = v.trim().to_ascii_lowercase();
+        let (n, mult) = if let Some(n) = v.strip_suffix('k') {
+            (n, 1024)
+        } else if let Some(n) = v.strip_suffix('m') {
+            (n, 1024 * 1024)
+        } else {
+            (v.as_str(), 1)
+        };
+        n.parse::<usize>().unwrap_or_else(|_| panic!("size {v}")) * mult
+    };
+    match s.strip_prefix("dist:") {
+        Some(spec) => spec
+            .split(',')
+            .map(|part| {
+                let (size, weight) = part
+                    .rsplit_once(':')
+                    .unwrap_or_else(|| panic!("size {part}"));
+                (
+                    bytes(size),
+                    weight.parse().unwrap_or_else(|_| panic!("weight {part}")),
+                )
+            })
+            .collect(),
+        None => vec![(bytes(s), 1.0)],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+/// What one message was told, as recorded.
+#[derive(Debug, Clone)]
+struct Rec {
+    id: String,
+    recipient: String,
+    code: u16,
+    stage: &'static str,
+    text: String,
+    latency_ms: f64,
+    sent_ms: u128,
 }
 
 #[tokio::main]
 async fn main() {
-    let args = args();
-    let tls = args.starttls.then(|| connector(&args.ca));
-    let mut results = Vec::with_capacity(args.count);
+    let args = Arc::new(args());
+    let tls = (args.mode != Mode::Plain).then(|| Arc::new(connector(&args.ca)));
+    let started = Instant::now();
 
-    for n in 0..args.count {
-        let recipient = format!("{}-{n}@{}", args.tag, args.recipient_domain);
-        let outcome = send_one(&args, tls.as_ref(), &recipient).await;
-        let (code, text) = match outcome {
-            Ok((code, text)) => (code, text),
-            // A transport failure is reported as a code of 0 rather than
-            // crashing the run: the interesting case is "message 6 of 8 got a
-            // 451", and aborting would lose the five that succeeded.
-            Err(e) => (0, e),
-        };
-        results.push(format!(
-            r#"{{"recipient":{},"code":{code},"text":{}}}"#,
-            json_string(&recipient),
-            json_string(&text)
-        ));
+    let (tx, rx) = mpsc::unbounded_channel::<Rec>();
+    let collector = tokio::spawn(collect(Arc::clone(&args), rx, started));
+
+    let seq = Arc::new(AtomicU64::new(0));
+    let limit = args.count.unwrap_or(u64::MAX);
+    let deadline = args.duration.map(|d| started + d);
+    let time_left = move || deadline.is_none_or(|d| Instant::now() < d);
+
+    if let Some(rate) = args.rate {
+        // Open loop: sessions are *scheduled* at the rate, whatever the server
+        // is doing, and in-flight sessions are capped at --concurrency.
+        let sessions_per_sec = rate / args.per_session as f64;
+        let interval = Duration::from_secs_f64(1.0 / sessions_per_sec);
+        let permits = Arc::new(Semaphore::new(args.concurrency));
+        let mut next = tokio::time::Instant::now();
+        let mut running = tokio::task::JoinSet::new();
+        loop {
+            if !time_left() {
+                break;
+            }
+            let ids = take(&seq, args.per_session, limit);
+            if ids.is_empty() {
+                break;
+            }
+            tokio::time::sleep_until(next).await;
+            let scheduled = next.into_std();
+            next += interval;
+            let permit = Arc::clone(&permits)
+                .acquire_owned()
+                .await
+                .expect("semaphore");
+            let (args, tls, tx) = (Arc::clone(&args), tls.clone(), tx.clone());
+            running.spawn(async move {
+                session(&args, tls.as_deref(), &ids, scheduled, started, &tx).await;
+                drop(permit);
+            });
+        }
+        while running.join_next().await.is_some() {}
+    } else {
+        // Closed loop: --concurrency workers, each sending back to back.
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..args.concurrency {
+            let (args, tls, tx, seq) =
+                (Arc::clone(&args), tls.clone(), tx.clone(), Arc::clone(&seq));
+            workers.spawn(async move {
+                while time_left() {
+                    let ids = take(&seq, args.per_session, limit);
+                    if ids.is_empty() {
+                        break;
+                    }
+                    session(&args, tls.as_deref(), &ids, Instant::now(), started, &tx).await;
+                }
+            });
+        }
+        while workers.join_next().await.is_some() {}
     }
 
-    println!("[{}]", results.join(","));
+    drop(tx);
+    let summary = collector.await.expect("collector");
+    println!("{summary}");
 }
 
-/// One connection per message. Slower than reusing one, and the point: it is
-/// what an application sending in bulk through a pool actually looks like to
-/// Simmer, and it exercises the §5.1 session cap.
-async fn send_one(
+/// The next `n` message numbers, stopping at `limit`.
+fn take(seq: &AtomicU64, n: usize, limit: u64) -> Vec<u64> {
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let v = seq.fetch_add(1, Ordering::SeqCst);
+        if v >= limit {
+            break;
+        }
+        out.push(v);
+    }
+    out
+}
+
+/// Stream every record: to the JSONL file as it arrives, or — the acceptance
+/// suite's format — into one JSON array printed when the run ends. Returns the
+/// summary line.
+async fn collect(
+    args: Arc<Args>,
+    mut rx: mpsc::UnboundedReceiver<Rec>,
+    started: Instant,
+) -> String {
+    use std::io::Write;
+
+    let mut file = args.jsonl.as_ref().map(|p| {
+        std::io::BufWriter::new(
+            std::fs::File::create(p).unwrap_or_else(|e| panic!("creating {p}: {e}")),
+        )
+    });
+    let mut legacy: Vec<String> = Vec::new();
+    let mut latencies: Vec<f64> = Vec::new();
+    let (mut accepted, mut deferred, mut refused, mut transport) = (0u64, 0u64, 0u64, 0u64);
+
+    while let Some(first) = rx.recv().await {
+        let mut batch = vec![first];
+        while let Ok(more) = rx.try_recv() {
+            batch.push(more);
+        }
+        for r in batch {
+            match r.code {
+                0 => transport += 1,
+                200..=299 => accepted += 1,
+                400..=499 => deferred += 1,
+                _ => refused += 1,
+            }
+            if r.code != 0 {
+                latencies.push(r.latency_ms);
+            }
+            match file.as_mut() {
+                Some(f) => {
+                    let _ = writeln!(
+                        f,
+                        r#"{{"id":{},"recipient":{},"code":{},"stage":"{}","text":{},"latency_ms":{:.3},"sent_ms":{}}}"#,
+                        json_string(&r.id),
+                        json_string(&r.recipient),
+                        r.code,
+                        r.stage,
+                        json_string(&r.text),
+                        r.latency_ms,
+                        r.sent_ms
+                    );
+                }
+                None => legacy.push(format!(
+                    r#"{{"recipient":{},"code":{},"text":{}}}"#,
+                    json_string(&r.recipient),
+                    r.code,
+                    json_string(&r.text)
+                )),
+            }
+        }
+        if let Some(f) = file.as_mut() {
+            let _ = f.flush();
+        }
+    }
+
+    if file.is_none() {
+        println!("[{}]", legacy.join(","));
+    }
+
+    latencies.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    let pct = |p: f64| -> f64 {
+        if latencies.is_empty() {
+            return 0.0;
+        }
+        let i = ((p / 100.0) * (latencies.len() - 1) as f64).round() as usize;
+        latencies[i]
+    };
+    let elapsed = started.elapsed().as_secs_f64();
+    let total = accepted + deferred + refused + transport;
+    format!(
+        r#"{{"summary":{{"messages":{total},"accepted":{accepted},"deferred":{deferred},"refused":{refused},"transport":{transport},"elapsed_s":{elapsed:.3},"per_sec":{:.2},"p50_ms":{:.1},"p90_ms":{:.1},"p99_ms":{:.1},"max_ms":{:.1}}}}}"#,
+        total as f64 / elapsed.max(0.001),
+        pct(50.0),
+        pct(90.0),
+        pct(99.0),
+        latencies.last().copied().unwrap_or(0.0)
+    )
+}
+
+// ---------------------------------------------------------------------------
+// one session
+// ---------------------------------------------------------------------------
+
+/// A transport failure: which message it cut off, at which stage, and why.
+struct Cut {
+    at: usize,
+    stage: &'static str,
+    text: String,
+}
+
+async fn session(
     args: &Args,
     tls: Option<&tokio_rustls::TlsConnector>,
-    recipient: &str,
-) -> Result<(u16, String), String> {
-    let stream = tokio::time::timeout(
+    numbers: &[u64],
+    scheduled: Instant,
+    started: Instant,
+    tx: &mpsc::UnboundedSender<Rec>,
+) {
+    if let Err(cut) = converse(args, tls, numbers, scheduled, started, tx).await {
+        for (k, n) in numbers.iter().enumerate().skip(cut.at) {
+            let (id, recipient) = identity(args, *n);
+            let _ = tx.send(Rec {
+                id,
+                recipient,
+                code: 0,
+                stage: if k == cut.at { cut.stage } else { "not_sent" },
+                text: cut.text.clone(),
+                latency_ms: scheduled.elapsed().as_secs_f64() * 1000.0,
+                sent_ms: scheduled.duration_since(started).as_millis(),
+            });
+        }
+    }
+}
+
+fn identity(args: &Args, n: u64) -> (String, String) {
+    let id = format!("{}-{n}", args.tag);
+    let recipient = format!("{id}@{}", args.recipient_domain);
+    (id, recipient)
+}
+
+fn cut(at: usize, stage: &'static str) -> impl Fn(String) -> Cut {
+    move |text| Cut { at, stage, text }
+}
+
+async fn converse(
+    args: &Args,
+    tls: Option<&tokio_rustls::TlsConnector>,
+    numbers: &[u64],
+    scheduled: Instant,
+    started: Instant,
+    tx: &mpsc::UnboundedSender<Rec>,
+) -> Result<(), Cut> {
+    // Every message in the session gets the same verdict when the session is
+    // refused before its first transaction.
+    let refuse_all = |code: u16, stage: &'static str, text: String| {
+        for n in numbers {
+            let (id, recipient) = identity(args, *n);
+            let _ = tx.send(Rec {
+                id,
+                recipient,
+                code,
+                stage,
+                text: text.clone(),
+                latency_ms: scheduled.elapsed().as_secs_f64() * 1000.0,
+                sent_ms: scheduled.duration_since(started).as_millis(),
+            });
+        }
+    };
+
+    let tcp = tokio::time::timeout(
         Duration::from_secs(10),
         TcpStream::connect((args.host.as_str(), args.port)),
     )
     .await
-    .map_err(|_| "connect timed out".to_string())?
-    .map_err(|e| format!("connect: {e}"))?;
+    .map_err(|_| cut(0, "transport")("connect timed out".to_string()))?
+    .map_err(|e| cut(0, "transport")(format!("connect: {e}")))?;
 
-    let mut io = BufReader::new(Stream::Plain(stream));
-    expect(&mut io, 220).await?;
-
-    write(&mut io, "EHLO loadgen.acceptance\r\n").await?;
-    read_multiline(&mut io, 250).await?;
-
-    if let Some(connector) = tls {
-        write(&mut io, "STARTTLS\r\n").await?;
-        expect(&mut io, 220).await?;
-        let Stream::Plain(tcp) = std::mem::replace(io.get_mut(), Stream::Taken) else {
-            return Err("STARTTLS on a stream that is not plaintext".to_string());
-        };
-        let name = rustls::pki_types::ServerName::try_from(args.tls_name.clone())
-            .map_err(|e| format!("--tls-name: {e}"))?;
-        let upgraded = connector
-            .connect(name, tcp)
+    let stream = if args.mode == Mode::Implicit {
+        let connector = tls.expect("implicit mode has a connector");
+        let tls = connector
+            .connect(server_name(args), tcp)
             .await
-            .map_err(|e| format!("TLS handshake: {e}"))?;
+            .map_err(|e| cut(0, "transport")(format!("TLS handshake: {e}")))?;
+        Stream::Tls(Box::new(tls.into()))
+    } else {
+        Stream::Plain(tcp)
+    };
+    let mut io = BufReader::new(stream);
+
+    let (code, text) = read_reply(&mut io).await.map_err(cut(0, "transport"))?;
+    if code != 220 {
+        refuse_all(code, "banner", text);
+        return Ok(());
+    }
+
+    ehlo(&mut io).await.map_err(cut(0, "transport"))?;
+
+    if args.mode == Mode::Starttls {
+        write(&mut io, "STARTTLS\r\n")
+            .await
+            .map_err(cut(0, "transport"))?;
+        let (code, text) = read_reply(&mut io).await.map_err(cut(0, "transport"))?;
+        if code != 220 {
+            refuse_all(code, "tls", text);
+            return Ok(());
+        }
+        let Stream::Plain(tcp) = std::mem::replace(io.get_mut(), Stream::Taken) else {
+            return Err(cut(0, "transport")(
+                "STARTTLS on a stream that is not plaintext".into(),
+            ));
+        };
+        let connector = tls.expect("starttls mode has a connector");
+        let upgraded = connector
+            .connect(server_name(args), tcp)
+            .await
+            .map_err(|e| cut(0, "transport")(format!("TLS handshake: {e}")))?;
         io = BufReader::new(Stream::Tls(Box::new(upgraded.into())));
         // RFC 3207 §4.2: everything learned before the handshake is void.
-        write(&mut io, "EHLO loadgen.acceptance\r\n").await?;
-        read_multiline(&mut io, 250).await?;
+        ehlo(&mut io).await.map_err(cut(0, "transport"))?;
     }
 
-    if !args.password.is_empty() {
-        // AUTH PLAIN: NUL authzid, NUL-separated (RFC 4616).
-        let payload = format!("\0{}\0{}", args.username, args.password);
-        let encoded = base64_encode(payload.as_bytes());
-        write(&mut io, &format!("AUTH PLAIN {encoded}\r\n")).await?;
-        expect(&mut io, 235).await?;
+    if args.auth != AuthMech::None && !args.password.is_empty() {
+        let wrong = unit(args.seed, numbers[0], 1) * 100.0 < args.wrong_password_pct;
+        let password = if wrong {
+            "not-the-password"
+        } else {
+            args.password.as_str()
+        };
+        let (code, text) = auth(&mut io, args.auth, &args.username, password)
+            .await
+            .map_err(cut(0, "transport"))?;
+        if code != 235 {
+            refuse_all(code, "auth", text);
+            let _ = write(&mut io, "QUIT\r\n").await;
+            return Ok(());
+        }
     }
 
-    write(&mut io, &format!("MAIL FROM:<{}>\r\n", args.from)).await?;
-    let (code, text) = read_reply(&mut io).await?;
-    if code != 250 {
-        return Ok((code, text));
+    for (k, n) in numbers.iter().enumerate() {
+        let began = if k == 0 { scheduled } else { Instant::now() };
+        let (id, recipient) = identity(args, *n);
+        let record = |code: u16, stage: &'static str, text: String| {
+            let _ = tx.send(Rec {
+                id: id.clone(),
+                recipient: recipient.clone(),
+                code,
+                stage,
+                text,
+                latency_ms: began.elapsed().as_secs_f64() * 1000.0,
+                sent_ms: began.duration_since(started).as_millis(),
+            });
+        };
+
+        if k > 0 {
+            write(&mut io, "RSET\r\n")
+                .await
+                .map_err(cut(k, "transport"))?;
+            read_reply(&mut io).await.map_err(cut(k, "transport"))?;
+        }
+
+        let body = message(args, &id, &recipient, *n);
+        let params = if args.charset != Charset::Utf8 {
+            " BODY=8BITMIME"
+        } else {
+            ""
+        };
+        let mail = format!("MAIL FROM:<{}>{params}\r\n", args.from);
+        let rcpt = format!("RCPT TO:<{recipient}>\r\n");
+
+        let replies = if args.pipelining {
+            write(&mut io, &format!("{mail}{rcpt}DATA\r\n"))
+                .await
+                .map_err(cut(k, "transport"))?;
+            let mut r = Vec::with_capacity(3);
+            for _ in 0..3 {
+                r.push(read_reply(&mut io).await.map_err(cut(k, "transport"))?);
+            }
+            r
+        } else {
+            let mut r = Vec::with_capacity(3);
+            for (line, want) in [
+                (mail.as_str(), 250),
+                (rcpt.as_str(), 250),
+                ("DATA\r\n", 354),
+            ] {
+                write(&mut io, line).await.map_err(cut(k, "transport"))?;
+                let reply = read_reply(&mut io).await.map_err(cut(k, "transport"))?;
+                let stop = reply.0 != want;
+                r.push(reply);
+                if stop {
+                    break;
+                }
+            }
+            r
+        };
+
+        let stages = ["mail", "rcpt", "data"];
+        let wants = [250, 250, 354];
+        if let Some(i) = replies.iter().zip(wants).position(|(r, w)| r.0 != w) {
+            let (code, text) = replies[i].clone();
+            record(code, stages[i], text);
+            continue;
+        }
+
+        write_bytes(&mut io, &body)
+            .await
+            .map_err(cut(k, "transport"))?;
+        let (code, text) = read_reply(&mut io).await.map_err(cut(k, "transport"))?;
+        record(code, "dot", text);
     }
 
-    write(&mut io, &format!("RCPT TO:<{recipient}>\r\n")).await?;
-    let (code, text) = read_reply(&mut io).await?;
-    if code != 250 {
-        return Ok((code, text));
-    }
-
-    write(&mut io, "DATA\r\n").await?;
-    let (code, text) = read_reply(&mut io).await?;
-    if code != 354 {
-        return Ok((code, text));
-    }
-
-    write(&mut io, &message(args, recipient)).await?;
-    let (code, text) = read_reply(&mut io).await?;
-
-    // Best effort — the verdict is already in hand.
     let _ = write(&mut io, "QUIT\r\n").await;
-    Ok((code, text))
+    Ok(())
 }
 
-/// A client that trusts the CA in `path` and nothing else. A panic rather than
-/// a reported error: without the CA there is no run to report on.
+fn server_name(args: &Args) -> rustls::pki_types::ServerName<'static> {
+    rustls::pki_types::ServerName::try_from(args.tls_name.clone())
+        .unwrap_or_else(|e| panic!("--tls-name {}: {e}", args.tls_name))
+}
+
+async fn ehlo(io: &mut BufReader<Stream>) -> Result<(), String> {
+    write(io, "EHLO loadgen.acceptance\r\n").await?;
+    let (code, text) = read_reply(io).await?;
+    if code != 250 {
+        return Err(format!("EHLO: {code} {text}"));
+    }
+    Ok(())
+}
+
+async fn auth(
+    io: &mut BufReader<Stream>,
+    mech: AuthMech,
+    username: &str,
+    password: &str,
+) -> Result<(u16, String), String> {
+    match mech {
+        AuthMech::Login => {
+            write(io, "AUTH LOGIN\r\n").await?;
+            let (code, text) = read_reply(io).await?;
+            if code != 334 {
+                return Ok((code, text));
+            }
+            write(io, &format!("{}\r\n", base64_encode(username.as_bytes()))).await?;
+            let (code, text) = read_reply(io).await?;
+            if code != 334 {
+                return Ok((code, text));
+            }
+            write(io, &format!("{}\r\n", base64_encode(password.as_bytes()))).await?;
+            read_reply(io).await
+        }
+        _ => {
+            // AUTH PLAIN: NUL authzid, NUL-separated (RFC 4616).
+            let payload = format!("\0{username}\0{password}");
+            write(
+                io,
+                &format!("AUTH PLAIN {}\r\n", base64_encode(payload.as_bytes())),
+            )
+            .await?;
+            read_reply(io).await
+        }
+    }
+}
+
+/// The message, dot-terminated and ready for the wire.
+///
+/// With no size, charset, stamp or script options the bytes are exactly the
+/// first loadgen's — the §1.1 cutover test compares two runs byte for byte.
+fn message(args: &Args, id: &str, recipient: &str, n: u64) -> Vec<u8> {
+    let (charset, extra_body): (&str, &[u8]) = match args.charset {
+        Charset::Utf8 => ("utf-8", b""),
+        // "Café crème, naïve" in each single-byte charset; CP1252 adds an em dash
+        // and a euro sign, which ISO-8859-1 does not have.
+        Charset::Latin1 => ("iso-8859-1", b"Caf\xe9 cr\xe8me, na\xefve\r\n"),
+        Charset::Cp1252 => ("windows-1252", b"Caf\xe9 cr\xe8me \x97 na\xefve, \x805\r\n"),
+    };
+
+    let mut out = Vec::with_capacity(1024);
+    out.extend_from_slice(
+        format!(
+            "From: {}\r\n\
+             To: {recipient}\r\n\
+             Subject: {}\r\n\
+             Message-ID: <{}-{}@oldbrand.com>\r\n\
+             Return-Path: <bounces@oldbrand.com>\r\n\
+             X-Mailer: AcceptanceApp 1.0\r\n\
+             DKIM-Signature: v=1; a=rsa-sha256; d=oldbrand.com; s=s1; b=notarealsignature\r\n\
+             Authentication-Results: mx.oldbrand.com; spf=pass\r\n\
+             ARC-Seal: i=1; cv=none; d=oldbrand.com\r\n\
+             MIME-Version: 1.0\r\n",
+            args.from_header,
+            args.subject,
+            args.tag,
+            recipient.split('@').next().unwrap_or("x"),
+        )
+        .as_bytes(),
+    );
+    if args.stamp {
+        out.extend_from_slice(format!("X-Test-Id: {id}\r\n").as_bytes());
+    }
+    if let Some(script) = &args.sink_script {
+        if unit(args.seed, n, 2) * 100.0 < args.sink_script_pct {
+            out.extend_from_slice(format!("X-Sink-Script: {script}\r\n").as_bytes());
+        }
+    }
+    out.extend_from_slice(format!("Content-Type: text/plain; charset={charset}\r\n").as_bytes());
+    if args.charset != Charset::Utf8 {
+        out.extend_from_slice(b"Content-Transfer-Encoding: 8bit\r\n");
+    }
+    out.extend_from_slice(
+        b"\r\nYour order has shipped.\r\nTrack it at https://oldbrand.com/track\r\n",
+    );
+    out.extend_from_slice(extra_body);
+
+    if let Some(target) = pick_size(args, n) {
+        // Plain 76-column lines: never a leading dot, so no stuffing needed.
+        let line = [b'x'; 76];
+        while out.len() < target {
+            out.extend_from_slice(&line);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out.extend_from_slice(b".\r\n");
+    out
+}
+
+fn pick_size(args: &Args, n: u64) -> Option<usize> {
+    if args.sizes.is_empty() {
+        return None;
+    }
+    let total: f64 = args.sizes.iter().map(|(_, w)| w).sum();
+    let mut roll = unit(args.seed, n, 3) * total;
+    for (size, weight) in &args.sizes {
+        if roll < *weight {
+            return Some(*size);
+        }
+        roll -= weight;
+    }
+    args.sizes.last().map(|(s, _)| *s)
+}
+
+/// A deterministic number in `[0, 1)` for message `n` — SplitMix64 over the seed,
+/// the message number and a salt per decision, so a run is reproducible and each
+/// decision independent of the others.
+fn unit(seed: u64, n: u64, salt: u64) -> f64 {
+    let mut z = seed
+        .wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        .wrapping_add(salt.wrapping_mul(0xD1B5_4A32_D192_ED03));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// A client that trusts `path` (a PEM CA) or, for `os`, the platform store —
+/// the same lookup the server's `required_verify` routes use. A panic rather
+/// than a reported error: without trust there is no run to report on.
 fn connector(path: &str) -> tokio_rustls::TlsConnector {
     use rustls::pki_types::pem::PemObject;
-    let ca = rustls::pki_types::CertificateDer::from_pem_file(path)
-        .unwrap_or_else(|e| panic!("reading --ca {path}: {e}"));
     let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca).expect("--ca is not a usable trust anchor");
+    if path == "os" {
+        for cert in rustls_native_certs::load_native_certs().certs {
+            let _ = roots.add(cert);
+        }
+        assert!(!roots.is_empty(), "--ca os: the platform store is empty");
+    } else {
+        let ca = rustls::pki_types::CertificateDer::from_pem_file(path)
+            .unwrap_or_else(|e| panic!("reading --ca {path}: {e}"));
+        roots.add(ca).expect("--ca is not a usable trust anchor");
+    }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -232,40 +837,23 @@ fn connector(path: &str) -> tokio_rustls::TlsConnector {
     tokio_rustls::TlsConnector::from(Arc::new(config))
 }
 
-/// The message body, carrying one of everything the §4.3 assertions look for.
-fn message(args: &Args, recipient: &str) -> String {
-    format!(
-        "From: {}\r\n\
-         To: {recipient}\r\n\
-         Subject: {}\r\n\
-         Message-ID: <{}-{}@oldbrand.com>\r\n\
-         Return-Path: <bounces@oldbrand.com>\r\n\
-         X-Mailer: AcceptanceApp 1.0\r\n\
-         DKIM-Signature: v=1; a=rsa-sha256; d=oldbrand.com; s=s1; b=notarealsignature\r\n\
-         Authentication-Results: mx.oldbrand.com; spf=pass\r\n\
-         ARC-Seal: i=1; cv=none; d=oldbrand.com\r\n\
-         MIME-Version: 1.0\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         \r\n\
-         Your order has shipped.\r\n\
-         Track it at https://oldbrand.com/track\r\n\
-         .\r\n",
-        args.from_header,
-        args.subject,
-        args.tag,
-        recipient.split('@').next().unwrap_or("x"),
-    )
-}
-
 // ---------------------------------------------------------------------------
 // a very small SMTP client
 // ---------------------------------------------------------------------------
 
 async fn write(io: &mut BufReader<Stream>, s: &str) -> Result<(), String> {
+    write_bytes(io, s.as_bytes()).await
+}
+
+async fn write_bytes(io: &mut BufReader<Stream>, b: &[u8]) -> Result<(), String> {
     io.get_mut()
-        .write_all(s.as_bytes())
+        .write_all(b)
         .await
-        .map_err(|e| format!("write: {e}"))
+        .map_err(|e| format!("write: {e}"))?;
+    io.get_mut()
+        .flush()
+        .await
+        .map_err(|e| format!("flush: {e}"))
 }
 
 async fn read_line(io: &mut BufReader<Stream>) -> Result<String, String> {
@@ -278,35 +866,23 @@ async fn read_line(io: &mut BufReader<Stream>) -> Result<String, String> {
     }
 }
 
-/// Read one reply, following multi-line continuations.
+/// Read one reply, following multi-line continuations; the text is the last
+/// line's.
 async fn read_reply(io: &mut BufReader<Stream>) -> Result<(u16, String), String> {
     loop {
         let line = read_line(io).await?;
         let trimmed = line.trim_end();
-        if trimmed.len() < 4 {
+        if trimmed.len() < 3 {
             return Err(format!("short reply: {trimmed}"));
         }
         let code: u16 = trimmed[..3]
             .parse()
             .map_err(|_| format!("unparseable reply: {trimmed}"))?;
-        // `250-` continues, `250 ` ends.
-        if trimmed.as_bytes()[3] == b'-' {
+        if trimmed.as_bytes().get(3) == Some(&b'-') {
             continue;
         }
-        return Ok((code, trimmed[4..].to_string()));
+        return Ok((code, trimmed.get(4..).unwrap_or_default().to_string()));
     }
-}
-
-async fn read_multiline(io: &mut BufReader<Stream>, want: u16) -> Result<(), String> {
-    let (code, text) = read_reply(io).await?;
-    if code != want {
-        return Err(format!("expected {want}, got {code} {text}"));
-    }
-    Ok(())
-}
-
-async fn expect(io: &mut BufReader<Stream>, want: u16) -> Result<(), String> {
-    read_multiline(io, want).await
 }
 
 /// Base64 without a dependency — `base64` is a runtime dependency of the library
@@ -338,11 +914,19 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 fn json_string(s: &str) -> String {
-    let escaped = s
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t");
-    format!("\"{escaped}\"")
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
