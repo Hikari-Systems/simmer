@@ -2179,6 +2179,40 @@ which also bounds an implicit-TLS handshake — already stop a peer that never
 authenticates from holding a slot indefinitely. It becomes worth building the day
 Simmer listens somewhere `allowed_cidrs` cannot be tight.
 
+## The test programme (after phase 11)
+
+The plan is in `docs/TESTING.md` once it lands: six tiers — fast, end-to-end and a
+multi-server matrix, stress at 10x the ceilings, a 1 h / 24 h soak, fault injection,
+and deep generative testing — run nightly and on manual dispatch. Its step 0 was a
+defect found while planning it.
+
+### D-073 — CI builds the shipped image with `--target runtime`, and the acceptance suite gets its manual job
+
+**Found:** `.github/workflows/build.yml` ran `docker build` with no `--target`. The
+Dockerfile's last stage has been `acceptance` since phase 4 (D-042), whose entrypoint
+is `/app/loadgen`, and an unpinned build produces the last stage. **Every image CI
+pushed to GHCR since phase 4 — the `sha`, branch and `latest` tags — was the
+acceptance load generator, not the server.** `CLAUDE.md` and `docker-compose.yml`
+both warned that "a deployment pipeline would have to" pin the target; the pipeline
+in this repository did not. Nothing is deployed yet (STATE.md), so nothing ran the
+wrong image; the first deployment would have.
+
+**Decision:** `--target runtime` in `build.yml`, with a comment saying why.
+Verified by the entrypoint of the image CI pushes after this change
+(`docker image inspect … --format '{{.Config.Entrypoint}}'` → `[/app/server]`).
+
+**Also:** D-042 item 3 decided the acceptance suite would run on manual dispatch and
+never built the job. It is `.github/workflows/acceptance.yml`: `workflow_dispatch`
+only, a separate workflow so that dispatching it never builds or pushes an image,
+running exactly the two commands `docs/ACCEPTANCE.md` gives. `README.md` said "CI
+runs all of these" of a list that included the compose steps, which was never true;
+it now says which job runs what.
+
+**Why reordering the Dockerfile was not the fix:** putting `runtime` last would make
+the unpinned build correct, but it cannot be last — `acceptance` is `FROM runtime`, so
+it must come after it. Pinning the target is the only fix that keeps the stage graph,
+and it is the one every other builder already uses.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

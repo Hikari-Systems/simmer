@@ -484,9 +484,16 @@ same time, and a post-hoc increment passes every other test in the suite and fai
 that one. Nothing about the Docker build depends on it — the queries are checked
 at runtime, never by `query_as!` (see `CLAUDE.md`).
 
-CI runs all of these. Note this is *not* the house norm — the standard
-hikari-systems `build.yml` builds and pushes the image with no test or lint gate.
-Simmer adds one because its central correctness argument is a property test.
+CI's `check` job runs `fmt`, `clippy`, `cargo test` and `cargo deny` on every
+push. Note this is *not* the house norm — the standard hikari-systems `build.yml`
+builds and pushes the image with no test or lint gate. Simmer adds one because its
+central correctness argument is a property test. The compose steps do **not** run
+on push: the acceptance suite is the manually dispatched `acceptance.yml` workflow
+(D-042), so run `docker compose up -d --build` yourself before pushing.
+
+The image CI pushes is built with `--target runtime`. Anything else that builds the
+shipped image must pass it too — the Dockerfile's last stage is the acceptance
+loadgen, and an unpinned build produces that instead of the server (D-073).
 
 The `docker compose up` step is not ceremony: it is the only thing that exercises
 the privileged port-25 bind, the tmpfs the §8.1 buffer spills onto, and the

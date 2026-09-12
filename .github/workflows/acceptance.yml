@@ -1,0 +1,48 @@
+name: Acceptance (manual)
+
+# D-042 item 3: the §12.3 acceptance suite runs on manual dispatch, not on every
+# push — it builds the release image and restarts the app container once per
+# simulated day, which is minutes of work that a lint fix does not need. Decided in
+# phase 4 and not built until D-073.
+#
+# A separate workflow rather than a `workflow_dispatch` trigger on build.yml, so
+# that dispatching it never builds or pushes an image to GHCR.
+#
+# The nightly test programme (docs/TESTING.md, once it exists) will run this suite
+# on a schedule too; this job stays as the one-button way to run it on any branch.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  acceptance:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      # The host side is `cargo test --test acceptance`, which needs the test
+      # binary compiled; the same cache build.yml's check job writes serves it.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+
+      # Exactly the two commands README.md and docs/ACCEPTANCE.md give. `--wait`
+      # so the suite does not start against an app that is still migrating.
+      # tls-init runs first by dependency and mints the stack's certificate.
+      - name: Bring up the acceptance stack
+        run: docker compose --profile acceptance up -d --build --wait
+
+      - name: Run the acceptance suite
+        run: cargo test --locked --test acceptance -- --ignored --test-threads=1
+
+      - name: Compose logs
+        if: failure()
+        run: docker compose --profile acceptance logs --no-color --timestamps
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile acceptance down -v

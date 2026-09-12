@@ -147,9 +147,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
 
+      # `--target runtime` is load-bearing. The Dockerfile's last stage is
+      # `acceptance` (the loadgen, entrypoint /app/loadgen), and an unpinned
+      # `docker build` produces the *last* stage — so without this line every
+      # image pushed to GHCR since phase 4 was the load generator, not the
+      # server. CLAUDE.md and docker-compose.yml both say so; this is the
+      # deployment pipeline they were warning. See DECISIONS.md D-073.
       - name: Build and push to S3 registry
         run: |
-          docker build --platform linux/${{ matrix.platform }} \
+          docker build --platform linux/${{ matrix.platform }} --target runtime \
             -t localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }} .
           docker push localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }}
 

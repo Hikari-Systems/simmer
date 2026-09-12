@@ -1,0 +1,13 @@
+# actionlint knows GitHub-hosted runner labels only. Blacksmith runners register
+# under their own labels, so they are declared here rather than silenced per line.
+# Sizes from docs.blacksmith.sh (x64: 2/4/8/16/32 vCPU with 8/16/32/64/128 GB; arm:
+# 6/12/24/48/96 GB).
+self-hosted-runner:
+  labels:
+    - blacksmith-2vcpu-ubuntu-2404
+    - blacksmith-4vcpu-ubuntu-2404
+    - blacksmith-8vcpu-ubuntu-2404
+    - blacksmith-16vcpu-ubuntu-2404
+    - blacksmith-2vcpu-ubuntu-2404-arm
+    - blacksmith-4vcpu-ubuntu-2404-arm
+    - blacksmith-8vcpu-ubuntu-2404-arm
