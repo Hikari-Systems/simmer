@@ -23,17 +23,17 @@
 //! because the tests share one compose stack and one pair of traps, and two of
 //! them restart `app` underneath everything else.
 
-mod support;
+mod compose;
 
-use std::collections::BTreeMap;
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
 
+use compose::mail::header;
+use compose::stack::ACCEPTANCE;
+use compose::traps::{Trap, OVERFLOW, WARMING};
 use simmer::config::Config;
 
-const TRAP_WARMING: &str = "http://127.0.0.1:18025";
-const TRAP_OVERFLOW: &str = "http://127.0.0.1:18026";
+const TRAP_WARMING: Trap = WARMING;
+const TRAP_OVERFLOW: Trap = OVERFLOW;
 const ACCEPTANCE_CONFIG: &str = "simmer.acceptance.yaml";
 
 // ---------------------------------------------------------------------------
@@ -367,39 +367,54 @@ fn submission_on_587_is_verified_tls_and_refuses_plaintext_auth() {
 ///   the two runs are distinguishable, and the receiving server writes its own
 ///   `Return-Path`. Neither is Simmer's output.
 fn comparable(raw: &str) -> Vec<String> {
-    const EXCLUDED: [&str; 6] = [
-        "reply-to",
-        "received",
-        "message-id",
-        "list-unsubscribe",
-        "to",
-        "return-path",
-    ];
-
-    let mut out = Vec::new();
-    let mut skipping = false;
-    for line in raw.replace("\r\n", "\n").lines() {
-        let continuation = line.starts_with(' ') || line.starts_with('\t');
-        if continuation {
-            if !skipping {
-                out.push(line.to_string());
-            }
-            continue;
-        }
-        skipping = line
-            .split_once(':')
-            .map(|(name, _)| EXCLUDED.contains(&name.to_ascii_lowercase().as_str()))
-            .unwrap_or(false);
-        if !skipping {
-            out.push(line.to_string());
-        }
-    }
-    out
+    compose::mail::without_headers(
+        raw,
+        &[
+            "reply-to",
+            "received",
+            "message-id",
+            "list-unsubscribe",
+            "to",
+            "return-path",
+        ],
+    )
 }
 
 // ---------------------------------------------------------------------------
 // driving the stack
 // ---------------------------------------------------------------------------
+
+// The helpers below are the shared compose harness (`tests/compose/`), named as
+// this suite always named them so its tests read unchanged.
+
+fn compose() -> Command {
+    ACCEPTANCE.compose()
+}
+
+fn restart_app_at_day(day: usize) {
+    ACCEPTANCE.restart_app_at_day(day);
+}
+
+fn reset_quota() {
+    ACCEPTANCE.reset_quota();
+}
+
+fn reset_traps() {
+    TRAP_WARMING.reset();
+    TRAP_OVERFLOW.reset();
+}
+
+fn wait_for_count(trap: Trap, want: usize) -> usize {
+    trap.wait_for_count(want)
+}
+
+fn raw_messages(trap: Trap) -> Vec<String> {
+    trap.raw_messages()
+}
+
+fn return_paths(trap: Trap) -> Vec<String> {
+    trap.return_paths()
+}
 
 /// The warming route's schedule, read from the same file Simmer reads.
 ///
@@ -459,48 +474,6 @@ fn load_acceptance_config() -> Config {
     })
 }
 
-/// Move `warmup.started` back by `day` days and re-create the container.
-///
-/// The `- 1h` is not decoration: landing exactly on a day boundary makes the
-/// test a race against its own clock.
-fn restart_app_at_day(day: usize) {
-    let started =
-        chrono::Utc::now() - chrono::Duration::days(day as i64) - chrono::Duration::hours(1);
-
-    *warmup_started().lock().expect("lock") =
-        started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-    let status = compose()
-        .args(["up", "-d", "--force-recreate", "--wait", "app"])
-        .status()
-        .expect("docker compose up");
-    assert!(status.success(), "failed to restart app at day {day}");
-}
-
-/// The `warmup.started` the `app` container is currently running with.
-///
-/// Held here rather than passed at each call site because **every** compose
-/// invocation has to carry it. Compose re-renders the whole file on every
-/// command, and a command that renders `app` differently from the running
-/// container will recreate it — so a `docker compose run loadgen` without this
-/// variable silently resets the ramp to the compose default mid-test, and the
-/// suite then measures the wrong day while looking like it worked.
-fn warmup_started() -> &'static Mutex<String> {
-    static STARTED: OnceLock<Mutex<String>> = OnceLock::new();
-    STARTED.get_or_init(|| Mutex::new(String::new()))
-}
-
-fn compose() -> Command {
-    let mut c = Command::new("docker");
-    c.args(["compose", "--profile", "acceptance"]);
-    c.env("SIMMER_CONFIG", "/app/simmer.acceptance.yaml");
-    let started = warmup_started().lock().expect("lock").clone();
-    if !started.is_empty() {
-        c.env("SIMMER_WARMUP_STARTED", started);
-    }
-    c
-}
-
 /// Run the loadgen inside the compose network and parse its JSON.
 fn loadgen(extra: &[&str]) -> Vec<LoadgenReply> {
     let mut cmd = compose();
@@ -538,159 +511,6 @@ struct LoadgenReply {
 // ---------------------------------------------------------------------------
 // the traps
 // ---------------------------------------------------------------------------
-
-/// Truncate the quota tables.
-///
-/// The exact analogue of `reset_traps`, and needed for the same reason. Quota
-/// state lives in Postgres and outlives a container restart by design (§7.4), so
-/// a test that re-uses a simulated day another test has already spent finds the
-/// allowance gone and watches every message fall through to overflow — which
-/// looks precisely like a routing bug. The suite owns this database.
-fn reset_quota() {
-    let out = Command::new("docker")
-        .args(["compose", "exec", "-T", "simmer-db"])
-        .args([
-            "psql",
-            "-U",
-            "simmer",
-            "-d",
-            "simmer",
-            "-q",
-            "-c",
-            "truncate quota_usage, quota_reservation, route_state;",
-        ])
-        .output()
-        .expect("psql");
-    assert!(
-        out.status.success(),
-        "failed to reset quota state: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn reset_traps() {
-    for trap in [TRAP_WARMING, TRAP_OVERFLOW] {
-        let out = Command::new("curl")
-            .args(["-sf", "-X", "DELETE", &format!("{trap}/api/v1/messages")])
-            .output()
-            .expect("curl");
-        assert!(out.status.success(), "failed to reset {trap}");
-    }
-    // `ACCEPTANCE.md` §6: reset between simulated days, or day 3's assertions
-    // see day 2's mail.
-    for trap in [TRAP_WARMING, TRAP_OVERFLOW] {
-        assert_eq!(count(trap), 0, "{trap} did not reset");
-    }
-}
-
-fn count(trap: &str) -> usize {
-    let body = get(&format!("{trap}/api/v1/messages?limit=1"));
-    let v: serde_json::Value = serde_json::from_str(&body).expect("trap JSON");
-    v["total"].as_u64().expect("total") as usize
-}
-
-/// Poll until the count reaches `want` and then stops moving.
-///
-/// **Never sleep a fixed interval** — `ACCEPTANCE.md` §6 names this as the single
-/// most likely source of flakes. Waiting for the count to be *stable* rather than
-/// merely correct is what catches an off-by-one that arrives late: a run that
-/// should deliver 5 and delivers 6 would otherwise pass by being read at the
-/// right moment.
-fn wait_for_count(trap: &str, want: usize) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let mut last = count(trap);
-    let mut stable_since = Instant::now();
-
-    loop {
-        std::thread::sleep(Duration::from_millis(200));
-        let now = count(trap);
-        if now != last {
-            last = now;
-            stable_since = Instant::now();
-        } else if now == want && stable_since.elapsed() > Duration::from_secs(2) {
-            return now;
-        } else if stable_since.elapsed() > Duration::from_secs(10) {
-            // Settled on the wrong number. Return it; the caller's assertion
-            // says what was expected far better than a timeout message would.
-            return now;
-        }
-
-        if Instant::now() > deadline {
-            return now;
-        }
-    }
-}
-
-fn message_ids(trap: &str) -> Vec<String> {
-    let body = get(&format!("{trap}/api/v1/messages?limit=500"));
-    let v: serde_json::Value = serde_json::from_str(&body).expect("trap JSON");
-    v["messages"]
-        .as_array()
-        .expect("messages")
-        .iter()
-        .map(|m| m["ID"].as_str().expect("ID").to_string())
-        .collect()
-}
-
-/// Every message's raw source, exactly as the receiving server stored it.
-fn raw_messages(trap: &str) -> Vec<String> {
-    message_ids(trap)
-        .iter()
-        .map(|id| get(&format!("{trap}/api/v1/message/{id}/raw")))
-        .collect()
-}
-
-/// The envelope sender each message arrived with, per the trap's own record —
-/// not per a header Simmer wrote.
-fn return_paths(trap: &str) -> Vec<String> {
-    message_ids(trap)
-        .iter()
-        .map(|id| {
-            let body = get(&format!("{trap}/api/v1/message/{id}"));
-            let v: serde_json::Value = serde_json::from_str(&body).expect("trap JSON");
-            v["ReturnPath"].as_str().unwrap_or_default().to_string()
-        })
-        .collect()
-}
-
-fn get(url: &str) -> String {
-    let out = Command::new("curl")
-        .args(["-sf", url])
-        .output()
-        .expect("curl");
-    assert!(out.status.success(), "GET {url} failed");
-    String::from_utf8_lossy(&out.stdout).to_string()
-}
-
-/// The unfolded value of a header in a raw message.
-fn header(raw: &str, name: &str) -> Option<String> {
-    let mut headers: BTreeMap<String, String> = BTreeMap::new();
-    let mut current: Option<(String, String)> = None;
-
-    for line in raw.replace("\r\n", "\n").lines() {
-        if line.is_empty() {
-            break;
-        }
-        if line.starts_with(' ') || line.starts_with('\t') {
-            if let Some((_, v)) = current.as_mut() {
-                v.push(' ');
-                v.push_str(line.trim());
-            }
-            continue;
-        }
-        if let Some((k, v)) = current.take() {
-            headers.entry(k).or_insert(v);
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            current = Some((k.to_ascii_lowercase(), v.trim().to_string()));
-        }
-    }
-    if let Some((k, v)) = current.take() {
-        headers.entry(k).or_insert(v);
-    }
-
-    headers.get(&name.to_ascii_lowercase()).cloned()
-}
 
 // ---------------------------------------------------------------------------
 // the one test that needs no Docker
