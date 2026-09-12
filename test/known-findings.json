@@ -31,13 +31,5 @@
       "no mechanism available"
     ],
     "note": "Outbound AUTH is always PLAIN (src/downstream/client.rs): a downstream offering only LOGIN answers 535 and Simmer defers 451 on every retry. Observed against postfix-login-only in the T2 matrix."
-  },
-  {
-    "id": "F14",
-    "check": "t2/matrix/helo-name",
-    "because": [
-      "not its server.hostname"
-    ],
-    "note": "The outbound EHLO names the downstream's own host (src/downstream/client.rs `ehlo(&ds.host)`), not server.hostname (SPEC §4.1: the EHLO identity). A downstream that rejects clients claiming its own name defers every message 451 (D-023). Observed in every Postfix Received: header in the T2 matrix."
   }
 ]

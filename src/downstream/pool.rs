@@ -185,6 +185,7 @@ impl RoutePool {
         self: &Arc<Self>,
         route: &Route,
         tls: &TlsConfigs,
+        hostname: &str,
     ) -> Result<Checkout, RelayError> {
         // §8.4 gives no budget for "waiting for a peer of yours to finish", and
         // the connect budget is the closest thing with the right meaning: it is
@@ -228,7 +229,7 @@ impl RoutePool {
             return Ok(self.checked_out(permit, conn, idle.messages, true));
         }
 
-        let conn = Connection::open(route, tls, &self.budget).await?;
+        let conn = Connection::open(route, tls, hostname, &self.budget).await?;
         self.opened.fetch_add(1, Ordering::Relaxed);
         Ok(self.checked_out(permit, conn, 0, false))
     }
@@ -312,6 +313,7 @@ impl Checkout {
         &mut self,
         route: &Route,
         tls: &TlsConfigs,
+        hostname: &str,
     ) -> Result<(), RelayError> {
         // Dropped rather than QUIT: it has already failed to answer once, and
         // spending another command budget asking it to say goodbye delays a
@@ -319,7 +321,7 @@ impl Checkout {
         self.conn = None;
         self.pool.discarded.fetch_add(1, Ordering::Relaxed);
 
-        self.conn = Some(Connection::open(route, tls, &self.pool.budget).await?);
+        self.conn = Some(Connection::open(route, tls, hostname, &self.pool.budget).await?);
         self.pool.opened.fetch_add(1, Ordering::Relaxed);
         self.messages = 0;
         self.reused = false;
@@ -517,7 +519,11 @@ routes:
             .expect("held");
 
         let (tls, _) = TlsConfigs::load().expect("tls");
-        let err = pool.checkout(&r, &tls).await.err().expect("must fail");
+        let err = pool
+            .checkout(&r, &tls, "simmer.test")
+            .await
+            .err()
+            .expect("must fail");
         assert!(
             matches!(err, RelayError::PoolExhausted),
             "expected PoolExhausted, got {err:?}"
@@ -534,7 +540,7 @@ routes:
         let (tls, _) = TlsConfigs::load().expect("tls");
         assert!(
             matches!(
-                pool.checkout(&r, &tls).await,
+                pool.checkout(&r, &tls, "simmer.test").await,
                 Err(RelayError::PoolExhausted)
             ),
             "a drained pool must not open a new connection during shutdown"

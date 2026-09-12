@@ -153,36 +153,32 @@ fn every_inbound_mode_reaches_a_real_mta() {
 #[ignore = "needs the matrix compose profile"]
 fn simmer_introduces_itself_by_its_own_name() {
     // §4.1: `server.hostname` is Simmer's EHLO identity, and RFC 5321 §4.1.1.1
-    // wants the client's own name there. Postfix records the name it was given
-    // as the `from` of its Received: header.
+    // wants the client's own name there — finding F14 (D-077) was the
+    // downstream's own name in that slot. Postfix records the name it was given
+    // as the `from` of its Received:, and records the *last* one, so the TLS
+    // route checks the EHLO Simmer re-issues after STARTTLS.
     let _logs = MATRIX.logs_on_failure();
     traps::MATRIX.reset();
 
-    let replies = send("plain", "helo", 1, &[]);
-    assert!(replies.iter().all(|r| r.code == 250), "{replies:?}");
-    assert_eq!(traps::MATRIX.wait_for_count(1), 1);
-    let raw = traps::MATRIX.raw_messages().remove(0);
-    let received = postfix_received(&raw, "postfix-plain")
-        .unwrap_or_else(|| panic!("no Received: from postfix-plain:\n{raw}"));
-    // "Received: from <EHLO name> (<reverse DNS> [<address>]) by postfix-plain …"
-    let helo = received
-        .trim_start_matches("Received:")
-        .trim()
-        .strip_prefix("from ")
-        .and_then(|rest| rest.split_whitespace().next())
-        .unwrap_or_default()
-        .to_string();
-
-    judge(
-        "t2/matrix/helo-name",
-        if helo == "simmer.acceptance" {
-            Ok(())
-        } else {
-            Err(format!(
-                "Simmer's EHLO named {helo:?}, not its server.hostname simmer.acceptance"
-            ))
-        },
-    );
+    for domain in ["plain", "tls"] {
+        let replies = send(domain, &format!("helo-{domain}"), 1, &[]);
+        assert!(replies.iter().all(|r| r.code == 250), "{replies:?}");
+    }
+    assert_eq!(traps::MATRIX.wait_for_count(2), 2);
+    for raw in traps::MATRIX.raw_messages() {
+        let route =
+            header(&raw, "X-Simmer-Route").unwrap_or_else(|| panic!("no X-Simmer-Route:\n{raw}"));
+        let received = postfix_received(&raw, &route)
+            .unwrap_or_else(|| panic!("no Received: from {route}:\n{raw}"));
+        // "Received: from <EHLO name> (<reverse DNS> [<address>]) by <server> …"
+        let helo = received
+            .trim_start_matches("Received:")
+            .trim()
+            .strip_prefix("from ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_default();
+        assert_eq!(helo, "simmer.acceptance", "{route}: {received}");
+    }
 }
 
 // ---------------------------------------------------------------------------

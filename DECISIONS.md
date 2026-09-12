@@ -2288,6 +2288,26 @@ The scrape handler keeps its own call, which is harmless. Verified by the soak's
 comparison of a scraped and a never-scraped instance, which is the only place it is
 observable; there is no cheap deterministic test for it.
 
+### D-077 — The outbound `EHLO` names Simmer, not the downstream (finding F14)
+
+**Found:** by the T2 server matrix. Every Postfix `Received:` header gave the
+downstream's own host as the client's name: `downstream/client.rs` sent
+`EHLO {downstream.host}` on connect and again after `STARTTLS`. §4.1 gives
+`server.hostname` as Simmer's identity — "EHLO banner, Received headers,
+certificate name" — and RFC 5321 §4.1.1.1 wants the client's own name in that slot.
+A receiving MTA that refuses a client claiming to be itself, a common anti-forgery
+rule, would refuse at `EHLO`, which D-023 turns into a `451` for every message on
+the route, indefinitely. Postal, the production downstream, would have been
+greeted with its own name.
+
+**Decision:** both `EHLO`s send `server.hostname`, threaded from `relay` through
+the pool's checkout and reopen into `Connection::open`. `deliver` loses the
+hostname parameter it had never used, since the name is spent before the envelope.
+Nothing is configurable: there is one identity to present, and §4.1 already names
+it. Tested in-process (`tests/pool.rs`: every `EHLO` the fake downstream receives)
+and live (`tests/e2e_matrix.rs`: Postfix's `Received:` on a plaintext route and on
+a `STARTTLS` route, where the name that counts is the second `EHLO`).
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

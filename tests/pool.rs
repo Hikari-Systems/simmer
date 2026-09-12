@@ -112,6 +112,37 @@ async fn a_reused_connection_is_reset_between_messages() {
 }
 
 #[tokio::test]
+async fn simmer_greets_the_downstream_by_its_own_hostname() {
+    // Finding F14 (D-077): §4.1's `server.hostname` is Simmer's EHLO identity,
+    // outbound as well as in. The downstream's own name in that slot is the
+    // spoof an anti-forgery rule refuses, and a refusal at EHLO is D-023's 451
+    // for every message on the route.
+    let down = FakeDownstream::start(Script::default()).await;
+    let simmer = Simmer::start(&config_with_pool(
+        down.addr,
+        "pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }",
+    ))
+    .await;
+
+    let mut client = simmer.connect().await;
+    client.hello().await;
+    assert_eq!(
+        client
+            .deliver("a@oldbrand.com", "b@example.com", "Subject: x\r\n\r\nb\r\n")
+            .await
+            .code,
+        250
+    );
+
+    let ehlos: Vec<String> = down
+        .commands()
+        .into_iter()
+        .filter(|c| c.to_ascii_uppercase().starts_with("EHLO"))
+        .collect();
+    assert_eq!(ehlos, ["EHLO simmer.test"], "{:?}", down.commands());
+}
+
+#[tokio::test]
 async fn max_messages_per_connection_retires_the_connection() {
     // §8.3's third knob. Two messages per connection, four messages, so the
     // second and fourth retire theirs and the downstream sees two connections.

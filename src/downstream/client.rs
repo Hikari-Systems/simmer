@@ -129,9 +129,9 @@ pub async fn relay(
 ) -> Result<Delivered, RelayError> {
     let pool = pools.for_route(route);
     let budget = pool.budget();
-    let mut checkout = pool.checkout(route, tls).await?;
+    let mut checkout = pool.checkout(route, tls, hostname).await?;
 
-    let mut result = checkout.conn().deliver(hostname, message, budget).await;
+    let mut result = checkout.conn().deliver(message, budget).await;
 
     // The one retry, and the exact shape of it matters.
     //
@@ -157,8 +157,8 @@ pub async fn relay(
             "pooled connection was dead on reuse; retrying once on a fresh connection"
         );
         metrics::pool_retry(&route.name);
-        checkout.reopen(route, tls).await?;
-        result = checkout.conn().deliver(hostname, message, budget).await;
+        checkout.reopen(route, tls, hostname).await?;
+        result = checkout.conn().deliver(message, budget).await;
     }
 
     checkout.release(reusable(&result)).await;
@@ -195,9 +195,12 @@ pub(super) struct Connection {
 }
 
 impl Connection {
+    /// `hostname` is Simmer's own `server.hostname`: the name both `EHLO`s give
+    /// (D-077). Never the downstream's.
     pub(super) async fn open(
         route: &Route,
         tls: &TlsConfigs,
+        hostname: &str,
         budget: &Budget,
     ) -> Result<Connection, RelayError> {
         let ds = &route.downstream;
@@ -229,11 +232,11 @@ impl Connection {
                 });
             }
 
-            conn.caps = conn.ehlo(&ds.host, budget).await?;
+            conn.caps = conn.ehlo(hostname, budget).await?;
 
             let wants_tls = allow_starttls && ds.tls != TlsMode::Off;
             if wants_tls {
-                match conn.try_starttls(route, tls, budget).await {
+                match conn.try_starttls(route, tls, hostname, budget).await {
                     Ok(true) => {}
                     // Not advertised.
                     Ok(false) => match ds.tls {
@@ -268,8 +271,8 @@ impl Connection {
         }
     }
 
-    async fn ehlo(&mut self, host: &str, budget: &Budget) -> Result<WireReply, RelayError> {
-        self.write(&format!("EHLO {host}\r\n"), Stage::Ehlo, budget.command)
+    async fn ehlo(&mut self, hostname: &str, budget: &Budget) -> Result<WireReply, RelayError> {
+        self.write(&format!("EHLO {hostname}\r\n"), Stage::Ehlo, budget.command)
             .await?;
         let reply = self.read_reply(Stage::Ehlo, budget.command).await?;
         if !reply.is_positive() {
@@ -288,6 +291,7 @@ impl Connection {
         &mut self,
         route: &Route,
         tls: &TlsConfigs,
+        hostname: &str,
         budget: &Budget,
     ) -> Result<bool, RelayError> {
         if !self.caps.advertises("STARTTLS") {
@@ -333,7 +337,7 @@ impl Connection {
         // RFC 3207 §4.2: the client MUST discard knowledge from the previous
         // EHLO and re-issue it. A downstream can legitimately advertise AUTH
         // only after the channel is encrypted.
-        self.caps = self.ehlo(&route.downstream.host, budget).await?;
+        self.caps = self.ehlo(hostname, budget).await?;
         Ok(true)
     }
 
@@ -373,7 +377,6 @@ impl Connection {
 
     pub(super) async fn deliver(
         &mut self,
-        _hostname: &str,
         message: &Message<'_>,
         budget: &Budget,
     ) -> Result<Delivered, RelayError> {
