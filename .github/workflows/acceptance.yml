@@ -30,12 +30,19 @@ jobs:
         with:
           save-if: false
 
-      # Exactly the commands README.md and docs/ACCEPTANCE.md give, override file
-      # included (it carries the test CA's OS trust store). `--wait`
-      # so the suite does not start against an app that is still migrating.
-      # tls-init runs first by dependency and mints the stack's certificate.
+      # The images first — app, tls-init and the loadgen — then only the
+      # long-running services. `up --wait` fails on any container that exits,
+      # even with 0, unless another service depends on it: tls-init is a
+      # completed dependency of app and is fine, but the one-shot loadgen is not,
+      # and a whole-project `up --wait` failed this step with everything healthy
+      # ("container simmer-loadgen-1 exited (0)"). The suite runs the loadgen
+      # itself, with `compose run`, so it only needs to be built here.
+      # Override file included: it carries the test CA's OS trust store.
+      - name: Build the acceptance images
+        run: docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance build
+
       - name: Bring up the acceptance stack
-        run: docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance up -d --build --wait
+        run: docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance up -d --wait app trap-warming trap-overflow
 
       - name: Run the acceptance suite
         run: cargo test --locked --test acceptance -- --ignored --test-threads=1
