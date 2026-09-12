@@ -13,6 +13,8 @@
 //! file costs about a second and is the only thing that makes an equality
 //! assertion on a gauge mean anything.
 
+mod support;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -518,4 +520,55 @@ async fn no_scrape_exposes_a_recipient(pool: PgPool) {
     let (_, body) = scrape(&state).await;
     assert!(!body.contains('@'), "{body}");
     assert!(!body.contains("recipient_hash"), "{body}");
+}
+
+/// **F7** — `simmer_unmatched_sender_total{domain}` takes its label from the
+/// client.
+///
+/// `relay.rs` passes the unmatched sender's domain — from `From:`, else the
+/// envelope — straight into the label, and a Prometheus series never expires in
+/// this exporter. Two hundred distinct domains are two hundred series held for
+/// the life of the process, and nothing but the ACL (D-071) bounds how many a
+/// client can mint: an `auth: optional` listener, like this fixture's, bounds
+/// nothing. Capping the label is a divergence from §9.1, which names it, so the
+/// fix needs the spec author; until then this stays pinned. See
+/// `tests/findings.rs` for how `xfail` works.
+#[tokio::test]
+async fn f7_unmatched_sender_series_are_bounded() {
+    let _serial = exclusive().await;
+    let prometheus = handle();
+
+    support::xfail("F7", &["series after"], async move {
+        const DOMAINS: usize = 200;
+        const ALLOWED_SERIES: usize = 50;
+
+        let down = support::FakeDownstream::start(support::Script::default()).await;
+        let simmer = support::Simmer::start(&support::config_for(down.addr, "")).await;
+        let mut c = simmer.connect().await;
+        c.hello().await;
+        for i in 0..DOMAINS {
+            let sender = format!("x@d{i}.unmatched.test");
+            let r = c
+                .deliver(
+                    &sender,
+                    "bob@example.net",
+                    &format!("From: {sender}\r\nSubject: {i}\r\n\r\nhi\r\n"),
+                )
+                .await;
+            assert_eq!(r.code, 250, "message {i}: {r:?}");
+        }
+
+        let body = prometheus.render();
+        let series = body
+            .lines()
+            .filter(|l| l.starts_with("simmer_unmatched_sender_total{"))
+            .filter(|l| l.contains(".unmatched.test"))
+            .count();
+        assert!(
+            series <= ALLOWED_SERIES,
+            "{series} simmer_unmatched_sender_total series after {DOMAINS} distinct sender \
+             domains; the label is client-controlled"
+        );
+    })
+    .await;
 }

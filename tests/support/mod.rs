@@ -9,7 +9,9 @@
 #![allow(dead_code)] // each integration test file uses a different subset
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -76,6 +78,12 @@ pub struct Script {
     /// looking healthy and is dead by the time the next message picks it up —
     /// precisely the case a `NOOP` on checkout cannot catch inside its threshold.
     pub close_after_rset: bool,
+    /// Record the message, *then* wait this long before answering the final dot.
+    ///
+    /// The shape §10.2 is about: the downstream has the message and the reply is
+    /// late. It also holds the connection busy, which is what the pool-bound tests
+    /// need to make concurrency observable from this side.
+    pub final_dot_delay: Option<Duration>,
 }
 
 impl Default for Script {
@@ -96,6 +104,7 @@ impl Default for Script {
             ],
             drop_mid_data: false,
             close_after_rset: false,
+            final_dot_delay: None,
         }
     }
 }
@@ -128,6 +137,11 @@ pub struct FakeDownstream {
     connections: Arc<Mutex<usize>>,
     /// Every command line, across every connection, in order.
     commands: Arc<Mutex<Vec<String>>>,
+    /// Connections open right now, and the most ever open at once. §8.3's bound
+    /// is a claim about *concurrent* connections, which the lifetime count above
+    /// cannot see.
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 impl FakeDownstream {
@@ -138,20 +152,28 @@ impl FakeDownstream {
         let connections = Arc::new(Mutex::new(0usize));
         let commands = Arc::new(Mutex::new(Vec::new()));
 
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
         let sink = Arc::clone(&received);
         let counter = Arc::clone(&connections);
         let log = Arc::clone(&commands);
+        let (open, most) = (Arc::clone(&active), Arc::clone(&peak));
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
                 *counter.lock().expect("not poisoned") += 1;
+                let now = open.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
                 let script = script.clone();
                 let sink = Arc::clone(&sink);
                 let log = Arc::clone(&log);
+                let open = Arc::clone(&open);
                 tokio::spawn(async move {
                     let _ = serve_one(stream, script, sink, log).await;
+                    open.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
@@ -161,7 +183,19 @@ impl FakeDownstream {
             received,
             connections,
             commands,
+            active,
+            peak,
         }
+    }
+
+    /// The most connections this downstream has ever had open at once.
+    pub fn peak_connections(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+
+    /// Connections open right now.
+    pub fn open_connections(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
     }
 
     /// How many TCP connections have been accepted.
@@ -318,6 +352,9 @@ async fn serve_one(
             if matches!(script.final_dot, Act::Ok) {
                 sink.lock().expect("not poisoned").push(seen.clone());
             }
+            if let Some(delay) = script.final_dot_delay {
+                tokio::time::sleep(delay).await;
+            }
             act!(script.final_dot, "250 2.0.0 queued as ABC123\r\n");
             seen = Received::default();
         } else if upper.starts_with("QUIT") {
@@ -373,6 +410,9 @@ pub struct Simmer {
     /// §8.3's pools, so a test can read the statistics §9.2 reports and drive
     /// §10.4's drain without a process to signal.
     pub pools: Arc<simmer::downstream::Pool>,
+    /// §10.4's in-flight reservations — the engine's own registry, so a test can
+    /// assert that every reservation a relay took was resolved.
+    pub registry: ReservationRegistry,
     stop: smtp::Shutdown,
     hard: smtp::Shutdown,
 }
@@ -415,12 +455,13 @@ impl Simmer {
             .unwrap_or_else(|e| panic!("test config's templates do not compile: {e:?}"));
 
         let pools = Arc::new(simmer::downstream::Pool::build(&config));
+        let registry = ReservationRegistry::new();
         let engine = Engine {
             config: Arc::new(config),
             tls: Arc::new(tls),
             pools: Arc::clone(&pools),
             quota,
-            registry: ReservationRegistry::new(),
+            registry: registry.clone(),
             rewriters: Arc::new(rewriters),
             frequency: Arc::new(Frequency::new()),
             preflight,
@@ -443,6 +484,7 @@ impl Simmer {
             addr,
             addrs,
             pools,
+            registry,
             stop,
             hard,
         }
@@ -1029,5 +1071,56 @@ impl TestPki {
             .with_root_certificates(roots)
             .with_no_client_auth();
         tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Known findings
+// ---------------------------------------------------------------------------
+
+/// Run a check that a *known, not yet fixed* defect is expected to fail.
+///
+/// The test-programme counterpart of `test/known-findings.toml`, for `cargo
+/// test`. `#[ignore]` would hide the defect and, worse, hide its fix: nobody
+/// notices an ignored test start passing. This runs the check every time and
+/// inverts the verdict:
+///
+/// - the check **panics** → the defect is still there → the test passes, and
+///   says `XFAIL` on stderr;
+/// - the check **passes** → the defect looks fixed → the test fails with
+///   `XPASS`, so the fixing commit has to delete the marker and turn the check
+///   into an ordinary test.
+///
+/// `finding` is the id from the test programme's findings table (`F1`, `F2`, …).
+///
+/// `because` lists the failure messages the defect produces, and a panic counts
+/// as `XFAIL` only if its message contains one of them. Without that, a check
+/// broken for an unrelated reason — a typo, a harness fault, a changed reply —
+/// would be reported as "known defect still present" and hide itself. A panic
+/// with any other message fails the test as a wrong-reason failure.
+pub async fn xfail<F>(finding: &str, because: &[&str], check: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    match tokio::spawn(check).await {
+        Err(e) if e.is_panic() => {
+            let payload = e.into_panic();
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(
+                because.iter().any(|b| message.contains(b)),
+                "{finding}: the check failed, but not for the known reason — expected one \
+                 of {because:?}, got: {message}"
+            );
+            eprintln!("XFAIL {finding}: the known defect is still present ({message})");
+        }
+        Err(e) => panic!("{finding}: the check did not complete: {e}"),
+        Ok(()) => panic!(
+            "XPASS {finding}: the check now passes, so the defect looks fixed. Remove the \
+             xfail marker (and its test/known-findings.toml entry) in the fixing commit"
+        ),
     }
 }
