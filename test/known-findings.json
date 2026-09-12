@@ -2,19 +2,42 @@
   {
     "id": "F1",
     "check": "stress/S8a/memory",
-    "because": ["anon memory grew by"],
+    "because": [
+      "anon memory grew by"
+    ],
     "note": "A DATA line with no LF is buffered whole (src/smtp/session.rs read_until without take). Also pinned in cargo test: tests/finding_f1_data_line.rs."
   },
   {
     "id": "F2",
     "check": "stress/S9/reservations",
-    "because": ["reservations_in_flight", "stored but answered"],
+    "because": [
+      "reservations_in_flight",
+      "stored but answered"
+    ],
     "note": "timeouts.session cancels an in-flight relay: duplicate on retry, uncommitted delivery, leaked registry entry. Also pinned in cargo test: tests/findings.rs."
   },
   {
     "id": "F7",
     "check": "soak/V3/metric-series",
-    "because": ["metric series grew"],
+    "because": [
+      "metric series grew"
+    ],
     "note": "simmer_unmatched_sender_total{domain} is client-controlled. Capping it diverges from SPEC.md §9.1 and needs the spec author. Also pinned in cargo test: tests/metrics_endpoint.rs."
+  },
+  {
+    "id": "F9",
+    "check": "t2/matrix/login-only",
+    "because": [
+      "no mechanism available"
+    ],
+    "note": "Outbound AUTH is always PLAIN (src/downstream/client.rs): a downstream offering only LOGIN answers 535 and Simmer defers 451 on every retry. Observed against postfix-login-only in the T2 matrix."
+  },
+  {
+    "id": "F14",
+    "check": "t2/matrix/helo-name",
+    "because": [
+      "not its server.hostname"
+    ],
+    "note": "The outbound EHLO names the downstream's own host (src/downstream/client.rs `ehlo(&ds.host)`), not server.hostname (SPEC §4.1: the EHLO identity). A downstream that rejects clients claiming its own name defers every message 451 (D-023). Observed in every Postfix Received: header in the T2 matrix."
   }
 ]

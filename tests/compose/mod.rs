@@ -9,6 +9,7 @@
 //!
 //! - [`stack`] — one compose stack, and every command against it.
 //! - [`configs`] — a tier's Simmer config, loaded and validated on the host.
+//! - [`loadgen`] — sending, through the loadgen inside the stack's network.
 //! - [`traps`] — reading Mailpit.
 //! - [`mail`] — parsing what arrived.
 //! - [`findings`] — `test/known-findings.json`, XFAIL and XPASS for these tiers.
@@ -21,6 +22,7 @@
 pub mod configs;
 pub mod findings;
 pub mod leak;
+pub mod loadgen;
 pub mod mail;
 pub mod reconcile;
 pub mod stack;

@@ -125,6 +125,20 @@ impl Trap {
             })
             .collect()
     }
+
+    /// Every message as `(envelope sender, raw source)`, both read per id so the
+    /// pairs cannot be mismatched by a message arriving between two listings.
+    pub fn envelopes(self) -> Vec<(String, String)> {
+        self.message_ids()
+            .iter()
+            .map(|id| {
+                let v = json(&get(&format!("{}/api/v1/message/{id}", self.base)));
+                let return_path = v["ReturnPath"].as_str().unwrap_or_default().to_string();
+                let raw = get(&format!("{}/api/v1/message/{id}/raw", self.base));
+                (return_path, raw)
+            })
+            .collect()
+    }
 }
 
 pub fn get(url: &str) -> String {

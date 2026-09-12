@@ -25,6 +25,7 @@
 
 mod compose;
 
+use compose::loadgen::Reply as LoadgenReply;
 use compose::mail::header;
 use compose::stack::{Stack, ACCEPTANCE, ACCEPTANCE_UNTRUSTED};
 use compose::traps::{Trap, OVERFLOW, WARMING};
@@ -533,36 +534,7 @@ fn loadgen(extra: &[&str]) -> Vec<LoadgenReply> {
 /// [`loadgen`] through a particular stack — the untrusted one, for negative
 /// controls.
 fn loadgen_via(stack: &Stack, extra: &[&str]) -> Vec<LoadgenReply> {
-    let mut cmd = stack.compose();
-    // `--no-deps`: the loadgen declares `depends_on: app`, and resolving that
-    // dependency is enough to make compose reconcile `app` against a freshly
-    // rendered config. `restart_app_at_day` has already waited for it to be
-    // healthy; nothing here needs compose to check again.
-    cmd.args(["run", "--rm", "--no-deps", "--no-TTY", "loadgen"])
-        .args(["--host", "app", "--port", "25"])
-        .args(extra);
-
-    let out = cmd.output().expect("docker compose run loadgen");
-    assert!(
-        out.status.success(),
-        "loadgen failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let json = stdout
-        .lines()
-        .find(|l| l.starts_with('['))
-        .unwrap_or_else(|| panic!("no JSON in loadgen output:\n{stdout}"));
-    serde_json::from_str(json).unwrap_or_else(|e| panic!("loadgen JSON: {e}\n{json}"))
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct LoadgenReply {
-    #[allow(dead_code)]
-    recipient: String,
-    code: u16,
-    text: String,
+    compose::loadgen::run(stack, extra)
 }
 
 // ---------------------------------------------------------------------------

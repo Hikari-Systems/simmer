@@ -42,6 +42,9 @@ case "${PF_TLS:-off}" in
   may|encrypt)
     pc "smtpd_tls_security_level = ${PF_TLS}"
     pc "smtpd_tls_chain_files = ${PF_TLS_KEY:?PF_TLS_KEY is required with TLS}, ${PF_TLS_CERT:?PF_TLS_CERT is required with TLS}"
+    # The negotiated protocol in the Received: header, so a test reads the
+    # encryption off the message rather than trusting a log level.
+    pc "smtpd_tls_received_header = yes"
     ;;
   *) echo "PF_TLS must be off, may or encrypt" >&2; exit 1 ;;
 esac
