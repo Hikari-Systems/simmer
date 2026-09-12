@@ -14,7 +14,8 @@
 
 mod compose;
 
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use compose::findings::judge;
@@ -344,8 +345,77 @@ fn a_login_only_server_is_reached_with_the_mechanism_it_offers() {
 }
 
 // ---------------------------------------------------------------------------
+// another submitting client
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the matrix compose profile"]
+fn postfix_as_a_submitting_client_is_verified_authenticated_and_relayed() {
+    // A second client implementation beside the loadgen: Postfix relaying to 587
+    // at `secure`, verified through its OS trust store, with SASL. Its log says
+    // the handshake verified; Simmer's Received: says the session was encrypted
+    // and authenticated; the trap says it arrived once, under the route identity.
+    let _logs = MATRIX.logs_on_failure();
+    traps::MATRIX.reset();
+
+    submit_via_postfix_client(
+        "From: Jane <jane@client.matrix.test>\n\
+         To: postfix-client@example.net\n\
+         Subject: Sent by Postfix\n\
+         \n\
+         Submitted with sendmail, relayed by Postfix.\n",
+    );
+    assert_eq!(traps::MATRIX.wait_for_count(1), 1);
+    let (return_path, raw) = traps::MATRIX.envelopes().remove(0);
+    assert_eq!(return_path, "bounce@mailpit-direct.out.test");
+    let ours = received_lines(&raw)
+        .into_iter()
+        .find(|l| l.contains("by simmer.acceptance"))
+        .unwrap_or_else(|| panic!("no Received: from Simmer:\n{raw}"));
+    assert!(ours.starts_with("Received: from postfix-client "), "{ours}");
+    assert!(ours.contains("with ESMTPSA id"), "{ours}");
+
+    // `secure` would have refused an unverified server rather than downgrade, so
+    // the message arriving is itself the proof; the log line says so in words.
+    let log =
+        String::from_utf8_lossy(&MATRIX.run(&["logs", "--no-color", "postfix-client"]).stdout)
+            .to_string();
+    assert!(
+        log.contains("Verified TLS connection established to app["),
+        "postfix-client did not verify Simmer's certificate:\n{log}"
+    );
+    let queue = String::from_utf8_lossy(
+        &MATRIX
+            .run(&["exec", "-T", "postfix-client", "postqueue", "-p"])
+            .stdout,
+    )
+    .to_string();
+    assert!(queue.contains("Mail queue is empty"), "{queue}");
+}
+
+// ---------------------------------------------------------------------------
 // driving the matrix
 // ---------------------------------------------------------------------------
+
+/// Hand `message` (LF line endings, as `sendmail` expects) to postfix-client
+/// from `jane@client.matrix.test`, recipients taken from its headers.
+fn submit_via_postfix_client(message: &str) {
+    let mut child = MATRIX
+        .compose()
+        .args(["exec", "-T", "postfix-client"])
+        .args(["sendmail", "-i", "-t", "-f", "jane@client.matrix.test"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("docker compose exec");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(message.as_bytes())
+        .expect("write to sendmail");
+    let status = child.wait().expect("sendmail");
+    assert!(status.success(), "sendmail in postfix-client failed");
+}
 
 /// Send `count` messages from `jane@<domain>.matrix.test`, which picks the server.
 fn send(domain: &str, tag: &str, count: usize, extra: &[&str]) -> Vec<Reply> {

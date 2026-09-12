@@ -16,6 +16,14 @@
 #   PF_SIZE            message_size_limit in bytes
 #   PF_RATE            smtpd_client_message_rate_limit per minute
 #   PF_SMTPD_TIMEOUT   smtpd_timeout, e.g. 10s
+#
+# The outbound side, for a variant that submits to Simmer rather than receiving
+# from it:
+#
+#   PF_CLIENT_TLS        none | secure                  (smtp_tls_security_level)
+#   PF_CLIENT_TLS_MATCH  smtp_tls_secure_cert_match     (default nexthop)
+#   PF_CLIENT_SASL_USER  log in to PF_RELAYHOST as this user
+#   PF_CLIENT_SASL_PASS  with this password
 set -eu
 
 pc() { postconf -e "$@"; }
@@ -28,7 +36,38 @@ pc "inet_interfaces = all"
 pc "inet_protocols = ipv4"
 pc "compatibility_level = 3.6"
 pc "maillog_file = /dev/stdout"
-pc "smtp_tls_security_level = none"
+case "${PF_CLIENT_TLS:-none}" in
+  none)
+    pc "smtp_tls_security_level = none"
+    ;;
+  secure)
+    pc "smtp_tls_security_level = secure"
+    pc "smtp_tls_secure_cert_match = ${PF_CLIENT_TLS_MATCH:-nexthop}"
+    # The OS trust store — whatever update-ca-certificates put there, which in
+    # the test stacks includes the per-run CA (test-trust). Both settings, and
+    # named here rather than left to Debian's main.cf: its CApath is also
+    # /etc/ssl/certs, so a negative control that only moved the CAfile would
+    # still verify.
+    pc "smtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt"
+    pc "smtp_tls_CApath = /etc/ssl/certs"
+    # No session cache: a resumed session reports the verification it inherited,
+    # and a test reading "Verified" wants this connection's.
+    pc "smtp_tls_session_cache_database ="
+    pc "smtp_tls_loglevel = 1"
+    ;;
+  *) echo "PF_CLIENT_TLS must be none or secure" >&2; exit 1 ;;
+esac
+if [ -n "${PF_CLIENT_SASL_USER:-}" ]; then
+  # texthash: read as-is, so no postmap step and no database type to pick.
+  printf '%s %s:%s\n' "${PF_RELAYHOST}" "$PF_CLIENT_SASL_USER" \
+    "${PF_CLIENT_SASL_PASS:?PF_CLIENT_SASL_PASS is required with PF_CLIENT_SASL_USER}" \
+    > /etc/postfix/sasl_passwd
+  chmod 0600 /etc/postfix/sasl_passwd
+  pc "smtp_sasl_auth_enable = yes"
+  pc "smtp_sasl_password_maps = texthash:/etc/postfix/sasl_passwd"
+  pc "smtp_sasl_security_options = noanonymous"
+  pc "smtp_sasl_tls_security_options = noanonymous"
+fi
 pc "smtpd_relay_restrictions = permit_mynetworks permit_sasl_authenticated reject_unauth_destination"
 pc "smtputf8_enable = ${PF_SMTPUTF8:-yes}"
 # No chroot: the sasldb and the TLS files then live where the config says, and a

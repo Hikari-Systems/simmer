@@ -127,5 +127,27 @@ services:
       PF_RATE: "20"
       PF_SMTPD_TIMEOUT: "10s"
 
+  # The other direction: Postfix as a submitting client, a second implementation
+  # beside the loadgen. `sendmail` into it, and it relays to Simmer's 587 with
+  # STARTTLS at `secure` — verified through its OS trust store (test-trust),
+  # matched against Simmer's certificate name since the nexthop is the service
+  # name — and SASL as cfapp. Nothing reaches it from outside.
+  postfix-client:
+    <<: *postfix
+    environment:
+      PF_HOSTNAME: postfix-client
+      PF_RELAYHOST: "[app]:587"
+      PF_CLIENT_TLS: secure
+      PF_CLIENT_TLS_MATCH: simmer.acceptance
+      PF_CLIENT_SASL_USER: cfapp
+      PF_CLIENT_SASL_PASS: local-dev-password
+    volumes:
+      - test-trust:/etc/ssl/certs:ro
+    depends_on:
+      app:
+        condition: service_healthy
+      tls-init:
+        condition: service_completed_successfully
+
 volumes:
   matrix-config:

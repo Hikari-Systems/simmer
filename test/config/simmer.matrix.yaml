@@ -12,6 +12,8 @@
 #   jane@login.matrix.test      → postfix-login-only   (SASL LOGIN only — F9)
 #   jane@strict.matrix.test     → postfix-strict       (no 8BITMIME/SMTPUTF8, small SIZE)
 #   jane@ratelimit.matrix.test  → postfix-ratelimit    (rate limit, short timeout)
+#   jane@client.matrix.test     → mailpit-direct       (no rule: postfix-client's
+#                                                       submissions, via default_chain)
 #
 # Every route is a single overflow route — no ramp — because the matrix is about
 # SMTP compliance against different servers, not quota; the acceptance suite owns
