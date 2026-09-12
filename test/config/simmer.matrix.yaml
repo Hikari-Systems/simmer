@@ -14,6 +14,9 @@
 #   jane@ratelimit.matrix.test  → postfix-ratelimit    (rate limit, short timeout)
 #   jane@client.matrix.test     → mailpit-direct       (no rule: postfix-client's
 #                                                       submissions, via default_chain)
+#   jane@flows.matrix.test      → warming-flows, then mailpit-direct
+#                                                      (tests/e2e_flows.rs: the
+#                                                       rewrite, §7.3, the control plane)
 #
 # Every route is a single overflow route — no ramp — because the matrix is about
 # SMTP compliance against different servers, not quota; the acceptance suite owns
@@ -71,6 +74,7 @@ senders:
   - { match: "login.matrix.test", match_on: envelope, chain: [postfix-login-only] }
   - { match: "strict.matrix.test", match_on: envelope, chain: [postfix-strict] }
   - { match: "ratelimit.matrix.test", match_on: envelope, chain: [postfix-ratelimit] }
+  - { match: "flows.matrix.test", match_on: envelope, chain: [warming-flows, mailpit-direct] }
 
 default_chain: [mailpit-direct]
 strict_senders: false
@@ -139,6 +143,34 @@ routes:
       envelope_from: "bounce@postfix-strict.out.test"
       set_headers:
         X-Simmer-Route: "{{route.name}}"
+
+  # The one warming route: tests/e2e_flows.rs's. A body rewrite, a recipient
+  # frequency limit tight enough to steer within a test, and an allowance large
+  # enough that quota never does unless a test overrides it. Delivers into the
+  # matrix trap directly, so what a test reads is Simmer's output unmodified.
+  - name: warming-flows
+    downstream:
+      host: "trap-matrix"
+      port: 1025
+      tls: off
+      pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+    identity:
+      envelope_from: "bounce@warming-flows.out.test"
+      set_headers:
+        X-Simmer-Route: "{{route.name}}"
+      body_rewrites:
+        - pattern: 'https://oldbrand\.com/'
+          replacement: "https://newbrand.com/"
+    preflight:
+      enabled: false
+    recipient_frequency:
+      mode: to_address
+      window: { unit: daily, count: 1 }
+      threshold: 2
+    warmup:
+      started: "${SIMMER_WARMUP_STARTED}"
+      schedule:
+        default: [1000]
 
   - name: postfix-ratelimit
     overflow: true

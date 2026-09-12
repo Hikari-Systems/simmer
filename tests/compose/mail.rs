@@ -32,6 +32,30 @@ pub fn header(raw: &str, name: &str) -> Option<String> {
     headers.get(&name.to_ascii_lowercase()).cloned()
 }
 
+/// Every `Received:` header, unfolded, in the order they appear (newest first).
+/// Unfolding joins a continuation with one space, which is exactly what a fold
+/// at a space took out.
+pub fn received(raw: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for line in raw.replace("\r\n", "\n").lines() {
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(last) = lines.last_mut() {
+                last.push(' ');
+                last.push_str(line.trim());
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    lines
+        .into_iter()
+        .filter(|l| l.to_ascii_lowercase().starts_with("received:"))
+        .collect()
+}
+
 /// The message's lines with the named headers — and their continuation lines —
 /// removed, for a byte comparison that ignores what is allowed to differ.
 pub fn without_headers(raw: &str, excluded: &[&str]) -> Vec<String> {

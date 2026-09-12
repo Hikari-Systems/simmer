@@ -8,6 +8,7 @@
 //! Postgres and `/metrics`.
 //!
 //! - [`stack`] — one compose stack, and every command against it.
+//! - [`admin`] — the admin API and `/metrics`, over the published port.
 //! - [`configs`] — a tier's Simmer config, loaded and validated on the host.
 //! - [`loadgen`] — sending, through the loadgen inside the stack's network.
 //! - [`traps`] — reading Mailpit.
@@ -19,6 +20,7 @@
 
 #![allow(dead_code)] // each tier uses a different subset
 
+pub mod admin;
 pub mod configs;
 pub mod findings;
 pub mod leak;

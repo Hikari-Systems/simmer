@@ -106,6 +106,10 @@ struct Args {
     charset: Charset,
     jsonl: Option<String>,
     seed: u64,
+    helo: String,
+    /// A message read whole from stdin, sent verbatim (after CRLF and
+    /// dot-stuffing) in place of the generated one.
+    raw: Option<Vec<u8>>,
 }
 
 fn args() -> Args {
@@ -137,6 +141,8 @@ fn args() -> Args {
         charset: Charset::Utf8,
         jsonl: None,
         seed: 1,
+        helo: "loadgen.acceptance".to_string(),
+        raw: None,
     };
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -156,6 +162,13 @@ fn args() -> Args {
             }
             "--stamp" => {
                 a.stamp = true;
+                i += 1;
+                continue;
+            }
+            "--raw-stdin" => {
+                let mut raw = Vec::new();
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut raw).expect("stdin");
+                a.raw = Some(raw);
                 i += 1;
                 continue;
             }
@@ -191,6 +204,7 @@ fn args() -> Args {
             }
             "--ca" => a.ca = value(),
             "--tls-name" => a.tls_name = value(),
+            "--helo" => a.helo = value(),
             "--auth" => {
                 a.auth = match value().as_str() {
                     "plain" => AuthMech::Plain,
@@ -554,7 +568,9 @@ async fn converse(
         return Ok(());
     }
 
-    ehlo(&mut io).await.map_err(cut(0, "transport"))?;
+    ehlo(&mut io, &args.helo)
+        .await
+        .map_err(cut(0, "transport"))?;
 
     if args.mode == Mode::Starttls {
         write(&mut io, "STARTTLS\r\n")
@@ -577,7 +593,9 @@ async fn converse(
             .map_err(|e| cut(0, "transport")(format!("TLS handshake: {e}")))?;
         io = BufReader::new(Stream::Tls(Box::new(upgraded.into())));
         // RFC 3207 §4.2: everything learned before the handshake is void.
-        ehlo(&mut io).await.map_err(cut(0, "transport"))?;
+        ehlo(&mut io, &args.helo)
+            .await
+            .map_err(cut(0, "transport"))?;
     }
 
     if args.auth != AuthMech::None && !args.password.is_empty() {
@@ -620,7 +638,11 @@ async fn converse(
         }
 
         let body = message(args, &id, &recipient, *n);
-        let params = if args.charset != Charset::Utf8 {
+        let raw_8bit = args
+            .raw
+            .as_ref()
+            .is_some_and(|r| r.iter().any(|&b| b > 0x7F));
+        let params = if args.charset != Charset::Utf8 || raw_8bit {
             " BODY=8BITMIME"
         } else {
             ""
@@ -679,8 +701,8 @@ fn server_name(args: &Args) -> rustls::pki_types::ServerName<'static> {
         .unwrap_or_else(|e| panic!("--tls-name {}: {e}", args.tls_name))
 }
 
-async fn ehlo(io: &mut BufReader<Stream>) -> Result<(), String> {
-    write(io, "EHLO loadgen.acceptance\r\n").await?;
+async fn ehlo(io: &mut BufReader<Stream>, helo: &str) -> Result<(), String> {
+    write(io, &format!("EHLO {helo}\r\n")).await?;
     let (code, text) = read_reply(io).await?;
     if code != 250 {
         return Err(format!("EHLO: {code} {text}"));
@@ -727,6 +749,9 @@ async fn auth(
 /// With no size, charset, stamp or script options the bytes are exactly the
 /// first loadgen's — the §1.1 cutover test compares two runs byte for byte.
 fn message(args: &Args, id: &str, recipient: &str, n: u64) -> Vec<u8> {
+    if let Some(raw) = &args.raw {
+        return wire_form(raw);
+    }
     let (charset, extra_body): (&str, &[u8]) = match args.charset {
         Charset::Utf8 => ("utf-8", b""),
         // "Café crème, naïve" in each single-byte charset; CP1252 adds an em dash
@@ -779,6 +804,24 @@ fn message(args: &Args, id: &str, recipient: &str, n: u64) -> Vec<u8> {
             out.extend_from_slice(&line);
             out.extend_from_slice(b"\r\n");
         }
+    }
+    out.extend_from_slice(b".\r\n");
+    out
+}
+
+/// A `--raw-stdin` message as it goes on the wire: CRLF line endings,
+/// dot-stuffed, terminated. The input is whatever a test wrote, in either line
+/// ending.
+fn wire_form(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len() + 64);
+    let text = raw.strip_suffix(b"\n").unwrap_or(raw);
+    for line in text.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.first() == Some(&b'.') {
+            out.push(b'.');
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b".\r\n");
     out

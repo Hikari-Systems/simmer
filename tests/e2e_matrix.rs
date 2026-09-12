@@ -532,6 +532,7 @@ fn the_matrix_config_is_valid_and_routes_each_server_by_sender() {
             "postfix-tls-auth",
             "postfix-login-only",
             "postfix-strict",
+            "warming-flows",
             "postfix-ratelimit"
         ]
     );
@@ -554,6 +555,14 @@ fn the_matrix_config_is_valid_and_routes_each_server_by_sender() {
                 panic!("{sender} matched no rule")
             }
         }
+    }
+    // tests/e2e_flows.rs's sender: the one warming route, then the baseline.
+    let flows = simmer::routing::sender_match::Senders::new(Some("jane@flows.matrix.test"), None);
+    match simmer::routing::sender_match::match_sender(&cfg, &flows) {
+        simmer::routing::sender_match::Match::Rule { rule, .. } => {
+            assert_eq!(rule.chain, ["warming-flows", "mailpit-direct"])
+        }
+        simmer::routing::sender_match::Match::Unmatched => panic!("flows matched no rule"),
     }
     assert_eq!(
         cfg.default_chain.as_deref(),

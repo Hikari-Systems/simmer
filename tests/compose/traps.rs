@@ -114,6 +114,15 @@ impl Trap {
             .collect()
     }
 
+    /// Every message's raw source as bytes. [`Trap::raw_messages`] is lossy over
+    /// anything that is not UTF-8, which is exactly what a charset test reads.
+    pub fn raw_bytes(self) -> Vec<Vec<u8>> {
+        self.message_ids()
+            .iter()
+            .map(|id| get_bytes(&format!("{}/api/v1/message/{id}/raw", self.base)))
+            .collect()
+    }
+
     /// The envelope sender each message arrived with, per the trap's own record —
     /// not per a header Simmer wrote.
     pub fn return_paths(self) -> Vec<String> {
@@ -139,6 +148,15 @@ impl Trap {
             })
             .collect()
     }
+}
+
+pub fn get_bytes(url: &str) -> Vec<u8> {
+    let out = Command::new("curl")
+        .args(["-sf", url])
+        .output()
+        .expect("curl");
+    assert!(out.status.success(), "GET {url} failed");
+    out.stdout
 }
 
 pub fn get(url: &str) -> String {
