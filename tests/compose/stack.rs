@@ -41,6 +41,15 @@ pub static MATRIX: Stack = Stack::new(
     "/config/simmer.matrix.yaml",
 );
 
+/// The T3 stress stack (`test/compose/stress.yml`): the acceptance stack with
+/// `app` at 2 CPUs and 1 GiB running `test/config/simmer.stress.yaml`, and the
+/// counting `sink` as both routes' downstream.
+pub static STRESS: Stack = Stack::new(
+    &["acceptance", "stress"],
+    &["test/compose/acceptance.yml", "test/compose/stress.yml"],
+    "/config/simmer.stress.yaml",
+);
+
 /// The same stack *without* its override, so without the test CA in any OS
 /// trust store — for negative controls only, and only with `run --no-deps`. A
 /// command that reconciled `app` through this stack would recreate it untrusted

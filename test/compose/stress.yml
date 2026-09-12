@@ -1,0 +1,79 @@
+# The T3 stress stack (docs/TESTING.md; the test programme's step 4). Layered on
+# the acceptance stack:
+#
+#   docker compose -f docker-compose.yml -f test/compose/acceptance.yml \
+#     -f test/compose/stress.yml --profile acceptance --profile stress build
+#   ... up -d --wait app sink
+#   cargo test --test stress -- --ignored --test-threads=1
+#
+# `tests/compose/stack.rs`'s STRESS stack builds every command with exactly these
+# files and profiles.
+#
+# `app` runs test/config/simmer.stress.yaml under the resource limits the stress
+# bar is stated against: the scenarios gate on bounds holding and on no OOM kill
+# at 1 GiB, and neither means anything on an unlimited container.
+
+services:
+  app:
+    cpus: 2
+    mem_limit: 1g
+    volumes:
+      - stress-config:/config:ro
+    depends_on:
+      stress-config:
+        condition: service_completed_successfully
+
+  # test/config/ into the `stress-config` volume. See test/config/Dockerfile for
+  # why this is an image and not a bind mount.
+  stress-config:
+    profiles: ["stress"]
+    build:
+      context: .
+      dockerfile: test/config/Dockerfile
+    volumes:
+      - stress-config:/config
+    healthcheck:
+      disable: true
+
+  # Both routes' downstream: src/bin/sink.rs, one listener per route. It keeps
+  # counts and one JSON line per message and nothing that grows with the body,
+  # so under load it is neither the bottleneck nor the leak.
+  #
+  # Faults are per scenario: the harness re-creates this service with SINK_ARGS
+  # set (`--slow-ms 2000`, `--stall-at-dot-pct 1`, `--lose-every 50`, …) and the
+  # JSONL starts afresh. Root, like the loadgen here, only so both can write the
+  # results volume.
+  sink:
+    profiles: ["stress"]
+    build:
+      context: .
+      target: acceptance
+    user: "0"
+    entrypoint:
+      - sh
+      - -ec
+      - exec /app/sink --listen 0.0.0.0:2525 --listen 0.0.0.0:2526 --http 0.0.0.0:8081 --jsonl /results/sink.jsonl $${SINK_ARGS:-}
+    environment:
+      SINK_ARGS: "${SINK_ARGS:-}"
+    ports:
+      - "127.0.0.1:18081:8081"
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - stress-results:/results
+    # The image's HEALTHCHECK is the server's; this is not the server.
+    healthcheck:
+      disable: true
+
+  # Hundreds of clients from one container: descriptors, and somewhere to write
+  # the per-message record the harness reconciles against the sink's.
+  loadgen:
+    user: "0"
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    volumes:
+      - stress-results:/results
+
+volumes:
+  stress-config:
+  stress-results:
