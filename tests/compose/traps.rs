@@ -20,6 +20,12 @@ pub const OVERFLOW: Trap = Trap {
     base: "http://127.0.0.1:18026",
 };
 
+/// The T2 matrix's trap, which every Postfix variant relays into
+/// (`test/compose/matrix.yml`).
+pub const MATRIX: Trap = Trap {
+    base: "http://127.0.0.1:18027",
+};
+
 /// Mailpit's page size here. The API caps a page, so every listing pages.
 const PAGE: usize = 250;
 

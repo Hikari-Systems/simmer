@@ -8,6 +8,7 @@
 //! Postgres and `/metrics`.
 //!
 //! - [`stack`] — one compose stack, and every command against it.
+//! - [`configs`] — a tier's Simmer config, loaded and validated on the host.
 //! - [`traps`] — reading Mailpit.
 //! - [`mail`] — parsing what arrived.
 //! - [`findings`] — `test/known-findings.json`, XFAIL and XPASS for these tiers.
@@ -17,6 +18,7 @@
 
 #![allow(dead_code)] // each tier uses a different subset
 
+pub mod configs;
 pub mod findings;
 pub mod leak;
 pub mod mail;

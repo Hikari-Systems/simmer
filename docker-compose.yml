@@ -189,6 +189,23 @@ services:
         chown 1000:1000 ca.pem cert.pem key.pem
         chmod 0644 ca.pem cert.pem
         chmod 0600 key.pem
+        # The T2 matrix's TLS downstream (test/compose/matrix.yml). Simmer
+        # verifies it against the route's downstream host, so the name is the
+        # compose service name. Root-owned: Postfix reads its key as root, at
+        # startup, before dropping privileges.
+        mkdir -p postfix-tls-auth
+        openssl req -new -noenc -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
+          -keyout postfix-tls-auth/key.pem -out /tmp/pf.csr -subj /CN=postfix-tls-auth 2>/dev/null
+        printf '%s\n' 'subjectAltName=DNS:postfix-tls-auth' \
+          'basicConstraints=critical,CA:FALSE' \
+          'keyUsage=critical,digitalSignature' \
+          'extendedKeyUsage=serverAuth' > /tmp/pf.ext
+        openssl x509 -req -in /tmp/pf.csr -CA ca.pem -CAkey /tmp/ca.key \
+          -CAserial /tmp/ca.srl -days 30 -extfile /tmp/pf.ext \
+          -out postfix-tls-auth/cert.pem 2>/dev/null
+        cat ca.pem >> postfix-tls-auth/cert.pem
+        chmod 0644 postfix-tls-auth/cert.pem
+        chmod 0600 postfix-tls-auth/key.pem
         # The same CA, installed the way an operator installs an internal CA:
         # into the OS trust store. The result is exported to `test-trust`, which
         # test/compose/acceptance.yml mounts over /etc/ssl/certs in every

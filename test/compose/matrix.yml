@@ -1,0 +1,131 @@
+# The T2 server matrix (docs/TESTING.md; the test programme's step 3). Layered on
+# the acceptance stack:
+#
+#   docker compose -f docker-compose.yml -f test/compose/acceptance.yml \
+#     -f test/compose/matrix.yml --profile acceptance --profile matrix up -d --build
+#
+# `tests/compose/stack.rs`'s MATRIX stack builds every command with exactly these
+# files and profiles.
+#
+# `app` runs test/config/simmer.matrix.yaml, whose routes pick a downstream by the
+# sender's domain. Every downstream here relays into one Mailpit trap, so a test
+# asserts arrival the same way whichever server carried the message.
+#
+# Postfix is one repo-built image (test/postfix/) configured by environment. The
+# variants Simmer reaches without logging in trust any client to relay
+# (PF_MYNETWORKS); the two that require AUTH trust only loopback, so a missing or
+# rejected AUTH is a refusal rather than a silent relay.
+
+x-postfix: &postfix
+  profiles: ["matrix"]
+  build:
+    context: .
+    dockerfile: test/postfix/Dockerfile
+  image: simmer-test-postfix
+  depends_on:
+    trap-matrix:
+      condition: service_healthy
+
+services:
+  app:
+    volumes:
+      - matrix-config:/config:ro
+    depends_on:
+      matrix-config:
+        condition: service_completed_successfully
+
+  # test/config/ into the `matrix-config` volume. See test/config/Dockerfile for
+  # why this is an image and not a bind mount.
+  matrix-config:
+    profiles: ["matrix"]
+    build:
+      context: .
+      dockerfile: test/config/Dockerfile
+    volumes:
+      - matrix-config:/config
+    healthcheck:
+      disable: true
+
+  # The one trap everything in the matrix delivers to. Same pinned Mailpit as the
+  # acceptance traps (v1.30.7).
+  trap-matrix:
+    profiles: ["matrix"]
+    image: axllent/mailpit@sha256:d5ecbb067db3705fa953d79e1b7f81ef84038df67aba6c52825d8c02a1ea748a
+    ports:
+      - "127.0.0.1:18027:8025"
+    environment:
+      MP_SMTP_BIND_ADDR: "0.0.0.0:1025"
+      MP_MAX_MESSAGES: "0"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
+
+  # No AUTH, no TLS: a real MTA's replies, multiline EHLO and SIZE.
+  postfix-plain:
+    <<: *postfix
+    environment:
+      PF_HOSTNAME: postfix-plain
+      PF_RELAYHOST: "[trap-matrix]:1025"
+      PF_MYNETWORKS: "0.0.0.0/0"
+
+  # STARTTLS required and SASL PLAIN+LOGIN, with a leaf from the per-run test
+  # CA. Simmer's route is `required_verify`, so this is outbound verification
+  # through the OS trust store against a real server, and downstream AUTH
+  # against real SASL.
+  postfix-tls-auth:
+    <<: *postfix
+    environment:
+      PF_HOSTNAME: postfix-tls-auth
+      PF_RELAYHOST: "[trap-matrix]:1025"
+      PF_TLS: encrypt
+      PF_TLS_CERT: /tls/postfix-tls-auth/cert.pem
+      PF_TLS_KEY: /tls/postfix-tls-auth/key.pem
+      PF_SASL_MECHS: "PLAIN LOGIN"
+      PF_SASL_USER: matrix
+      PF_SASL_PASS: matrix-password
+    volumes:
+      - acceptance-tls:/tls:ro
+    depends_on:
+      trap-matrix:
+        condition: service_healthy
+      tls-init:
+        condition: service_completed_successfully
+
+  # SASL LOGIN only, no TLS — the mechanism is the only variable. Finding F9:
+  # Simmer's outbound AUTH is always PLAIN.
+  postfix-login-only:
+    <<: *postfix
+    environment:
+      PF_HOSTNAME: postfix-login-only
+      PF_RELAYHOST: "[trap-matrix]:1025"
+      PF_SASL_MECHS: "LOGIN"
+      PF_SASL_USER: matrix
+      PF_SASL_PASS: matrix-password
+
+  # No 8BITMIME, no SMTPUTF8, a 64 KiB size limit: D-018's and D-074's refusals
+  # and the SIZE pre-check against a real server.
+  postfix-strict:
+    <<: *postfix
+    environment:
+      PF_HOSTNAME: postfix-strict
+      PF_RELAYHOST: "[trap-matrix]:1025"
+      PF_MYNETWORKS: "0.0.0.0/0"
+      PF_NO_8BITMIME: "1"
+      PF_SMTPUTF8: "no"
+      PF_SIZE: "65536"
+
+  # Real-world deferrals: a per-client message rate limit, and an idle timeout
+  # short enough to reap Simmer's pooled connections between messages (D-068).
+  postfix-ratelimit:
+    <<: *postfix
+    environment:
+      PF_HOSTNAME: postfix-ratelimit
+      PF_RELAYHOST: "[trap-matrix]:1025"
+      PF_MYNETWORKS: "0.0.0.0/0"
+      PF_RATE: "20"
+      PF_SMTPD_TIMEOUT: "10s"
+
+volumes:
+  matrix-config:

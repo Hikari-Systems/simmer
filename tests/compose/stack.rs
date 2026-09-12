@@ -32,6 +32,15 @@ pub static ACCEPTANCE: Stack = Stack::new(
     "/app/simmer.acceptance.yaml",
 );
 
+/// The T2 server matrix (`test/compose/matrix.yml`): the acceptance stack plus
+/// five Postfix variants and a Mailpit trap they all deliver to, with `app`
+/// running `test/config/simmer.matrix.yaml`.
+pub static MATRIX: Stack = Stack::new(
+    &["acceptance", "matrix"],
+    &["test/compose/acceptance.yml", "test/compose/matrix.yml"],
+    "/config/simmer.matrix.yaml",
+);
+
 /// The same stack *without* its override, so without the test CA in any OS
 /// trust store — for negative controls only, and only with `run --no-deps`. A
 /// command that reconciled `app` through this stack would recreate it untrusted
