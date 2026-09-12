@@ -105,7 +105,8 @@ services:
   # Behind a profile, so `docker compose up -d` keeps meaning exactly what it
   # meant before and none of this starts unless it is asked for:
   #
-  #   docker compose --profile acceptance up -d --build
+  #   docker compose -f docker-compose.yml -f test/compose/acceptance.yml \
+  #     --profile acceptance up -d --build
   #   cargo test --test acceptance -- --ignored --test-threads=1
   #
   # `tests/acceptance.rs` drives it: it restarts `app` with a different
@@ -188,8 +189,21 @@ services:
         chown 1000:1000 ca.pem cert.pem key.pem
         chmod 0644 ca.pem cert.pem
         chmod 0600 key.pem
+        # The same CA, installed the way an operator installs an internal CA:
+        # into the OS trust store. The result is exported to `test-trust`, which
+        # test/compose/acceptance.yml mounts over /etc/ssl/certs in every
+        # verifying container, so their handshakes go through the real platform
+        # lookup (rustls-native-certs -> openssl-probe -> /etc/ssl/certs) rather
+        # than a CA path handed to the client. Copied with -L: the store is
+        # symlinks into /usr/share and /usr/local/share, which would dangle in
+        # another container.
+        cp ca.pem /usr/local/share/ca-certificates/simmer-acceptance-ca.crt
+        update-ca-certificates >/dev/null 2>&1
+        rm -rf /trust/* /trust/.[!.]*
+        cp -rL /etc/ssl/certs/. /trust/
     volumes:
       - acceptance-tls:/tls
+      - test-trust:/trust
     healthcheck:
       disable: true
 
@@ -213,3 +227,8 @@ services:
 
 volumes:
   acceptance-tls:
+  # tls-init's OS trust store: Debian's roots plus the per-run test CA. Mounted
+  # only by the acceptance override (test/compose/acceptance.yml) — mounted here,
+  # a plain `docker compose up`, where tls-init never runs, would give `app` an
+  # empty root store and break every real `required_verify` route.
+  test-trust:

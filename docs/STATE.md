@@ -135,7 +135,7 @@ docker compose up -d --build                  both containers healthy
 Plus the acceptance tier, which needs its own stack and is not in `cargo test`:
 
 ```
-docker compose --profile acceptance up -d --build
+docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance up -d --build
 cargo test --test acceptance -- --ignored --test-threads=1     5 passed, 0 failed
 ```
 

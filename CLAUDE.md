@@ -140,7 +140,7 @@ The §12.3 acceptance suite runs against its own stack and is **not** in
 `cargo test` — it needs Docker and a couple of minutes of container restarts:
 
 ```sh
-docker compose --profile acceptance up -d --build
+docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance up -d --build
 cargo test --test acceptance -- --ignored --test-threads=1
 ```
 

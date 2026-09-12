@@ -1,5 +1,12 @@
 # Acceptance harness — design
 
+**Every acceptance command layers `test/compose/acceptance.yml` on
+`docker-compose.yml`.** The override mounts `tls-init`'s OS trust store — Debian's
+roots plus the per-run test CA — over `/etc/ssl/certs` in `app` and `loadgen`, so
+verified TLS goes through the real platform lookup. It is an override rather than
+part of the base file because the base file is also the plain local stack, where
+`tls-init` never runs and the mount would leave `app` with no roots at all.
+
 **Status: built in phase 4, completed in phase 5.** This document is the design;
 `tests/acceptance.rs`, `simmer.acceptance.yaml`, `src/bin/loadgen.rs` and
 `docker-compose.yml`'s `acceptance` profile are the build. §7's phasing table
@@ -12,7 +19,7 @@ leaf against that CA (D-070). The outbound half — a trap requiring STARTTLS wi
 `required_verify` — is still outstanding.
 
 ```sh
-docker compose --profile acceptance up -d --build
+docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance up -d --build
 cargo test --test acceptance -- --ignored --test-threads=1
 ```
 

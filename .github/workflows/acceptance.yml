@@ -30,19 +30,20 @@ jobs:
         with:
           save-if: false
 
-      # Exactly the two commands README.md and docs/ACCEPTANCE.md give. `--wait`
+      # Exactly the commands README.md and docs/ACCEPTANCE.md give, override file
+      # included (it carries the test CA's OS trust store). `--wait`
       # so the suite does not start against an app that is still migrating.
       # tls-init runs first by dependency and mints the stack's certificate.
       - name: Bring up the acceptance stack
-        run: docker compose --profile acceptance up -d --build --wait
+        run: docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance up -d --build --wait
 
       - name: Run the acceptance suite
         run: cargo test --locked --test acceptance -- --ignored --test-threads=1
 
       - name: Compose logs
         if: failure()
-        run: docker compose --profile acceptance logs --no-color --timestamps
+        run: docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance logs --no-color --timestamps
 
       - name: Tear down
         if: always()
-        run: docker compose --profile acceptance down -v
+        run: docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance down -v

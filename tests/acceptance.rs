@@ -15,7 +15,7 @@
 //! # Running it
 //!
 //! ```sh
-//! docker compose --profile acceptance up -d --build
+//! docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance up -d --build
 //! cargo test --test acceptance -- --ignored --test-threads=1
 //! ```
 //!
@@ -25,10 +25,8 @@
 
 mod compose;
 
-use std::process::Command;
-
 use compose::mail::header;
-use compose::stack::ACCEPTANCE;
+use compose::stack::{Stack, ACCEPTANCE, ACCEPTANCE_UNTRUSTED};
 use compose::traps::{Trap, OVERFLOW, WARMING};
 use simmer::config::Config;
 
@@ -310,6 +308,9 @@ fn submission_on_587_is_verified_tls_and_refuses_plaintext_auth() {
     reset_quota();
     reset_traps();
 
+    // `--ca os`: the loadgen trusts what its OS trust store trusts, as the
+    // server's own `required_verify` does — the test CA is there only because
+    // tls-init installed it with update-ca-certificates.
     let replies = loadgen(&[
         "--count",
         "1",
@@ -318,6 +319,8 @@ fn submission_on_587_is_verified_tls_and_refuses_plaintext_auth() {
         "--port",
         "587",
         "--starttls",
+        "--ca",
+        "os",
     ]);
     assert!(
         replies.iter().all(|r| r.code == 250),
@@ -354,6 +357,55 @@ fn submission_on_587_is_verified_tls_and_refuses_plaintext_auth() {
             .all(|r| r.code == 530 && r.text.contains("STARTTLS")),
         "plaintext AUTH on 587 was not refused with 530: {refused:?}"
     );
+
+    // The negative control. The same verified submission from a loadgen whose OS
+    // trust store is the image's own must fail its handshake — which proves the
+    // pass above came from the OS-installed test CA, not from some other path.
+    let untrusted = loadgen_via(
+        &ACCEPTANCE_UNTRUSTED,
+        &[
+            "--count",
+            "1",
+            "--tag",
+            "untrusted",
+            "--port",
+            "587",
+            "--starttls",
+            "--ca",
+            "os",
+        ],
+    );
+    assert!(
+        untrusted
+            .iter()
+            .all(|r| r.code == 0 && r.text.contains("TLS handshake")),
+        "a loadgen without the test CA completed the handshake: {untrusted:?}"
+    );
+
+    // And the CA reached the store the way an operator's would: the trusted
+    // bundle is the image's bundle plus exactly one certificate.
+    let bundle = |stack: &Stack| -> usize {
+        let out = stack.run(&[
+            "run",
+            "--rm",
+            "--no-deps",
+            "--no-TTY",
+            "--entrypoint",
+            "sh",
+            "loadgen",
+            "-c",
+            "grep -c 'BEGIN CERTIFICATE' /etc/ssl/certs/ca-certificates.crt",
+        ]);
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("a certificate count")
+    };
+    assert_eq!(
+        bundle(&ACCEPTANCE),
+        bundle(&ACCEPTANCE_UNTRUSTED) + 1,
+        "the OS trust store should be the image's plus the test CA"
+    );
 }
 
 /// Strip everything D-002 excludes from §12.3's comparison, plus what the
@@ -389,10 +441,6 @@ fn comparable(raw: &str) -> Vec<String> {
 
 // The helpers below are the shared compose harness (`tests/compose/`), named as
 // this suite always named them so its tests read unchanged.
-
-fn compose() -> Command {
-    ACCEPTANCE.compose()
-}
 
 fn restart_app_at_day(day: usize) {
     ACCEPTANCE.restart_app_at_day(day);
@@ -479,7 +527,13 @@ fn load_acceptance_config() -> Config {
 
 /// Run the loadgen inside the compose network and parse its JSON.
 fn loadgen(extra: &[&str]) -> Vec<LoadgenReply> {
-    let mut cmd = compose();
+    loadgen_via(&ACCEPTANCE, extra)
+}
+
+/// [`loadgen`] through a particular stack — the untrusted one, for negative
+/// controls.
+fn loadgen_via(stack: &Stack, extra: &[&str]) -> Vec<LoadgenReply> {
+    let mut cmd = stack.compose();
     // `--no-deps`: the loadgen declares `depends_on: app`, and resolving that
     // dependency is enough to make compose reconcile `app` against a freshly
     // rendered config. `restart_app_at_day` has already waited for it to be

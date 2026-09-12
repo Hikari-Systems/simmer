@@ -24,8 +24,20 @@ pub struct Stack {
     warmup_started: Mutex<String>,
 }
 
-/// The §12.3 acceptance stack (`docs/ACCEPTANCE.md`).
-pub static ACCEPTANCE: Stack = Stack::new(&["acceptance"], &[], "/app/simmer.acceptance.yaml");
+/// The §12.3 acceptance stack (`docs/ACCEPTANCE.md`), with its override: the
+/// test CA in `app`'s and `loadgen`'s OS trust store.
+pub static ACCEPTANCE: Stack = Stack::new(
+    &["acceptance"],
+    &["test/compose/acceptance.yml"],
+    "/app/simmer.acceptance.yaml",
+);
+
+/// The same stack *without* its override, so without the test CA in any OS
+/// trust store — for negative controls only, and only with `run --no-deps`. A
+/// command that reconciled `app` through this stack would recreate it untrusted
+/// and every later test would measure the wrong thing.
+pub static ACCEPTANCE_UNTRUSTED: Stack =
+    Stack::new(&["acceptance"], &[], "/app/simmer.acceptance.yaml");
 
 impl Stack {
     pub const fn new(

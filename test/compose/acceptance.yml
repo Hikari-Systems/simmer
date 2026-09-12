@@ -1,0 +1,27 @@
+# The acceptance stack's override (docs/ACCEPTANCE.md). Every acceptance command
+# layers it on the base file:
+#
+#   docker compose -f docker-compose.yml -f test/compose/acceptance.yml \
+#     --profile acceptance up -d --build
+#
+# It carries the one thing that must NOT apply to a plain `docker compose up`:
+# tls-init's OS trust store — Debian's roots plus the per-run test CA, installed
+# with update-ca-certificates — mounted over /etc/ssl/certs. Every container that
+# verifies TLS then does so through the real platform lookup, exactly as the
+# server's `required_verify` routes do in production, instead of through a CA path
+# handed to the client. In the base file the mount would leave the plain local
+# stack's `app` with an empty root store, since tls-init only runs under this
+# profile.
+#
+# `tests/compose/stack.rs` builds every acceptance command with this file, so a
+# test cannot forget it; `ACCEPTANCE_UNTRUSTED` there is the same stack without
+# it, for negative controls.
+
+services:
+  app:
+    volumes:
+      - test-trust:/etc/ssl/certs:ro
+
+  loadgen:
+    volumes:
+      - test-trust:/etc/ssl/certs:ro
