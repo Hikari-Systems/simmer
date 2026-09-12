@@ -167,6 +167,11 @@ routes:
       # never claimed by accident — a UTF-8 address is then refused at MAIL FROM
       # rather than discovered mid-relay. See DECISIONS.md D-018.
       smtputf8: false
+      # Postal advertises no 8BITMIME but accepts 8-bit bodies. Without this,
+      # every message whose body really is 8-bit (UTF-8 text sent as `8bit`,
+      # which modern mailers do) is refused 451 4.3.5 on every retry. A 7-bit
+      # body is fine either way. See DECISIONS.md D-074.
+      assume_8bitmime: true
     identity:
       # §1.1 constraint 1: absolute assignment, never a relative transformation.
       #

@@ -340,6 +340,17 @@ of them can deliver. A UTF-8 address presented when the capability was not
 advertised is refused `550 5.6.7` at `MAIL FROM`, rather than discovered
 mid-relay. See `DECISIONS.md` D-018.
 
+### 8BITMIME
+
+`BODY=8BITMIME` is passed on only to a downstream that advertises `8BITMIME`. A body
+with no byte above 0x7F is 7-bit whatever the client declared, so it goes to any
+downstream, without the parameter. A body that really is 8-bit goes to a downstream
+without the extension only if its route sets `downstream.assume_8bitmime: true` —
+Postal is the reason: it advertises no `8BITMIME` but accepts 8-bit bodies, and the
+shipped config declares it on the Postal route. Otherwise that message is deferred
+`451 4.3.5` and counted in `simmer_downstream_config_error_total`. See
+`DECISIONS.md` D-074.
+
 ### Timeout budget
 
 The sum of the per-stage downstream timeouts (`connect` + `command` + `data`)

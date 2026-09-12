@@ -77,6 +77,8 @@ pub struct DownstreamView {
     pub port: u16,
     pub tls: &'static str,
     pub smtputf8: bool,
+    /// D-074: the downstream is declared 8-bit clean without `8BITMIME`.
+    pub assume_8bitmime: bool,
     /// Whether downstream credentials are configured — never what they are.
     pub authenticated: bool,
 }
@@ -226,6 +228,7 @@ pub fn project_route(
             port: route.downstream.port,
             tls: tls_name(route.downstream.tls),
             smtputf8: route.downstream.smtputf8,
+            assume_8bitmime: route.downstream.assume_8bitmime,
             authenticated: route.downstream.auth.is_some(),
         },
         recipient_frequency: route.recipient_frequency.as_ref().map(frequency_view),

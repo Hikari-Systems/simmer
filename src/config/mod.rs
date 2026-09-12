@@ -523,6 +523,20 @@ pub struct Downstream {
     /// accident. See `DECISIONS.md` D-018.
     #[serde(default)]
     pub smtputf8: bool,
+
+    /// Is this downstream 8-bit clean even though its `EHLO` does not say
+    /// `8BITMIME`? (D-074, finding F13.)
+    ///
+    /// Postal, the production downstream, advertises no `8BITMIME` and accepts
+    /// 8-bit bodies anyway. RFC 6152 lets a relay facing a server without the
+    /// extension either convert to 7-bit or refuse; Simmer does neither to a
+    /// body that is 7-bit already, and for a genuinely 8-bit one it needs to be
+    /// *told* the server is clean, since `EHLO` says otherwise. Default `false`:
+    /// an undeclared downstream keeps `451 4.3.5` and the config-error metric,
+    /// which is loud, over silently sending 8-bit data to a server that may not
+    /// take it.
+    #[serde(default)]
+    pub assume_8bitmime: bool,
 }
 
 /// §8.2.

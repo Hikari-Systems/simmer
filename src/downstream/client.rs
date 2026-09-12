@@ -53,6 +53,9 @@ pub struct Message<'a> {
     /// them or the relay fails with [`RelayError::MissingCapability`].
     pub smtputf8: bool,
     pub body_8bitmime: bool,
+    /// The route declares its downstream 8-bit clean without `8BITMIME`
+    /// (`downstream.assume_8bitmime`, D-074).
+    pub assume_8bitmime: bool,
 }
 
 /// Timeouts resolved for one route (§8.4).
@@ -109,6 +112,11 @@ impl WireReply {
             }
         })
     }
+}
+
+/// Does the body contain any byte outside 7-bit ASCII? (D-074.)
+fn has_8bit(body: &[u8]) -> bool {
+    body.iter().any(|&b| b > 0x7F)
 }
 
 /// Relay one message to a route's downstream over a pooled connection (§8.3).
@@ -374,7 +382,20 @@ impl Connection {
         if message.smtputf8 && !self.caps.advertises("SMTPUTF8") {
             return Err(RelayError::MissingCapability("SMTPUTF8"));
         }
-        if message.body_8bitmime && !self.caps.advertises("8BITMIME") {
+        // D-074 (finding F13). The client's `BODY=8BITMIME` is a claim about
+        // what the body *may* contain, and many clients make it for every
+        // message. Towards a downstream without the extension:
+        // - a body with no byte above 0x7F is 7-bit whatever was declared, and is
+        //   sent without the parameter — RFC-correct, and nothing to decide;
+        // - a genuinely 8-bit body goes only where the route declares the
+        //   server 8-bit clean, and is otherwise refused as a capability
+        //   mismatch, as before.
+        let downstream_8bitmime = self.caps.advertises("8BITMIME");
+        if message.body_8bitmime
+            && !downstream_8bitmime
+            && !message.assume_8bitmime
+            && has_8bit(message.body)
+        {
             return Err(RelayError::MissingCapability("8BITMIME"));
         }
         if let Some(max) = self.caps.max_size() {
@@ -390,7 +411,8 @@ impl Connection {
 
         // -- MAIL FROM --
         let mut params = String::new();
-        if message.body_8bitmime {
+        // Only a server that advertised the extension is told about it.
+        if message.body_8bitmime && downstream_8bitmime {
             params.push_str(" BODY=8BITMIME");
         }
         if message.smtputf8 {

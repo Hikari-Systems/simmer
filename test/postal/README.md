@@ -42,10 +42,12 @@ Observed on the spike run (`probe-results.json`), not read from documentation:
 - **EHLO:** `STARTTLS` and `AUTH CRAM-MD5 PLAIN LOGIN`. **No `SIZE`, `8BITMIME`,
   `SMTPUTF8` or `PIPELINING`.** It nevertheless answers `250` to `MAIL FROM … BODY=8BITMIME`
   and to `SMTPUTF8`, and pipelined commands work.
-- **Simmer consequence — finding F13.** Simmer's outbound client refuses to send a
-  `BODY=8BITMIME` message to a downstream that does not advertise `8BITMIME`
-  (`MissingCapability` → `451 4.3.5`, `src/downstream/client.rs`). Against Postal
-  that defers every such message, on every retry.
+- **Simmer consequence — finding F13, fixed by D-074.** Simmer's outbound client
+  refused to send a `BODY=8BITMIME` message to a downstream that does not advertise
+  `8BITMIME` (`451 4.3.5`), which against Postal deferred every such message on
+  every retry. Now a 7-bit body goes without the parameter, and an 8-bit one goes
+  where the route sets `downstream.assume_8bitmime: true`, as the shipped config
+  does for Postal.
 - **Postal replaces the envelope sender** with `<server-token>@<return-path domain>`,
   whatever the client sent. Assert on headers, never on the envelope Mailpit sees.
 - It adds `X-Postal-MsgID`, `Resent-Sender` (off with

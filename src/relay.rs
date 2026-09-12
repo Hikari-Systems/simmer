@@ -327,6 +327,7 @@ pub async fn reserve_relay_commit(
             body: &rewritten.raw,
             smtputf8: message.smtputf8,
             body_8bitmime: message.body_8bitmime,
+            assume_8bitmime: selected.route.downstream.assume_8bitmime,
         },
     )
     .await;

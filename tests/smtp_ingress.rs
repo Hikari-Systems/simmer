@@ -850,3 +850,84 @@ async fn body_8bitmime_is_carried_through_to_the_downstream() {
         got.mail_from_params
     );
 }
+
+// -- D-074 (finding F13): 8BITMIME towards a downstream that lacks it ---------
+
+/// A downstream advertising neither 8BITMIME nor SMTPUTF8 — Postal's EHLO.
+async fn no_8bitmime_stack(route_extra: &str) -> (FakeDownstream, Simmer) {
+    let down = FakeDownstream::start(Script::with(|s| {
+        s.caps = vec!["SIZE 26214400".into(), "AUTH PLAIN".into()];
+    }))
+    .await;
+    let cfg = config_for(down.addr, "")
+        .replace("      tls: off", &format!("      tls: off{route_extra}"));
+    let simmer = Simmer::start(&cfg).await;
+    (down, simmer)
+}
+
+const EIGHT_BIT_BODY: &str = "From: jane@oldbrand.com\r\nSubject: caf\u{e9}\r\n\
+                              Content-Type: text/plain; charset=utf-8\r\n\
+                              Content-Transfer-Encoding: 8bit\r\n\r\n\
+                              Caf\u{e9} cr\u{e8}me\r\n";
+
+async fn send_declared_8bitmime(simmer: &Simmer, body: &str) -> support::Reply {
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    assert_eq!(
+        c.command("MAIL FROM:<jane@oldbrand.com> BODY=8BITMIME")
+            .await
+            .code,
+        250
+    );
+    assert_eq!(c.command("RCPT TO:<bob@gmail.com>").await.code, 250);
+    assert_eq!(c.command("DATA").await.code, 354);
+    c.send_raw(body.as_bytes()).await;
+    c.send(".").await;
+    c.read_reply().await
+}
+
+#[tokio::test]
+async fn a_7bit_body_declared_8bitmime_goes_to_a_downstream_without_it() {
+    // Many clients declare BODY=8BITMIME for every message. A body with no byte
+    // above 0x7F is 7-bit whatever was declared, so it is relayed — without the
+    // parameter, which the downstream never offered. This is the common case
+    // F13 broke against Postal.
+    let (down, simmer) = no_8bitmime_stack("").await;
+    let r = send_declared_8bitmime(&simmer, BODY).await;
+    assert_eq!(r.code, 250, "{r:?}");
+    let got = down.last().expect("received");
+    assert!(
+        !got.mail_from_params.contains("BODY=8BITMIME"),
+        "the downstream never advertised 8BITMIME, but was told BODY=8BITMIME: {:?}",
+        got.mail_from_params
+    );
+}
+
+#[tokio::test]
+async fn an_8bit_body_to_an_undeclared_downstream_without_8bitmime_is_still_451() {
+    // Unchanged for a route that has not declared its downstream 8-bit clean:
+    // RFC 6152 leaves conversion or refusal, and Simmer does not convert.
+    // 451 4.3.5 — a configuration problem, loud in the metrics, and never a 5xx
+    // a client would record against the recipient.
+    let (down, simmer) = no_8bitmime_stack("").await;
+    let r = send_declared_8bitmime(&simmer, EIGHT_BIT_BODY).await;
+    assert_eq!(r.code, 451, "{r:?}");
+    assert!(r.contains("4.3.5"), "{r:?}");
+    assert!(down.messages().is_empty());
+}
+
+#[tokio::test]
+async fn a_route_declared_8bit_clean_relays_an_8bit_body_without_the_parameter() {
+    // D-074: `assume_8bitmime: true` — what the shipped config sets on the
+    // Postal route. The body's bytes arrive exactly as sent.
+    let (down, simmer) = no_8bitmime_stack("\n      assume_8bitmime: true").await;
+    let r = send_declared_8bitmime(&simmer, EIGHT_BIT_BODY).await;
+    assert_eq!(r.code, 250, "{r:?}");
+    let got = down.last().expect("received");
+    assert!(
+        !got.mail_from_params.contains("BODY=8BITMIME"),
+        "{:?}",
+        got.mail_from_params
+    );
+    assert_eq!(support::without_received(&got.body), EIGHT_BIT_BODY);
+}

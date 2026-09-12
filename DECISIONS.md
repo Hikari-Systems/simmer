@@ -2213,6 +2213,42 @@ the unpinned build correct, but it cannot be last — `acceptance` is `FROM runt
 it must come after it. Pinning the target is the only fix that keeps the stage graph,
 and it is the one every other builder already uses.
 
+### D-074 — 8BITMIME towards a downstream that does not advertise it (finding F13)
+
+**Found:** by the test programme's Postal spike (`test/postal/`). Postal — the
+production downstream — advertises neither `8BITMIME` nor `SIZE`, and answers `250`
+to `BODY=8BITMIME` regardless. The outbound client refused any message whose client
+had declared `BODY=8BITMIME` to a downstream not advertising the extension
+(`MissingCapability` → `451 4.3.5`). Many clients declare it for every message, so
+against Postal a large share of real traffic would have been deferred on every
+retry, indefinitely — never delivered, never refused.
+
+**Spec:** §8 is silent; RFC 6152 §3 says a relay facing a server without 8BITMIME
+must convert the message to 7-bit or refuse it.
+
+**Decision** (the option the user chose from four):
+
+- **A body with no byte above 0x7F is 7-bit, whatever the client declared**, and is
+  relayed without the `BODY=8BITMIME` parameter. Fully RFC-correct; no decision
+  needed. `BODY=8BITMIME` is now sent only to a downstream that advertised the
+  extension.
+- **A genuinely 8-bit body** goes to a downstream without the extension only where
+  the route declares it 8-bit clean: a new per-route `downstream.assume_8bitmime`,
+  default `false` — the same shape as D-018's `downstream.smtputf8`, for the same
+  reason: `EHLO` does not tell the truth, so the operator must. Sent without the
+  parameter, bytes unchanged. An undeclared route keeps `451 4.3.5` and
+  `simmer_downstream_config_error_total{stage="capability"}`.
+- **The shipped config declares it on the Postal route.** `/routes` reports it next
+  to `smtputf8`.
+
+**Not chosen:** converting to quoted-printable (RFC-correct always, but a sizeable
+feature that changes body bytes and overrides D-045's never-change-the-encoding
+rule); sending 8-bit bodies to any downstream (silently wrong for a server that
+genuinely is not 8-bit clean); fixing only the 7-bit case.
+
+Three tests in `tests/smtp_ingress.rs` pin the three cases against a fake downstream
+with Postal's `EHLO`.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
