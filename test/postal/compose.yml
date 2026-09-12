@@ -1,0 +1,189 @@
+# Postal v3 (3.3.7) as a downstream SMTP server for automated tests -- postal-spike.
+# Usage: docker compose -p postalspike -f compose.yml up -d --wait
+# No bind mounts, no published ports: config via env vars + inline `configs:`; keys in a named volume.
+name: postalspike
+
+x-postal-image: &postal-image ghcr.io/postalserver/postal:3.3.7@sha256:e54b4a7eb106ee15eda5664311c4b9415546d4196f5c4336d23a78d6ce57b819
+
+x-postal-env: &postal-env
+  # Every Konfig path maps to UPPERCASE_UNDERSCORE env vars (arrays comma-separated).
+  MAIN_DB_HOST: mariadb
+  MAIN_DB_USERNAME: root
+  MAIN_DB_PASSWORD: postal
+  MESSAGE_DB_HOST: mariadb
+  MESSAGE_DB_USERNAME: root
+  MESSAGE_DB_PASSWORD: postal
+  POSTAL_WEB_HOSTNAME: postal.test
+  POSTAL_SMTP_HOSTNAME: postal.test
+  POSTAL_SIGNING_KEY_PATH: /config/signing.key
+  # Every outbound delivery goes to the Mailpit trap instead of MX lookup.
+  POSTAL_SMTP_RELAYS: smtp://mailpit:1025?ssl_mode=None
+  DNS_RETURN_PATH_DOMAIN: rp.postal.test
+  DNS_HELO_HOSTNAME: postal.test
+  SMTP_SERVER_TLS_ENABLED: "true"
+  SMTP_SERVER_TLS_CERTIFICATE_PATH: /config/smtp.cert
+  SMTP_SERVER_TLS_PRIVATE_KEY_PATH: /config/smtp.key
+  SMTP_SERVER_MAX_MESSAGE_SIZE: "14"
+  RAILS_SECRET_KEY: 3f1c0de2a1b94e6f8d7c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706
+  LOGGING_ENABLED: "true"
+  SILENCE_POSTAL_CONFIG_MESSAGES: "true"
+
+services:
+  mariadb:
+    image: mariadb:10.11@sha256:07c0aaff7396b74cb7975cba78257178d188e30f531a5db2b617c48beef13c41
+    command: ["--innodb-log-file-size=256M", "--max-connections=300"]
+    environment:
+      MARIADB_ROOT_PASSWORD: postal
+      MARIADB_DATABASE: postal
+    volumes: [mariadb-data:/var/lib/mysql]
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  mailpit:
+    image: axllent/mailpit:v1.31.1@sha256:98b916bd3c8d61f7633a52d3ea2f58d00620cb01ca57ab59edde68c347a95365
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 2s
+      retries: 30
+
+  # One-shot: generate keys into the config volume, create/migrate the DB, provision org/server/domain/credential.
+  postal-init:
+    image: *postal-image
+    user: root
+    environment:
+      <<: *postal-env
+      SPIKE_SMTP_PASSWORD: spike-smtp-password-0001
+      SPIKE_SENDER_DOMAIN: sender.test
+    configs:
+      - source: gen_keys
+        target: /spike/gen-keys.rb
+      - source: provision
+        target: /spike/provision.rb
+    volumes: [postal-config:/config]
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        cd /opt/postal/app
+        ruby /spike/gen-keys.rb
+        postal initialize
+        bundle exec rails runner /spike/provision.rb
+    depends_on:
+      mariadb: {condition: service_healthy}
+    restart: "no"
+
+  smtp:
+    image: *postal-image
+    command: ["postal", "smtp-server"]
+    environment: *postal-env
+    volumes: [postal-config:/config:ro]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:9091/health"]
+      interval: 2s
+      retries: 60
+    depends_on:
+      postal-init: {condition: service_completed_successfully}
+      mailpit: {condition: service_healthy}
+
+  worker:
+    image: *postal-image
+    command: ["postal", "worker"]
+    environment: *postal-env
+    volumes: [postal-config:/config:ro]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:9090/health"]
+      interval: 2s
+      retries: 60
+    depends_on:
+      postal-init: {condition: service_completed_successfully}
+      mailpit: {condition: service_healthy}
+
+volumes:
+  mariadb-data:
+  postal-config:
+
+configs:
+  gen_keys:
+    content: |
+      # Generates /config/signing.key (Postal's required RSA signing key) and a self-signed
+      # SMTP TLS cert/key for STARTTLS, unless files already exist (so supplied PEMs win).
+      require "openssl"
+
+      dir = ENV.fetch("SPIKE_CONFIG_DIR", "/config")
+      host = ENV.fetch("POSTAL_SMTP_HOSTNAME", "postal.test")
+
+      signing = File.join(dir, "signing.key")
+      File.write(signing, OpenSSL::PKey::RSA.new(2048).to_pem) unless File.exist?(signing)
+
+      cert_path = File.join(dir, "smtp.cert")
+      key_path  = File.join(dir, "smtp.key")
+      unless File.exist?(cert_path) && File.exist?(key_path)
+        key = OpenSSL::PKey::RSA.new(2048)
+        name = OpenSSL::X509::Name.parse("/CN=#{host}")
+        cert = OpenSSL::X509::Certificate.new
+        cert.version = 2
+        cert.serial = 1
+        cert.subject = name
+        cert.issuer = name
+        cert.public_key = key.public_key
+        cert.not_before = Time.now - 60
+        cert.not_after = Time.now + (365 * 86_400)
+        ef = OpenSSL::X509::ExtensionFactory.new(cert, cert)
+        cert.add_extension(ef.create_extension("subjectAltName", "DNS:#{host},DNS:smtp", false))
+        cert.sign(key, OpenSSL::Digest.new("SHA256"))
+        File.write(key_path, key.to_pem)
+        File.write(cert_path, cert.to_pem)
+      end
+
+      Dir[File.join(dir, "*")].each { |f| File.chmod(0o644, f) }
+      puts "keys ready in #{dir}: #{Dir.children(dir).sort.join(', ')}"
+
+  provision:
+    content: |
+      # Postal 3.3.7 headless provisioning -- run with `bundle exec rails runner provision.rb`.
+      # Idempotent: safe to run on every stack start.
+      #
+      # Creates: admin user (Organization.owner is a required belongs_to), organization,
+      # a Live-mode mail server (Development mode HOLDS every outgoing message), a verified
+      # sending domain, and an SMTP credential whose key (= the SMTP AUTH password) is forced to a
+      # known value. Postal ignores the SMTP AUTH username for PLAIN/LOGIN; only the key matters.
+
+      cred_key      = ENV.fetch("SPIKE_SMTP_PASSWORD", "spike-smtp-password-0001")
+      sender_domain = ENV.fetch("SPIKE_SENDER_DOMAIN", "sender.test")
+      use_for_any   = ENV.fetch("SPIKE_DOMAIN_USE_FOR_ANY", "false") == "true"
+
+      user = User.find_by(email_address: "admin@postal.test") || User.create!(
+        first_name: "Spike", last_name: "Admin", email_address: "admin@postal.test",
+        password: "spike-admin-password", admin: true, email_verified_at: Time.now
+      )
+
+      org = Organization.find_by(permalink: "spike") ||
+            Organization.create!(name: "Spike", permalink: "spike", owner: user)
+
+      # after_create provisions the per-server message DB (CREATE DATABASE `postal-server-<id>`),
+      # so the message_db user needs CREATE privileges.
+      server = org.servers.find_by(permalink: "relay") ||
+               org.servers.create!(name: "Relay", permalink: "relay", mode: "Live")
+      server.update!(mode: "Live") unless server.mode == "Live"
+
+      # The SMTP server checks the *From header* (not MAIL FROM) against verified domains
+      # owned by the server or its organization; failure => "530 From/Sender name is not valid".
+      domain = server.domains.find_by(name: sender_domain) ||
+               server.domains.create!(name: sender_domain, verification_method: "DNS")
+      domain.update_columns(verified_at: Time.now) unless domain.verified?
+      domain.update_columns(use_for_any: use_for_any) unless domain.use_for_any == use_for_any
+
+      # Credential#generate_key overwrites any key given at create time with a random
+      # 24-char string, so set the known value afterwards with update_column (skips the
+      # "key cannot be changed" validation).
+      cred = server.credentials.find_by(name: "spike") ||
+             server.credentials.create!(type: "SMTP", name: "spike")
+      cred.update_column(:key, cred_key) unless cred.key == cred_key
+
+      puts({ organization: org.permalink, server: server.full_permalink, server_mode: server.mode,
+             server_token: server.token, domain: domain.name, domain_verified: domain.reload.verified?,
+             use_for_any: domain.use_for_any, credential_type: cred.type,
+             credential_key: cred.reload.key }.to_json)
+

@@ -1,0 +1,241 @@
+{
+  "banner": [
+    "220 postal.test ESMTP Postal/JSUVHCUB"
+  ],
+  "ehlo_plain": [
+    "250-My capabilities are",
+    "250-STARTTLS",
+    "250 AUTH CRAM-MD5 PLAIN LOGIN"
+  ],
+  "starttls_reply": [
+    220,
+    "Ready to start TLS"
+  ],
+  "ehlo_after_starttls": [
+    250,
+    "My capabilities are\nAUTH CRAM-MD5 PLAIN LOGIN"
+  ],
+  "tls_version": "TLSv1.3",
+  "tls_cipher": "TLS_AES_256_GCM_SHA384",
+  "auth_PLAIN_wrong": [
+    535,
+    "Invalid credential"
+  ],
+  "auth_LOGIN_wrong": [
+    535,
+    "Invalid credential"
+  ],
+  "auth_PLAIN_ok": [
+    235,
+    "Granted for spike/relay"
+  ],
+  "auth_LOGIN_ok": [
+    235,
+    "Granted for spike/relay"
+  ],
+  "auth_CRAM-MD5_ok": [
+    235,
+    "Granted for spike/relay"
+  ],
+  "unauth_rcpt": [
+    "530 Authentication required"
+  ],
+  "unknown_from_domain": [
+    530,
+    "From/Sender name is not valid"
+  ],
+  "unknown_envelope_verified_from": [
+    250,
+    "accepted"
+  ],
+  "mail_from_reply": [
+    250,
+    "OK"
+  ],
+  "rcpt_reply": [
+    250,
+    "OK"
+  ],
+  "data_reply": [
+    250,
+    "OK"
+  ],
+  "too_large": [
+    552,
+    "Message too large (maximum size 14MB)"
+  ],
+  "pipelined_replies": [
+    "250 OK",
+    "250 OK",
+    "354 Go ahead",
+    "250 OK",
+    "221 Closing Connection"
+  ],
+  "smtputf8_8bitmime_transcript": [
+    [
+      "C",
+      "AUTH PLAIN AHgAc3Bpa2Utc210cC1wYXNzd29yZC0wMDAx"
+    ],
+    [
+      "S",
+      [
+        "235 Granted for spike/relay"
+      ]
+    ],
+    [
+      "C",
+      "MAIL FROM:<app@sender.test> SMTPUTF8"
+    ],
+    [
+      "S",
+      [
+        "250 OK"
+      ]
+    ],
+    [
+      "C",
+      "RCPT TO:<j\u00fcrgen@example.net>"
+    ],
+    [
+      "S",
+      [
+        "250 OK"
+      ]
+    ],
+    [
+      "C",
+      "RSET"
+    ],
+    [
+      "S",
+      [
+        "250 OK"
+      ]
+    ],
+    [
+      "C",
+      "MAIL FROM:<app@sender.test> BODY=8BITMIME"
+    ],
+    [
+      "S",
+      [
+        "250 OK"
+      ]
+    ],
+    [
+      "C",
+      "QUIT"
+    ],
+    [
+      "S",
+      [
+        "221 Closing Connection"
+      ]
+    ]
+  ],
+  "delivered": true,
+  "delivery_latency_s": 1.21,
+  "mailpit_summary": {
+    "ID": "0utdRbpa8uBC2eKF8lf8pU",
+    "MessageID": "7d0060f5-78f2-4d9b-9e8e-dd8ede2c6040@client.spike",
+    "From": {
+      "Name": "App Sender",
+      "Address": "app@sender.test"
+    },
+    "To": [
+      {
+        "Name": "",
+        "Address": "rcpt@example.net"
+      }
+    ],
+    "Cc": [],
+    "Bcc": [],
+    "ReplyTo": [],
+    "ReturnPath": "joqbqj@rp.postal.test",
+    "Subject": "spike-bae1c02d",
+    "ListUnsubscribe": {
+      "Header": "",
+      "Links": [],
+      "Errors": "",
+      "HeaderPost": ""
+    },
+    "Date": "2026-09-12T11:38:38.483Z",
+    "Tags": [],
+    "Username": "",
+    "Text": "hello from the postal spike\r\n\r\n",
+    "HTML": "",
+    "Size": 1338,
+    "Inline": [],
+    "Attachments": []
+  },
+  "raw_as_delivered": "Return-Path: <joqbqj@rp.postal.test>\r\nReceived: from postal.test (postalspike-worker-1.postalspike_default. [172.26.0.5])\r\n        by 3250fbcee7d4 (Mailpit) with SMTP\r\n        for <rcpt@example.net>; Sat, 12 Sep 2026 11:38:38 +0000 (UTC)\r\nResent-Sender: joqbqj@rp.postal.test\r\nDKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n\td=rp.postal.test;\r\n\ts=postal; t=1789213118;\r\n\tbh=JNmMv9e7s5lZRYkwESqws16YKPYzWaraSut3DpxoPxs=;\r\n\th=from:to:subject:message-id:content-type:content-transfer-encoding:mime-version;\r\n\tb=JjrRelhypN1ctJ0ixijByK/BlwpApu/z6WQFbNYRH7ykdVsWPPrjbiG6zIG/w1hLOEEC17WU\r\n\tqNkuapWHyjD1twWmsjRcwS2ELkPx6xLWk2HJmYS+UyEC9ZlHQmzrPlmI2471i1qZuz93K6xt\r\n\t/rZL3cHDuODZYOmcdBVSHyEw62L3Deq4hHSEMesXfOUk4gy4Z/g7qKosTAMyBPQHbG9MaaZu\r\n\tC03IabRg84BEhb6HwtTQRheNbamB45nSw+KGCmX6RT0gMR/C40QAZkycFtAxYNyYZI9VPB6h\r\n\tl13OhL0Pz/YfS2eopl1B7+mKipmqNDzaEOO1B2g/NG4rgy6JB/pmLA==\r\nX-Postal-MsgID: Evz0W6ni7Dmo6QVB\r\nReceived: from probe.client (cc-jail-claude-run-208282237124.postalspike_default [172.26.0.6]) by postal.test with SMTP; Sat, 12 Sep 2026 11:38:38 -0000\r\nFrom: App Sender <app@sender.test>\r\nTo: rcpt@example.net\r\nSubject: spike-bae1c02d\r\nMessage-ID: <7d0060f5-78f2-4d9b-9e8e-dd8ede2c6040@client.spike>\r\nContent-Type: text/plain; charset=\"utf-8\"\r\nContent-Transfer-Encoding: 7bit\r\nMIME-Version: 1.0\r\n\r\nhello from the postal spike\r\n\r\n",
+  "original_message_id": "<7d0060f5-78f2-4d9b-9e8e-dd8ede2c6040@client.spike>",
+  "mailpit_headers": {
+    "Content-Transfer-Encoding": [
+      "7bit"
+    ],
+    "Content-Type": [
+      "text/plain; charset=\"utf-8\""
+    ],
+    "Dkim-Signature": [
+      "v=1; a=rsa-sha256; c=relaxed/relaxed; d=rp.postal.test; s=postal; t=1789213118; bh=JNmMv9e7s5lZRYkwESqws16YKPYzWaraSut3DpxoPxs=; h=from:to:subject:message-id:content-type:content-transfer-encoding:mime-version; b=JjrRelhypN1ctJ0ixijByK/BlwpApu/z6WQFbNYRH7ykdVsWPPrjbiG6zIG/w1hLOEEC17WU qNkuapWHyjD1twWmsjRcwS2ELkPx6xLWk2HJmYS+UyEC9ZlHQmzrPlmI2471i1qZuz93K6xt /rZL3cHDuODZYOmcdBVSHyEw62L3Deq4hHSEMesXfOUk4gy4Z/g7qKosTAMyBPQHbG9MaaZu C03IabRg84BEhb6HwtTQRheNbamB45nSw+KGCmX6RT0gMR/C40QAZkycFtAxYNyYZI9VPB6h l13OhL0Pz/YfS2eopl1B7+mKipmqNDzaEOO1B2g/NG4rgy6JB/pmLA=="
+    ],
+    "From": [
+      "App Sender <app@sender.test>"
+    ],
+    "Message-Id": [
+      "<7d0060f5-78f2-4d9b-9e8e-dd8ede2c6040@client.spike>"
+    ],
+    "Mime-Version": [
+      "1.0"
+    ],
+    "Received": [
+      "from postal.test (postalspike-worker-1.postalspike_default. [172.26.0.5]) by 3250fbcee7d4 (Mailpit) with SMTP for <rcpt@example.net>; Sat, 12 Sep 2026 11:38:38 +0000 (UTC)",
+      "from probe.client (cc-jail-claude-run-208282237124.postalspike_default [172.26.0.6]) by postal.test with SMTP; Sat, 12 Sep 2026 11:38:38 -0000"
+    ],
+    "Resent-Sender": [
+      "joqbqj@rp.postal.test"
+    ],
+    "Return-Path": [
+      "<joqbqj@rp.postal.test>"
+    ],
+    "Subject": [
+      "spike-bae1c02d"
+    ],
+    "To": [
+      "rcpt@example.net"
+    ],
+    "X-Postal-Msgid": [
+      "Evz0W6ni7Dmo6QVB"
+    ]
+  },
+  "mailpit_all": [
+    {
+      "Subject": "envelope-unknown-36007842",
+      "To": [
+        {
+          "Name": "",
+          "Address": "rcpt@example.net"
+        }
+      ],
+      "From": {
+        "Name": "",
+        "Address": "app@sender.test"
+      }
+    },
+    {
+      "Subject": "spike-bae1c02d",
+      "To": [
+        {
+          "Name": "",
+          "Address": "rcpt@example.net"
+        }
+      ],
+      "From": {
+        "Name": "App Sender",
+        "Address": "app@sender.test"
+      }
+    }
+  ],
+  "envelope_unknown_raw_head": "Bcc: rcpt2@example.net\r\nReturn-Path: <joqbqj@rp.postal.test>\r\nReceived: from postal.test (postalspike-worker-1.postalspike_default. [172.26.0.5])\r\n        by 3250fbcee7d4 (Mailpit) with SMTP\r\n        for <rcpt2@example.net>; Sat, 12 Sep 2026 11:38:38 +0000 (UTC)\r\nResent-Sender: joqbqj@rp.postal.test\r\nDKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n\td=rp.postal.test;\r\n\ts=postal; t=1789213118;\r\n\tbh=JNmMv9e7s5lZRYkwESqws16YKPYzWaraSut3DpxoPxs=;\r\n\th=from:to:subject:message-id:content-type:content-transfer-encoding:mime-version;\r\n\tb=RURnrUlOI1gtrTxX4VOvbP0Lyf8zFL6FeaFBdLcgLqjlrqTbUeHxJOeRAizQoUYRgt5xxNaC\r\n\tdvumbMwghKNOzhmbQulKvdYNebbdhsd+tkoKgXfaQ7zEhuJGdPFwQhOGCXmXtzGvzi1LUefK\r\n\tzaPNR1/pGXRnPcH2SB+4Sce9DJj+Q+mk5z8DFX6B5g2XpPrcWvPfGvt0QoV0lJokZ5oo76Ho\r\n\tVq3x0AUaUYtgif2Q6W9RoDHThH/nU++1BBZqV6SuhU0zsXpdDztm2d5j7mtuPbJ03n0HIlq0\r\n\thz47qcIn2OSvUn+4y6fF/nJPgsZpnjvba0YlBhK0PfiJE8F5LpnMvQ==\r\nX-Postal-MsgID: alIbe5i5zEQYdc5U\r\nReceived: from probe.client (cc-jail-claude-run-208282237124.postalspike_default [172.26.0.6]) by postal.test with SMTP; Sat, 12 Sep 2026 11:38:38 -0000\r\nFrom: app@sender.test\r\nTo: rcpt@example.net\r\nSubject: envelope-unknown-36007842\r\nMessage-ID: <8a9b8a6c-7694-4135-ab74-575fa80090ee@client.spike>\r\nContent-Type: text/plain; charset=\"utf-8\"\r\nContent-Transfer-Encoding: 7bit\r\nMIME-Version: 1.0\r\n\r\nhello from the postal spike\r\n"
+}
