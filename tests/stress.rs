@@ -499,6 +499,154 @@ fn s4_large_messages_stay_within_memory() {
 }
 
 // ---------------------------------------------------------------------------
+// S6 — mixed realistic traffic
+// ---------------------------------------------------------------------------
+
+/// About half the run's volume, so the ramp runs out partway through and the
+/// §3.2 walk has to steer while everything else is going on.
+const S6_ALLOWANCE: i64 = 200;
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s6_mixed_realistic_traffic_holds_every_invariant() {
+    // The nearest thing in the tier to what an application actually does: all
+    // three ports at once, both AUTH mechanisms, a few wrong passwords, a size mix
+    // straddling §8.1's spill threshold, sessions that send several messages with
+    // RSET between them, and a downstream misbehaving at realistic rates — while
+    // the allowance runs out underneath it.
+    //
+    // Two sizing choices, both deliberate. The mix tops out at 4 MiB rather than
+    // the 15 MiB first sketched: at ~0.4 MB/s per stream a 15 MiB body sits at
+    // ~37 s of the 60 s data timeout, the 1.3x margin that made S4 flaky twice.
+    // 4 MiB is ~10 s and still four times the spill threshold. And the sink drops
+    // after the dot rather than stalling: a stall is only ambiguous once it
+    // outlasts the 60 s downstream budget, which would make this scenario minutes
+    // long, while a drop is ambiguous at once. S9 owns the stall.
+    let _logs = STRESS.logs_on_failure();
+    let sizes = "dist:4k:80,100k:15,1m:4,4m:1";
+    let mut s = Scenario::sending(
+        "S6",
+        "--fail-rcpt-pct 1 --fail-data-pct 0.5 --drop-after-dot-pct 0.2",
+        &[],
+    );
+    s.before = Some(pin_the_s6_allowance);
+    s.loadgens = vec![
+        (
+            "mix25",
+            args(&[
+                "--port",
+                "25",
+                "--tag",
+                "m25",
+                "--count",
+                "200",
+                "--concurrency",
+                "16",
+                "--per-session",
+                "5",
+                "--size",
+                sizes,
+                "--auth",
+                "plain",
+                "--wrong-password-pct",
+                "1",
+            ]),
+        ),
+        (
+            "mix587",
+            args(&[
+                "--port",
+                "587",
+                "--starttls",
+                "--ca",
+                "os",
+                "--tag",
+                "m587",
+                "--count",
+                "160",
+                "--concurrency",
+                "12",
+                "--per-session",
+                "4",
+                "--size",
+                sizes,
+                "--auth",
+                "login",
+                "--wrong-password-pct",
+                "1",
+            ]),
+        ),
+        (
+            "mix465",
+            args(&[
+                "--port",
+                "465",
+                "--mode",
+                "implicit",
+                "--ca",
+                "os",
+                "--tag",
+                "m465",
+                "--count",
+                "40",
+                "--concurrency",
+                "4",
+                "--per-session",
+                "2",
+                "--size",
+                sizes,
+                "--auth",
+                "plain",
+            ]),
+        ),
+    ];
+    // The injected downstream faults are the scenario's own doing.
+    s.expected_errors = &["downstream"];
+    let seen = run(&s);
+
+    // The ramp was never exceeded — and it was actually reached, or the scenario
+    // proved nothing about steering. Not an exact figure: the injected faults mean
+    // some warming reservations release instead of committing, so "never more than
+    // the allowance" is the invariant, not "exactly it".
+    let committed: i64 = STRESS
+        .psql(
+            "select coalesce(sum(committed), 0) from quota_usage where route = 'warming-newbrand'",
+        )
+        .parse()
+        .expect("committed");
+    let overflow: i64 = STRESS
+        .psql(
+            "select coalesce(sum(committed), 0) from quota_usage \
+             where route = 'overflow-established'",
+        )
+        .parse()
+        .expect("overflow committed");
+    eprintln!(
+        "  S6: {committed} committed on warming (allowance {S6_ALLOWANCE}), {overflow} on overflow"
+    );
+    assert!(
+        committed <= S6_ALLOWANCE,
+        "warming committed {committed}, over its allowance of {S6_ALLOWANCE}"
+    );
+    assert!(committed > 0, "nothing committed on warming");
+    assert!(
+        overflow > 0,
+        "nothing steered to overflow, so the allowance never ran out"
+    );
+
+    judge_all(&s, &seen);
+}
+
+fn pin_the_s6_allowance() {
+    let (status, body) = admin::post(
+        &STRESS,
+        "/routes/warming-newbrand/allowance",
+        &serde_json::json!({ "domain_group": "catchall", "allowance": S6_ALLOWANCE }),
+    );
+    assert_eq!(status, 200, "pinning the allowance: {body}");
+}
+
+// ---------------------------------------------------------------------------
 // S7 — two instances, one quota
 // ---------------------------------------------------------------------------
 
