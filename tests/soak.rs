@@ -229,6 +229,12 @@ fn soak_run() {
 #[ignore = "reads target/soak/*.csv from a previous soak_run"]
 fn soak_analyze() {
     let mut judged = 0;
+    // Every instance is analysed before anything fails. `app` and `app2` carry
+    // identical streams and differ only in that `app` is scraped, so `app2`'s
+    // numbers are what make `app`'s mean anything (F8) — and a bare `assert!`
+    // inside the loop threw exactly that away, ending the run on the first
+    // instance and leaving the comparison to be rebuilt by hand.
+    let mut failures: Vec<String> = Vec::new();
     for instance in INSTANCES {
         let samples = read_samples(instance);
         if samples.is_empty() {
@@ -289,12 +295,13 @@ fn soak_analyze() {
                     ""
                 }
             );
-            assert!(
-                !v.leaking,
-                "{instance}: {name} is growing at {:+.2} {unit} with a quartile step of {:+.2}",
-                v.slope_per_hour / scale,
-                v.quartile_step / scale
-            );
+            if v.leaking {
+                failures.push(format!(
+                    "{instance}: {name} is growing at {:+.2} {unit} with a quartile step of {:+.2}",
+                    v.slope_per_hour / scale,
+                    v.quartile_step / scale
+                ));
+            }
         }
 
         // Hard bounds, at every sample rather than on the trend: these are not
@@ -302,11 +309,12 @@ fn soak_analyze() {
         let peak_established = samples.iter().map(|s| s.established).max().unwrap_or(0);
         let peak_close_wait = samples.iter().map(|s| s.close_wait).max().unwrap_or(0);
         eprintln!("  peak established {peak_established}, peak CLOSE_WAIT {peak_close_wait}");
-        assert!(
-            peak_close_wait <= 64,
-            "{instance}: CLOSE_WAIT peaked at {peak_close_wait}, which is more sockets \
-             half-closed than every downstream pool put together"
-        );
+        if peak_close_wait > 64 {
+            failures.push(format!(
+                "{instance}: CLOSE_WAIT peaked at {peak_close_wait}, which is more sockets \
+                 half-closed than every downstream pool put together"
+            ));
+        }
     }
     // F7's series count: reported, not judged. The senders that would make it grow
     // are V3's fresh, unmatched domains, and they do not exist yet — so a gate here
@@ -327,6 +335,12 @@ fn soak_analyze() {
     }
 
     assert!(judged > 0, "no samples at all; run soak_run first");
+    assert!(
+        failures.is_empty(),
+        "{} of {judged} instances failed:\n  {}",
+        failures.len(),
+        failures.join("\n  ")
+    );
 }
 
 // ---------------------------------------------------------------------------
