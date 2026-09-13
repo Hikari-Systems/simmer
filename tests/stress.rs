@@ -59,13 +59,7 @@ fn s0_a_clean_run_passes_every_check() {
     // Well inside the ceilings' reach: 32 clients against a pool of 4. Nothing
     // here should fail, so a failure is the harness's or a real regression's.
     let _logs = STRESS.logs_on_failure();
-    let s = Scenario {
-        name: "S0",
-        sink_args: "",
-        loadgen: args(&["--count", "2000", "--concurrency", "32"]),
-        expected_errors: &[],
-        bare_close_ok: false,
-    };
+    let s = Scenario::sending("S0", "", &["--count", "2000", "--concurrency", "32"]);
     let seen = run(&s);
     assert_eq!(seen.sent.len(), 2000, "the loadgen recorded every message");
     judge_all(&s, &seen);
@@ -77,13 +71,11 @@ fn the_accounting_check_catches_a_sink_that_loses_mail() {
     // Checking the checks: a sink that answers 250 and keeps nothing for one
     // message in fifty must fail U3, or a passing U3 proves nothing.
     let _logs = STRESS.logs_on_failure();
-    let s = Scenario {
-        name: "selfcheck",
-        sink_args: "--lose-every 50",
-        loadgen: args(&["--count", "500", "--concurrency", "16"]),
-        expected_errors: &[],
-        bare_close_ok: false,
-    };
+    let s = Scenario::sending(
+        "selfcheck",
+        "--lose-every 50",
+        &["--count", "500", "--concurrency", "16"],
+    );
     let seen = run(&s);
     let report = reconcile::reconcile(&seen.sent, &seen.received, Some(seen.ambiguous_delta));
     let lost = report
@@ -92,6 +84,270 @@ fn the_accounting_check_catches_a_sink_that_loses_mail() {
         .filter(|v| v.contains("nothing arrived"))
         .count();
     assert_eq!(lost, 10, "{:#?}", report.violations);
+}
+
+// ---------------------------------------------------------------------------
+// S1 — connection flood
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s1_a_connection_flood_is_bounded_and_every_client_is_answered() {
+    // 640 clients at once across all three listeners, each reading the banner and
+    // then holding its socket open. Past 64 the rest must get 421 4.3.2, that 421
+    // count must equal connections_refused{max_sessions} (U8), and no client may
+    // be dropped without a reply (U2) — an accepted-then-idle client is ended by
+    // the command timeout with a 421, not a bare close.
+    let _logs = STRESS.logs_on_failure();
+    // Each flood gets its own tag, so the per-message ids do not collide across
+    // the three loadgens' record files. --hold 25s outlasts the 15 s command
+    // timeout, so an accepted-then-idle client is ended by the server, not by
+    // itself. 465 speaks implicit TLS, verified through the OS trust store.
+    let silent = |tag: &'static str, port: &str, n: &str, tls: &[&str]| {
+        let mut a = vec![
+            "--behaviour",
+            "silent",
+            "--tag",
+            tag,
+            "--port",
+            port,
+            "--count",
+            n,
+            "--concurrency",
+            n,
+            "--hold",
+            "25s",
+        ];
+        a.extend_from_slice(tls);
+        (tag, args(&a))
+    };
+    let mut s = Scenario::sending("S1", "", &[]);
+    s.loadgens = vec![
+        silent("flood25", "25", "400", &[]),
+        silent("flood587", "587", "120", &[]),
+        silent(
+            "flood465",
+            "465",
+            "120",
+            &["--mode", "implicit", "--ca", "os"],
+        ),
+    ];
+    // The implicit port refuses over-cap with a bare close, which §5.1 permits and
+    // U8 counts as a refusal.
+    s.bare_close_ok = true;
+    s.bare_close_is_refusal = true;
+    let seen = run(&s);
+    assert_eq!(
+        seen.peaks.sessions, 64.0,
+        "the flood should drive sessions to the cap"
+    );
+    assert!(
+        seen.refused_max_sessions_delta > 400,
+        "a 640-client flood should refuse most: {}",
+        seen.refused_max_sessions_delta
+    );
+    judge_all(&s, &seen);
+}
+
+// ---------------------------------------------------------------------------
+// S2 — pool saturation
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s2_a_slow_downstream_saturates_the_pool_without_overrunning_it() {
+    // The sink answers every message 2 s slow. 64 senders pile onto a pool of 4:
+    // the sink must never see more than 4 connections (U4), a client that waits
+    // out the connect budget gets 451 4.4.5 and its message is never delivered
+    // (U1, U3), and nothing is a permanent failure.
+    let _logs = STRESS.logs_on_failure();
+    let s = Scenario::sending(
+        "S2",
+        "--slow-ms 2000",
+        &["--count", "120", "--concurrency", "64"],
+    );
+    let seen = run(&s);
+    let deferred = seen.sent.iter().filter(|r| r.code == 451).count();
+    assert!(
+        deferred > 0,
+        "a 2 s sink under 64 senders should defer some: {deferred}"
+    );
+    judge_all(&s, &seen);
+}
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s2b_a_downstream_that_reaps_idle_connections_never_duplicates() {
+    // The sink closes idle connections after 1 s, so a pooled connection is dead
+    // on reuse (D-068). Simmer's one retry must deliver each message exactly once
+    // — no loss, no duplicate (U3) — under a stream that reuses connections hard.
+    let _logs = STRESS.logs_on_failure();
+    let s = Scenario::sending(
+        "S2b",
+        "--idle-close-secs 1",
+        &[
+            "--count",
+            "200",
+            "--concurrency",
+            "8",
+            "--per-session",
+            "25",
+        ],
+    );
+    let seen = run(&s);
+    judge_all(&s, &seen);
+}
+
+// ---------------------------------------------------------------------------
+// S5 — AUTH storm (F3a)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s5_an_auth_storm_stays_within_memory_and_keeps_answering() {
+    // 200 clients over STARTTLS+AUTH, half with the wrong password, all paying
+    // argon2's ~19 MiB cost. This is the scenario F3a was expected to OOM — 64
+    // sessions × 19 MiB ≈ 1.2 GiB — and it did under glibc. It does not here, for
+    // two measured reasons: argon2 is CPU-bound, so on 2 CPUs only a handful
+    // verify at once rather than all 64 (peak ~530 MiB, not 1.2 GiB), and jemalloc
+    // (D-078) returns each block promptly. So F3a does not reproduce at this core
+    // count; the gate is that memory stays clear of the limit and /healthcheck
+    // keeps answering while the CPU hashes. A host with far more cores could bring
+    // F3a back, which the memory bound would then catch.
+    let _logs = STRESS.logs_on_failure();
+    let mut s = Scenario::sending(
+        "S5",
+        "",
+        &[
+            "--port",
+            "587",
+            "--starttls",
+            "--ca",
+            "os",
+            "--auth",
+            "plain",
+            "--wrong-password-pct",
+            "50",
+            "--count",
+            "200",
+            "--concurrency",
+            "64",
+        ],
+    );
+    s.max_anon_mib = Some(900.0);
+    s.max_healthcheck_ms = Some(1000.0);
+    // The wrong-password half is answered 535, which is a permitted permanent
+    // reply (U1 already exempts 535); nothing here should ERROR.
+    let seen = run(&s);
+    judge_all(&s, &seen);
+}
+
+// ---------------------------------------------------------------------------
+// S8 — slowloris
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s8a_a_data_line_with_no_terminator_is_bounded(/* F1 */) {
+    // One client reaches DATA and sends 300 MiB with no line ending. Finding F1:
+    // the line is buffered whole because MAX_DATA_LINE is checked only after the
+    // read, so anon climbs past the bound. A known finding until the length is
+    // checked as the line is read.
+    let _logs = STRESS.logs_on_failure();
+    let mut s = Scenario::sending(
+        "S8a",
+        "",
+        &[
+            "--behaviour",
+            "no-lf",
+            "--count",
+            "1",
+            "--concurrency",
+            "1",
+            "--no-lf-bytes",
+            "300m",
+            "--hold",
+            "60s",
+        ],
+    );
+    s.max_anon_mib = Some(96.0);
+    // F1's other face: the session is buffering the whole line, so it ends by
+    // dropping the client rather than answering — tolerated here (the memory
+    // bound is the gate), and how Simmer logs it is not U7's business.
+    s.bare_close_ok = true;
+    s.expected_errors = &["data line too long", "MAX_DATA_LINE"];
+    let seen = run(&s);
+    judge_all(&s, &seen);
+}
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s8b_noop_idlers_are_closed_at_the_session_timeout() {
+    // Clients that authenticate and then only NOOP, forever. NOOP does not reset
+    // the session timeout (it runs from connect), so each is ended at 120 s with a
+    // 421 — never left open (a client still holding at its own 140 s deadline is a
+    // code-0 record, which U2 fails).
+    let _logs = STRESS.logs_on_failure();
+    let mut s = Scenario::sending("S8b", "", &[]);
+    s.loadgens = vec![(
+        "idlers",
+        args(&[
+            "--behaviour",
+            "noop-idle",
+            "--count",
+            "8",
+            "--concurrency",
+            "8",
+            "--idle-every",
+            "5s",
+            "--hold",
+            "140s",
+        ]),
+    )];
+    let seen = run(&s);
+    assert!(
+        seen.sent.iter().all(|r| r.code == 421),
+        "every idler should be ended with a 421: {:?}",
+        seen.sent
+            .iter()
+            .map(|r| (r.code, r.text.as_str()))
+            .collect::<Vec<_>>()
+    );
+    judge_all(&s, &seen);
+}
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s8c_data_tricklers_hit_the_data_timeout() {
+    // Clients that reach DATA and then dribble a byte every 2 s without ever
+    // completing a line. The data timeout ends them with a 421; none is left open.
+    let _logs = STRESS.logs_on_failure();
+    let mut s = Scenario::sending("S8c", "", &[]);
+    s.loadgens = vec![(
+        "tricklers",
+        args(&[
+            "--behaviour",
+            "data-trickle",
+            "--count",
+            "8",
+            "--concurrency",
+            "8",
+            "--trickle-every",
+            "2s",
+            "--hold",
+            "120s",
+        ]),
+    )];
+    let seen = run(&s);
+    assert!(
+        seen.sent.iter().all(|r| r.code == 421),
+        "every trickler should be ended with a 421: {:?}",
+        seen.sent
+            .iter()
+            .map(|r| (r.code, r.text.as_str()))
+            .collect::<Vec<_>>()
+    );
+    judge_all(&s, &seen);
 }
 
 // ---------------------------------------------------------------------------
@@ -106,12 +362,41 @@ struct Scenario {
     name: &'static str,
     /// Passed to the sink as `SINK_ARGS` (`--slow-ms 2000`, `--lose-every 50`).
     sink_args: &'static str,
-    /// Loadgen arguments after the ones every run carries (`--stamp`, `--jsonl`).
-    loadgen: Vec<String>,
+    /// One or more loadgens, run at once, each `(label, args after the shared
+    /// ones)`. The label names its own JSONL, so several floods on different
+    /// ports do not clobber one record. Every one carries `--stamp`.
+    loadgens: Vec<(&'static str, Vec<String>)>,
     /// Substrings of the ERROR lines this scenario provokes on purpose (U7).
     expected_errors: &'static [&'static str],
-    /// Port 465 may close without a reply before its handshake (U2).
+    /// U2 tolerates a client that got no reply (code 0): the implicit port's
+    /// pre-handshake refusal, or a client the scenario means to have dropped.
     bare_close_ok: bool,
+    /// U8 counts a no-reply client as a `max_sessions` refusal — true only for a
+    /// flood of the implicit port, where a bare close *is* the refusal.
+    bare_close_is_refusal: bool,
+    /// When set, a `memory` check that cgroup anon stayed under this many MiB —
+    /// how S8a (F1) and S5 (F3a) are gated.
+    max_anon_mib: Option<f64>,
+    /// When set, a `healthcheck` check that `/healthcheck`'s p99 under load stayed
+    /// under this many ms — S5's "still answering while argon2 runs".
+    max_healthcheck_ms: Option<f64>,
+}
+
+impl Scenario {
+    /// A sending scenario: the loadgen, load args, and the defaults every check
+    /// starts from.
+    fn sending(name: &'static str, sink_args: &'static str, loadgen: &[&str]) -> Scenario {
+        Scenario {
+            name,
+            sink_args,
+            loadgens: vec![("loadgen", args(loadgen))],
+            expected_errors: &[],
+            bare_close_ok: false,
+            bare_close_is_refusal: false,
+            max_anon_mib: None,
+            max_healthcheck_ms: None,
+        }
+    }
 }
 
 /// Everything a run saw, for the checks to judge.
@@ -132,6 +417,10 @@ struct Seen {
 }
 
 fn run(s: &Scenario) -> Seen {
+    // A previous scenario may have left `app` OOM-killed (S5). Every scenario
+    // starts from a healthy one, or its `before` scrape and its own baseline mean
+    // nothing.
+    ensure_app_up();
     STRESS.reset_quota();
     fresh_sink(s.sink_args);
     let container_before = container_state();
@@ -141,12 +430,18 @@ fn run(s: &Scenario) -> Seen {
     // report — so nothing below may assume it answers.
 
     let sampler = Sampler::start();
-    let summary = loadgen(&s.loadgen);
+    let summaries = loadgens(&s.loadgens);
     let quiesced = quiesce();
     let peaks = sampler.stop();
+    let summary = summaries.join("\n  ");
 
     let after_metrics = try_scrape().unwrap_or_default();
-    let sent: Vec<Sent> = reconcile::read_jsonl(&results("loadgen.jsonl"));
+    let mut sent: Vec<Sent> = Vec::new();
+    for (label, _) in &s.loadgens {
+        sent.extend(reconcile::read_jsonl::<Sent>(&results(&format!(
+            "{label}.jsonl"
+        ))));
+    }
     let received = settled_sink_records();
     let sink: serde_json::Value =
         serde_json::from_str(&compose::traps::get(SINK_STATS)).expect("sink stats JSON");
@@ -190,6 +485,9 @@ fn run(s: &Scenario) -> Seen {
         seen.peaks.backends,
         seen.peaks.anon as f64 / 1_048_576.0
     );
+    if let Some(p99) = seen.peaks.healthcheck_p99_ms() {
+        eprintln!("  /healthcheck p99 under load: {p99:.0} ms");
+    }
     seen
 }
 
@@ -319,30 +617,84 @@ fn checks(s: &Scenario, seen: &Seen) -> Vec<(&'static str, Result<(), String>)> 
         .collect();
     out.push(("log", failures(&unexpected, |l| l.to_string())));
 
-    // U8 — every session refused at the ceiling was told so, and counted.
+    // U8 — every session refused at the ceiling was accounted for. A plaintext
+    // listener answers the refusal 421 at the banner; the implicit port (465)
+    // refuses with a bare TCP close before the handshake (src/smtp/mod.rs), which
+    // the client records as a transport failure — so where the scenario permits
+    // bare closes, those are refusals too. Both still increment the metric.
     let told_421 = seen
         .sent
         .iter()
         .filter(|r| r.code == 421 && r.stage == "banner")
         .count() as u64;
+    let bare_refusals = if s.bare_close_is_refusal {
+        seen.sent.iter().filter(|r| r.code == 0).count() as u64
+    } else {
+        0
+    };
+    let observed = told_421 + bare_refusals;
     out.push((
         "refusals",
-        if told_421 == seen.refused_max_sessions_delta {
+        if observed == seen.refused_max_sessions_delta {
             Ok(())
         } else {
             Err(format!(
-                "{told_421} clients got 421 at the banner, but \
-                 connections_refused{{max_sessions}} rose by {}",
+                "{told_421} clients got 421 at the banner and {bare_refusals} a bare close, \
+                 {observed} in all, but connections_refused{{max_sessions}} rose by {}",
                 seen.refused_max_sessions_delta
             ))
         },
     ));
 
+    // Memory — only where a scenario names a bound. cgroup anon, so tmpfs spill
+    // and page cache are not counted (F1's line buffer and F3a's argon2 blocks
+    // are anonymous). Gated against known findings like the rest.
+    if let Some(max) = s.max_anon_mib {
+        let peak = seen.peaks.anon as f64 / 1_048_576.0;
+        out.push((
+            "memory",
+            if peak <= max {
+                Ok(())
+            } else {
+                Err(format!(
+                    "cgroup anon peaked at {peak:.0} MiB, over the {max:.0} MiB bound"
+                ))
+            },
+        ));
+    }
+
+    // The control plane stayed responsive while the CPU was busy hashing.
+    if let Some(max) = s.max_healthcheck_ms {
+        out.push((
+            "healthcheck",
+            match seen.peaks.healthcheck_p99_ms() {
+                None => Err("no /healthcheck sample was taken".to_string()),
+                Some(p99) if p99 <= max => Ok(()),
+                Some(p99) => Err(format!(
+                    "/healthcheck p99 was {p99:.0} ms, over the {max:.0} ms bound"
+                )),
+            },
+        ));
+    }
+
     out
 }
 
 fn judge_all(s: &Scenario, seen: &Seen) {
-    let results = checks(s, seen);
+    let mut results = checks(s, seen);
+
+    // When the container was OOM-killed, one root cause fails half the checks —
+    // accounting, baseline, the probe — none of which can speak to anything with
+    // the process dead. Judge only the checks that are about the kill itself
+    // (`container`, and `memory` if the scenario set a bound); the rest are noted
+    // and dropped. A scenario that expects the OOM lists `container` (and
+    // `memory`) in the known findings, so the finding still lands.
+    let oomed = seen.container_after.contains("oom=true");
+    if oomed {
+        eprintln!("  (container was OOM-killed; judging only container/memory)");
+        results.retain(|(check, _)| *check == "container" || *check == "memory");
+    }
+
     for (check, result) in &results {
         eprintln!(
             "  {check:<11} {}",
@@ -417,13 +769,27 @@ where
 // sampling while the load runs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct Peaks {
     sessions: f64,
     backends: usize,
     /// cgroup `memory.stat` anon: the process's own memory, without the tmpfs
     /// spill and page cache that `memory.current` would count.
     anon: u64,
+    /// One `GET /healthcheck` latency per sample, in ms — the control plane's
+    /// responsiveness while the message path is under load (S5).
+    healthcheck_ms: Vec<f64>,
+}
+
+impl Peaks {
+    fn healthcheck_p99_ms(&self) -> Option<f64> {
+        if self.healthcheck_ms.is_empty() {
+            return None;
+        }
+        let mut v = self.healthcheck_ms.clone();
+        v.sort_by(|a, b| a.total_cmp(b));
+        Some(v[(v.len() as f64 * 0.99) as usize % v.len()])
+    }
 }
 
 struct Sampler {
@@ -452,6 +818,11 @@ impl Sampler {
                         peaks.sessions = peaks.sessions.max(value(&body, "simmer_sessions_active"));
                     }
                 }
+                // /healthcheck is cheap and touches no argon2, so its latency is
+                // whether ordinary requests are starved while the CPU hashes.
+                if let Some(ms) = healthcheck_ms() {
+                    peaks.healthcheck_ms.push(ms);
+                }
                 tick += 1;
                 thread::sleep(Duration::from_secs(1));
             }
@@ -464,6 +835,19 @@ impl Sampler {
         self.stop.store(true, Ordering::Relaxed);
         self.handle.join().expect("the sampler thread")
     }
+}
+
+/// One `GET /healthcheck` round trip in ms, or `None` if it did not answer
+/// (which the container check catches — this must not make the sampler panic).
+fn healthcheck_ms() -> Option<f64> {
+    let start = Instant::now();
+    let ok = Command::new("curl")
+        .args(["-sf", "-o", "/dev/null", "--max-time", "5"])
+        .arg(format!("{}/healthcheck", admin::BASE))
+        .status()
+        .ok()?
+        .success();
+    ok.then(|| start.elapsed().as_secs_f64() * 1000.0)
 }
 
 /// Simmer's connections to Postgres: the TCP ones. `psql` through `exec` comes
@@ -509,6 +893,24 @@ fn anon() -> Option<u64> {
 
 fn args(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
+}
+
+/// Make sure `app` is running and healthy, force-recreating it if a previous
+/// scenario left it dead. Idempotent and quick when it is already up.
+fn ensure_app_up() {
+    if healthcheck_ms().is_some() {
+        return;
+    }
+    let out = STRESS
+        .compose()
+        .args(["up", "-d", "--no-deps", "--force-recreate", "--wait", "app"])
+        .output()
+        .expect("docker compose up app");
+    assert!(
+        out.status.success(),
+        "app would not come back up: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Clear the results and re-create the sink with this scenario's faults, so its
@@ -557,27 +959,47 @@ fn fresh_sink(sink_args: &str) {
     }
 }
 
-/// Run the loadgen to completion and return its summary line.
-fn loadgen(extra: &[String]) -> String {
+/// Run every loadgen at once, each writing `/results/<label>.jsonl`, and return
+/// their summary lines in the same order. They share the results volume, so a
+/// misbehaving flood on 587 and a sending stream on 25 accumulate side by side.
+fn loadgens(specs: &[(&'static str, Vec<String>)]) -> Vec<String> {
+    let handles: Vec<_> = specs
+        .iter()
+        .map(|(label, extra)| {
+            let label = (*label).to_string();
+            let extra = extra.clone();
+            thread::spawn(move || one_loadgen(&label, &extra))
+        })
+        .collect();
+    handles
+        .into_iter()
+        .map(|h| h.join().expect("a loadgen thread"))
+        .collect()
+}
+
+/// One loadgen to completion. A misbehaving `--behaviour` run still prints its
+/// summary and JSONL, so this is the same for senders and floods; a client whose
+/// own socket setup fails is a harness fault and panics.
+fn one_loadgen(label: &str, extra: &[String]) -> String {
     let out = STRESS
         .compose()
         .args(["run", "--rm", "--no-deps", "--no-TTY", "loadgen"])
         .args(["--host", "app", "--port", "25", "--stamp"])
-        .args(["--jsonl", "/results/loadgen.jsonl"])
+        .args(["--jsonl", &format!("/results/{label}.jsonl")])
         .args(extra)
         .output()
         .expect("docker compose run loadgen");
     assert!(
         out.status.success(),
-        "loadgen failed: {}",
+        "loadgen {label} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
+    let summary = stdout
         .lines()
         .find(|l| l.starts_with("{\"summary\""))
-        .unwrap_or_else(|| panic!("no summary in the loadgen's output:\n{stdout}"))
-        .to_string()
+        .unwrap_or_else(|| panic!("no summary in loadgen {label}'s output:\n{stdout}"));
+    format!("{label}: {summary}")
 }
 
 fn results(file: &str) -> String {

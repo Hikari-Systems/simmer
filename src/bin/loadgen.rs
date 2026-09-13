@@ -77,6 +77,23 @@ enum Charset {
     Cp1252,
 }
 
+/// What each client does. `Send` is the load generator; the rest are the silent
+/// and slow clients of the stress tier's S1 and S8 — one connection per
+/// "message", and never a message delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Behaviour {
+    /// Send mail: everything the loadgen did before this flag existed.
+    Send,
+    /// Read the banner, then say nothing at all.
+    Silent,
+    /// Greet and authenticate, then `NOOP` every `--idle-every`.
+    NoopIdle,
+    /// Reach `DATA`, then send one byte every `--trickle-every`.
+    DataTrickle,
+    /// Reach `DATA`, then send `--no-lf-bytes` without a line ending.
+    NoLf,
+}
+
 #[derive(Debug, Clone)]
 struct Args {
     host: String,
@@ -110,6 +127,12 @@ struct Args {
     /// A message read whole from stdin, sent verbatim (after CRLF and
     /// dot-stuffing) in place of the generated one.
     raw: Option<Vec<u8>>,
+    behaviour: Behaviour,
+    /// How long a misbehaving client waits for the server to end it.
+    hold: Duration,
+    idle_every: Duration,
+    trickle_every: Duration,
+    no_lf_bytes: usize,
 }
 
 fn args() -> Args {
@@ -143,6 +166,11 @@ fn args() -> Args {
         seed: 1,
         helo: "loadgen.acceptance".to_string(),
         raw: None,
+        behaviour: Behaviour::Send,
+        hold: Duration::from_secs(300),
+        idle_every: Duration::from_secs(5),
+        trickle_every: Duration::from_secs(1),
+        no_lf_bytes: 512 * 1024 * 1024,
     };
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -205,6 +233,22 @@ fn args() -> Args {
             "--ca" => a.ca = value(),
             "--tls-name" => a.tls_name = value(),
             "--helo" => a.helo = value(),
+            "--behaviour" => {
+                a.behaviour = match value().as_str() {
+                    "send" => Behaviour::Send,
+                    "silent" => Behaviour::Silent,
+                    "noop-idle" => Behaviour::NoopIdle,
+                    "data-trickle" => Behaviour::DataTrickle,
+                    "no-lf" => Behaviour::NoLf,
+                    other => panic!(
+                        "--behaviour {other}: send, silent, noop-idle, data-trickle or no-lf"
+                    ),
+                }
+            }
+            "--hold" => a.hold = parse_duration(&value()),
+            "--idle-every" => a.idle_every = parse_duration(&value()),
+            "--trickle-every" => a.trickle_every = parse_duration(&value()),
+            "--no-lf-bytes" => a.no_lf_bytes = parse_sizes(&value())[0].0,
             "--auth" => {
                 a.auth = match value().as_str() {
                     "plain" => AuthMech::Plain,
@@ -568,6 +612,12 @@ async fn converse(
         return Ok(());
     }
 
+    if args.behaviour == Behaviour::Silent {
+        let (code, text) = await_reply(&mut io, args.hold).await;
+        refuse_all(code, "idle", text);
+        return Ok(());
+    }
+
     ehlo(&mut io, &args.helo)
         .await
         .map_err(cut(0, "transport"))?;
@@ -611,6 +661,21 @@ async fn converse(
         if code != 235 {
             refuse_all(code, "auth", text);
             let _ = write(&mut io, "QUIT\r\n").await;
+            return Ok(());
+        }
+    }
+
+    match args.behaviour {
+        Behaviour::Send | Behaviour::Silent => {}
+        Behaviour::NoopIdle => {
+            let (code, text) = noop_until_told(&mut io, args).await;
+            refuse_all(code, "idle", text);
+            return Ok(());
+        }
+        Behaviour::DataTrickle | Behaviour::NoLf => {
+            let (_, recipient) = identity(args, numbers[0]);
+            let (code, stage, text) = misbehave_in_data(&mut io, args, &recipient).await;
+            refuse_all(code, stage, text);
             return Ok(());
         }
     }
@@ -694,6 +759,104 @@ async fn converse(
 
     let _ = write(&mut io, "QUIT\r\n").await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// misbehaving clients (--behaviour)
+// ---------------------------------------------------------------------------
+
+/// Wait up to `hold` for the server to say something: its reply, or code 0 for a
+/// close with no reply, or code 0 for silence past the hold.
+async fn await_reply(io: &mut BufReader<Stream>, hold: Duration) -> (u16, String) {
+    match tokio::time::timeout(hold, read_reply(io)).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(e)) => (0, format!("closed without a reply: {e}")),
+        Err(_) => (0, format!("still open after {hold:?}")),
+    }
+}
+
+/// After a failed write, whatever the server said before it hung up — a reply
+/// already sitting in the receive buffer is the one that matters.
+async fn parting_words(io: &mut BufReader<Stream>, write_error: String) -> (u16, String) {
+    match tokio::time::timeout(Duration::from_secs(5), read_reply(io)).await {
+        Ok(Ok(reply)) => reply,
+        _ => (0, format!("closed without a reply: {write_error}")),
+    }
+}
+
+/// `NOOP` every `--idle-every` until the server ends the session.
+async fn noop_until_told(io: &mut BufReader<Stream>, args: &Args) -> (u16, String) {
+    let deadline = Instant::now() + args.hold;
+    loop {
+        tokio::time::sleep(args.idle_every).await;
+        if Instant::now() > deadline {
+            return (0, format!("still open after {:?}", args.hold));
+        }
+        if let Err(e) = write(io, "NOOP\r\n").await {
+            return parting_words(io, e).await;
+        }
+        match read_reply(io).await {
+            Ok((250, _)) => {}
+            Ok(reply) => return reply,
+            Err(e) => return (0, format!("closed without a reply: {e}")),
+        }
+    }
+}
+
+/// Reach `DATA`, then trickle a byte at a time or send one endless line.
+async fn misbehave_in_data(
+    io: &mut BufReader<Stream>,
+    args: &Args,
+    recipient: &str,
+) -> (u16, &'static str, String) {
+    for (line, want, stage) in [
+        (format!("MAIL FROM:<{}>\r\n", args.from), 250, "mail"),
+        (format!("RCPT TO:<{recipient}>\r\n"), 250, "rcpt"),
+        ("DATA\r\n".to_string(), 354, "data"),
+    ] {
+        if let Err(e) = write(io, &line).await {
+            return (0, "transport", e);
+        }
+        match read_reply(io).await {
+            Ok((code, _)) if code == want => {}
+            Ok((code, text)) => return (code, stage, text),
+            Err(e) => return (0, "transport", e),
+        }
+    }
+    let deadline = Instant::now() + args.hold;
+
+    if args.behaviour == Behaviour::NoLf {
+        let chunk = vec![b'x'; 64 * 1024];
+        let mut sent = 0usize;
+        while sent < args.no_lf_bytes {
+            let n = chunk.len().min(args.no_lf_bytes - sent);
+            if let Err(e) = write_bytes(io, &chunk[..n]).await {
+                let (code, text) = parting_words(io, e).await;
+                return (code, "data", format!("{text} (after {sent} bytes)"));
+            }
+            sent += n;
+        }
+        let (code, text) =
+            await_reply(io, deadline.saturating_duration_since(Instant::now())).await;
+        return (code, "data", format!("{text} (after {sent} bytes)"));
+    }
+
+    loop {
+        if Instant::now() > deadline {
+            return (0, "data", format!("still open after {:?}", args.hold));
+        }
+        if let Err(e) = write_bytes(io, b"x").await {
+            let (code, text) = parting_words(io, e).await;
+            return (code, "data", text);
+        }
+        // Wait one interval for a reply before the next byte. A reply line arrives
+        // in one segment, so abandoning a read that has seen nothing loses nothing.
+        match tokio::time::timeout(args.trickle_every, read_reply(io)).await {
+            Ok(Ok((code, text))) => return (code, "data", text),
+            Ok(Err(e)) => return (0, "data", format!("closed without a reply: {e}")),
+            Err(_) => {}
+        }
+    }
 }
 
 fn server_name(args: &Args) -> rustls::pki_types::ServerName<'static> {
