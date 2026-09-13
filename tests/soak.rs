@@ -40,6 +40,7 @@ mod compose;
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -149,6 +150,26 @@ fn soak_run() {
         })
         .collect();
 
+    // V2 — `app` is scraped every 30 s and `app2` never is. The two carry
+    // identical streams, so a difference between their slopes is the exporter's
+    // own doing (F8) rather than the message path's; without this, a difference
+    // between the instances means nothing at all.
+    //
+    // The series count is recorded alongside, because unbounded label cardinality
+    // (F7) is a growth curve like any other. It is reported, not judged: the
+    // senders that would drive it arrive with V3.
+    let scraper = {
+        let flag = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                if let Some(series) = scrape_series_count() {
+                    append_metrics(started.elapsed().as_secs_f64(), series);
+                }
+                thread::sleep(Duration::from_secs(30));
+            }
+        })
+    };
+
     // One open-loop stream per instance, identical but for the host they point
     // at, so anything that differs between them is the instances' doing.
     let seconds = format!("{}s", duration.as_secs());
@@ -193,6 +214,7 @@ fn soak_run() {
     for sampler in samplers {
         let _ = sampler.join();
     }
+    let _ = scraper.join();
     eprintln!(
         "soak: finished after {:.1} minutes; samples in {SAMPLE_DIR}/",
         started.elapsed().as_secs_f64() / 60.0
@@ -286,6 +308,24 @@ fn soak_analyze() {
              half-closed than every downstream pool put together"
         );
     }
+    // F7's series count: reported, not judged. The senders that would make it grow
+    // are V3's fresh, unmatched domains, and they do not exist yet — so a gate here
+    // would pass for the wrong reason, and since F7 is already in the
+    // known-findings list, passing would fail the run as an XPASS. The number is
+    // worth watching in the meantime.
+    let series = read_metrics();
+    if let (Some(first), Some(last)) = (series.first(), series.last()) {
+        let peak = series.iter().map(|(_, n)| *n).max().unwrap_or(0);
+        eprintln!(
+            "\nmetrics: {} series at {:.0}s, {} at {:.0}s, peak {peak}, across {} scrapes",
+            first.1,
+            first.0,
+            last.1,
+            last.0,
+            series.len()
+        );
+    }
+
     assert!(judged > 0, "no samples at all; run soak_run first");
 }
 
@@ -358,6 +398,53 @@ fn sample_instance(instance: &str) -> Option<Sample> {
         }
     }
     Some(s)
+}
+
+/// How many distinct series `/metrics` is exporting right now.
+///
+/// Every non-comment, non-blank line is one series, labels included — which is
+/// the number F7 is about: a label whose value the client chooses has no natural
+/// ceiling, and the cost of one is paid on every scrape forever.
+fn scrape_series_count() -> Option<usize> {
+    let out = Command::new("curl")
+        .args(["-sf", "--max-time", "10", "http://127.0.0.1:8080/metrics"])
+        .output()
+        .ok()?;
+    out.status.success().then(|| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .count()
+    })
+}
+
+fn metrics_csv() -> PathBuf {
+    PathBuf::from(SAMPLE_DIR).join("metrics.csv")
+}
+
+fn append_metrics(t: f64, series: usize) {
+    let path = metrics_csv();
+    let fresh = !path.exists();
+    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    if fresh {
+        let _ = writeln!(f, "t,series");
+    }
+    let _ = writeln!(f, "{t:.1},{series}");
+}
+
+fn read_metrics() -> Vec<(f64, usize)> {
+    let Ok(text) = fs::read_to_string(metrics_csv()) else {
+        return Vec::new();
+    };
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (t, n) = line.split_once(',')?;
+            Some((t.parse().ok()?, n.trim().parse().ok()?))
+        })
+        .collect()
 }
 
 fn csv_path(instance: &str) -> PathBuf {
