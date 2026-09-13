@@ -21,6 +21,13 @@ services:
     # and their 19 MiB buffers — coexist depends on the cores available.
     cpus: "${STRESS_APP_CPUS:-2}"
     mem_limit: 1g
+    ulimits:
+      # Generous by default; S1b shrinks it so accept() starts returning EMFILE
+      # and the §5.1 loop's behaviour under descriptor exhaustion is observable
+      # (F6). Soft and hard together, or the process could raise it back.
+      nofile:
+        soft: "${STRESS_APP_NOFILE:-65536}"
+        hard: "${STRESS_APP_NOFILE:-65536}"
     environment:
       # simmer.stress.yaml reads this; S9 overrides it to catch a relay in flight.
       # Defaulted here so every other command renders `app` identically.

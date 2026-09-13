@@ -18,7 +18,7 @@
 mod compose;
 
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -499,6 +499,47 @@ fn s4_large_messages_stay_within_memory() {
 }
 
 // ---------------------------------------------------------------------------
+// S4b — a full tmpfs (F5)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s4b_a_full_spill_area_still_answers_the_client() {
+    // §8.1 spills a body above 1 MiB to tmpfs. Shrink that tmpfs to 16 MiB and
+    // send eight concurrent 4 MiB messages — 32 MiB of demand — and the spill
+    // write hits ENOSPC.
+    //
+    // Finding F5: `MessageBuffer::append` returns the io error, and the DATA loop
+    // maps it to `DataError::Io`, which ends the session. The *read* side answers
+    // `451 4.3.0 internal buffering error` (session.rs); the write side answers
+    // nothing at all, so the client is dropped mid-DATA. §14.1's rule is about
+    // what a reply makes a client record permanently, but a client told nothing
+    // has to guess, and a guess of "retry forever" is the kindest one available.
+    //
+    // The gate is U2: every client is answered. A bare close is the finding.
+    let _logs = STRESS.logs_on_failure();
+    let mut s = Scenario::sending(
+        "S4b",
+        "",
+        &["--count", "16", "--concurrency", "8", "--size", "4m"],
+    );
+    s.app_env = &[("SIMMER_TMPFS_SIZE", "16m")];
+    let seen = run(&s);
+    let silent = seen.sent.iter().filter(|r| r.code == 0).count();
+    let deferred = seen
+        .sent
+        .iter()
+        .filter(|r| (400..500).contains(&r.code))
+        .count();
+    eprintln!(
+        "  S4b: {silent} clients dropped without a reply, {deferred} answered 4xx, \
+         of {} sent",
+        seen.sent.len()
+    );
+    judge_all(&s, &seen);
+}
+
+// ---------------------------------------------------------------------------
 // S6 — mixed realistic traffic
 // ---------------------------------------------------------------------------
 
@@ -644,6 +685,86 @@ fn pin_the_s6_allowance() {
         &serde_json::json!({ "domain_group": "catchall", "allowance": S6_ALLOWANCE }),
     );
     assert_eq!(status, 200, "pinning the allowance: {body}");
+}
+
+// ---------------------------------------------------------------------------
+// S1b — descriptor exhaustion (F6)
+// ---------------------------------------------------------------------------
+
+/// CPU the instance had burned when the load began.
+///
+/// Taken in the scenario's `before` hook rather than around `run()`, because
+/// `run()` re-creates the container: a reading from before that and one from
+/// after belong to two different cgroups, and subtracting them measures nothing.
+/// The first attempt at S1b did exactly that and reported a confident 0.0.
+static CPU_BASELINE: AtomicU64 = AtomicU64::new(0);
+
+fn capture_cpu_baseline() {
+    CPU_BASELINE.store(cpu_usage_usec().unwrap_or(0), Ordering::Relaxed);
+}
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s1b_descriptor_exhaustion_does_not_spin_the_accept_loop() {
+    // `app` is given 512 descriptors and then offered 600 sockets at once, so
+    // `accept()` starts returning EMFILE while the flood keeps knocking.
+    //
+    // Finding F6: the §5.1 accept loop logs the error, calls `yield_now()` and
+    // loops — no backoff. A descriptor shortage is not transient the way a
+    // vanished peer is, so the loop can spin against a full table, burning the CPU
+    // that the sessions already accepted need to finish and drain it.
+    //
+    // Two gates, both bespoke because no U-check covers them: the CPU the instance
+    // burns across the scenario, and how many accept failures it logs. Both are
+    // reported either way, since the useful output here is the number.
+    let _logs = STRESS.logs_on_failure();
+    let mut s = Scenario::sending("S1b", "", &[]);
+    // 96, not 512. A running instance already needs ~89 descriptors at full
+    // stretch — 64 sessions, 10 for the database pool, 12 across the two
+    // downstream pools, 3 listeners — so 512 was never reached: the flood hit the
+    // §5.1 session cap first, 536 clients were answered 421 at the banner, and a
+    // refused connection holds its descriptor only for an instant.
+    s.app_env = &[("STRESS_APP_NOFILE", "96")];
+    s.before = Some(capture_cpu_baseline);
+    s.loadgens = vec![(
+        "starve",
+        args(&[
+            "--behaviour",
+            "silent",
+            "--tag",
+            "starve",
+            "--count",
+            "600",
+            "--concurrency",
+            "600",
+            "--hold",
+            "20s",
+        ]),
+    )];
+    // Sockets that never get a descriptor are refused by the kernel, not by §5.1,
+    // so a client can see a reset rather than a 421 — and that is not a
+    // max_sessions refusal either.
+    s.bare_close_ok = true;
+
+    let seen = run(&s);
+    let cpu_after = cpu_usage_usec().unwrap_or(0);
+    let cpu_seconds =
+        cpu_after.saturating_sub(CPU_BASELINE.load(Ordering::Relaxed)) as f64 / 1_000_000.0;
+    let accept_failures = seen.log.matches("accept failed").count();
+    eprintln!("  S1b: {cpu_seconds:.1} CPU-seconds, {accept_failures} accept failures logged");
+
+    judge(
+        "stress/S1b/accept-spin",
+        if cpu_seconds <= 20.0 && accept_failures <= 200 {
+            Ok(())
+        } else {
+            Err(format!(
+                "the accept loop burned {cpu_seconds:.1} CPU-seconds and logged \
+                 {accept_failures} accept failures under descriptor exhaustion"
+            ))
+        },
+    );
+    judge_all(&s, &seen);
 }
 
 // ---------------------------------------------------------------------------
@@ -1338,6 +1459,21 @@ impl Sampler {
         self.stop.store(true, Ordering::Relaxed);
         self.handle.join().expect("the sampler thread")
     }
+}
+
+/// CPU microseconds the instance has burned since it started, from the cgroup.
+///
+/// A delta across a scenario is how F6 is judged: an accept loop spinning on
+/// `EMFILE` shows up as CPU spent with no work done, which no other check sees.
+fn cpu_usage_usec() -> Option<u64> {
+    let out = STRESS
+        .compose()
+        .args(["exec", "-T", "app", "cat", "/sys/fs/cgroup/cpu.stat"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("usage_usec ")?.trim().parse().ok())
 }
 
 /// One `GET /healthcheck` round trip in ms, or `None` if it did not answer

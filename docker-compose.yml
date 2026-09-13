@@ -41,7 +41,12 @@ services:
       # maximum-size message simultaneously. 512 MiB covers ~20 concurrent
       # large messages; if simmer_messages_total starts showing 451s with no
       # downstream error, this is the first thing to raise.
-      - /tmp:rw,noexec,nosuid,size=512m
+      #
+      # Interpolable so a stress scenario can shrink it and make the spill fail
+      # (F5). It lives here rather than in the stress override because compose
+      # *appends* sequence keys across files: an override would leave two /tmp
+      # entries rather than replacing this one.
+      - /tmp:rw,noexec,nosuid,size=${SIMMER_TMPFS_SIZE:-512m}
     environment:
       DATABASE_URL: "postgres://simmer:simmer@simmer-db:5432/simmer"
       # §9.3's bearer token. Local development only — never a real credential.

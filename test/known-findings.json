@@ -46,5 +46,13 @@
       "ms to be told"
     ],
     "note": "No lock_timeout or statement_timeout (src/db.rs sets only acquire_timeout), so a query that already holds a pool connection waits on a blocked row or table indefinitely: measured at ~27 s to answer while a lock was held for 25 s."
+  },
+  {
+    "id": "F5",
+    "check": "stress/S4b/bare-close",
+    "because": [
+      "closed without a reply at transport"
+    ],
+    "note": "A full tmpfs ends the session with no SMTP reply. MessageBuffer::append returns the ENOSPC from the §8.1 spill write, and the DATA loop maps it to DataError::Io, which tears the session down; the read side answers 451 4.3.0 internal buffering error, the write side answers nothing. Measured: a 16 MiB tmpfs under 8 concurrent 4 MiB bodies dropped 11 of 16 clients mid-DATA, none of them with a 4xx."
   }
 ]
