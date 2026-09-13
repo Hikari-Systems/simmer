@@ -1,9 +1,10 @@
 # The soak tier (T4) — what it does, and what it has found
 
-**Status: V2 and V3 built and pushed (`e88c7be`, `c554f2e`, `a1b25c3`); V4 and the
-burst/idle variants outstanding.** This document records what the soak tier is,
-what two runs have established, and — at least as usefully — what they have *not*
-established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
+**Status: V2 and V3 built and pushed (`e88c7be`, `c554f2e`, `a1b25c3`); a clean
+1-hour run has produced the tier's first leak verdict — no leak on either instance
+(§3a); V4 and the burst/idle variants outstanding.** This document records what the
+soak tier is, what three runs have established, and — at least as usefully — what
+they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
 configuration; the test programme's step 5 is the plan.
 
 The tier exists for the failures that only appear over hours: memory that creeps,
@@ -141,16 +142,91 @@ soak load rather than under S3's deliberate 25-second lock.
 
 ---
 
-## 4. What these runs do **not** establish
+## 3a. The clean 1-hour run — no leak
 
-**No leak verdict has been produced.** `leak::verdict` needs eight post-warm-up
+2026-09-13, 20:05–21:05 UTC, the V3 configuration, `app`, `app2` and `sink`
+re-created by `soak_run` itself (`--no-deps`, so the stale-config trap in §6 cannot
+fire — `"senders": 1` confirmed on both). 10 msg/s per instance for 60 minutes.
+
+| | `app` | `app2` |
+|---|---|---|
+| messages | 36,010 | 36,010 |
+| accepted | **36,010** | **36,010** |
+| deferred / refused / transport | 0 / 0 / 0 | 0 / 0 / 0 |
+| p50 / p90 | 11.0 ms / 39.9 ms | 11.4 ms / 41.7 ms |
+| p99 / max | 4,902.4 ms / 17,673.2 ms | 4,921.6 ms / 18,032.6 ms |
+| peak established | 28 | 27 |
+| peak CLOSE_WAIT | 0 | 1 (one sample; 0 once load stopped) |
+
+**Accounting.** The sink holds 72,020 records, every one `delivered` and
+`mismatch:false`. Joined against the loadgens' JSONL by id: **0 duplicate
+deliveries, 0 ids answered `250` and never delivered, 0 deliveries with no
+loadgen record.** `simmer_messages_total` shows 1,801 on `overflow-established` and
+34,209 on the warming route on *each* instance — and ids `0..36009` with
+`n % 20 == 0` are exactly 1,801 fresh senders.
+
+**The leak verdict — the tier's first.** The default warm-up of 10 minutes leaves
+50 minutes of steady state, ten five-minute floors against the eight
+`leak::verdict` needs. `soak_analyze` passed:
+
+| | anon | fds | threads |
+|---|---|---|---|
+| `app` | +0.57 MiB/h, step +0.30 MiB | −4.00 /h, step −0.50 | 0.00 /h, step −0.50 |
+| `app2` | −6.08 MiB/h, step −0.66 MiB | −6.00 /h, step −0.50 | 0.00 /h, step −0.50 |
+
+Nothing trends up on either instance, scraped or not. §4's `fds +6.00/h` did not
+reappear here, which fits it having been the window.
+
+**Return to baseline**, scraped at 21:06 with the load stopped:
+
+| | `app` | `app2` |
+|---|---|---|
+| `reservations_in_flight` | 0 | 0 |
+| `quota_reserved`, both routes | 0 | 0 |
+| pool `active` (idle) | 0 (2) | 0 (1) |
+| DB pool `in_use` (idle) | 0 (4) | 0 (4) |
+| `sessions_active` / `tasks_alive` / threads | 0 / 11 / 3 | 0 / 11 / 3 |
+| open fds / RSS | 21 / 25.9 MiB | 20 / 30.8 MiB |
+| CLOSE_WAIT | 0 | 0 |
+
+**F7 XFAILed as intended:** 360 series (300 unmatched-sender) at 600 s to 1,846
+(1,786) at 3,572 s, across 121 post-warm-up scrapes.
+
+**Log hygiene:** about 79,280 lines per instance, **no ERROR**. The WARNs are
+3,602 `sender matched no rule` per instance (two per fresh sender, 2 × 1,801), the
+startup `strict_senders` notice, and §7.4 slow statements — 44 on `app`, 34 on
+`app2` plus one slow pool acquire — every one of them but a single `app` line at
+21:00 inside **20:25:27–20:25:46**.
+
+**That 19-second window was a stall of the shared database, not of Simmer.** Both
+instances hit it at the same instant, with statements taking up to 11.0 s. The
+replies over one second jump to about 60 in run-minute 19 against 5–9 in every
+other minute, and it is where both maxima (17.7 s and 18.0 s, against 9.7 s in §2)
+come from. It was not a Postgres checkpoint — those ran 20:21:49–20:22:25 and
+20:26:49–20:27:33, on either side. It coincides with another session on the same
+host: two `postgres:18` containers belonging to it were created at 20:26:00,
+fourteen seconds after the stall ended, and its jail was at 7.4 GiB and 20% CPU
+minutes later. That is circumstantial, and it is recorded as such. Correctness did
+not move: nothing was deferred, refused, lost or duplicated. It does bear on F4 —
+with no `statement_timeout`, an 11-second stall is simply 11 seconds of waiting —
+and on §6's shared-host warning.
+
+**§5's tail reproduced a third time.** With run-minutes 19–20 excluded, 215 of
+34,812 messages on `app` took over six seconds (0.62%) and 214 on `app2` (0.61%),
+with a maximum of 10.9 s — the same proportion and ceiling as §2 — and the hole
+between one and three seconds is back: 3 messages on `app`, 0 on `app2`. This run
+is also what explained it: the tail is every 4 MiB message (§5, F16).
+
+## 4. What the first two runs did **not** establish
+
+**Neither produced a leak verdict** — §3a's run is the first that did. `leak::verdict` needs eight post-warm-up
 floors, a floor being the minimum over a five-minute window — so it takes forty
 minutes of *steady state* on top of the warm-up before the slope gate means
 anything. The 20-minute run yields three floors; the killed run yields about eight
 and a half, right on the boundary. Both are correctly reported `inconclusive`, and
 the slopes printed alongside (`+22.59 MiB/h` anon, `+30.00 threads/h`) are
-start-up artefacts of a short window, not measurements. **A clean 1-hour run is
-still owed.**
+start-up artefacts of a short window, not measurements. The clean 1-hour run this
+called for is §3a.
 
 **`fds LEAKING` was an artefact, and is recorded here so it is not rediscovered as
 a finding.** The salvaged run's analysis reported `app: fds +6.00 fds/h, quartile
@@ -171,10 +247,12 @@ raised once at the end.
 
 ---
 
-## 5. Open observation: a 6–12 second latency tail
+## 5. The 6–12 second latency tail — explained after §3a: finding F16
 
-Unexplained, reproduced on two independent stacks, and **not a correctness
-defect** — every message was accepted exactly once, with no duplicates and no loss.
+Reproduced on three stacks, and **not a correctness defect** — every message was
+accepted exactly once, with no duplicates and no loss. The cause is at the end of
+this section; what comes before it is kept as written, because it records what was
+ruled out and why.
 
 The distribution is bimodal rather than long-tailed. Over the 20-minute run's
 12,010 messages on `app` (figures reproducible from the results volume, unlike the
@@ -214,6 +292,50 @@ known-slow id cannot be traced through the server log, which is what forced the
 work above into population inference instead of direct observation. Closing that
 gap should come before T5.
 
+### The cause: every 4 MiB message — about 2.35 s per MiB past the spill threshold (F16)
+
+The harness gap turned out not to be the blocker. §3a's two instances were slow on
+the **same message ids** — 232 of the 235 over six seconds, 148 of the 160 between
+three and six — and two independent processes agree like that only when the cause
+is the input. The loadgen picks each body size deterministically from the id
+(`pick_size`, SplitMix64 over seed 1), so the sizes can be recomputed offline. On
+`app` (`app2` agrees to within a few messages):
+
+| body | share | p50 | min | over 3 s |
+|---|---|---|---|---|
+| 4 KiB | 79.9% | 10.7 ms | 6.2 ms | 17 |
+| 100 KiB | 15.0% | 11.1 ms | 6.5 ms | 4 |
+| 1 MiB | 4.0% | 17.2 ms | 10.8 ms | 0 |
+| 4 MiB | 1.0% | 6,579 ms | 4,569 ms | **374 of 374** |
+
+Every 4 MiB message is slow, and beyond about twenty small ones per instance nothing
+else is. That is the bimodal shape and the one per cent in the table above. A direct
+probe on the idle stack — three messages per size, one at a time, so no queue is
+involved — draws the curve:
+
+| body | 1 MiB | 2 MiB | 3 MiB | 4 MiB | 5 MiB |
+|---|---|---|---|---|---|
+| p50 | 45 ms | 2,430 ms | 4,747 ms | 7,131 ms | 8,772 ms |
+
+Flat below §8.1's 1 MiB `SPILL_THRESHOLD`, then linear at about **2.35 s per MiB**
+above it. The mechanism is in `src/smtp/buffer.rs`: once spilled, the buffer is a
+bare `tokio::fs::File`, and `read_data_inner` in `session.rs` calls `append` twice
+per line — the content, then `\r\n`. Each append is its own `write_all`, and tokio
+performs every file write as a separate blocking-pool job. At 78-byte lines that is
+about 27,000 round trips per MiB; 2.35 s over 27,000 is about 87 µs each.
+
+Why the eight hypotheses missed it: the downstream really was fast — the time is
+spent *receiving*, before the relay begins — and every partition tried (session
+position, AUTH, timing) was orthogonal to body size.
+
+**What it costs in production.** A 76-column base64 attachment has the same line
+shape as the loadgen's filler, so the shipped 25 MiB `max_message_bytes` means
+roughly 56 s of `DATA` for a maximal message, and 7 s for an ordinary 4 MiB one.
+Each of those writes occupies a blocking-pool thread, which is the likely reason the
+small messages beside a large one were slowed as well — likely, not measured.
+
+**Not yet fixed.**
+
 ---
 
 ## 6. Operational traps
@@ -252,18 +374,28 @@ because their source no longer exists.
 
 And one worth stating plainly: **the soak must not share a machine with heavy
 builds.** The 1-hour run was killed while concurrent `cargo clippy` invocations ran
-alongside two loadgens, two Simmer instances, a sink and Postgres.
+alongside two loadgens, two Simmer instances, a sink and Postgres. Other sessions
+share the host as well, and nothing in the harness can stop them: §3a's
+19-second database stall is the likely cost of one.
+
+**The loadgen containers report `unhealthy`, and it means nothing.** The
+`acceptance` stage is `FROM runtime`, so it inherits the server's `HEALTHCHECK`
+(`/app/server healthcheck`, probing 8080), which a loadgen never serves. The
+samples and the JSONL are the evidence that a sender is alive, not the health
+column.
 
 ---
 
 ## 7. Outstanding
 
-- A clean 1-hour run — the shortest that yields a real leak verdict. Nothing so far
-  has produced one.
+- ~~A clean 1-hour run~~ — done, §3a: no leak on either instance.
 - **V4**: relays cancelled by the session timeout, driving F2.
 - Bursts every 15 minutes; idle gaps every 30 minutes past `idle_ttl` with the sink
   closing idle connections at 45 s (CLOSE_WAIT, F10).
-- Return-to-baseline assertions, currently verified by hand (§3) rather than by the
-  analyser.
-- The `correlation_id` ↔ `X-Test-Id` link (§5).
+- Return-to-baseline assertions, currently verified by hand (§3, §3a) rather than
+  by the analyser.
+- **F16**: buffer the §8.1 spill file's writes (§5).
+- The `correlation_id` ↔ `X-Test-Id` link. No longer the blocker §5 said it was —
+  F16 was found without it — but still the only way to trace one message through
+  the server log.
 - The 24-hour variant, and whether the CI runner permits a job that long.
