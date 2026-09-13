@@ -2380,6 +2380,66 @@ limit is what that needs. A deployment that really is login-bound has one knob,
 F3a — the *concurrent* peak, 64 sessions × 19 MiB — is untouched by this and
 stays open: it wants a bound on concurrent verifications, proposed separately.
 
+### D-079 — A bound on concurrent argon2 verifications (finding F3a, corrected)
+
+**What F3a claimed.** Concurrent `AUTH` verifications are bounded only by
+`max_concurrent_sessions`, so 64 sessions × §4.1's `m_cost` of 19 MiB ≈ 1.2 GiB
+would OOM a 1 GiB container. The stress tier was built to catch it.
+
+**What the measurements actually showed.** It does not reproduce, in five
+attempts, all on `app` at 1 GiB with the counting sink:
+
+| Shape | Peak |
+|---|---|
+| 200 logins, 64 concurrent, 2 CPUs | ~530 MiB |
+| the same at 8 CPUs | ~295 MiB |
+| the same at 1 CPU | ~484 MiB |
+| 64 logins released together at one instant, 2 CPUs | 526 MiB (`memory.peak`) |
+| the same at 8 CPUs | 608 MiB (`memory.peak`) |
+
+More cores made it *better*, not worse: a verification holds its 19 MiB only while
+it runs, and more cores finish it sooner. Nor is the session cap the ceiling —
+even with all 64 clients connected, greeted and released to `AUTH` at one shared
+instant (the loadgen's `--auth-delay`), only about 32 were ever in flight, because
+`spawn_blocking` cannot create threads faster than the earlier hashes complete.
+The figures above are the kernel's own `memory.peak`, not sampled, after sampling
+at 0.4 s was found to under-read by ~40%.
+
+**Decision:** bound it anyway, at `max(4, 2 × available_parallelism())`, held as
+`auth::VerifyLimit` and shared by every session. Not for F3a's reason, which is
+not real: for the reason the measurements exposed. ~32 in flight is 608 MiB, 59%
+of the budget, and nothing in the design holds it there — it is the outcome of a
+race between thread creation and hash duration, and it moves with the kernel, the
+allocator, `m_cost`, or a raised session cap. The bound makes the ceiling a
+property of the configuration (`permits × m_cost`: 4 × 19 MiB ≈ 76 MiB on two
+CPUs, 32 × 19 MiB ≈ 608 MiB on sixteen) instead of a coincidence of timing.
+
+`available_parallelism` honours the cgroup quota, so a container bounds itself to
+what it may actually use; twice the cores leaves one ready to start as another
+finishes, and argon2 being CPU-bound means more in flight than that buys memory
+and nothing else. The cost is latency for a burst of clients, bounded by
+`timeouts.command`, and `simmer_auth_verifies_in_flight` against
+`simmer_auth_verifies_max` says when that is happening.
+
+**Verified** on the same synchronised burst of 64 logins, `memory.peak` again:
+
+| | before | after | bound |
+|---|---|---|---|
+| 2 CPUs | 526 MiB | **85 MiB** | 4 permits (~76 MiB) |
+| 8 CPUs | 608 MiB | **316 MiB** | 16 permits (~304 MiB) |
+
+All 64 clients were still answered `235` at both sizes; the queueing shows up only
+as latency, about three seconds for 64 simultaneous logins on two CPUs and nothing
+measurable on eight. The peak now tracks `permits × m_cost`, which is the point.
+
+Throughput is unaffected, as expected: the bound is never below the core count and
+argon2 is CPU-bound, so queueing an already-saturated resource costs memory
+nothing and throughput nothing.
+
+This is not a red-green fix: the bound was written after the behaviour was
+measured, so the evidence above stands in for a failing test. What is pinned in
+tests is the bound itself.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

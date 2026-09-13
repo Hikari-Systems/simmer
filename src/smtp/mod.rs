@@ -23,7 +23,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::config::{IngressAuth, IngressTls};
 use crate::downstream::stream::Stream;
 use crate::relay::Engine;
-use crate::{metrics, smtp::acl::Acl, smtp::auth::Verifier};
+use crate::{metrics, smtp::acl::Acl, smtp::auth::Verifier, smtp::auth::VerifyLimit};
 
 /// A minimal cancellation primitive.
 ///
@@ -95,6 +95,22 @@ struct Shared {
     /// §5.1 `max_concurrent_sessions`. A permit is held for the whole session,
     /// and one pool serves every listener.
     sessions: Arc<Semaphore>,
+    /// D-079 — the bound on concurrent argon2 verifications. See
+    /// [`auth::VerifyLimit`] for why it exists.
+    verifies: VerifyLimit,
+}
+
+/// D-079's bound: twice the cores this process may use, and never fewer than 4.
+///
+/// argon2 is CPU-bound, so more in flight than the CPUs can work on buys memory
+/// and nothing else; twice leaves room for one to be scheduled while another
+/// finishes. `available_parallelism` honours the cgroup quota, so a 2-CPU
+/// container bounds itself at 4 verifies (~76 MiB) and a 16-CPU host at 32.
+fn max_concurrent_verifies() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    (cores * 2).max(4)
 }
 
 /// The SMTP listeners (§5.1).
@@ -161,10 +177,16 @@ impl Listener {
             bound.push((listener, Arc::new(policy)));
         }
 
+        let verifies = max_concurrent_verifies();
+        tracing::info!(
+            max_concurrent_verifies = verifies,
+            "argon2 verification bound (D-079)"
+        );
         let shared = Shared {
             verifier: Arc::new(Verifier::new(&cfg.server.auth)),
             acl: Arc::new(Acl::new(&cfg.server.auth)),
             sessions: Arc::new(Semaphore::new(cfg.server.max_concurrent_sessions)),
+            verifies: VerifyLimit::new(verifies),
             allowed,
             engine,
         };
@@ -333,6 +355,7 @@ async fn handle(
         shared.engine.clone(),
         Arc::clone(&shared.verifier),
         Arc::clone(&shared.acl),
+        shared.verifies.clone(),
         policy,
     );
 

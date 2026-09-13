@@ -38,7 +38,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use super::acl::Acl;
-use super::auth::{self, AuthState, AuthStep, Verifier};
+use super::auth::{self, AuthState, AuthStep, Verifier, VerifyLimit};
 use super::buffer::{self, MessageBuffer};
 use super::command::{self, Command, MailParams, ParseError};
 use super::reply::{self, Reply};
@@ -73,6 +73,8 @@ pub struct Session {
     engine: Engine,
     verifier: Arc<Verifier>,
     acl: Arc<Acl>,
+    /// D-079 — permits for argon2 verification, shared with every other session.
+    verifies: VerifyLimit,
     /// The listener's TLS and AUTH policy (D-070).
     policy: Arc<Policy>,
 
@@ -124,6 +126,7 @@ impl Session {
         engine: Engine,
         verifier: Arc<Verifier>,
         acl: Arc<Acl>,
+        verifies: VerifyLimit,
         policy: Arc<Policy>,
     ) -> Self {
         Self {
@@ -132,6 +135,7 @@ impl Session {
             engine,
             verifier,
             acl,
+            verifies,
             policy,
             greeted: None,
             esmtp: false,
@@ -469,12 +473,16 @@ impl Session {
                 // argon2id costs tens of milliseconds of CPU by design. Running
                 // it on the async runtime would let a burst of AUTH attempts
                 // stall every other session sharing the worker.
+                //
+                // D-079 — and not more than the verification bound at once.
                 let verifier = Arc::clone(&self.verifier);
                 let u = username.clone();
+                let permit = self.verifies.acquire().await;
                 let ok =
                     tokio::task::spawn_blocking(move || verifier.verify_blocking(&u, &password))
                         .await
                         .unwrap_or(false);
+                drop(permit);
 
                 if ok {
                     tracing::info!(

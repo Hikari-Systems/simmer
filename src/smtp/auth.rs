@@ -23,6 +23,8 @@
 //! *Authentication is authentication only.* The authenticated username plays no
 //! part in route selection, and nothing in this module hands it to the router.
 
+use std::sync::Arc;
+
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -43,6 +45,43 @@ pub struct Verifier {
     /// A syntactically valid argon2id hash that no password matches, used to
     /// spend the same CPU on an unknown username as on a known one.
     decoy: String,
+}
+
+/// D-079 — how many argon2 verifications may run at once, and the permits that
+/// hold to it.
+///
+/// Each verification holds `m_cost` (19 MiB at §4.1's example parameters) for as
+/// long as it runs, and `spawn_blocking` will start a thread per waiting session.
+/// Unbounded, the peak is therefore whatever the race between thread creation and
+/// hash duration happens to allow — measured at about 32 in flight, 608 MiB, on a
+/// synchronised burst of 64 logins, with nothing in the design holding it there.
+/// This makes the ceiling a property of the configuration instead.
+#[derive(Clone)]
+pub struct VerifyLimit {
+    permits: Arc<tokio::sync::Semaphore>,
+    max: usize,
+}
+
+impl VerifyLimit {
+    pub fn new(max: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(max)),
+            max,
+        }
+    }
+
+    /// Wait for a permit, and report how many verifications are now in flight.
+    ///
+    /// Waiting costs a burst of clients some latency, bounded by the command
+    /// timeout; the alternative is unbounded memory.
+    pub async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("the verification semaphore is never closed");
+        crate::metrics::auth_verifies_in_flight(self.permits.available_permits(), self.max);
+        permit
+    }
 }
 
 /// The decoy used when the configuration holds no usable hash to take parameters
@@ -275,6 +314,31 @@ fn decode_utf8(b64: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D-079 — the bound is a bound: past `max`, a verification waits for a
+    /// permit rather than starting and holding another `m_cost` of memory.
+    ///
+    /// The sizing rule itself (`max(4, 2 × cores)`) is deliberately not asserted:
+    /// a test of that arithmetic would only compare it with itself.
+    #[tokio::test]
+    async fn a_verification_past_the_bound_waits_for_a_permit() {
+        let limit = VerifyLimit::new(2);
+        let first = limit.acquire().await;
+        let _second = limit.acquire().await;
+
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(50), limit.acquire()).await;
+        assert!(
+            blocked.is_err(),
+            "a third verification started while both permits were held"
+        );
+
+        // And a released permit is handed straight on.
+        drop(first);
+        let third =
+            tokio::time::timeout(std::time::Duration::from_millis(500), limit.acquire()).await;
+        assert!(third.is_ok(), "releasing a permit did not admit a waiter");
+    }
 
     /// Grants play no part in verification; any will do.
     fn grants() -> crate::config::Grants {

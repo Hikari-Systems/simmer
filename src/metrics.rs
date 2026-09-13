@@ -218,6 +218,17 @@ fn describe() {
         "server.max_concurrent_sessions (§5.1)"
     );
     describe_gauge!(
+        "simmer_auth_verifies_in_flight",
+        "argon2 verifications running right now (D-079). Each holds auth.m_cost of \
+         memory while it runs; pinned at simmer_auth_verifies_max means logins are \
+         queueing for a permit"
+    );
+    describe_gauge!(
+        "simmer_auth_verifies_max",
+        "D-079's bound on concurrent argon2 verifications: twice the usable cores, \
+         at least 4"
+    );
+    describe_gauge!(
         "simmer_reservations_in_flight",
         "§7.4 reservations this process is holding in its §10.4 registry. Nonzero on an \
          idle instance means a reservation was stranded"
@@ -446,6 +457,15 @@ pub fn process(stats: ProcessStats) {
 pub fn sessions(active: usize, max: usize) {
     metrics::gauge!("simmer_sessions_active").set(active as f64);
     metrics::gauge!("simmer_sessions_max").set(max as f64);
+}
+
+/// D-079 — how many argon2 verifications are running, against the bound.
+///
+/// Takes the permits *available* rather than the count in flight, because that is
+/// what the semaphore can tell us without a second counter to keep in step.
+pub fn auth_verifies_in_flight(available: usize, max: usize) {
+    metrics::gauge!("simmer_auth_verifies_in_flight").set(max.saturating_sub(available) as f64);
+    metrics::gauge!("simmer_auth_verifies_max").set(max as f64);
 }
 
 /// D-075 — the §10.4 registry's size.
