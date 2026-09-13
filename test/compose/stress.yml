@@ -31,6 +31,67 @@ services:
       stress-config:
         condition: service_completed_successfully
 
+  # A second instance of the same Simmer, on the same database (S7, and the soak
+  # tier's A/B pair). One quota, two processes: §7.4's reservation protocol is
+  # what stops them both spending the same allowance.
+  #
+  # Declared in full rather than with `extends:`, deliberately. `app` above is an
+  # override of the base file's service; `app2` has no base to inherit, and
+  # compose's `extends` *merges* multi-value keys, so it would publish the base's
+  # 127.0.0.1:8080:8080 alongside its own and clash — besides silently dropping
+  # depends_on. Everything here that mirrors the base `app` must be kept in step
+  # with it: the build target, the config, and above all SIMMER_WARMUP_STARTED,
+  # since a different warm-up instant means a different §7.2 day index and the two
+  # instances would quietly account against different rows instead of contending.
+  app2:
+    profiles: ["stress"]
+    build:
+      context: .
+      # The Dockerfile's last stage is `acceptance` (the loadgen), so this pin is
+      # load-bearing exactly as it is for `app`.
+      target: runtime
+    cpus: "${STRESS_APP_CPUS:-2}"
+    mem_limit: 1g
+    ports:
+      # Its own admin port: 8080 is `app`'s and 18081 is the sink's stats.
+      - "127.0.0.1:8081:8080"
+    read_only: true
+    cap_add:
+      - NET_BIND_SERVICE
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    environment:
+      # The same database as `app`. That is the point of this service.
+      DATABASE_URL: "postgres://simmer:simmer@simmer-db:5432/simmer"
+      SIMMER_ADMIN_TOKEN: "local-dev-token-not-a-secret"
+      SIMMER_CFAPP_HASH: "$$argon2id$$v=19$$m=19456,t=2,p=1$$iYj0sVhRvzAWM9kzsFBKyg$$V1tnVXTGEO+BD0x9q1uccuo91w84jrz+qDKA3qElLFE"
+      POSTAL_USER: "postal"
+      POSTAL_PASS: "postal-local"
+      SENDGRID_KEY: "SG.local"
+      RUST_LOG: "info,sqlx=warn"
+      SIMMER_CONFIG: "${SIMMER_CONFIG:-/app/simmer.yaml}"
+      SIMMER_WARMUP_STARTED: "${SIMMER_WARMUP_STARTED:-2026-08-01T09:00:00Z}"
+      SIMMER_SESSION_TIMEOUT: "${SIMMER_SESSION_TIMEOUT:-120s}"
+      SIMMER_TLS_DIR: "/tls"
+    volumes:
+      - acceptance-tls:/tls:ro
+      - test-trust:/etc/ssl/certs:ro
+      - stress-config:/config:ro
+    healthcheck:
+      test: ["CMD", "/app/server", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    depends_on:
+      simmer-db:
+        condition: service_healthy
+      stress-config:
+        condition: service_completed_successfully
+      tls-init:
+        condition: service_completed_successfully
+        required: false
+
   # test/config/ into the `stress-config` volume. See test/config/Dockerfile for
   # why this is an image and not a bind mount.
   stress-config:

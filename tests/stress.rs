@@ -34,6 +34,10 @@ const STRESS_CONFIG: &str = "test/config/simmer.stress.yaml";
 /// The sink's stats, published by `test/compose/stress.yml`.
 const SINK_STATS: &str = "http://127.0.0.1:18081/";
 
+/// Every Simmer instance the stress stack can run. A scenario names the ones it
+/// needs in `app_services`; [`recreate_app`] stops the rest.
+const INSTANCES: [&str; 2] = ["app", "app2"];
+
 // ---------------------------------------------------------------------------
 // the one test that needs no Docker
 // ---------------------------------------------------------------------------
@@ -495,6 +499,129 @@ fn s4_large_messages_stay_within_memory() {
 }
 
 // ---------------------------------------------------------------------------
+// S7 — two instances, one quota
+// ---------------------------------------------------------------------------
+
+/// The warming allowance S7 pins before its load: small enough that the two
+/// instances are still sending when it runs out, which is the only moment the
+/// §7.4 protocol is actually under test.
+const S7_ALLOWANCE: i64 = 50;
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s7_two_instances_spend_one_allowance_exactly_once() {
+    // Two Simmers on one database, sending at the same time, with the warming
+    // route pinned to an allowance neither stream can satisfy alone. §7.4's
+    // reserve/send/commit is the only thing stopping them both spending it: the
+    // row lock is taken per reservation, so exactly the allowance may commit and
+    // every message after it must steer to overflow rather than overshoot the ramp
+    // — an overshoot being precisely the reputational damage the ramp exists to
+    // avoid.
+    let _logs = STRESS.logs_on_failure();
+    let mut s = Scenario::sending("S7", "", &[]);
+    s.app_services = &["app", "app2"];
+    s.before = Some(pin_the_warming_allowance);
+    s.loadgens = vec![
+        (
+            "inst1",
+            args(&[
+                "--host",
+                "app",
+                "--tag",
+                "i1",
+                "--count",
+                "60",
+                "--concurrency",
+                "8",
+            ]),
+        ),
+        (
+            "inst2",
+            args(&[
+                "--host",
+                "app2",
+                "--tag",
+                "i2",
+                "--count",
+                "60",
+                "--concurrency",
+                "8",
+            ]),
+        ),
+    ];
+    let seen = run(&s);
+
+    // Both instances agreed on the day, or they were never contending at all:
+    // §7.2's index comes from `warmup.started`, and two containers rendered from
+    // different environments would quietly account against different rows and
+    // pass this scenario while testing nothing. `recreate_app` brings both up in
+    // one compose invocation precisely so they cannot diverge.
+    // Scoped to the warming route on purpose: `overflow-established` carries no
+    // warm-up block, so §7.2 gives it a different day index by design, and
+    // counting across both routes would never be 1.
+    let days = STRESS
+        .psql("select count(distinct day_index) from quota_usage where route = 'warming-newbrand'");
+    assert_eq!(
+        days, "1",
+        "the instances accounted against different day rows, so they never contended"
+    );
+
+    // Exactly the allowance committed on the warming route, and not one more.
+    let committed = STRESS.psql(
+        "select coalesce(sum(committed), 0) from quota_usage where route = 'warming-newbrand'",
+    );
+    assert_eq!(
+        committed,
+        S7_ALLOWANCE.to_string(),
+        "warming committed, against an allowance of {S7_ALLOWANCE}"
+    );
+
+    // And each instance stayed inside the per-route pool bound on its own: the
+    // sink counts peaks per peer, so one instance cannot hide behind the other.
+    for (peer, peak) in sink_peer_peaks(&seen.sink, ":2525") {
+        assert!(
+            peak <= 4,
+            "{peer} opened {peak} concurrent warming connections, pool max 4"
+        );
+    }
+
+    judge_all(&s, &seen);
+}
+
+/// Pin the warming route's allowance for today.
+///
+/// After `run()`'s quota reset and before the first message: an override is a
+/// column on the day's own `quota_usage` row, so setting it earlier would only
+/// have it truncated away.
+fn pin_the_warming_allowance() {
+    let (status, body) = admin::post(
+        &STRESS,
+        "/routes/warming-newbrand/allowance",
+        &serde_json::json!({ "domain_group": "catchall", "allowance": S7_ALLOWANCE }),
+    );
+    assert_eq!(status, 200, "pinning the allowance: {body}");
+}
+
+/// Peak concurrent connections per peer on one listener, from the sink's stats.
+/// Keys are `"<listener> <peer ip>"`, so each instance shows up separately.
+fn sink_peer_peaks(stats: &serde_json::Value, port: &str) -> Vec<(String, u64)> {
+    stats["peers"]
+        .as_object()
+        .map(|peers| {
+            peers
+                .iter()
+                .filter(|(k, _)| {
+                    k.split_whitespace()
+                        .next()
+                        .is_some_and(|listener| listener.ends_with(port))
+                })
+                .map(|(k, v)| (k.clone(), v["peak"].as_u64().unwrap_or(0)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // S9 — a relay cancelled mid-flight (F2)
 // ---------------------------------------------------------------------------
 
@@ -565,6 +692,13 @@ struct Scenario {
     /// own sink faults would answer it (S9 stalls every message at the dot), since
     /// a probe that fails for the injected reason says nothing about recovery.
     probe: bool,
+    /// The Simmer instances this scenario runs against, re-created before it.
+    /// `["app"]` for all but S7, which needs a second one on the same database.
+    app_services: &'static [&'static str],
+    /// Something that must happen *before* the load — S7's allowance override,
+    /// which has to be in place before the first message or nothing steers.
+    /// Runs after the quota reset, since an override is a row that reset clears.
+    before: Option<fn()>,
 }
 
 impl Scenario {
@@ -584,6 +718,8 @@ impl Scenario {
             during: None,
             max_reply_ms: None,
             probe: true,
+            app_services: &["app"],
+            before: None,
         }
     }
 }
@@ -606,8 +742,11 @@ struct Seen {
 }
 
 fn run(s: &Scenario) -> Seen {
-    recreate_app(s.app_env);
+    recreate_app(s.app_env, s.app_services);
     STRESS.reset_quota();
+    if let Some(before) = s.before {
+        before();
+    }
     fresh_sink(s.sink_args);
     let container_before = container_state();
     let since = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -756,9 +895,12 @@ fn checks(s: &Scenario, seen: &Seen) -> Vec<(&'static str, Result<(), String>)> 
             seen.peaks.sessions, c.sessions
         ));
     }
+    // `database.max_connections` is a per-process bound, and `backends()` reports
+    // the most any single instance held, so this compares like with like whether
+    // the scenario runs one instance or two.
     if seen.peaks.backends > c.db {
         bounds.push(format!(
-            "{} database backends, max {}",
+            "one instance held {} database backends, max {}",
             seen.peaks.backends, c.db
         ));
     }
@@ -1063,8 +1205,13 @@ fn healthcheck_ms() -> Option<f64> {
     ok.then(|| start.elapsed().as_secs_f64() * 1000.0)
 }
 
-/// Simmer's connections to Postgres: the TCP ones. `psql` through `exec` comes
-/// in over the local socket, so the harness never counts itself.
+/// The most Postgres connections any one Simmer instance is holding.
+///
+/// Per instance, not in total: `database.max_connections` is a per-process bound,
+/// so with two instances (S7) an aggregate of 20 is correct while either one
+/// holding 15 is not — and only the per-client figure can tell those apart. Only
+/// TCP clients count; `psql` through `exec` arrives over the local socket, so the
+/// harness never counts itself.
 fn backends() -> Option<usize> {
     let out = STRESS
         .compose()
@@ -1081,8 +1228,9 @@ fn backends() -> Option<usize> {
         .args([
             "-qAt",
             "-c",
-            "select count(*) from pg_stat_activity where datname = 'simmer' \
-             and client_addr is not null",
+            "select coalesce(max(held), 0) from (select count(*) as held \
+             from pg_stat_activity where datname = 'simmer' \
+             and client_addr is not null group by client_addr) per_instance",
         ])
         .output()
         .ok()?;
@@ -1108,27 +1256,47 @@ fn args(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
 
-/// Start every scenario from a freshly created `app` carrying exactly that
-/// scenario's environment.
+/// Start every scenario from freshly created Simmer instances carrying exactly
+/// that scenario's environment — `app` alone, or both instances for S7.
 ///
 /// Always a re-create rather than a health check, for three reasons: a scenario
-/// that changes `app`'s environment (S9's short session timeout) would otherwise
+/// that changes the environment (S9's short session timeout) would otherwise
 /// leave it in place for the next one, which is D-042's trap in a new guise; a
-/// scenario may have left `app` OOM-killed; and a fresh process gives the memory
-/// checks a clean baseline. `SIMMER_SESSION_TIMEOUT` always has a value from
-/// `test/compose/stress.yml`, so the rendering is identical unless asked otherwise.
-fn recreate_app(env: &[(&str, &str)]) {
+/// scenario may have left an instance OOM-killed; and a fresh process gives the
+/// memory checks a clean baseline. `SIMMER_SESSION_TIMEOUT` always has a value
+/// from `test/compose/stress.yml`, so the rendering is identical unless asked
+/// otherwise.
+fn recreate_app(env: &[(&str, &str)], services: &[&str]) {
+    // Stop the instances this scenario did not ask for. An instance nobody is
+    // sending to is not idle: it holds a database pool, runs the §7.3 sweeper and
+    // the §6.7 preflight loop, and so moves the very numbers the bounds checks
+    // read — `app2` left running charged every single-instance scenario for its
+    // ten backends.
+    let idle: Vec<&str> = INSTANCES
+        .iter()
+        .copied()
+        .filter(|i| !services.contains(i))
+        .collect();
+    if !idle.is_empty() {
+        let _ = STRESS
+            .compose()
+            .args(["stop", "-t", "5"])
+            .args(&idle)
+            .output();
+    }
+
     let mut cmd = STRESS.compose();
     for (k, v) in env {
         cmd.env(k, v);
     }
     let out = cmd
-        .args(["up", "-d", "--no-deps", "--force-recreate", "--wait", "app"])
+        .args(["up", "-d", "--no-deps", "--force-recreate", "--wait"])
+        .args(services)
         .output()
-        .expect("docker compose up app");
+        .expect("docker compose up");
     assert!(
         out.status.success(),
-        "app would not come back up: {}",
+        "{services:?} would not come back up: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
