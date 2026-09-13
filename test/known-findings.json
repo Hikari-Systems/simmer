@@ -8,15 +8,6 @@
     "note": "A DATA line with no LF is buffered whole (src/smtp/session.rs read_until without take), so a 300 MiB no-LF line grows anon well past the bound before MAX_DATA_LINE is checked. Also pinned in cargo test: tests/finding_f1_data_line.rs."
   },
   {
-    "id": "F2",
-    "check": "stress/S9/reservations",
-    "because": [
-      "reservations_in_flight",
-      "stored but answered"
-    ],
-    "note": "timeouts.session cancels an in-flight relay: duplicate on retry, uncommitted delivery, leaked registry entry. Also pinned in cargo test: tests/findings.rs."
-  },
-  {
     "id": "F7",
     "check": "soak/V3/metric-series",
     "because": [
@@ -31,5 +22,29 @@
       "no mechanism available"
     ],
     "note": "Outbound AUTH is always PLAIN (src/downstream/client.rs): a downstream offering only LOGIN answers 535 and Simmer defers 451 on every retry. Observed against postfix-login-only in the T2 matrix."
+  },
+  {
+    "id": "F2",
+    "check": "stress/S9/accounting",
+    "because": [
+      "stored without a reply"
+    ],
+    "note": "timeouts.session runs from connect, so it cancels an in-flight relay: the downstream has already stored the message but Simmer neither counts it as ambiguous nor tells the client. Also pinned in cargo test: tests/findings.rs."
+  },
+  {
+    "id": "F2",
+    "check": "stress/S9/baseline",
+    "because": [
+      "reservations_in_flight"
+    ],
+    "note": "The same cancellation leaks the reservation: reservations_in_flight, the quota_reservation rows and quota_usage.reserved all stay non-zero after the load, until the sweeper expires them."
+  },
+  {
+    "id": "F4",
+    "check": "stress/S3/latency",
+    "because": [
+      "ms to be told"
+    ],
+    "note": "No lock_timeout or statement_timeout (src/db.rs sets only acquire_timeout), so a query that already holds a pool connection waits on a blocked row or table indefinitely: measured at ~27 s to answer while a lock was held for 25 s."
   }
 ]

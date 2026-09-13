@@ -351,6 +351,134 @@ fn s8c_data_tricklers_hit_the_data_timeout() {
 }
 
 // ---------------------------------------------------------------------------
+// S3 — the database blocked (F4)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s3_a_blocked_database_defers_without_hanging_the_client() {
+    // One transaction holds `quota_usage` for 25 s while 64 senders arrive. §7.5's
+    // answer with `fail_closed` is `451 4.3.0 quota service unavailable` —
+    // temporary, never permanent — and the pool must not exceed its 10
+    // connections. Finding F4: nothing sets `lock_timeout` or `statement_timeout`,
+    // so a query that already holds a pool connection waits on the lock rather
+    // than giving up, and those clients wait far past their own budget.
+    let _logs = STRESS.logs_on_failure();
+    // A duration, not a count: the lock takes about a second to establish through
+    // `docker exec`, and a fixed count against a fast sink would be over before
+    // the database was blocked at all. 30 s of load against a 25 s lock also shows
+    // the recovery once it is released.
+    let mut s = Scenario::sending("S3", "", &["--duration", "30s", "--concurrency", "64"]);
+    s.during = Some(block_the_quota_table);
+    s.max_reply_ms = Some(10_000.0); // the database connect_timeout (5 s), plus 5
+    s.expected_errors = &["quota store unavailable"];
+    let seen = run(&s);
+    let deferred = seen
+        .sent
+        .iter()
+        .filter(|r| r.code == 451 && r.text.contains("4.3.0"))
+        .count();
+    assert!(
+        deferred > 0,
+        "a blocked quota table should defer 451 4.3.0: {:?}",
+        seen.sent.iter().map(|r| r.code).collect::<Vec<_>>()
+    );
+    judge_all(&s, &seen);
+}
+
+/// Hold `quota_usage` against all comers for longer than any client's budget.
+///
+/// A table lock rather than `SELECT … FOR UPDATE`: the row exists only once
+/// something has reserved against it, and `run()` has just truncated the table, so
+/// a row lock would need a warm-up message — whose delivery would then show up in
+/// the accounting as something no loadgen sent.
+fn block_the_quota_table() {
+    let _ = STRESS
+        .compose()
+        .args([
+            "exec",
+            "-T",
+            "simmer-db",
+            "psql",
+            "-U",
+            "simmer",
+            "-d",
+            "simmer",
+            "-qAt",
+            "-c",
+            "begin; lock table quota_usage in access exclusive mode; \
+             select pg_sleep(25); commit;",
+        ])
+        .output();
+}
+
+// ---------------------------------------------------------------------------
+// S4 — large messages (F3b)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s4_large_messages_stay_within_memory() {
+    // 4 concurrent 20 MiB messages whose bodies the route rewrites, so §6.4 copies
+    // the whole body rather than passing it through, and §8.1 spills each to
+    // tmpfs. Nothing admits DATA by memory (F3b), so what this measures is what
+    // the peak actually is; the gate is that it stays clear of the container's
+    // 1 GiB and that every message is either delivered or cleanly deferred.
+    //
+    // Four, not eight: at 8 concurrent this container moves about 0.4 MB/s per
+    // stream, so a 20 MiB body brushed the 60 s data timeout and most clients were
+    // cut off mid-DATA with a broken pipe — which measured the timeout, not the
+    // memory. That run did settle the memory question, though: anon peaked at
+    // 23 MiB for 8 × 20 MiB of body, because the buffer is on tmpfs, not the heap.
+    let _logs = STRESS.logs_on_failure();
+    let mut s = Scenario::sending(
+        "S4",
+        "",
+        &["--count", "8", "--concurrency", "4", "--size", "20m"],
+    );
+    s.max_anon_mib = Some(900.0);
+    let seen = run(&s);
+    // Measured against the bodies in flight at once, not the whole run — and the
+    // bodies themselves are on tmpfs (§8.1), so what this ratio describes is the
+    // engine's own working set beside them.
+    let bodies_mib = 4.0 * 20.0;
+    eprintln!(
+        "  S4: peak anon {:.0} MiB for 4 concurrent 20 MiB bodies ({:.1}x, bodies on tmpfs)",
+        seen.peaks.anon as f64 / 1_048_576.0,
+        seen.peaks.anon as f64 / 1_048_576.0 / bodies_mib
+    );
+    judge_all(&s, &seen);
+}
+
+// ---------------------------------------------------------------------------
+// S9 — a relay cancelled mid-flight (F2)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s9_a_relay_cancelled_by_the_session_timeout_is_accounted_for() {
+    // The session timeout runs from connect, so a short one fires while a relay is
+    // still in flight: the sink holds the dot for 30 s, the session is cut at 20.
+    // Finding F2: the downstream has the message, the client is told 421, and the
+    // reservation is left behind — loss and leak, both of which the accounting and
+    // baseline checks see.
+    let _logs = STRESS.logs_on_failure();
+    let mut s = Scenario::sending(
+        "S9",
+        "--stall-at-dot-pct 100 --stall-secs 30",
+        &["--count", "8", "--concurrency", "8"],
+    );
+    s.app_env = &[("SIMMER_SESSION_TIMEOUT", "20s")];
+    s.expected_errors = &["session timeout", "reservation"];
+    // The sink stalls *every* message at the dot, so a probe would be answered by
+    // the injected fault rather than by Simmer's state. The rest of U5 — the
+    // reservations, the rows, the pool — is what this scenario is about.
+    s.probe = false;
+    let seen = run(&s);
+    judge_all(&s, &seen);
+}
+
+// ---------------------------------------------------------------------------
 // a scenario, and what it observed
 // ---------------------------------------------------------------------------
 
@@ -380,6 +508,19 @@ struct Scenario {
     /// When set, a `healthcheck` check that `/healthcheck`'s p99 under load stayed
     /// under this many ms — S5's "still answering while argon2 runs".
     max_healthcheck_ms: Option<f64>,
+    /// Environment `app` is re-created with for this scenario — S9's short
+    /// `SIMMER_SESSION_TIMEOUT`. Empty means the tier's own values.
+    app_env: &'static [(&'static str, &'static str)],
+    /// Something that must happen *while* the load runs — S3's held database
+    /// lock. Started after the quota reset, and joined when the load ends.
+    during: Option<fn()>,
+    /// When set, a `latency` check that no client waited longer than this for its
+    /// reply — S3's "answered within its own budget even with the database blocked".
+    max_reply_ms: Option<f64>,
+    /// Whether U5 sends its probe message after the load. Off where the scenario's
+    /// own sink faults would answer it (S9 stalls every message at the dot), since
+    /// a probe that fails for the injected reason says nothing about recovery.
+    probe: bool,
 }
 
 impl Scenario {
@@ -395,6 +536,10 @@ impl Scenario {
             bare_close_is_refusal: false,
             max_anon_mib: None,
             max_healthcheck_ms: None,
+            app_env: &[],
+            during: None,
+            max_reply_ms: None,
+            probe: true,
         }
     }
 }
@@ -417,10 +562,7 @@ struct Seen {
 }
 
 fn run(s: &Scenario) -> Seen {
-    // A previous scenario may have left `app` OOM-killed (S5). Every scenario
-    // starts from a healthy one, or its `before` scrape and its own baseline mean
-    // nothing.
-    ensure_app_up();
+    recreate_app(s.app_env);
     STRESS.reset_quota();
     fresh_sink(s.sink_args);
     let container_before = container_state();
@@ -430,7 +572,14 @@ fn run(s: &Scenario) -> Seen {
     // report — so nothing below may assume it answers.
 
     let sampler = Sampler::start();
+    // Whatever must happen while the load runs. Started here, after the quota
+    // reset, so a scenario that locks the quota table cannot deadlock the
+    // truncate that precedes it.
+    let during = s.during.map(thread::spawn);
     let summaries = loadgens(&s.loadgens);
+    if let Some(handle) = during {
+        let _ = handle.join();
+    }
     let quiesced = quiesce();
     let peaks = sampler.stop();
     let summary = summaries.join("\n  ");
@@ -447,7 +596,11 @@ fn run(s: &Scenario) -> Seen {
         serde_json::from_str(&compose::traps::get(SINK_STATS)).expect("sink stats JSON");
     let after = Baseline::read(&after_metrics);
     // U5's probe: a message after the load stops still gets through.
-    let probe = compose::loadgen::run(&STRESS, &["--count", "1", "--tag", "probe"]);
+    let probe = if s.probe {
+        compose::loadgen::run(&STRESS, &["--count", "1", "--tag", "probe"])
+    } else {
+        Vec::new()
+    };
     let container_after = container_state();
     let log = String::from_utf8_lossy(
         &STRESS
@@ -645,6 +798,22 @@ fn checks(s: &Scenario, seen: &Seen) -> Vec<(&'static str, Result<(), String>)> 
             ))
         },
     ));
+
+    // Latency — only where a scenario names a bound. §14.1's rule has a corollary:
+    // a client must be *answered*, and within its own budget, even when Simmer's
+    // dependencies are misbehaving.
+    if let Some(max) = s.max_reply_ms {
+        let slow: Vec<&Sent> = seen.sent.iter().filter(|r| r.latency_ms > max).collect();
+        out.push((
+            "latency",
+            failures(&slow, |r| {
+                format!(
+                    "{} waited {:.0} ms to be told {} {}",
+                    r.id, r.latency_ms, r.code, r.text
+                )
+            }),
+        ));
+    }
 
     // Memory — only where a scenario names a bound. cgroup anon, so tmpfs spill
     // and page cache are not counted (F1's line buffer and F3a's argon2 blocks
@@ -895,14 +1064,21 @@ fn args(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
 
-/// Make sure `app` is running and healthy, force-recreating it if a previous
-/// scenario left it dead. Idempotent and quick when it is already up.
-fn ensure_app_up() {
-    if healthcheck_ms().is_some() {
-        return;
+/// Start every scenario from a freshly created `app` carrying exactly that
+/// scenario's environment.
+///
+/// Always a re-create rather than a health check, for three reasons: a scenario
+/// that changes `app`'s environment (S9's short session timeout) would otherwise
+/// leave it in place for the next one, which is D-042's trap in a new guise; a
+/// scenario may have left `app` OOM-killed; and a fresh process gives the memory
+/// checks a clean baseline. `SIMMER_SESSION_TIMEOUT` always has a value from
+/// `test/compose/stress.yml`, so the rendering is identical unless asked otherwise.
+fn recreate_app(env: &[(&str, &str)]) {
+    let mut cmd = STRESS.compose();
+    for (k, v) in env {
+        cmd.env(k, v);
     }
-    let out = STRESS
-        .compose()
+    let out = cmd
         .args(["up", "-d", "--no-deps", "--force-recreate", "--wait", "app"])
         .output()
         .expect("docker compose up app");
@@ -1102,8 +1278,15 @@ fn scrape() -> String {
 }
 
 fn try_scrape() -> Option<String> {
+    // Bounded: a scrape runs two database queries, and S3 deliberately blocks the
+    // database — an untimed curl would hang the sampler for the whole scenario.
     let out = Command::new("curl")
-        .args(["-sf", &format!("{}/metrics", admin::BASE)])
+        .args([
+            "-sf",
+            "--max-time",
+            "10",
+            &format!("{}/metrics", admin::BASE),
+        ])
         .output()
         .ok()?;
     out.status

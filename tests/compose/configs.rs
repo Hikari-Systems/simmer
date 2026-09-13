@@ -27,6 +27,8 @@ pub fn load(path: &str) -> Config {
     }
     for (k, v) in [
         ("SIMMER_WARMUP_STARTED", "2026-08-01T00:00:00Z"),
+        // test/config/simmer.stress.yaml's session timeout, which S9 overrides.
+        ("SIMMER_SESSION_TIMEOUT", "120s"),
         ("DATABASE_URL", "postgres://simmer:simmer@127.0.0.1:5433/simmer"),
         ("SIMMER_ADMIN_TOKEN", "test-tier-admin-token"),
         (

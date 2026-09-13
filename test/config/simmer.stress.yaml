@@ -29,7 +29,10 @@ server:
   timeouts:
     command: 15s
     data: 60s
-    session: 120s
+    # S9 shortens this to catch a relay in flight (F2); every other scenario gets
+    # the tier's own 120s. Always supplied, with that default, by
+    # test/compose/stress.yml — the harness re-creates `app` per scenario.
+    session: "${SIMMER_SESSION_TIMEOUT}"
   auth:
     allow_insecure_auth: true
     mechanisms: [PLAIN, LOGIN]

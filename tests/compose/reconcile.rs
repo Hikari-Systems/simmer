@@ -25,6 +25,10 @@ pub struct Sent {
     pub stage: String,
     #[serde(default)]
     pub text: String,
+    /// How long the client waited for this reply. The load tiers gate on it where
+    /// being answered *promptly* is the point (S3).
+    #[serde(default)]
+    pub latency_ms: f64,
 }
 
 /// One sink line: what a downstream did with one message.

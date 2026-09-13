@@ -19,6 +19,8 @@ fn sent(id: &str, code: u16) -> Sent {
         code,
         stage: if code == 0 { "transport" } else { "dot" }.into(),
         text: String::new(),
+        // These fixtures exercise the reconciliation rules, which do not read it.
+        latency_ms: 0.0,
     }
 }
 

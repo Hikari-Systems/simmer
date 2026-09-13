@@ -17,6 +17,10 @@ services:
   app:
     cpus: 2
     mem_limit: 1g
+    environment:
+      # simmer.stress.yaml reads this; S9 overrides it to catch a relay in flight.
+      # Defaulted here so every other command renders `app` identically.
+      SIMMER_SESSION_TIMEOUT: "${SIMMER_SESSION_TIMEOUT:-120s}"
     volumes:
       - stress-config:/config:ro
     depends_on:
