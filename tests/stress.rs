@@ -242,6 +242,44 @@ fn s5_an_auth_storm_stays_within_memory_and_keeps_answering() {
     judge_all(&s, &seen);
 }
 
+#[test]
+#[ignore = "needs the stress compose profile"]
+fn s5b_an_auth_storm_on_eight_cpus_stays_within_memory() {
+    // The same storm as S5 with four times the cores, and the same 1 GiB.
+    //
+    // F3a is about *concurrency*, not the session cap on its own: each verify
+    // holds ~19 MiB for as long as it runs, so the peak is however many are in
+    // flight at once. At 2 CPUs that was around 530 MiB — not because the cap is
+    // 64, but because sessions arrive staggered and argon2 is CPU-bound. More
+    // cores make everything ahead of AUTH faster, so more sessions reach it
+    // together. This asks what that does on a machine the size of a real one.
+    let _logs = STRESS.logs_on_failure();
+    let mut s = Scenario::sending(
+        "S5-8cpu",
+        "",
+        &[
+            "--port",
+            "587",
+            "--starttls",
+            "--ca",
+            "os",
+            "--auth",
+            "plain",
+            "--wrong-password-pct",
+            "50",
+            "--count",
+            "400",
+            "--concurrency",
+            "64",
+        ],
+    );
+    s.app_env = &[("STRESS_APP_CPUS", "8")];
+    s.max_anon_mib = Some(900.0);
+    s.max_healthcheck_ms = Some(1000.0);
+    let seen = run(&s);
+    judge_all(&s, &seen);
+}
+
 // ---------------------------------------------------------------------------
 // S8 — slowloris
 // ---------------------------------------------------------------------------
@@ -425,25 +463,31 @@ fn s4_large_messages_stay_within_memory() {
     // the peak actually is; the gate is that it stays clear of the container's
     // 1 GiB and that every message is either delivered or cleanly deferred.
     //
-    // Four, not eight: at 8 concurrent this container moves about 0.4 MB/s per
-    // stream, so a 20 MiB body brushed the 60 s data timeout and most clients were
-    // cut off mid-DATA with a broken pipe — which measured the timeout, not the
-    // memory. That run did settle the memory question, though: anon peaked at
-    // 23 MiB for 8 × 20 MiB of body, because the buffer is on tmpfs, not the heap.
+    // The sizing is measured, not guessed, and both halves matter. This container
+    // moves about 0.4 MB/s per stream, so at 8 concurrent a 20 MiB body ran past
+    // the 60 s data timeout and most clients were cut off mid-DATA — that measured
+    // the timeout, not the memory. Dropping to 4 concurrent was not enough either:
+    // 20 MiB still took ~46 s of a 60 s budget, a 23% margin, and one message in
+    // eight duly crossed it on a loaded run. 10 MiB at 4 concurrent takes ~23 s,
+    // a 2.6x margin, and is still ten times §8.1's 1 MiB spill threshold, so the
+    // spill-and-copy path this exists to exercise is unchanged.
+    //
+    // If this ever wants to be 20 MiB again, raise the data timeout with it or the
+    // scenario goes back to measuring the timeout.
     let _logs = STRESS.logs_on_failure();
     let mut s = Scenario::sending(
         "S4",
         "",
-        &["--count", "8", "--concurrency", "4", "--size", "20m"],
+        &["--count", "8", "--concurrency", "4", "--size", "10m"],
     );
     s.max_anon_mib = Some(900.0);
     let seen = run(&s);
     // Measured against the bodies in flight at once, not the whole run — and the
     // bodies themselves are on tmpfs (§8.1), so what this ratio describes is the
     // engine's own working set beside them.
-    let bodies_mib = 4.0 * 20.0;
+    let bodies_mib = 4.0 * 10.0;
     eprintln!(
-        "  S4: peak anon {:.0} MiB for 4 concurrent 20 MiB bodies ({:.1}x, bodies on tmpfs)",
+        "  S4: peak anon {:.0} MiB for 4 concurrent 10 MiB bodies ({:.1}x, bodies on tmpfs)",
         seen.peaks.anon as f64 / 1_048_576.0,
         seen.peaks.anon as f64 / 1_048_576.0 / bodies_mib
     );

@@ -15,7 +15,11 @@
 
 services:
   app:
-    cpus: 2
+    # Two by default, because the stated bar is that the bounds hold on a small
+    # machine. A scenario can ask for more through the harness's per-scenario
+    # environment: F3a is a *concurrency* finding, so how many argon2 verifies —
+    # and their 19 MiB buffers — coexist depends on the cores available.
+    cpus: "${STRESS_APP_CPUS:-2}"
     mem_limit: 1g
     environment:
       # simmer.stress.yaml reads this; S9 overrides it to catch a relay in flight.

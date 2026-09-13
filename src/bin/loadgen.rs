@@ -133,6 +133,10 @@ struct Args {
     idle_every: Duration,
     trickle_every: Duration,
     no_lf_bytes: usize,
+    /// Hold every connection open and authenticate at this offset from the run's
+    /// start, so the verifies coincide rather than being staggered by each
+    /// client's own handshake. Zero authenticates as soon as the client is ready.
+    auth_delay: Duration,
 }
 
 fn args() -> Args {
@@ -171,6 +175,7 @@ fn args() -> Args {
         idle_every: Duration::from_secs(5),
         trickle_every: Duration::from_secs(1),
         no_lf_bytes: 512 * 1024 * 1024,
+        auth_delay: Duration::ZERO,
     };
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -249,6 +254,7 @@ fn args() -> Args {
             "--idle-every" => a.idle_every = parse_duration(&value()),
             "--trickle-every" => a.trickle_every = parse_duration(&value()),
             "--no-lf-bytes" => a.no_lf_bytes = parse_sizes(&value())[0].0,
+            "--auth-delay" => a.auth_delay = parse_duration(&value()),
             "--auth" => {
                 a.auth = match value().as_str() {
                     "plain" => AuthMech::Plain,
@@ -646,6 +652,14 @@ async fn converse(
         ehlo(&mut io, &args.helo)
             .await
             .map_err(cut(0, "transport"))?;
+    }
+
+    // A synchronised burst. Every client is connected and greeted by now, so
+    // waiting for one shared instant puts all the argon2 verifies in flight at
+    // once — the only shape that decouples what an arrival costs from what a
+    // verify costs, since otherwise both are paid on the same CPUs.
+    if !args.auth_delay.is_zero() {
+        tokio::time::sleep_until((started + args.auth_delay).into()).await;
     }
 
     if args.auth != AuthMech::None && !args.password.is_empty() {
