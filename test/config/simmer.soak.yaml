@@ -81,11 +81,12 @@ senders:
   - match: "oldbrand.com"
     match_on: envelope
     chain: [warming-newbrand, overflow-established]
-  # V3's fresh `u<seq>.soak.test` senders take the same chain, so a domain nobody
-  # has seen before still reaches the warming route and its §9.1 label (F7).
-  - match: "*.soak.test"
-    match_on: envelope
-    chain: [warming-newbrand, overflow-established]
+  # There is deliberately **no** rule for `*.soak.test`. V3's senders have to be
+  # granted but unmatched, which is the only state that reaches §5.4's
+  # fall-through and labels `simmer_unmatched_sender_total{domain}` with a domain
+  # the client chose (F7). The grant in `server.auth.users` stays — without it the
+  # ACL refuses at MAIL FROM and no message is ever accepted, which would look
+  # exactly like F7 not reproducing.
 
 default_chain: [overflow-established]
 strict_senders: false

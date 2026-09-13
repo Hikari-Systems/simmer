@@ -107,6 +107,14 @@ struct Args {
     per_session: usize,
     from: String,
     from_header: String,
+    /// Draw every message's sender from a domain nobody has seen before,
+    /// `u<n>.soak.test`, in the envelope **and** the `From:` header.
+    ///
+    /// Both, because `relay.rs` labels `simmer_unmatched_sender_total` with the
+    /// `From:` header's domain and only falls back to the envelope's — varying
+    /// the envelope alone would emit one series forever and read as F7 failing
+    /// to reproduce against an untouched defect.
+    fresh_sender: bool,
     recipient_domain: String,
     tag: String,
     subject: String,
@@ -152,6 +160,7 @@ fn args() -> Args {
         per_session: 1,
         from: "jane@oldbrand.com".to_string(),
         from_header: "Jane Smith <jane@oldbrand.com>".to_string(),
+        fresh_sender: false,
         recipient_domain: "example.net".to_string(),
         tag: "run".to_string(),
         subject: "Your order has shipped".to_string(),
@@ -195,6 +204,11 @@ fn args() -> Args {
             }
             "--stamp" => {
                 a.stamp = true;
+                i += 1;
+                continue;
+            }
+            "--fresh-sender" => {
+                a.fresh_sender = true;
                 i += 1;
                 continue;
             }
@@ -563,6 +577,31 @@ fn identity(args: &Args, n: u64) -> (String, String) {
     (id, recipient)
 }
 
+/// This message's envelope sender and `From:` header.
+///
+/// With `--fresh-sender`, one message in twenty comes from `u<n>.soak.test` — a
+/// domain the server has never seen and never will again. The ACL still grants it
+/// (`*.soak.test`), so the message is accepted; no `senders:` rule matches it, so
+/// it falls through to `default_chain` and mints a new
+/// `simmer_unmatched_sender_total{domain}` series on the way. That is F7, driven
+/// rather than argued about.
+///
+/// One in twenty, not all of them: at 10 msg/s for an hour, every message would
+/// be ~34,000 series rather than ~1,700, which stops being a measurement of the
+/// defect and becomes a cardinality bomb of the test's own making — it would be
+/// the soak's memory and scrape time under test, not Simmer's.
+fn sender(args: &Args, n: u64) -> (String, String) {
+    if !args.fresh_sender || !n.is_multiple_of(FRESH_SENDER_EVERY) {
+        return (args.from.clone(), args.from_header.clone());
+    }
+    let envelope = format!("jane@u{n}.soak.test");
+    let header = format!("Jane Smith <{envelope}>");
+    (envelope, header)
+}
+
+/// One message in twenty carries a never-before-seen sender domain: the plan's 5%.
+const FRESH_SENDER_EVERY: u64 = 20;
+
 fn cut(at: usize, stage: &'static str) -> impl Fn(String) -> Cut {
     move |text| Cut { at, stage, text }
 }
@@ -726,7 +765,7 @@ async fn converse(
         } else {
             ""
         };
-        let mail = format!("MAIL FROM:<{}>{params}\r\n", args.from);
+        let mail = format!("MAIL FROM:<{}>{params}\r\n", sender(args, *n).0);
         let rcpt = format!("RCPT TO:<{recipient}>\r\n");
 
         let replies = if args.pipelining {
@@ -950,7 +989,7 @@ fn message(args: &Args, id: &str, recipient: &str, n: u64) -> Vec<u8> {
              Authentication-Results: mx.oldbrand.com; spf=pass\r\n\
              ARC-Seal: i=1; cv=none; d=oldbrand.com\r\n\
              MIME-Version: 1.0\r\n",
-            args.from_header,
+            sender(args, n).1,
             args.subject,
             args.tag,
             recipient.split('@').next().unwrap_or("x"),

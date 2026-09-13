@@ -162,8 +162,8 @@ fn soak_run() {
         let flag = Arc::clone(&stop);
         thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
-                if let Some(series) = scrape_series_count() {
-                    append_metrics(started.elapsed().as_secs_f64(), series);
+                if let Some((total, unmatched)) = scrape_series_count() {
+                    append_metrics(started.elapsed().as_secs_f64(), total, unmatched);
                 }
                 thread::sleep(Duration::from_secs(30));
             }
@@ -197,6 +197,11 @@ fn soak_run() {
                 "10".to_string(),
                 "--size".to_string(),
                 "dist:4k:80,100k:15,1m:4,4m:1".to_string(),
+                // V3 (F7): one message in twenty from a domain nobody has seen
+                // before, granted by the ACL but matched by no `senders:` rule,
+                // so it falls through to `default_chain` and mints a new
+                // `simmer_unmatched_sender_total{domain}` series.
+                "--fresh-sender".to_string(),
                 "--jsonl".to_string(),
                 format!("/results/soak-{instance}.jsonl"),
             ];
@@ -316,22 +321,46 @@ fn soak_analyze() {
             ));
         }
     }
-    // F7's series count: reported, not judged. The senders that would make it grow
-    // are V3's fresh, unmatched domains, and they do not exist yet — so a gate here
-    // would pass for the wrong reason, and since F7 is already in the
-    // known-findings list, passing would fail the run as an XPASS. The number is
-    // worth watching in the meantime.
+    // F7 — `simmer_unmatched_sender_total{domain}` takes its label from a domain
+    // the client chose, so V3's fresh `u<n>.soak.test` senders mint a new series
+    // every time one arrives. Judged from the post-warm-up baseline, not from
+    // zero: the series present at start-up are the configured routes' and are
+    // nobody's defect.
     let series = read_metrics();
-    if let (Some(first), Some(last)) = (series.first(), series.last()) {
-        let peak = series.iter().map(|(_, n)| *n).max().unwrap_or(0);
-        eprintln!(
-            "\nmetrics: {} series at {:.0}s, {} at {:.0}s, peak {peak}, across {} scrapes",
-            first.1,
-            first.0,
-            last.1,
-            last.0,
-            series.len()
-        );
+    let after: Vec<(f64, usize, usize)> = if series.len() < 2 {
+        Vec::new()
+    } else {
+        let span = series.last().expect("series").0 - series[0].0;
+        let warmup = match std::env::var("SOAK_WARMUP") {
+            Ok(v) => duration_str(&v).as_secs_f64(),
+            Err(_) => (0.15 * span).clamp(600.0, 5400.0),
+        };
+        series
+            .iter()
+            .copied()
+            .filter(|(t, ..)| *t >= warmup)
+            .collect()
+    };
+    match (after.first(), after.last()) {
+        (Some(&(t0, tot0, u0)), Some(&(t1, tot1, u1))) if t1 > t0 => {
+            eprintln!(
+                "\nmetrics: {tot0} series ({u0} unmatched-sender) at {t0:.0}s -> \
+                 {tot1} ({u1}) at {t1:.0}s, across {} post-warm-up scrapes",
+                after.len()
+            );
+            let grew = u1.saturating_sub(u0);
+            let result = if grew > ALLOWED_SERIES_GROWTH {
+                Err(format!(
+                    "metric series grew by {grew} (unmatched-sender {u0} -> {u1}) over \
+                     {:.0} minutes; the domain label is client-controlled",
+                    (t1 - t0) / 60.0
+                ))
+            } else {
+                Ok(())
+            };
+            compose::findings::judge("soak/V3/metric-series", result);
+        }
+        _ => eprintln!("\nmetrics: too few post-warm-up scrapes for a series verdict"),
     }
 
     assert!(judged > 0, "no samples at all; run soak_run first");
@@ -414,49 +443,67 @@ fn sample_instance(instance: &str) -> Option<Sample> {
     Some(s)
 }
 
-/// How many distinct series `/metrics` is exporting right now.
+/// How many series `/metrics` is exporting right now: every series, and the
+/// `simmer_unmatched_sender_total` ones specifically.
 ///
-/// Every non-comment, non-blank line is one series, labels included — which is
-/// the number F7 is about: a label whose value the client chooses has no natural
-/// ceiling, and the cost of one is paid on every scrape forever.
-fn scrape_series_count() -> Option<usize> {
+/// Every non-comment, non-blank line is one series, labels included. The total is
+/// context; the judgement is made on the unmatched-sender count alone, because the
+/// total moves for reasons that are nobody's defect — a new route label, a new
+/// outcome — and gating on it would quietly turn this into a different check.
+fn scrape_series_count() -> Option<(usize, usize)> {
     let out = Command::new("curl")
         .args(["-sf", "--max-time", "10", "http://127.0.0.1:8080/metrics"])
         .output()
         .ok()?;
     out.status.success().then(|| {
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-            .count()
+        let body = String::from_utf8_lossy(&out.stdout);
+        let live = || {
+            body.lines()
+                .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        };
+        (
+            live().count(),
+            live()
+                .filter(|l| l.starts_with("simmer_unmatched_sender_total{"))
+                .count(),
+        )
     })
 }
+
+/// §9.1's own series move for innocent reasons — a route added, an outcome first
+/// seen — so a handful of new ones is not the defect. F7 is unbounded growth, and
+/// 5% of an hour's messages is ~1,700 fresh domains against this.
+const ALLOWED_SERIES_GROWTH: usize = 50;
 
 fn metrics_csv() -> PathBuf {
     PathBuf::from(SAMPLE_DIR).join("metrics.csv")
 }
 
-fn append_metrics(t: f64, series: usize) {
+fn append_metrics(t: f64, total: usize, unmatched: usize) {
     let path = metrics_csv();
     let fresh = !path.exists();
     let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
     if fresh {
-        let _ = writeln!(f, "t,series");
+        let _ = writeln!(f, "t,series,unmatched");
     }
-    let _ = writeln!(f, "{t:.1},{series}");
+    let _ = writeln!(f, "{t:.1},{total},{unmatched}");
 }
 
-fn read_metrics() -> Vec<(f64, usize)> {
+fn read_metrics() -> Vec<(f64, usize, usize)> {
     let Ok(text) = fs::read_to_string(metrics_csv()) else {
         return Vec::new();
     };
     text.lines()
         .skip(1)
         .filter_map(|line| {
-            let (t, n) = line.split_once(',')?;
-            Some((t.parse().ok()?, n.trim().parse().ok()?))
+            let mut f = line.split(',');
+            Some((
+                f.next()?.trim().parse().ok()?,
+                f.next()?.trim().parse().ok()?,
+                f.next()?.trim().parse().ok()?,
+            ))
         })
         .collect()
 }
