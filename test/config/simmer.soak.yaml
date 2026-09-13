@@ -1,0 +1,140 @@
+# The T4 soak configuration (docs/TESTING.md; the test programme's step 5).
+#
+# Delivered into `app` and `app2` at /config by the same `stress-config` one-shot
+# that carries the stress config: test/config/Dockerfile copies the whole
+# directory, so this file is already there and the soak stack differs from the
+# stress stack only in SIMMER_CONFIG. The volume's name is a little narrow for
+# what it now carries; it is not renamed because that would strand the volume a
+# running stack is using.
+#
+# What the soak changes, and why each matters over hours rather than seconds:
+#
+#   * `idle_ttl` 60s with a downstream that closes idle connections sooner, so
+#     reuse, reaping and D-068's retry all happen thousands of times rather than
+#     once (V5's CLOSE_WAIT question).
+#   * Downstream timeouts 5/10/60s, which put §7.4's reservation expiry at 205s —
+#     long enough that a cancelled relay leaves a reservation visible for a while
+#     (F2), short enough that the sweeper's behaviour is observable in an hour.
+#   * A session timeout of 300s: long sessions are the realistic shape, and it is
+#     what V4 cancels a relay against. A literal, not the stress tier's
+#     ${SIMMER_SESSION_TIMEOUT}, so the two tiers cannot perturb each other.
+#   * `recipient_frequency` on the warming route, so §7.3 writes rows and evicts
+#     them continuously — the table that F12 says is never pruned.
+#   * An allowance no run can exhaust: 24 hours at 10 msg/s is ~864k messages, so
+#     steering here is recipient frequency's doing and never quota's. A soak that
+#     silently fell through to overflow after an hour would measure the wrong
+#     route for the other twenty-three.
+
+server:
+  listeners:
+    - address: "0.0.0.0:25"
+      auth: required
+    - address: "0.0.0.0:587"     # starttls_required, auth required (port defaults)
+    - address: "0.0.0.0:465"     # implicit, auth required (port defaults)
+  tls:
+    certificate: "${SIMMER_TLS_DIR}/cert.pem"
+    private_key: "${SIMMER_TLS_DIR}/key.pem"
+  hostname: "simmer.acceptance"
+  max_message_bytes: 26214400
+  max_recipients: 1
+  max_concurrent_sessions: 64
+  allowed_cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+  timeouts:
+    command: 30s
+    data: 120s
+    session: 300s
+  auth:
+    allow_insecure_auth: true
+    mechanisms: [PLAIN, LOGIN]
+    users:
+      # Two users sharing one hash: `soakapp` is the soak's own identity, granted
+      # the soak's domains, while `cfapp` stays so anything pointed at this config
+      # by habit still authenticates.
+      - username: "soakapp"
+        password_hash: "${SIMMER_CFAPP_HASH}"
+        grants:
+          send_as: ["oldbrand.com", "newbrand.com", "*.soak.test"]
+      - username: "cfapp"
+        password_hash: "${SIMMER_CFAPP_HASH}"
+        grants:
+          send_as: ["oldbrand.com", "newbrand.com", "*.soak.test"]
+
+database:
+  url: "${DATABASE_URL}"
+  max_connections: 10
+  connect_timeout: 5s
+  fail_closed: true
+
+admin:
+  listen: "0.0.0.0:8080"
+  auth_token: "${SIMMER_ADMIN_TOKEN}"
+
+logging:
+  level: info
+  format: json
+
+domain_groups:
+  - name: catchall
+    domains: ["*"]
+
+senders:
+  - match: "oldbrand.com"
+    match_on: envelope
+    chain: [warming-newbrand, overflow-established]
+  # V3's fresh `u<seq>.soak.test` senders take the same chain, so a domain nobody
+  # has seen before still reaches the warming route and its §9.1 label (F7).
+  - match: "*.soak.test"
+    match_on: envelope
+    chain: [warming-newbrand, overflow-established]
+
+default_chain: [overflow-established]
+strict_senders: false
+
+routes:
+  - name: warming-newbrand
+    downstream:
+      host: "sink"
+      port: 2525
+      tls: off
+      pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+      timeouts:
+        connect: 5s
+        command: 10s
+        data: 60s
+    identity:
+      envelope_from: "bounce@newbrand.com"
+      set_headers:
+        X-Simmer-Route: "{{route.name}}"
+      body_rewrites:
+        - pattern: 'https://oldbrand\.com/'
+          replacement: "https://newbrand.com/"
+    preflight:
+      enabled: false
+    # §7.3 running continuously: rows written on every commit and evicted by the
+    # hourly sweeper, which is the churn F12 is about.
+    recipient_frequency:
+      mode: to_address
+      window: { unit: hourly, count: 1 }
+      threshold: 5
+    warmup:
+      started: "${SIMMER_WARMUP_STARTED}"
+      schedule:
+        default: [100000000]
+
+  - name: overflow-established
+    overflow: true
+    downstream:
+      host: "sink"
+      port: 2526
+      tls: off
+      pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
+      timeouts:
+        connect: 5s
+        command: 10s
+        data: 60s
+    identity:
+      envelope_from: "bounce@mail.established.com"
+      set_headers:
+        X-Simmer-Route: "{{route.name}}"
+    preflight:
+      enabled: false

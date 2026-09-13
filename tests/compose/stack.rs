@@ -50,6 +50,20 @@ pub static STRESS: Stack = Stack::new(
     "/config/simmer.stress.yaml",
 );
 
+/// The T4 soak stack (`docs/TESTING.md`, step 5).
+///
+/// The same files, profiles and services as [`STRESS`] — `app`, `app2`, the
+/// counting sink and the results volume are all exactly what a soak needs — and
+/// differs only in which config `app` reads. `test/config/Dockerfile` copies the
+/// whole directory into the shared volume, so `simmer.soak.yaml` is already
+/// mounted; no separate compose file is needed until the soak wants a service the
+/// stress tier does not have.
+pub static SOAK: Stack = Stack::new(
+    &["acceptance", "stress"],
+    &["test/compose/acceptance.yml", "test/compose/stress.yml"],
+    "/config/simmer.soak.yaml",
+);
+
 /// The same stack *without* its override, so without the test CA in any OS
 /// trust store — for negative controls only, and only with `run --no-deps`. A
 /// command that reconciled `app` through this stack would recreate it untrusted
