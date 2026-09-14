@@ -34,19 +34,30 @@
 //! anything. Below that it reports `inconclusive` and the run is a smoke test of
 //! the machinery. That is deliberate: a slope through a handful of points is a
 //! guess, and a gate built on a guess is a flake.
+//!
+//! ## V4 — relays cancelled by the session timeout (F2)
+//!
+//! A third stream per instance, on a sender (`cancel.soak.test`) and a route
+//! (`warming-cancel`) of its own, so V2's pair and V3's series are untouched. The
+//! sink holds each V4 message 15 s at the dot, so the 300 s session timeout lands
+//! in the middle of a relay about once a session. S9 shows that F2 exists; V4 asks
+//! what it costs over hours — in particular whether anything a cancellation
+//! strands is ever given back. `SOAK_V4=off` leaves it out, for a like-for-like
+//! comparison with a run from before it.
 
 mod compose;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use compose::leak;
+use compose::reconcile::{self, Received, Sent};
 use compose::stack::SOAK;
 
 const SOAK_CONFIG: &str = "test/config/simmer.soak.yaml";
@@ -64,6 +75,36 @@ const SAMPLE_EVERY: Duration = Duration::from_secs(10);
 
 /// The floor window `leak::floors` uses, in seconds.
 const FLOOR_WINDOW: f64 = 300.0;
+
+/// V4's route, and the sender whose rule reaches it and nothing else.
+const V4_ROUTE: &str = "warming-cancel";
+const V4_SENDER: &str = "jane@cancel.soak.test";
+
+/// How long the sink holds every V4 message at the dot before storing it.
+const V4_SLOW: Duration = Duration::from_secs(15);
+
+/// Messages per V4 session: more than the session timeout leaves room for, so
+/// every session is ended by the timeout rather than by running out of mail.
+const V4_PER_SESSION: u32 = 25;
+
+/// `timeouts.session` in the soak config. V4's stream stops this long before the
+/// run does, so its last session is cut inside the run rather than after it.
+/// Kept as a constant because `soak_run` must not load the config: that sets
+/// variables compose would then render `app` with.
+const V4_LEAD_OUT: Duration = Duration::from_secs(300);
+
+/// The loadgen's own wait for a reply (`read_reply` in `src/bin/loadgen.rs`).
+const LOADGEN_REPLY_WAIT: Duration = Duration::from_secs(30);
+
+/// §7.4's sweeper interval (`src/quota/sweeper.rs`).
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The most V4 reservation rows a sample may show. Per instance, one in flight
+/// and one stranded awaiting the sweeper — expiry plus a sweep is under the
+/// session timeout, so a stranded row is gone before the next cancellation — and
+/// one more each for a sweep delayed by the shared database's stalls (§3a). A
+/// sweeper that fell behind would pass this within the hour.
+const V4_MAX_ROWS: u64 = 6;
 
 // ---------------------------------------------------------------------------
 // the one test that needs no Docker
@@ -92,6 +133,62 @@ fn the_soak_config_is_valid_and_cannot_run_out_of_allowance() {
         cfg.server.max_concurrent_sessions, 64,
         "the soak runs at the real session ceiling"
     );
+
+    // V4 (F2). Every one of these is a way for the variant to stop cancelling
+    // relays while still looking as if it runs.
+    let cancel = cfg.route(V4_ROUTE).expect("V4's route");
+    assert!(
+        cancel
+            .warmup
+            .as_ref()
+            .expect("V4's route is a warming route: its reservation is what F2 strands")
+            .schedule
+            .default
+            .iter()
+            .all(|&n| n > 1_000_000),
+        "V4's allowance must outlast a 24 h run"
+    );
+    let domain = V4_SENDER.split_once('@').expect("an address").1;
+    let rule = cfg
+        .senders
+        .iter()
+        .find(|r| r.pattern == domain)
+        .expect("a sender rule for V4's domain");
+    assert_eq!(
+        rule.chain,
+        [V4_ROUTE],
+        "V4's sender reaches V4's route alone"
+    );
+
+    let session = cfg.server.timeouts.session;
+    assert_eq!(
+        session, V4_LEAD_OUT,
+        "soak_run stops V4 one session timeout early"
+    );
+    let data = cancel
+        .downstream
+        .timeouts
+        .as_ref()
+        .and_then(|t| t.data)
+        .expect("V4's route sets a data timeout");
+    // Held past the route's own data timeout, a message would take §10.2's
+    // ambiguous path instead of being cancelled — and F2 would look fixed.
+    assert!(
+        V4_SLOW < data,
+        "the sink's hold must end inside the route's data timeout"
+    );
+    assert!(
+        V4_SLOW < LOADGEN_REPLY_WAIT,
+        "the loadgen must wait out the sink's hold"
+    );
+    assert!(
+        V4_SLOW * V4_PER_SESSION > session,
+        "every V4 session must still be sending when the session timeout fires"
+    );
+    assert!(
+        simmer::quota::reservation_expiry(cancel, 1) + SWEEP_INTERVAL < session,
+        "a stranded reservation must be swept before the next session's cancellation"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +215,11 @@ fn soak_run() {
     // and make the slope through them meaningless.
     for instance in INSTANCES {
         let _ = fs::remove_file(csv_path(instance));
+        let _ = fs::remove_file(final_path(instance));
+        let _ = fs::remove_file(sample_path(&format!("v4-{instance}.jsonl")));
+    }
+    for file in ["metrics.csv", "v4.csv", "v4-sink.jsonl"] {
+        let _ = fs::remove_file(sample_path(file));
     }
     recreate_instances();
     SOAK.reset_quota();
@@ -156,14 +258,14 @@ fn soak_run() {
     // between the instances means nothing at all.
     //
     // The series count is recorded alongside, because unbounded label cardinality
-    // (F7) is a growth curve like any other. It is reported, not judged: the
-    // senders that would drive it arrive with V3.
+    // (F7, driven by V3) is a growth curve like any other — and so is V4's
+    // `reservations_in_flight`, which only `app` can show while the load runs.
     let scraper = {
         let flag = Arc::clone(&stop);
         thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
-                if let Some((total, unmatched)) = scrape_series_count() {
-                    append_metrics(started.elapsed().as_secs_f64(), total, unmatched);
+                if let Some(scrape) = scrape_app(started.elapsed().as_secs_f64()) {
+                    append_metrics(&scrape);
                 }
                 thread::sleep(Duration::from_secs(30));
             }
@@ -210,6 +312,41 @@ fn soak_run() {
         })
         .collect();
 
+    // V4 (F2) — a third stream per instance, identical on both so that V2's pair
+    // stays a pair, with the route's quota row sampled from the database: the one
+    // view of it that includes `app2` without scraping it.
+    let v4 = v4_enabled() && duration >= 2 * V4_LEAD_OUT;
+    if v4_enabled() && !v4 {
+        eprintln!(
+            "soak: V4 skipped: a run under {} minutes has no room for a cancellation",
+            (2 * V4_LEAD_OUT).as_secs() / 60
+        );
+    }
+    let v4_stop = Arc::new(AtomicBool::new(false));
+    let v4_sampler = v4.then(|| {
+        let flag = Arc::clone(&v4_stop);
+        thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                if let Some(ledger) = sample_v4_ledger() {
+                    append_v4_ledger(started.elapsed().as_secs_f64(), &ledger);
+                }
+                thread::sleep(Duration::from_secs(30));
+            }
+        })
+    });
+    let v4_loads: Vec<_> = if v4 {
+        INSTANCES
+            .iter()
+            .map(|instance| {
+                let args = v4_args(instance, duration - V4_LEAD_OUT);
+                let name = format!("{instance} V4");
+                thread::spawn(move || run_loadgen(&name, &args))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     for load in loads {
         let summary = load.join().expect("a load thread");
         eprintln!("  {summary}");
@@ -221,7 +358,41 @@ fn soak_run() {
     }
     let _ = scraper.join();
     eprintln!(
-        "soak: finished after {:.1} minutes; samples in {SAMPLE_DIR}/",
+        "soak: load finished after {:.1} minutes; samples in {SAMPLE_DIR}/",
+        started.elapsed().as_secs_f64() / 60.0
+    );
+
+    for load in v4_loads {
+        let summary = load.join().expect("a V4 load thread");
+        eprintln!("  {summary}");
+    }
+    v4_stop.store(true, Ordering::Relaxed);
+    if let Some(sampler) = v4_sampler {
+        let _ = sampler.join();
+    }
+    if v4 {
+        if drain_v4(started) {
+            eprintln!("soak: the sweeper has cleared V4's stranded reservations");
+        } else {
+            eprintln!("soak: V4's reservations had not drained; soak_analyze will say so");
+        }
+    }
+
+    // The only scrape `app2` ever gets, and the evidence the analyser reads for
+    // the state each instance was left in.
+    for instance in INSTANCES {
+        match scrape_in_container(instance) {
+            Some(body) => {
+                let _ = fs::write(final_path(instance), body);
+            }
+            None => eprintln!("soak: {instance} did not answer its final scrape"),
+        }
+    }
+    if v4 {
+        copy_v4_evidence();
+    }
+    eprintln!(
+        "soak: finished after {:.1} minutes",
         started.elapsed().as_secs_f64() / 60.0
     );
 }
@@ -249,12 +420,7 @@ fn soak_analyze() {
         judged += 1;
 
         let span = samples.last().expect("samples").t - samples[0].t;
-        // W = clamp(0.15 x D, 10 min, 90 min), overridable so a short run can
-        // still drive the whole analysis rather than being all warm-up.
-        let warmup = match std::env::var("SOAK_WARMUP") {
-            Ok(v) => duration_str(&v).as_secs_f64(),
-            Err(_) => (0.15 * span).clamp(600.0, 5400.0),
-        };
+        let warmup = warmup_for(span);
 
         eprintln!(
             "\n{instance}: {} samples over {:.1} minutes, warm-up {:.1} minutes",
@@ -326,50 +492,290 @@ fn soak_analyze() {
     // every time one arrives. Judged from the post-warm-up baseline, not from
     // zero: the series present at start-up are the configured routes' and are
     // nobody's defect.
-    let series = read_metrics();
-    let after: Vec<(f64, usize, usize)> = if series.len() < 2 {
+    let scrapes = read_metrics();
+    // V2 is `app` scraped and `app2` not. With no scrapes at all there is no
+    // asymmetry, no F7 verdict and no registry curve — and nothing else says so.
+    if judged > 0 && scrapes.is_empty() {
+        failures.push(
+            "app was never scraped (no metrics.csv): V2's asymmetry and F7 went unmeasured"
+                .to_string(),
+        );
+    }
+    let after: Vec<Scrape> = if scrapes.len() < 2 {
         Vec::new()
     } else {
-        let span = series.last().expect("series").0 - series[0].0;
-        let warmup = match std::env::var("SOAK_WARMUP") {
-            Ok(v) => duration_str(&v).as_secs_f64(),
-            Err(_) => (0.15 * span).clamp(600.0, 5400.0),
-        };
-        series
-            .iter()
-            .copied()
-            .filter(|(t, ..)| *t >= warmup)
-            .collect()
+        let warmup = warmup_for(scrapes.last().expect("scrapes").t - scrapes[0].t);
+        scrapes.iter().copied().filter(|s| s.t >= warmup).collect()
     };
     match (after.first(), after.last()) {
-        (Some(&(t0, tot0, u0)), Some(&(t1, tot1, u1))) if t1 > t0 => {
+        (Some(first), Some(last)) if last.t > first.t => {
             eprintln!(
-                "\nmetrics: {tot0} series ({u0} unmatched-sender) at {t0:.0}s -> \
-                 {tot1} ({u1}) at {t1:.0}s, across {} post-warm-up scrapes",
+                "\nmetrics: {} series ({} unmatched-sender) at {:.0}s -> {} ({}) at {:.0}s, \
+                 across {} post-warm-up scrapes",
+                first.series,
+                first.unmatched,
+                first.t,
+                last.series,
+                last.unmatched,
+                last.t,
                 after.len()
             );
-            let grew = u1.saturating_sub(u0);
+            let grew = last.unmatched.saturating_sub(first.unmatched);
             let result = if grew > ALLOWED_SERIES_GROWTH {
                 Err(format!(
-                    "metric series grew by {grew} (unmatched-sender {u0} -> {u1}) over \
+                    "metric series grew by {grew} (unmatched-sender {} -> {}) over \
                      {:.0} minutes; the domain label is client-controlled",
-                    (t1 - t0) / 60.0
+                    first.unmatched,
+                    last.unmatched,
+                    (last.t - first.t) / 60.0
                 ))
             } else {
                 Ok(())
             };
-            compose::findings::judge("soak/V3/metric-series", result);
+            verdict(&mut failures, "soak/V3/metric-series", result);
         }
         _ => eprintln!("\nmetrics: too few post-warm-up scrapes for a series verdict"),
     }
 
+    analyze_v4(&mut failures);
+
     assert!(judged > 0, "no samples at all; run soak_run first");
     assert!(
         failures.is_empty(),
-        "{} of {judged} instances failed:\n  {}",
+        "{} checks failed:\n  {}",
         failures.len(),
         failures.join("\n  ")
     );
+}
+
+/// W = clamp(0.15 x D, 10 min, 90 min), overridable with `SOAK_WARMUP` so a short
+/// run can still drive the whole analysis rather than being all warm-up.
+fn warmup_for(span: f64) -> f64 {
+    match std::env::var("SOAK_WARMUP") {
+        Ok(v) => duration_str(&v).as_secs_f64(),
+        Err(_) => (0.15 * span).clamp(600.0, 5400.0),
+    }
+}
+
+/// Judge one check against `test/known-findings.json`, collecting a real failure
+/// or an XPASS rather than panicking, so every check is reported before any fails.
+fn verdict(failures: &mut Vec<String>, check: &str, result: Result<(), String>) {
+    if let Err(e) = compose::findings::assess(check, result) {
+        failures.push(e);
+    }
+}
+
+fn joined(problems: Vec<String>) -> Result<(), String> {
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
+/// V4 (F2): what the session timeout's cancellations cost, judged from what
+/// `soak_run` copied to the host once the load and the drain were over.
+fn analyze_v4(failures: &mut Vec<String>) {
+    let sent: Vec<(&str, Vec<Sent>)> = INSTANCES
+        .iter()
+        .filter_map(|i| read_sample_jsonl(&format!("v4-{i}.jsonl")).map(|s| (*i, s)))
+        .collect();
+    if sent.is_empty() {
+        eprintln!("\nV4: no evidence in {SAMPLE_DIR}/ (a run from before V4, or SOAK_V4=off)");
+        return;
+    }
+    let received: Vec<Received> = read_sample_jsonl("v4-sink.jsonl").unwrap_or_default();
+    let ledger = read_v4_ledger();
+    let finals: Vec<(&str, Option<String>)> = INSTANCES
+        .iter()
+        .map(|i| (*i, fs::read_to_string(final_path(i)).ok()))
+        .collect();
+
+    let (mut driven, mut delivery, mut accounting, mut registry) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut registry_judged = false;
+    let mut stored = 0;
+    for (instance, sent) in &sent {
+        let prefix = format!("soak-v4-{instance}-");
+        let mine: Vec<Received> = received
+            .iter()
+            .filter(|r| r.id.starts_with(&prefix))
+            .cloned()
+            .collect();
+        // Cut by the session timeout: `421 … session timeout`, at whatever stage
+        // it caught the client. At the dot, it caught a relay.
+        let cut: BTreeSet<&str> = sent
+            .iter()
+            .filter(|s| s.code == 421 && s.text.contains("session timeout"))
+            .map(|s| s.id.as_str())
+            .collect();
+        let cut_at_dot = sent
+            .iter()
+            .filter(|s| cut.contains(s.id.as_str()) && s.stage == "dot")
+            .count();
+        // One client, so each session is the next run of consecutive ids.
+        let sessions: BTreeSet<u64> = sent
+            .iter()
+            .filter_map(|s| s.id.rsplit('-').next()?.parse::<u64>().ok())
+            .map(|n| n / u64::from(V4_PER_SESSION))
+            .collect();
+
+        let report = reconcile::reconcile(sent, &mine, None);
+        // F2's signature among reconcile's violations: a relay the timeout cut,
+        // answered 421, that the sink went on to store. Anything else is not F2.
+        let (lies, other): (Vec<&String>, Vec<&String>) = report.violations.iter().partition(|v| {
+            v.contains("but the message was delivered")
+                && v.split_once(':').is_some_and(|(id, _)| cut.contains(id))
+        });
+        stored += report.stored;
+        eprintln!(
+            "\nV4 {instance}: {} messages in {} sessions — {} accepted, {} cut by the \
+             session timeout ({cut_at_dot} at the dot, {} of them stored by the sink), \
+             {} ended with the connection",
+            sent.len(),
+            sessions.len(),
+            report.accepted,
+            cut.len(),
+            lies.len(),
+            report.transport
+        );
+
+        if cut_at_dot == 0 || cut_at_dot * 2 < sessions.len() {
+            driven.push(format!(
+                "{instance}: {cut_at_dot} relays cut at the dot in {} sessions; the session \
+                 timeout is not cancelling relays, so F2 is not being driven",
+                sessions.len()
+            ));
+        }
+        // Accepted, cut by the timeout, or never sent because the timeout closed
+        // the connection under it (code 0). Nothing else is V4's doing.
+        for s in sent {
+            if !(matches!(s.code, 0 | 250) || cut.contains(s.id.as_str())) {
+                delivery.push(format!(
+                    "{instance}: {} {} at {}: {}",
+                    s.id, s.code, s.stage, s.text
+                ));
+            }
+        }
+        delivery.extend(other.iter().map(|v| format!("{instance}: {v}")));
+        if !lies.is_empty() {
+            accounting.push(format!(
+                "{instance}: {} of the {} relays the session timeout cut were stored without \
+                 a reply the client could trust — told 421, so its retry delivers each twice",
+                lies.len(),
+                cut.len()
+            ));
+        }
+
+        match finals
+            .iter()
+            .find(|(i, _)| i == instance)
+            .and_then(|(_, body)| body.as_deref())
+        {
+            Some(body) => {
+                registry_judged = true;
+                let held = metric(body, "simmer_reservations_in_flight").unwrap_or(0.0);
+                eprintln!(
+                    "  reservations_in_flight {held} after the drain, against {} cut",
+                    cut.len()
+                );
+                if held != 0.0 {
+                    registry.push(format!(
+                        "{instance}: reservations_in_flight {held} after the drain, against {} \
+                         relays the session timeout cut; only commit, release or shutdown \
+                         removes an entry from the registry",
+                        cut.len()
+                    ));
+                }
+            }
+            None => eprintln!("  no final scrape of {instance}; its registry is not judged"),
+        }
+    }
+
+    // `app`'s registry while the load ran — the growth curve, where `app2` has
+    // only its final value.
+    let curve: Vec<(f64, f64)> = read_metrics()
+        .iter()
+        .filter_map(|s| Some((s.t, s.in_flight?)))
+        .collect();
+    if let (Some(a), Some(b)) = (curve.first(), curve.last()) {
+        if b.0 > a.0 {
+            eprintln!(
+                "\nV4 app: reservations_in_flight {} at {:.0}s -> {} at {:.0}s while the load \
+                 ran ({:+.1}/h)",
+                a.1,
+                a.0,
+                b.1,
+                b.0,
+                (b.1 - a.1) / (b.0 - a.0) * 3600.0
+            );
+        }
+    }
+
+    // The route's quota row, shared by both instances: its ledger against what
+    // the sink stored, and whether the sweeper kept the stranded rows bounded
+    // and cleared them once the load stopped.
+    let mut sweeper = Vec::new();
+    match ledger.last() {
+        Some((_, last)) => {
+            let peak = ledger.iter().map(|(_, l)| l.rows).max().unwrap_or(0);
+            let expired: f64 = finals
+                .iter()
+                .filter_map(|(_, body)| {
+                    metric(
+                        body.as_deref()?,
+                        &format!("simmer_reservation_expired_total{{route=\"{V4_ROUTE}\"}}"),
+                    )
+                })
+                .sum();
+            eprintln!(
+                "\nV4 {V4_ROUTE}: at most {peak} reservation rows across {} samples; at the \
+                 end {} rows, {} reserved, {} committed; {expired} reservations expired by the \
+                 sweeper",
+                ledger.len(),
+                last.rows,
+                last.reserved,
+                last.committed
+            );
+            if last.committed != stored as u64 {
+                accounting.push(format!(
+                    "the {V4_ROUTE} ledger committed {} of the {stored} V4 messages the sink \
+                     stored",
+                    last.committed
+                ));
+            }
+            if peak > V4_MAX_ROWS {
+                sweeper.push(format!(
+                    "{peak} {V4_ROUTE} reservation rows at once, against a bound of \
+                     {V4_MAX_ROWS}: stranded rows are accumulating faster than they are swept"
+                ));
+            }
+            if last.rows != 0 || last.reserved != 0 {
+                sweeper.push(format!(
+                    "{} {V4_ROUTE} reservation rows and {} reserved were still held once the \
+                     load had stopped and the drain had timed out",
+                    last.rows, last.reserved
+                ));
+            }
+        }
+        None => {
+            eprintln!("\nV4: no ledger samples; the route's ledger and the sweeper are not judged")
+        }
+    }
+
+    verdict(failures, "soak/V4/driven", joined(driven.clone()));
+    verdict(failures, "soak/V4/delivery", joined(delivery));
+    // With nothing cancelled, the F2 checks would pass for want of a cancellation
+    // and report an XPASS that means nothing; `driven` has already failed.
+    if driven.is_empty() {
+        verdict(failures, "soak/V4/accounting", joined(accounting));
+        if registry_judged {
+            verdict(failures, "soak/V4/registry", joined(registry));
+        }
+    }
+    if !ledger.is_empty() {
+        verdict(failures, "soak/V4/sweeper", joined(sweeper));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -443,31 +849,51 @@ fn sample_instance(instance: &str) -> Option<Sample> {
     Some(s)
 }
 
-/// How many series `/metrics` is exporting right now: every series, and the
-/// `simmer_unmatched_sender_total` ones specifically.
+/// One scrape of `app`, reduced to what the analyser judges.
+#[derive(Debug, Clone, Copy)]
+struct Scrape {
+    t: f64,
+    /// Every series `/metrics` is exporting.
+    series: usize,
+    /// The `simmer_unmatched_sender_total` ones (F7).
+    unmatched: usize,
+    /// `simmer_reservations_in_flight` (V4). `None` in a file from before V4.
+    in_flight: Option<f64>,
+}
+
+/// Scrape `app`, from inside its container like the final scrapes.
+///
+/// Not `curl` to the published port: that is the Docker host's loopback, which a
+/// harness running anywhere else — a jail, a CI container — cannot reach, and a
+/// failed scrape here is simply a sample not written. That cost a run: `app` went
+/// unscraped for twenty minutes, V2's asymmetry silently vanished, and F7 was
+/// "too few scrapes" rather than a verdict.
 ///
 /// Every non-comment, non-blank line is one series, labels included. The total is
 /// context; the judgement is made on the unmatched-sender count alone, because the
 /// total moves for reasons that are nobody's defect — a new route label, a new
 /// outcome — and gating on it would quietly turn this into a different check.
-fn scrape_series_count() -> Option<(usize, usize)> {
-    let out = Command::new("curl")
-        .args(["-sf", "--max-time", "10", "http://127.0.0.1:8080/metrics"])
-        .output()
-        .ok()?;
-    out.status.success().then(|| {
-        let body = String::from_utf8_lossy(&out.stdout);
-        let live = || {
-            body.lines()
-                .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        };
-        (
-            live().count(),
-            live()
-                .filter(|l| l.starts_with("simmer_unmatched_sender_total{"))
-                .count(),
-        )
+fn scrape_app(t: f64) -> Option<Scrape> {
+    let body = scrape_in_container("app")?;
+    let live = || {
+        body.lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+    };
+    Some(Scrape {
+        t,
+        series: live().count(),
+        unmatched: live()
+            .filter(|l| l.starts_with("simmer_unmatched_sender_total{"))
+            .count(),
+        in_flight: metric(&body, "simmer_reservations_in_flight"),
     })
+}
+
+/// One unlabelled series — or one exactly as labelled — from a scrape.
+fn metric(body: &str, series: &str) -> Option<f64> {
+    body.lines()
+        .find_map(|l| l.strip_prefix(series)?.strip_prefix(' '))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 /// §9.1's own series move for innocent reasons — a route added, an outcome first
@@ -475,41 +901,55 @@ fn scrape_series_count() -> Option<(usize, usize)> {
 /// 5% of an hour's messages is ~1,700 fresh domains against this.
 const ALLOWED_SERIES_GROWTH: usize = 50;
 
-fn metrics_csv() -> PathBuf {
-    PathBuf::from(SAMPLE_DIR).join("metrics.csv")
-}
-
-fn append_metrics(t: f64, total: usize, unmatched: usize) {
-    let path = metrics_csv();
+fn append_metrics(s: &Scrape) {
+    let path = sample_path("metrics.csv");
     let fresh = !path.exists();
     let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
     if fresh {
-        let _ = writeln!(f, "t,series,unmatched");
+        let _ = writeln!(f, "t,series,unmatched,reservations_in_flight");
     }
-    let _ = writeln!(f, "{t:.1},{total},{unmatched}");
+    let in_flight = s.in_flight.map(|v| v.to_string()).unwrap_or_default();
+    let _ = writeln!(f, "{:.1},{},{},{in_flight}", s.t, s.series, s.unmatched);
 }
 
-fn read_metrics() -> Vec<(f64, usize, usize)> {
-    let Ok(text) = fs::read_to_string(metrics_csv()) else {
+/// `metrics.csv`, including one from before V4, which has no fourth column.
+fn read_metrics() -> Vec<Scrape> {
+    let Ok(text) = fs::read_to_string(sample_path("metrics.csv")) else {
         return Vec::new();
     };
     text.lines()
         .skip(1)
         .filter_map(|line| {
             let mut f = line.split(',');
-            Some((
-                f.next()?.trim().parse().ok()?,
-                f.next()?.trim().parse().ok()?,
-                f.next()?.trim().parse().ok()?,
-            ))
+            Some(Scrape {
+                t: f.next()?.trim().parse().ok()?,
+                series: f.next()?.trim().parse().ok()?,
+                unmatched: f.next()?.trim().parse().ok()?,
+                in_flight: f.next().and_then(|v| v.trim().parse().ok()),
+            })
         })
         .collect()
 }
 
+fn sample_path(file: &str) -> PathBuf {
+    PathBuf::from(SAMPLE_DIR).join(file)
+}
+
 fn csv_path(instance: &str) -> PathBuf {
-    PathBuf::from(SAMPLE_DIR).join(format!("{instance}.csv"))
+    sample_path(&format!("{instance}.csv"))
+}
+
+/// Each instance's `/metrics` once the run is over.
+fn final_path(instance: &str) -> PathBuf {
+    sample_path(&format!("final-{instance}.prom"))
+}
+
+fn read_sample_jsonl<T: serde::de::DeserializeOwned>(file: &str) -> Option<Vec<T>> {
+    fs::read_to_string(sample_path(file))
+        .ok()
+        .map(|text| reconcile::read_jsonl(&text))
 }
 
 fn append_sample(instance: &str, t: f64, s: &Sample) {
@@ -571,6 +1011,201 @@ fn read_samples(instance: &str) -> Vec<Sample> {
 
 fn series(samples: &[Sample], pick: impl Fn(&Sample) -> f64) -> Vec<(f64, f64)> {
     samples.iter().map(|s| (s.t, pick(s))).collect()
+}
+
+// ---------------------------------------------------------------------------
+// V4 — relays cancelled by the session timeout (F2)
+// ---------------------------------------------------------------------------
+
+fn v4_enabled() -> bool {
+    std::env::var("SOAK_V4").map_or(true, |v| v != "off")
+}
+
+/// One client, back to back, sessions of [`V4_PER_SESSION`] small messages, each
+/// held [`V4_SLOW`] at the dot by the sink: a session is almost entirely relays
+/// in flight, so the session timeout almost always lands inside one.
+fn v4_args(instance: &str, run_for: Duration) -> Vec<String> {
+    [
+        "--host",
+        instance,
+        "--port",
+        "25",
+        "--username",
+        "soakapp",
+        "--from",
+        V4_SENDER,
+        "--from-header",
+        &format!("Jane Smith <{V4_SENDER}>"),
+        "--tag",
+        &format!("soak-v4-{instance}"),
+        "--duration",
+        &format!("{}s", run_for.as_secs()),
+        "--concurrency",
+        "1",
+        "--per-session",
+        &V4_PER_SESSION.to_string(),
+        "--size",
+        "4k",
+        "--sink-script",
+        &format!("slow@dot:{}s", V4_SLOW.as_secs()),
+        "--jsonl",
+        &format!("/results/soak-v4-{instance}.jsonl"),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// V4's quota row and reservations, from the database both instances share.
+#[derive(Debug, Clone, Copy)]
+struct Ledger {
+    rows: u64,
+    reserved: u64,
+    committed: u64,
+}
+
+fn sample_v4_ledger() -> Option<Ledger> {
+    let sql = format!(
+        "select (select count(*) from quota_reservation where route = '{V4_ROUTE}'), \
+         (select coalesce(sum(reserved), 0) from quota_usage where route = '{V4_ROUTE}'), \
+         (select coalesce(sum(committed), 0) from quota_usage where route = '{V4_ROUTE}')"
+    );
+    // Not `Stack::psql`, which panics: a sampler that died on one slow query
+    // would leave the rest of the run unsampled.
+    let out = SOAK
+        .compose()
+        .args([
+            "exec",
+            "-T",
+            "simmer-db",
+            "psql",
+            "-U",
+            "simmer",
+            "-d",
+            "simmer",
+            "-q",
+            "-At",
+            "-c",
+            &sql,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut f = text.trim().split('|').map(|v| v.parse::<u64>().ok());
+    Some(Ledger {
+        rows: f.next()??,
+        reserved: f.next()??,
+        committed: f.next()??,
+    })
+}
+
+fn append_v4_ledger(t: f64, l: &Ledger) {
+    let path = sample_path("v4.csv");
+    let fresh = !path.exists();
+    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    if fresh {
+        let _ = writeln!(f, "t,rows,reserved,committed");
+    }
+    let _ = writeln!(f, "{t:.1},{},{},{}", l.rows, l.reserved, l.committed);
+}
+
+fn read_v4_ledger() -> Vec<(f64, Ledger)> {
+    let Ok(text) = fs::read_to_string(sample_path("v4.csv")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut f = line.split(',').map(str::trim);
+            Some((
+                f.next()?.parse().ok()?,
+                Ledger {
+                    rows: f.next()?.parse().ok()?,
+                    reserved: f.next()?.parse().ok()?,
+                    committed: f.next()?.parse().ok()?,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Wait for the sweeper to clear what the last cancellations stranded: a
+/// reservation expires 205 s after it was taken and the sweeper runs every
+/// minute, so ten minutes is generous. Samples as it goes, so the drain is on
+/// the ledger's curve too.
+fn drain_v4(started: Instant) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        if let Some(l) = sample_v4_ledger() {
+            append_v4_ledger(started.elapsed().as_secs_f64(), &l);
+            if l.rows == 0 && l.reserved == 0 {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_secs(10));
+    }
+}
+
+/// `/metrics` from inside the instance's own network namespace, so `app2` —
+/// whose admin port is not published — can be read too.
+fn scrape_in_container(instance: &str) -> Option<String> {
+    let out = SOAK
+        .compose()
+        .args([
+            "exec",
+            "-T",
+            instance,
+            "bash",
+            "-c",
+            "exec 3<>/dev/tcp/127.0.0.1/8080; \
+             printf 'GET /metrics HTTP/1.0\\r\\n\\r\\n' >&3; cat <&3",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+}
+
+/// V4's records, copied out of the results volume so `soak_analyze` needs nothing
+/// but the host: both loadgens' JSONL, and the sink's lines for V4's ids alone —
+/// the whole file is ~70,000 lines an hour of V2's traffic.
+fn copy_v4_evidence() {
+    for instance in INSTANCES {
+        let text = from_results(&format!("cat /results/soak-v4-{instance}.jsonl"));
+        let _ = fs::write(sample_path(&format!("v4-{instance}.jsonl")), text);
+    }
+    let text = from_results(r#"grep '"id":"soak-v4-' /results/sink.jsonl || true"#);
+    let _ = fs::write(sample_path("v4-sink.jsonl"), text);
+}
+
+fn from_results(script: &str) -> String {
+    SOAK.compose()
+        .args([
+            "run",
+            "--rm",
+            "--no-deps",
+            "--no-TTY",
+            "--entrypoint",
+            "sh",
+            "loadgen",
+            "-c",
+            script,
+        ])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

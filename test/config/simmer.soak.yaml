@@ -16,7 +16,8 @@
 #     long enough that a cancelled relay leaves a reservation visible for a while
 #     (F2), short enough that the sweeper's behaviour is observable in an hour.
 #   * A session timeout of 300s: long sessions are the realistic shape, and it is
-#     what V4 cancels a relay against. A literal, not the stress tier's
+#     what V4 cancels a relay against — a sender of its own (`cancel.soak.test`)
+#     on a route of its own (`warming-cancel`). A literal, not the stress tier's
 #     ${SIMMER_SESSION_TIMEOUT}, so the two tiers cannot perturb each other.
 #   * `recipient_frequency` on the warming route, so §7.3 writes rows and evicts
 #     them continuously — the table that F12 says is never pruned.
@@ -81,6 +82,13 @@ senders:
   - match: "oldbrand.com"
     match_on: envelope
     chain: [warming-newbrand, overflow-established]
+  # V4 (F2): one exact domain, onto a route of its own, so the relays the session
+  # timeout cancels hold their own pool and their own quota row and cannot
+  # perturb V2's warming route. Exact, not a wildcard: V3's `u<n>.soak.test`
+  # must still match nothing.
+  - match: "cancel.soak.test"
+    match_on: envelope
+    chain: [warming-cancel]
   # There is deliberately **no** rule for `*.soak.test`. V3's senders have to be
   # granted but unmatched, which is the only state that reaches §5.4's
   # fall-through and labels `simmer_unmatched_sender_total{domain}` with a domain
@@ -117,6 +125,33 @@ routes:
       mode: to_address
       window: { unit: hourly, count: 1 }
       threshold: 5
+    warmup:
+      started: "${SIMMER_WARMUP_STARTED}"
+      schedule:
+        default: [100000000]
+
+  # V4's route (F2). A warming route, because a reservation with a ledger behind
+  # it is what a cancelled relay strands; a pool of its own, because the sink
+  # holds every V4 message 15 s at the dot and would otherwise sit on V2's
+  # connections; and the same downstream timeouts as the warming route, so the
+  # reservation expiry is the same 205 s and the sweeper clears a stranded row
+  # before the next session's cancellation, 300 s later, can strand another.
+  - name: warming-cancel
+    downstream:
+      host: "sink"
+      port: 2525
+      tls: off
+      pool: { max_connections: 2, idle_ttl: 60s, max_messages_per_connection: 100 }
+      timeouts:
+        connect: 5s
+        command: 10s
+        data: 60s
+    identity:
+      envelope_from: "bounce@cancel.newbrand.com"
+      set_headers:
+        X-Simmer-Route: "{{route.name}}"
+    preflight:
+      enabled: false
     warmup:
       started: "${SIMMER_WARMUP_STARTED}"
       schedule:

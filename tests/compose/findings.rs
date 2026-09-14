@@ -40,21 +40,39 @@ pub fn judge(check: &str, result: Result<(), String>) {
 }
 
 pub fn judge_against(entries: &[Entry], check: &str, result: Result<(), String>) {
+    if let Err(failure) = assess_against(entries, check, result) {
+        panic!("{failure}");
+    }
+}
+
+/// [`judge`], returning the real failure or XPASS instead of panicking — for a
+/// tier that judges several checks and wants every one of them reported before
+/// it fails. An XFAIL is printed and is `Ok`.
+pub fn assess(check: &str, result: Result<(), String>) -> Result<(), String> {
+    assess_against(&known(), check, result)
+}
+
+pub fn assess_against(
+    entries: &[Entry],
+    check: &str,
+    result: Result<(), String>,
+) -> Result<(), String> {
     let entry = entries.iter().find(|e| e.check == check);
     match (entry, result) {
-        (None, Ok(())) => {}
-        (None, Err(why)) => panic!("{check} failed: {why}"),
+        (None, Ok(())) => Ok(()),
+        (None, Err(why)) => Err(format!("{check} failed: {why}")),
         (Some(e), Err(why)) if e.because.iter().any(|b| why.contains(b.as_str())) => {
             eprintln!("XFAIL {} {check}: {why}", e.id);
+            Ok(())
         }
-        (Some(e), Err(why)) => panic!(
+        (Some(e), Err(why)) => Err(format!(
             "{check} failed, but not for known finding {}'s reason (expected one of {:?}): {why}",
             e.id, e.because
-        ),
-        (Some(e), Ok(())) => panic!(
+        )),
+        (Some(e), Ok(())) => Err(format!(
             "XPASS {} {check}: the check now passes, so the defect looks fixed. Delete its \
              entry from test/known-findings.json in the fixing commit",
             e.id
-        ),
+        )),
     }
 }

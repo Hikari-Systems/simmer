@@ -4,8 +4,11 @@
 1-hour run has produced the tier's first leak verdict — no leak on either instance
 (§3a) — and F16, the latency tail that run explained, is fixed by D-080 and
 confirmed by a second clean hour in which no message took longer than 264 ms
-(§3b); V4 and the burst/idle variants outstanding.** This document records what
-the soak tier is, what five runs have established, and — at least as usefully —
+(§3b); V4 built and driving F2 in two 20-minute runs and an hour (§8) — F2 exactly
+as predicted, one stranded registry entry per cut, eleven per instance an hour —
+but the hour failed the threads gate on a single bounded step that the gate cannot
+tell from a climb (§8, §7); the burst/idle variants outstanding.** This document records what
+the soak tier is, what eight runs have established, and — at least as usefully —
 what they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
 configuration; the test programme's step 5 is the plan.
 
@@ -46,7 +49,7 @@ at all, which is why the A/B pair was worth building before any variant.
 |---|---|---|
 | **V2** | `app` scraped, `app2` never — isolates F8 | built, exercised |
 | **V3** | one message in twenty from a fresh `u<n>.soak.test` sender — F7 | built, **drives the defect** |
-| **V4** | relays cancelled by the session timeout — F2 | outstanding |
+| **V4** | relays cancelled by the session timeout — F2 | built (§8) |
 | bursts | 60 s at 70 clients every 15 min | outstanding |
 | idle gaps | 3 min past `idle_ttl`, sink closing idle at 45 s — F10/CLOSE_WAIT | outstanding |
 
@@ -459,6 +462,26 @@ second without recompiling, including immediately after an edit. Where it matter
 plant a deliberate warning and confirm the gate *fails* before trusting that it
 passes.
 
+**`app` was scraped through a port the harness may not be able to reach.** The
+scraper `curl`ed `127.0.0.1:8080`, which is the Docker host's loopback. From
+anywhere else — the jail these runs are driven from, or a CI container — every
+scrape failed, and a failed scrape was just a sample not written. V4's first
+20-minute run is how it was found: no `metrics.csv` at all, so `app` went
+unscraped, V2's asymmetry was absent, and F7 printed "too few scrapes" instead of
+a verdict. Nothing failed. `app` is now scraped from inside its container, like
+the final scrapes, and `soak_analyze` fails a run in which `app` was never
+scraped. §3a's and §3b's runs were scraped — their `metrics.csv` rows survive in
+the accumulated file described next — so their V2 comparison and F7 figures stand.
+
+**`metrics.csv` used to outlive its run.** `soak_run` deleted the instances'
+CSVs and not the scrape file, so every run appended to the last and its clock
+restarted at zero. Found while building V4: the file held four runs. The F7 verdict
+took its baseline from the first post-warm-up row in the file — the *oldest*
+run's — and its end from the newest. The stream is deterministic, so that row was
+identical to the right one (360 series, 300 unmatched-sender, at 600 s) and the
+figures in §3a and §3b stand. Only §3b's count of 121 post-warm-up scrapes spans
+more than one run. `soak_run` now deletes every file it writes.
+
 **`soak_run` deletes the previous run's JSONL.** It begins with
 `rm -f /results/soak-*.jsonl`, which is right — two runs' records interleaved in one
 file would make the accounting meaningless — but it means a salvaged run's evidence
@@ -484,13 +507,255 @@ column.
 ## 7. Outstanding
 
 - ~~A clean 1-hour run~~ — done, §3a: no leak on either instance.
-- **V4**: relays cancelled by the session timeout, driving F2.
+- ~~**V4**: relays cancelled by the session timeout, driving F2~~ — built, §8.
 - Bursts every 15 minutes; idle gaps every 30 minutes past `idle_ttl` with the sink
   closing idle connections at 45 s (CLOSE_WAIT, F10).
 - Return-to-baseline assertions, currently verified by hand (§3, §3a, §3b) rather
   than by the analyser.
+- **The threads gate fails a bounded step** (§8's hour). Thread counts are
+  integers, so one +1 held from mid-window to the end clears both the slope limit
+  and the quartile step, although the count never went above 6 and was 3 at rest.
+  It needs a rule that tells a ratchet released at idle from a climb — the
+  at-rest count in `final-*.prom` is now there to use — and that rule wants its
+  own plan, not a limit raised to let one run through.
 - ~~**F16**: buffer the §8.1 spill file's writes~~ — fixed by D-080 (§5).
 - The `correlation_id` ↔ `X-Test-Id` link. No longer the blocker §5 said it was —
   F16 was found without it — but still the only way to trace one message through
   the server log.
 - The 24-hour variant, and whether the CI runner permits a job that long.
+
+---
+
+## 8. V4 — relays cancelled by the session timeout (F2)
+
+S9 shows F2 exists: `timeouts.session` runs from connect, and when it fires during
+the downstream conversation the relay future is simply dropped. V4 asks what that
+costs over hours, and the code says one part of it is never given back. A
+reservation leaves the §10.4 registry only by commit, release or the shutdown
+`drain()`; the sweeper deletes the database row at `expires_at` and never touches
+the registry. So `simmer_reservations_in_flight` should climb by one per
+cancellation for the life of the process, while the rows come and go.
+
+**How it is driven.** A third stream per instance, identical on both so V2's pair
+stays a pair, on a sender (`cancel.soak.test`) and a warming route
+(`warming-cancel`) of its own — its own pool and its own quota row, so V2's route
+and V3's series count are untouched. One client, sessions of 25 small messages
+back to back, each carrying `X-Sink-Script: slow@dot:15s`: a session is almost
+entirely relays in flight, so the 300 s session timeout lands inside one about
+once a session, roughly twelve an hour per instance. `slow@dot` rather than
+`stall@dot` because the sink records a stall as `stalled_at_dot` even when it
+answers in time, and reconcile would count every V4 message as ambiguous; `slow`
+records `delivered` after the hold, so only the cancelled message breaks a rule.
+The stream stops one session timeout before the run, so its last session is cut
+inside it. `SOAK_V4=off` leaves V4 out.
+
+The config test pins the timing it rests on, because each way of getting it wrong
+stops the variant cancelling anything while it still appears to run: the 15 s hold
+inside the route's 60 s data timeout (past it, the message takes §10.2's ambiguous
+path and F2 looks fixed) and the loadgen's 30 s reply wait; 25 × 15 s beyond the
+session timeout; and expiry plus one sweep (265 s) inside it, so a stranded row is
+gone before the next session can strand another.
+
+**What `soak_run` adds.** `app`'s 30 s scrape records `reservations_in_flight`; a
+database sampler records the route's reservation rows, `reserved` and
+`committed` every 30 s to `v4.csv` — the one view that includes `app2` without
+scraping it. Once the load stops it waits for the sweeper to clear the rows, then
+takes each instance's final `/metrics` (`final-<instance>.prom`, the only scrape
+`app2` ever gets) and copies V4's loadgen records and the sink's V4 lines to
+`target/soak/`, so the analyser needs nothing but the host. About five minutes on
+top of the run.
+
+**What `soak_analyze` judges:**
+
+| Check | Today | Rule |
+|---|---|---|
+| `soak/V4/driven` | must pass | relays cut at the dot in at least half the sessions, and at least one. Zero fails outright, so "F2 did not reproduce" cannot be read as "fixed" |
+| `soak/V4/delivery` | must pass | every other V4 message `250` and stored once; no phantom, duplicate or crossed envelope — kept apart so the XFAILs below cannot hide a regression |
+| `soak/V4/accounting` | **XFAIL F2** | no message stored by the sink and answered `4xx`; the route's `committed` equals what the sink stored |
+| `soak/V4/registry` | **XFAIL F2** | `reservations_in_flight` 0 on each instance after the drain |
+| `soak/V4/sweeper` | must pass | at most 6 reservation rows at any sample (one in flight and one awaiting the sweeper per instance, and a spare each for a sweep delayed by a database stall); rows and `reserved` 0 after the drain |
+
+With nothing cancelled, the two F2 checks would pass for want of a cancellation
+and report a meaningless XPASS, so they are judged only when `driven` passes. The
+existing fds and threads gates gain a use as well: at twelve cancellations an hour,
+a socket leaked per cancellation would be +12 fds/h against the 1/h limit.
+
+### The first 20-minute run — F2 driven, and a scraping hole found
+
+2026-09-14, 10:25–10:46 UTC, `app`, `app2` and `sink` re-created by `soak_run`
+from the D-080 images (ids checked against the build), `"senders": 2` on both.
+
+**V2 and V3's streams were untouched:** 12,010 of 12,010 accepted per instance,
+p50 11.1 / 10.3 ms, p99 55.8 / 57.7 ms, max 433 / 393 ms, no ERROR on either.
+
+**V4 did what it is for.** Per instance, 75 messages in 3 sessions: 57 accepted,
+and 3 cut by the session timeout — every one **at the dot, and every one stored by
+the sink** — plus the 15 the closed connection never let it send. The first cut
+landed at 10:30:58, 300 s into `app`'s first session, and `reservations_in_flight`
+stepped from 1 to 2 at that instant: the stranded entry plus the next message's.
+
+| | result |
+|---|---|
+| `driven` | pass — 3 of 3 sessions cut at the dot, per instance |
+| `delivery` | pass — no other refusal, no phantom, no duplicate |
+| `accounting` | **XFAIL F2** — 3 of 3 cuts per instance stored and told `421`; the ledger committed **114 of the 120** stored, short by exactly the 6 cuts |
+| `registry` | **XFAIL F2** — `reservations_in_flight` **3 on each instance after the drain, one per cut** |
+| `sweeper` | pass — at most 4 rows (two in flight, two stranded), 0 rows and 0 reserved after the drain; 6 expired |
+
+So S9's reading holds up and sharpens: the database side of F2 is bounded — the
+sweeper cleared every stranded row within one cycle — and the in-memory side is
+not. The registry held one entry per cancellation, none of them ever reclaimed.
+
+The sweeper's own warning is worth noting against F2: `app` logged three
+`released an expired reservation; the process either died mid-send or the
+reservation expiry is shorter than real downstream latency`. Neither is true
+here. The warning names the two causes §7.4 anticipated, and F2 is a third.
+
+**What it did not measure:** `app` was never scraped (§6), so there is no V2
+asymmetry, no F7 verdict and no registry curve from this run. `soak_analyze` now
+fails a run like it.
+
+### The second 20-minute run — everything measured
+
+10:48–11:09 UTC, the scraper fixed and nothing else changed; images and
+`"senders": 2` checked as before, and `metrics.csv` confirmed filling within the
+first minute.
+
+**V2/V3:** 12,010 of 12,010 accepted per instance, p99 55.1 / 56.6 ms, max 284 /
+248 ms, no ERROR. **F7 XFAILed** on 20 post-warm-up scrapes: 302 → 589
+unmatched-sender series in ten minutes.
+
+**V4 reproduced the first run exactly** — 3 of 3 sessions cut at the dot per
+instance, every cut stored, the ledger 114 of 120, 3 left in each registry, at
+most 4 rows, all swept — and this time `app`'s scrape shows the registry as it
+happens:
+
+| run-second | 91 | 242 | 393 | 544 | 695 | 846 | 997 | 1148 |
+|---|---|---|---|---|---|---|---|---|
+| `reservations_in_flight` | 1 | 1 | 2 | 2 | 3 | 3 | 4 | 4 |
+
+One live reservation throughout, plus one more stranded every 300 s that never
+comes back: a staircase, not a sawtooth. Over an hour that is about twelve per
+instance; over 24 hours about 280, each a small `HashMap` entry — trivial as
+memory, and a gauge that says reservations are in flight when none are. That is
+the part of F2 only a soak shows: §10.4's registry was written for the shutdown
+case and nothing prunes it in between.
+
+Leak slopes are `inconclusive` at twenty minutes, as they must be (§4).
+
+### The 1-hour run — F2 as predicted, and the threads gate trips
+
+2026-09-14, relays from 11:27 to 12:23 UTC by the containers' clock; `app`, `app2`
+and `sink` re-created by `soak_run` from the D-080 images (ids checked against the
+build), `"senders": 2` on both. **`soak_analyze` failed it on one gate:** `app2:
+threads is growing at +1.50 threads/h with a quartile step of +1.00`. Everything V4
+exists to measure came out as predicted; the failure is taken apart below, and the
+reading here is that the gate, not the server, is what needs work.
+
+| | `app` | `app2` |
+|---|---|---|
+| messages | 36,010 | 36,010 |
+| accepted | **36,010** | **36,010** |
+| deferred / refused / transport | 0 / 0 / 0 | 0 / 0 / 0 |
+| p50 / p90 | 10.7 ms / 40.2 ms | 10.0 ms / 39.2 ms |
+| p99 / max | 63.5 ms / 537.9 ms | 64.9 ms / 500.0 ms |
+| peak established | 10 | 10 |
+| peak CLOSE_WAIT | 0 | 0 |
+
+**Accounting.** The sink holds 72,460 records, every one `delivered` and
+`mismatch:false`, no id twice: 36,010 per V2 instance and 220 per V4 instance.
+`simmer_messages_total` shows 1,801 on `overflow-established` and 34,209 on
+`warming-newbrand` per instance — identical to §3a and §3b — and 209 on
+`warming-cancel`.
+
+**V4 — eleven cuts per instance, the registry equal to the cuts.** Per instance,
+275 messages in 11 sessions: 209 accepted, 11 cut by the session timeout, 55 never
+sent on the closed connection.
+
+| | result |
+|---|---|
+| `driven` | pass — 11 of 11 sessions cut at the dot, per instance |
+| `delivery` | pass — no other refusal, no phantom, no duplicate |
+| `accounting` | **XFAIL F2** — 11 of 11 cuts per instance stored and told `421`; the ledger committed **418 of the 440** stored, short by exactly the 22 cuts |
+| `registry` | **XFAIL F2** — `reservations_in_flight` **11 on each instance after the drain**, against 11 cuts |
+| `sweeper` | pass — at most 4 rows across 121 samples, 0 rows and 0 reserved after the drain; 22 expired |
+
+`app`'s registry, as the lowest value its scrape saw in each five minutes:
+
+| run-seconds | 0– | 300– | 600– | 900– | 1200– | 1500– | 1800– | 2100– | 2400– | 2700– | 3000– | 3300–3600 | drained |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `reservations_in_flight` | 0 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 11 | 11 |
+
+Until V4's stream stops at 3,300 s the floor is the cuts so far plus V4's one live
+reservation, exactly; after it, the eleven stranded entries alone, and that is what
+the drain leaves. The second 20-minute run's staircase, carried to an hour without
+a single step coming back.
+
+All 22 stranded rows were released by `app`'s sweeper, two per sweep — one from
+each instance — so `app` logged the 11 `released an expired reservation` WARNs and
+`app2` none. The rows are shared; whichever sweeper runs first takes them.
+
+**The leak verdict.** Ten floors after the 10-minute warm-up:
+
+| | anon | fds | threads |
+|---|---|---|---|
+| `app` | −0.45 MiB/h, step −0.73 MiB | 0.00 /h, step −1.00 | 0.00 /h, step +1.00 |
+| `app2` | +0.44 MiB/h, step +0.86 MiB | −2.40 /h, step −2.00 | **+1.50 /h, step +1.00 — LEAKING** |
+
+Memory and descriptors: no leak. A socket leaked per cancellation would have been
++11 fds/h; descriptors fell.
+
+Threads: one step, on both instances. Each sat at 5 through the load, as in §3a
+and §3b, then gained one — `app` at run-second 1,465, `app2` at 1,968 — kept it
+until the load stopped, and was back at 3 at rest (`/proc/1/status` read after the
+drain: 3 on both). Neither ever reached 7. `app` passed only because its step
+fell early enough to leave its Theil–Sen slope at 0; `app2`'s fell nearer the
+middle of the window, which reads as +1.5/h against the 1/h limit, and a quartile
+step of +1 against a step gate of about 0.3. Integer counts make that inevitable:
+any single +1 held from mid-window to the end clears both halves of the rule.
+
+The step is V4's — the pre-V4 hour (§3b) never went above 5 on either instance,
+and `app2` took the same step in both V4 20-minute runs (at 952 s and 932 s),
+where the verdict was inconclusive and so said nothing. Nothing is logged at
+either moment but routine relays. The likeliest reading, **not established**, is
+tokio's blocking pool: a blocking thread exits after 10 s idle, so the pool keeps
+as many threads as its peak concurrent jobs for as long as the work reaches each
+one within that; its jobs here are argon2 verifies (up to 4 at once, D-079) and
+spill-file writes. Which job V4 adds to it is not known. Bounded by a peak and
+released at idle is a ratchet, not a leak — but the gate cannot tell the two
+apart, and that is the harness's to fix (§7), not something to argue away one run
+at a time.
+
+**Return to baseline**, from `final-*.prom` after the drain:
+
+| | `app` | `app2` |
+|---|---|---|
+| `reservations_in_flight` | **11** (F2) | **11** (F2) |
+| `quota_reserved`, all three routes | 0 | 0 |
+| pool `active` (idle) | 0 (2) | 0 (2) |
+| DB pool `in_use` (idle) | 0 (3) | 0 (4) |
+| `sessions_active` / `tasks_alive` / threads | 0 / 11 / 3 | 0 / 11 / 3 |
+| open fds / RSS | 20 / 20.9 MiB | 21 / 25.7 MiB |
+
+`tasks_alive` is §3b's 11: a stranded registry entry holds no task.
+
+**F7 XFAILed as intended:** 386 series (302 unmatched-sender) at 605 s to 1,883
+(1,798) at 3,596 s, against §3b's 360 to 1,846 — V4's route adds its own.
+
+**Log hygiene:** 79,688 and 79,677 lines, **no ERROR**, no slow statement. The
+WARNs are the 3,602 `sender matched no rule` and the `strict_senders` notice on
+each, plus `app`'s 11 sweeper lines (F2 — the text blames a crash or a short
+expiry, and neither applies, as in the 20-minute runs).
+
+**Latency.** Worse in the tail than §3b, and the cause is not found. p99 rose
+from about 46 to 64 ms and the maximum from 263 to 538 ms; 21 messages on `app`
+and 25 on `app2` took over 200 ms, none over one second. The outliers fall at the
+same run-seconds on both instances — 1,937–1,951, 2,030–2,034, 2,086, 2,106,
+2,494, 2,960, 3,014, 3,075 — so it is something shared, not per instance; none
+is at a V4 cut (multiples of 300 s) and no statement was slow. Peak established
+connections rose from 7 to 10.
+
+One trap for whoever correlates these: the containers' clock ran about 7% slow
+against the loadgens' monotonic one — 3,355 s from first relay to last over a
+3,600 s load, and the sweeper's WARNs 279.6 s apart. Run-seconds cannot be turned
+into log timestamps by addition on this host.

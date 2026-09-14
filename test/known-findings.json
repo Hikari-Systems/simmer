@@ -37,7 +37,23 @@
     "because": [
       "reservations_in_flight"
     ],
-    "note": "The same cancellation leaks the reservation: reservations_in_flight, the quota_reservation rows and quota_usage.reserved all stay non-zero after the load, until the sweeper expires them."
+    "note": "The same cancellation leaks the reservation: the quota_reservation rows and quota_usage.reserved stay non-zero until the sweeper expires them, and reservations_in_flight never comes down at all, because nothing but commit, release or shutdown removes an entry from the §10.4 registry."
+  },
+  {
+    "id": "F2",
+    "check": "soak/V4/accounting",
+    "because": [
+      "stored without a reply"
+    ],
+    "note": "Soak V4: about once a session, the 300 s session timeout cancels a relay the sink then stores; the client was told 421, so its retry would deliver it twice, and the warming-cancel ledger never commits it."
+  },
+  {
+    "id": "F2",
+    "check": "soak/V4/registry",
+    "because": [
+      "reservations_in_flight"
+    ],
+    "note": "Soak V4: every cancelled relay leaves its entry in the §10.4 registry for the life of the process, so reservations_in_flight climbs by one per cancellation, about 12 an hour per instance, and is never reclaimed; the sweeper clears only the database rows."
   },
   {
     "id": "F4",
