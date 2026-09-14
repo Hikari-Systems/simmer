@@ -2440,6 +2440,69 @@ This is not a red-green fix: the bound was written after the behaviour was
 measured, so the evidence above stands in for a failing test. What is pinned in
 tests is the bound itself.
 
+### D-080 — The spilled `DATA` buffer batches its writes (finding F16)
+
+**Found:** by the soak tier (`docs/SOAK.md` §5). The 6–12 s latency tail that three
+soak runs reproduced, and eight hypotheses failed to explain, was every 4 MiB
+message: both instances were slow on the same message ids, and a probe at 1–5 MiB
+was flat below §8.1's spill threshold and linear above it at about **2.35 s per
+MiB**. Once a body passed `SPILL_THRESHOLD`, `MessageBuffer` held a bare
+`tokio::fs::File`, and the `DATA` loop appends twice per line. tokio performs every
+file write as its own blocking-pool job, so a body in 76-column lines — the shape of
+any base64 attachment — cost about 27,000 round trips per MiB. At the shipped
+25 MiB `max_message_bytes`, a maximal message would have spent roughly 56 s being
+received.
+
+The stress tier had measured the same thing and taken it for the container's
+speed. S4's and S6's sizing comments cite "about 0.4 MB/s per stream", which is
+2.35 s per MiB, and S4 was cut from 20 MiB to 10 MiB after it ran past the 60 s
+data timeout and later crossed it again on a loaded run. That flakiness was F16.
+
+**Decision:** the spilled file is wrapped in a 64 KiB `tokio::io::BufWriter`
+(`SPILL_WRITE_BUFFER`), and `header_block` and `read_all` flush it before seeking
+back. Sixteen blocking writes per MiB instead of 27,000. Nothing else about §8.1
+changes: still an unlinked temporary file, still tmpfs, still not a spool, and
+`len` counts buffered bytes exactly as before.
+
+**Not chosen:** merging the loop's two appends per line into one, which halves the
+count and leaves it per line; holding more in memory before spilling, which is
+§8.1's threshold and not this decision's to move; and a std `BufWriter` inside
+`spawn_blocking`, which is the same batching with more code.
+
+**F5 is deliberately unchanged.** With writes batched, a full tmpfs surfaces when a
+64 KiB batch is written rather than on the line that crossed the limit. The first
+build flushed only before reading back, and S4b caught what that did: two of
+sixteen sessions whose last batch was still pending met ENOSPC at that flush,
+logged `ERROR reading buffered message` and were answered `451 4.3.0` — failing
+the stress tier's no-ERROR log check. Which sessions land there depends on timing,
+so it could not be recorded as an expected failure: an XFAIL that sometimes passes
+fails the run. `MessageBuffer::finish` now writes the last batch at the terminating
+dot, inside `DATA`, so a full spill area fails exactly where and how it always did.
+Answering those clients `451` rather than dropping them is F5's fix, and a
+separate decision.
+
+**Verified:**
+
+- **Red, then green.** `spilled_appends_in_data_line_shape_are_fast` appends 4 MiB
+  in the `DATA` loop's exact shape under a 2 s bound. Before the fix it failed at
+  7.86 s; after it, the whole buffer module runs in 0.02 s.
+- **Through the shipped image**, on the idle stress stack — p50 of three messages
+  per size, one at a time:
+
+  | body | 1 MiB | 2 MiB | 3 MiB | 4 MiB | 5 MiB |
+  |---|---|---|---|---|---|
+  | before | 45 ms | 2,430 ms | 4,747 ms | 7,131 ms | 8,772 ms |
+  | after | 48 ms | 55 ms | 57 ms | 66 ms | 74 ms |
+
+- **S4**, eight 10 MiB messages at four concurrent: its sizing comment records
+  about 23 s per message; after the fix all eight took 0.57 s (p50 279 ms), with
+  peak anon at 33 MiB.
+- **S4b**, re-run on the final build: every check `ok` including `log`, and F5
+  XFAILed exactly as before — 6 of 16 clients dropped without a reply, 10
+  accepted, none answered `4xx`.
+- `cargo test` 869 passed across 29 binaries, `clippy -D warnings`, `fmt` and
+  `cargo deny check` clean.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

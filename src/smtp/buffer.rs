@@ -20,7 +20,7 @@
 use std::io;
 use std::path::Path;
 
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 
 /// §8.1: "buffered in memory up to a threshold (default 1 MiB) and spilled to a
 /// temporary file above it".
@@ -29,6 +29,15 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 /// tmpfs (see `docker-compose.yml`), which is what makes "not durable" a
 /// property of the deployment rather than a promise in a comment.
 pub const SPILL_THRESHOLD: usize = 1024 * 1024;
+
+/// The spilled file's write buffer (D-080, finding F16).
+///
+/// The `DATA` loop appends twice per line, and every write to a
+/// `tokio::fs::File` is its own job on the blocking pool — about 27,000 of them
+/// per MiB at 76-column lines, which cost ~2.35 s per MiB past the threshold.
+/// Batched at 64 KiB it is sixteen. Flushed before every read back, so the file
+/// is complete whenever anything looks at it.
+const SPILL_WRITE_BUFFER: usize = 64 * 1024;
 
 /// Where a spilled buffer goes. `TMPDIR` if set, else `/tmp`.
 fn spill_dir() -> std::path::PathBuf {
@@ -43,9 +52,10 @@ pub enum MessageBuffer {
     /// An **unlinked** temporary file. `tempfile::tempfile()` removes the
     /// directory entry immediately, so §8.1's "deleted when the session ends" is
     /// enforced by the kernel on last-close and survives a panic anywhere
-    /// between here and the end of the session.
+    /// between here and the end of the session. Writes are batched through
+    /// [`SPILL_WRITE_BUFFER`]; `len` counts buffered bytes too.
     Spilled {
-        file: tokio::fs::File,
+        file: BufWriter<tokio::fs::File>,
         len: usize,
     },
 }
@@ -81,7 +91,8 @@ impl MessageBuffer {
             MessageBuffer::Memory(v) => {
                 let existing = std::mem::take(v);
                 let file = tempfile::tempfile_in(spill_dir())?;
-                let mut file = tokio::fs::File::from_std(file);
+                let mut file =
+                    BufWriter::with_capacity(SPILL_WRITE_BUFFER, tokio::fs::File::from_std(file));
                 file.write_all(&existing).await?;
                 file.write_all(bytes).await?;
                 *self = MessageBuffer::Spilled {
@@ -98,6 +109,16 @@ impl MessageBuffer {
         }
     }
 
+    /// Write out anything still batched (D-080). Called at the end of `DATA`, so
+    /// a full spill area surfaces there — as a failed append always did (F5) —
+    /// rather than later, when the message is read back. A no-op in memory.
+    pub async fn finish(&mut self) -> io::Result<()> {
+        match self {
+            MessageBuffer::Memory(_) => Ok(()),
+            MessageBuffer::Spilled { file, .. } => file.flush().await,
+        }
+    }
+
     /// The leading header block, up to and including the blank line that ends it.
     ///
     /// §5.4 needs the first `From:` address to pick a route, and a spilled
@@ -109,6 +130,9 @@ impl MessageBuffer {
         let prefix = match self {
             MessageBuffer::Memory(v) => v[..v.len().min(max)].to_vec(),
             MessageBuffer::Spilled { file, .. } => {
+                // Bytes still in the write buffer are not in the file yet.
+                file.flush().await?;
+                let file = file.get_mut();
                 file.seek(io::SeekFrom::Start(0)).await?;
                 let mut buf = vec![0u8; max];
                 let n = read_up_to(file, &mut buf).await?;
@@ -132,6 +156,8 @@ impl MessageBuffer {
         match self {
             MessageBuffer::Memory(v) => Ok(v.clone()),
             MessageBuffer::Spilled { file, len } => {
+                file.flush().await?;
+                let file = file.get_mut();
                 file.seek(io::SeekFrom::Start(0)).await?;
                 let mut out = Vec::with_capacity(*len);
                 file.read_to_end(&mut out).await?;
@@ -272,6 +298,33 @@ mod tests {
         let all = b.read_all().await.unwrap();
         assert_eq!(&all[all.len() - 4..], b"tail");
         assert_eq!(b.len(), SPILL_THRESHOLD + 5);
+    }
+
+    /// F16. The `DATA` loop appends twice per line, and before D-080 each append
+    /// past the threshold was its own write on the blocking pool: a 4 MiB message
+    /// in 76-column lines took about 7 s to receive in the shipped image. This is
+    /// the loop's exact shape, at that size. The bound is generous — a batched
+    /// buffer does this in milliseconds, the unbatched one in seconds — so the
+    /// test fails on the defect rather than on a loaded host.
+    #[tokio::test]
+    async fn spilled_appends_in_data_line_shape_are_fast() {
+        let mut b = MessageBuffer::new();
+        let line = [b'x'; 76];
+        let started = std::time::Instant::now();
+        while b.len() < 4 * 1024 * 1024 {
+            b.append(&line).await.unwrap();
+            b.append(b"\r\n").await.unwrap();
+        }
+        let elapsed = started.elapsed();
+        assert!(b.is_spilled());
+
+        let all = b.read_all().await.unwrap();
+        assert_eq!(all.len(), b.len());
+        assert!(all.chunks(78).all(|c| c == [&line[..], b"\r\n"].concat()));
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "4 MiB in DATA-line appends took {elapsed:?}; spilled writes are not batched (F16)"
+        );
     }
 
     #[tokio::test]

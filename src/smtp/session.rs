@@ -834,11 +834,13 @@ impl Session {
 
             // The terminator is a lone dot on its own line.
             if content == b"." {
-                return if over {
-                    Err(DataError::TooLarge)
-                } else {
-                    Ok(())
-                };
+                if over {
+                    return Err(DataError::TooLarge);
+                }
+                // D-080: the spill file's last batch is written here, inside
+                // DATA, so a full spill area fails the way it always has (F5).
+                body.finish().await.map_err(|_| DataError::Io)?;
+                return Ok(());
             }
 
             let content = buffer::unstuff(content);

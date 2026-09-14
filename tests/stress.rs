@@ -467,8 +467,10 @@ fn s4_large_messages_stay_within_memory() {
     // the peak actually is; the gate is that it stays clear of the container's
     // 1 GiB and that every message is either delivered or cleanly deferred.
     //
-    // The sizing is measured, not guessed, and both halves matter. This container
-    // moves about 0.4 MB/s per stream, so at 8 concurrent a 20 MiB body ran past
+    // The sizing was measured, not guessed. The container then moved about
+    // 0.4 MB/s per stream — which was finding F16, unbatched writes to the §8.1
+    // spill file, fixed by D-080; all eight messages now take about half a
+    // second between them. At that rate, at 8 concurrent a 20 MiB body ran past
     // the 60 s data timeout and most clients were cut off mid-DATA — that measured
     // the timeout, not the memory. Dropping to 4 concurrent was not enough either:
     // 20 MiB still took ~46 s of a 60 s budget, a 23% margin, and one message in
@@ -476,8 +478,8 @@ fn s4_large_messages_stay_within_memory() {
     // a 2.6x margin, and is still ten times §8.1's 1 MiB spill threshold, so the
     // spill-and-copy path this exists to exercise is unchanged.
     //
-    // If this ever wants to be 20 MiB again, raise the data timeout with it or the
-    // scenario goes back to measuring the timeout.
+    // Since D-080, 20 MiB is well inside the data timeout again. It stays at
+    // 10 MiB because nothing this scenario measures needs more.
     let _logs = STRESS.logs_on_failure();
     let mut s = Scenario::sending(
         "S4",
@@ -557,9 +559,11 @@ fn s6_mixed_realistic_traffic_holds_every_invariant() {
     // the allowance runs out underneath it.
     //
     // Two sizing choices, both deliberate. The mix tops out at 4 MiB rather than
-    // the 15 MiB first sketched: at ~0.4 MB/s per stream a 15 MiB body sits at
-    // ~37 s of the 60 s data timeout, the 1.3x margin that made S4 flaky twice.
-    // 4 MiB is ~10 s and still four times the spill threshold. And the sink drops
+    // the 15 MiB first sketched: at the ~0.4 MB/s per stream measured then, a
+    // 15 MiB body sat at ~37 s of the 60 s data timeout, the 1.3x margin that made
+    // S4 flaky twice. That rate was finding F16 — unbatched writes to the §8.1
+    // spill file — not the container, and D-080 fixed it; 4 MiB is kept because it
+    // is still four times the spill threshold. And the sink drops
     // after the dot rather than stalling: a stall is only ambiguous once it
     // outlasts the 60 s downstream budget, which would make this scenario minutes
     // long, while a drop is ambiguous at once. S9 owns the stall.
