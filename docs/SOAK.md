@@ -2,9 +2,11 @@
 
 **Status: V2 and V3 built and pushed (`e88c7be`, `c554f2e`, `a1b25c3`); a clean
 1-hour run has produced the tier's first leak verdict — no leak on either instance
-(§3a); V4 and the burst/idle variants outstanding.** This document records what the
-soak tier is, what three runs have established, and — at least as usefully — what
-they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
+(§3a) — and F16, the latency tail that run explained, is fixed by D-080 and
+confirmed by a second clean hour in which no message took longer than 264 ms
+(§3b); V4 and the burst/idle variants outstanding.** This document records what
+the soak tier is, what five runs have established, and — at least as usefully —
+what they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
 configuration; the test programme's step 5 is the plan.
 
 The tier exists for the failures that only appear over hours: memory that creeps,
@@ -217,6 +219,97 @@ with a maximum of 10.9 s — the same proportion and ceiling as §2 — and the 
 between one and three seconds is back: 3 messages on `app`, 0 on `app2`. This run
 is also what explained it: the tail is every 4 MiB message (§5, F16).
 
+## 3b. After D-080 — twenty minutes, then a clean hour
+
+Both runs are on the fixed build, with the V3 configuration and the loadgen's
+deterministic stream, exactly as §3a — the same ids carry the same bodies — so
+every comparison below is like for like.
+
+**The 20-minute run** (2026-09-13, 21:33–21:54 UTC) was the gate for the hour.
+12,010 of 12,010 accepted per instance; the sink's 24,020 records all `delivered`,
+`mismatch:false`, none lost and none duplicated; no ERROR; everything back at
+baseline. 4 MiB bodies ran at p50 36 ms, max 85 ms. Its only outliers — 19 on
+`app` and 16 on `app2` over one second, 30 of the 35 of them small messages — all
+fell in one ten-second window, run-seconds 294–304 (21:39:00–21:39:10), on both
+instances at once, while both logged slow statements taking up to 7.8 s: a shared
+database stall again, like §3a's. The window closed as a Postgres checkpoint
+finished whose sync touched 61 files in 0.160 s, where every other checkpoint in
+either post-fix run touched 18–36 in at most 0.027 s and stalled nothing. §3a's
+stall matched no checkpoint at all, so this is an observation, not a cause.
+
+**The 1-hour run** (21:55–22:55 UTC), `app`, `app2` and `sink` re-created by
+`soak_run` from the fixed images (image ids checked against the build), `"senders": 1`
+on both:
+
+| | `app` | `app2` |
+|---|---|---|
+| messages | 36,010 | 36,010 |
+| accepted | **36,010** | **36,010** |
+| deferred / refused / transport | 0 / 0 / 0 | 0 / 0 / 0 |
+| p50 / p90 | 8.3 ms / 37.0 ms | 8.1 ms / 35.9 ms |
+| p99 / max | **46.8 ms / 263.4 ms** | **44.6 ms / 252.1 ms** |
+| peak established | 7 | 6 |
+| peak CLOSE_WAIT | 0 | 0 |
+
+**Accounting.** The sink holds 72,020 records, every one `delivered` and
+`mismatch:false`: **0 duplicate deliveries, 0 ids answered `250` and never
+delivered, 0 deliveries with no loadgen record.** `simmer_messages_total` shows
+1,801 on `overflow-established` and 34,209 on the warming route per instance —
+identical to §3a, as a deterministic stream should be.
+
+**The leak verdict — no leak, a second hour running.** Default warm-up of 10
+minutes, ten floors:
+
+| | anon | fds | threads |
+|---|---|---|---|
+| `app` | +0.28 MiB/h, step +1.72 MiB | 0.00 /h, step 0.00 | 0.00 /h, step 0.00 |
+| `app2` | +2.09 MiB/h, step −1.45 MiB | 0.00 /h, step 0.00 | 0.00 /h, step 0.00 |
+
+Descriptors and threads are exactly flat, where §3a's drifted slightly downward.
+
+**Return to baseline**, scraped at 22:55 with the load stopped:
+
+| | `app` | `app2` |
+|---|---|---|
+| `reservations_in_flight` | 0 | 0 |
+| `quota_reserved`, both routes | 0 | 0 |
+| pool `active` (idle) | 0 (2) | 0 (2) |
+| DB pool `in_use` (idle) | 0 (2) | 0 (3) |
+| `sessions_active` / `tasks_alive` / threads | 0 / 11 / 3 | 0 / 11 / 3 |
+| open fds / RSS | 19 / 28.3 MiB | 20 / 27.4 MiB |
+| CLOSE_WAIT | 0 | 0 |
+
+**F7 XFAILed as intended**, and identically to §3a: 360 series (300
+unmatched-sender) at 600 s to 1,846 (1,786) at 3,572 s.
+
+**Log hygiene:** 79,237 lines per instance, **no ERROR**, and the WARNs are only
+the 3,602 `sender matched no rule` and the startup `strict_senders` notice.
+**No slow statement at all** — against 44 and 34 in §3a — across twelve
+checkpoints, none of which stalled anything.
+
+**Latency by body size, before and after** (`app`; `app2` agrees to within a few
+milliseconds):
+
+| body | messages | §3a p50 | §3a max | §3b p50 | §3b p99 | §3b max |
+|---|---|---|---|---|---|---|
+| 4 KiB | 28,786 | 10.7 ms | 8,339.6 ms | 8.2 ms | 46.0 ms | 263.4 ms |
+| 100 KiB | 5,397 | 11.1 ms | 4,908.7 ms | 8.4 ms | 46.9 ms | 108.5 ms |
+| 1 MiB | 1,453 | 17.2 ms | 1,914.3 ms | 14.0 ms | 50.8 ms | 58.4 ms |
+| 4 MiB | 374 | **6,579.3 ms** | **17,673.2 ms** | **35.9 ms** | 71.5 ms | **82.6 ms** |
+
+Across the whole run on `app`: 35,821 under 50 ms, 188 at 50–200 ms, 1 between
+200 ms and one second, and **none over one second** — against 235 over six
+seconds in §3a.
+
+Two things this settles beyond F16 itself:
+
+- **§5 called the slowed small messages "likely, not measured".** With nothing
+  changed but D-080, no small message took longer than 263 ms, against 21 over
+  three seconds on `app` in §3a. Some of those were §3a's stall; the rest are
+  consistent with having been F16's collateral, and nothing here argues otherwise.
+- **Peak established connections fell from 28 to 7.** A 4 MiB session used to hold
+  its connection for seconds; now it holds it for tens of milliseconds.
+
 ## 4. What the first two runs did **not** establish
 
 **Neither produced a leak verdict** — §3a's run is the first that did. `leak::verdict` needs eight post-warm-up
@@ -334,7 +427,9 @@ roughly 56 s of `DATA` for a maximal message, and 7 s for an ordinary 4 MiB one.
 Each of those writes occupies a blocking-pool thread, which is the likely reason the
 small messages beside a large one were slowed as well — likely, not measured.
 
-**Not yet fixed.**
+**Fixed by D-080:** the spill file's writes are batched at 64 KiB and the last
+batch is written at the terminating dot. The same probe afterwards gives 48, 55,
+57, 66 and 74 ms for 1–5 MiB.
 
 ---
 
@@ -392,9 +487,9 @@ column.
 - **V4**: relays cancelled by the session timeout, driving F2.
 - Bursts every 15 minutes; idle gaps every 30 minutes past `idle_ttl` with the sink
   closing idle connections at 45 s (CLOSE_WAIT, F10).
-- Return-to-baseline assertions, currently verified by hand (§3, §3a) rather than
-  by the analyser.
-- **F16**: buffer the §8.1 spill file's writes (§5).
+- Return-to-baseline assertions, currently verified by hand (§3, §3a, §3b) rather
+  than by the analyser.
+- ~~**F16**: buffer the §8.1 spill file's writes~~ — fixed by D-080 (§5).
 - The `correlation_id` ↔ `X-Test-Id` link. No longer the blocker §5 said it was —
   F16 was found without it — but still the only way to trace one message through
   the server log.
