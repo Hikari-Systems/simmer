@@ -7,7 +7,8 @@ confirmed by a second clean hour in which no message took longer than 264 ms
 (§3b); V4 built and driving F2 in two 20-minute runs and an hour (§8) — F2 exactly
 as predicted, one stranded registry entry per cut, eleven per instance an hour —
 but the hour failed the threads gate on a single bounded step that the gate cannot
-tell from a climb (§8, §7); the burst/idle variants outstanding.** This document records what
+tell from a climb (§8, §7); the burst/idle variants outstanding.** A one-page
+summary is at the end of `DECISIONS.md`, "Test programme step 5 summary". This document records what
 the soak tier is, what eight runs have established, and — at least as usefully —
 what they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
 configuration; the test programme's step 5 is the plan.

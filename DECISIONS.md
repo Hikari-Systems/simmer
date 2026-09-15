@@ -3373,3 +3373,95 @@ D-070 through D-072. The ones a reader would not predict from `SPEC.md` or from
   the one most likely to surprise an operator, so it is a startup warning and a
   sentence in §2.3 rather than only a line here.
 
+---
+
+## Test programme step 5 summary — the soak tier (T4)
+
+`docs/SOAK.md` is the long form. The tier was built from `28382f9` (step 5a) to
+`7bcbb87` (V4) and run eight times on 2026-09-13 and 14: three 20-minute runs,
+one hour killed at 52.7 minutes and salvaged, and three clean hours. It found and
+fixed one defect (F16, D-080), drove two known ones over hours (F7, F2), and
+**its last hour failed on a harness gate that cannot tell a bounded step from a
+climb** — recorded, not waved through.
+
+### What changed
+
+| File | Step | What |
+|---|---|---|
+| `tests/soak.rs` | 5a, V2–V4 | **New.** `soak_run` drives two instances against one database and one sink and writes every sample to the host as it goes; `soak_analyze` judges the files as a separate test, so a killed run keeps its verdict. V2: `app` scraped, `app2` never. V3: fresh senders. V4: cancelled relays, its row sampler, the sweeper wait and `final-<instance>.prom`. `app` is scraped from inside its container |
+| `tests/compose/findings.rs` | V4 | A non-panicking `assess`: every instance is judged and failures are raised once, at the end |
+| `tests/compose/stack.rs` | 5a | The soak's additions to the shared compose helpers |
+| `test/config/simmer.soak.yaml` | 5a, V3, V4 | **New.** V3 drops the `*.soak.test` sender rule so fresh senders fall through to the default chain; V4 adds `cancel.soak.test` → `warming-cancel`, with its own pool and quota row so V2 and V3 are untouched |
+| `test/known-findings.json` | V4 | `soak/V4/accounting` and `soak/V4/registry` under F2; the S9 baseline note corrected about the registry |
+| `src/bin/loadgen.rs` | V3 | One message in twenty from a fresh `u<n>.soak.test`, varying the envelope and `From:` both |
+| `src/smtp/buffer.rs` | F16 | **D-080**: the spill file's writes batched at 64 KiB |
+| `docs/SOAK.md` | — | **New.** Every run, what it established and what it did not |
+
+`cargo test`: 869 passing across 29 binaries before `7bcbb87`, which changed
+nothing after that run but `docs/SOAK.md`. The soak's own config test runs in it;
+`soak_run` and `soak_analyze` are behind `--ignored` and need the stress stack.
+
+### What is tested
+
+- **Nothing lost, nothing doubled, over hours.** In each clean hour, 36,010 of
+  36,010 accepted per instance and every sink record `delivered` and
+  `mismatch:false`, joined by id: 0 duplicates, 0 answered `250` and never
+  delivered. The killed hour's 67,443 agree.
+- **No leak, twice.** Memory, descriptors and threads flat on both instances —
+  scraped and unscraped — over §3a's and §3b's hours. A verdict needs eight
+  five-minute floors after the warm-up, so a 20-minute run is `inconclusive` by
+  design, and §4 records the one false `fds LEAKING` so it is not rediscovered.
+- **Return to baseline**, checked by hand after every run: no sessions, nothing
+  reserved, pools and the DB pool idle, 11 tasks, 3 threads.
+- **F16, found and fixed.** Every 4 MiB message took 4.6–17.7 s: about 2.35 s per
+  MiB past the §8.1 spill threshold, one blocking-pool job per line. After D-080,
+  4 MiB runs at p50 36 ms, and the whole next hour's slowest message took 263 ms.
+- **F7 driven** (XFAIL): unmatched-sender series grow by about 1,500 an hour with
+  no ceiling, one per client-chosen domain.
+- **F2 driven over hours** (V4, XFAIL): 11 cuts per instance an hour, each one
+  stored by the sink and told `421`, so a client retry delivers it twice; the ledger
+  short by exactly the cuts; the §10.4 registry keeping one entry per cut for the
+  life of the process — a staircase, never a sawtooth. The database side is
+  bounded: at most 4 rows, all swept.
+- **The harness guards itself.** An unexpected pass fails the run, which forces a
+  fixed finding out of `known-findings.json`; the F2 checks are judged only once
+  `driven` passes, so "not reproduced" cannot read as "fixed"; a run in which `app`
+  was never scraped fails.
+
+### What is not tested
+
+- **Whether the V4 hour's threads step is benign.** Both instances went from 5 to 6
+  threads once, kept it until the load stopped and were at 3 at rest; the gate
+  failed `app2` on it. Tokio's blocking pool is the likely reading and it is not
+  established. The gate needs a rule that uses the at-rest count (§7).
+- **The V4 hour's latency tail**: a maximum of 538 ms against 263 ms, at the same
+  moments on both instances, cause not found.
+- **Bursts, idle gaps (F10, CLOSE_WAIT), the 24-hour run**, return to baseline as
+  an analyser assertion rather than a reading by hand, and the `correlation_id` ↔
+  `X-Test-Id` link. All in `docs/SOAK.md` §7.
+- **`app2` while it runs.** Unscraped by design, so its registry is seen only in
+  `final-app2.prom`.
+
+### Things the spec did not cover
+
+None of these amends `SPEC.md`; each is a question for its author.
+
+- **§10.4's registry has no pruning path** but commit, release and shutdown. It was
+  written for shutdown; under F2 it grows for the life of the process — about 280 a
+  day per instance at V4's rate — and `simmer_reservations_in_flight` then reports
+  reservations in flight when none are, which is the control plane misleading an
+  operator (D-026, D-056).
+- **§7.4's expiry warning names two causes**, a crash and an expiry shorter than
+  the downstream's latency. F2 is a third, and the warning's text points an
+  operator at neither of the real ones.
+- **§9.1's `domain` label is client-controlled** (F7). Capping it diverges from
+  §9.1.
+- **F4, corroborated**: with no `statement_timeout`, §3a's 11-second database stall
+  was simply 11 seconds of waiting under ordinary soak load.
+
+Two traps worth carrying beyond this tier (`docs/SOAK.md` §6, §8): `stress-config`
+reseeds the config volume from its *own* image, so a stale one restores an old
+configuration and exits 0 — verify by the startup line's `"senders"`; and on this
+host the containers' clock ran about 7% slow against the loadgens' monotonic one,
+so run-seconds cannot be turned into log timestamps by addition.
+
