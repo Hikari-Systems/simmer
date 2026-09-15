@@ -752,7 +752,20 @@ async fn converse(
             write(&mut io, "RSET\r\n")
                 .await
                 .map_err(cut(k, "transport"))?;
-            read_reply(&mut io).await.map_err(cut(k, "transport"))?;
+            let (code, text) = read_reply(&mut io).await.map_err(cut(k, "transport"))?;
+            // A refusal here ends the session: D-081's 421 at the session deadline
+            // arrives in answer to the next command, which is this RSET. It is
+            // recorded with its own code, like any other refusal, and the rest of
+            // the session never began. Ignoring it sent the next MAIL FROM into a
+            // closed connection and recorded a transport failure instead.
+            if code != 250 {
+                record(code, "rset", text.clone());
+                return Err(Cut {
+                    at: k + 1,
+                    stage: "not_sent",
+                    text,
+                });
+            }
         }
 
         let body = message(args, &id, &recipient, *n);

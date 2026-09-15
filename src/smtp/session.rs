@@ -66,6 +66,11 @@ const MAX_HEADER_SCAN: usize = 256 * 1024;
 /// How long [`Session::close`] waits for a `close_notify` to flush.
 const CLOSE_BUDGET: Duration = Duration::from_secs(2);
 
+/// D-081 — once the session's deadline has passed, how long Simmer waits for the
+/// client's next command so that its `421` answers that command. Bounds the
+/// overrun an idle client adds.
+const DEADLINE_GRACE: Duration = Duration::from_secs(2);
+
 /// Per-connection state.
 pub struct Session {
     io: BufReader<Stream>,
@@ -804,6 +809,21 @@ impl Session {
         // already pipelined would still be served with no time left. Without this,
         // a client that keeps its pipe full is never refused.
         if by_deadline && timeout.is_zero() {
+            // D-081 — the deadline passed while Simmer was busy, typically in a
+            // relay. The client is usually writing its next command right now,
+            // so the refusal answers that command rather than arriving
+            // unprompted: a 421 sent and the socket closed while the client
+            // writes left it with a broken pipe and no reply at all (soak V4).
+            // The command is read and refused, never served, and a client that
+            // sends nothing gets the 421 once the grace has passed.
+            let mut discard = String::new();
+            let _ = tokio::time::timeout(
+                DEADLINE_GRACE,
+                (&mut self.io)
+                    .take(MAX_COMMAND_LINE)
+                    .read_line(&mut discard),
+            )
+            .await;
             return Err(ReadError::SessionTimeout);
         }
         let read = async {

@@ -745,6 +745,44 @@ async fn a_command_pipelined_past_the_session_deadline_is_not_served() {
 }
 
 #[tokio::test]
+async fn past_the_deadline_the_next_command_is_answered_421() {
+    // D-081: a client that gets its 250 after the deadline and writes its next
+    // command at once must have that command answered 421. A 421 sent unprompted
+    // with the socket closed under it left soak V4's client a broken pipe and no
+    // reply at all.
+    let down = FakeDownstream::start(Script::with(|s| {
+        s.final_dot_delay = Some(std::time::Duration::from_secs(2));
+    }))
+    .await;
+    let cfg = config_for(down.addr, "")
+        .replace(
+            "timeouts: { command: 5s, data: 5s, session: 60s }",
+            "timeouts: { command: 5s, data: 5s, session: 1s }",
+        )
+        .replace(
+            "timeouts: { connect: 2s, command: 2s, data: 2s }",
+            "timeouts: { connect: 2s, command: 2s, data: 5s }",
+        );
+    let simmer = Simmer::start(&cfg).await;
+
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    let dot = c
+        .deliver(
+            "jane@oldbrand.com",
+            "bob@gmail.com",
+            "Subject: hi\r\n\r\nhello\r\n",
+        )
+        .await;
+    assert_eq!(dot.code, 250, "the relay finishes and is answered: {dot:?}");
+
+    let r = c.command("MAIL FROM:<jane@oldbrand.com>").await;
+    assert_eq!(r.code, 421, "{r:?}");
+    assert!(r.contains("session timeout"), "{r:?}");
+    assert!(c.is_closed().await, "421 closes the connection");
+}
+
+#[tokio::test]
 async fn the_session_deadline_cuts_a_data_transfer_short() {
     // D-081 caps every wait on the client by the time the session has left, so a
     // data budget longer than that does not outlive it.

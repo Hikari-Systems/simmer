@@ -2531,8 +2531,22 @@ command the client had already pipelined would still be served, and a client tha
 kept its pipe full would never be refused.
 
 A relay in flight is never cut. It finishes, the client gets the real reply, and
-the next wait on the client is refused at once. The timer arm of `handle`'s
+the client's next command is answered `421`. The timer arm of `handle`'s
 `select!` is gone. §10.4's hard stop stays.
+
+**The refusal answers the next command; it does not arrive unprompted.** The
+first build sent `421` and closed the socket the moment the deadline was found to
+have passed. Soak V4 showed what that does to a client that is sending. Its
+client got its `250` at the 300 s deadline and wrote its next `MAIL FROM` at once,
+into a socket Simmer had just closed. The write failed with a broken pipe, the
+client never read the `421`, and V4's `driven` check saw no session timeout at
+all.
+
+Now, when the deadline has already passed at a command boundary, Simmer waits up
+to `DEADLINE_GRACE` (2 s) for the next command. It reads that command and
+answers it `421 4.4.2 session timeout` without executing it. A client that sends
+nothing gets the `421` when the grace runs out. The grace adds at most 2 s to an
+idle client's overrun.
 
 **What it costs:** a session can outlive `timeouts.session` by one relay, and a
 relay is bounded. The pool checkout waits at most the route's `connect` budget
@@ -2541,6 +2555,18 @@ relay is bounded. The pool checkout waits at most the route's `connect` budget
 shipped defaults, so the overrun is at most 170 s, against a 600 s ceiling. The
 quota statements on either side of the conversation have no timeout until F4 is
 fixed, so a stalled database stretches the overrun as it stretches everything else.
+
+Stress S9 showed what that overrun means for a client, on the stack. Its sink
+held every dot for 30 s, exactly as long as its own client waits for a reply.
+The relays were no longer cut at the 20 s deadline, and they finished with `250`
+at 30,003 ms. By then the client had given up, milliseconds earlier, and the sink
+had four messages stored that no client heard about. Before this change, the same
+run told the client `421`. Either way the client retries, and the recipient gets
+the message twice.
+
+What protects a client is the README's "Timeout budget" rule: the downstream
+budget must sit comfortably under the client's own timeout. A session deadline
+cannot substitute for it. S9's stall is now 25 s, inside its client's wait.
 
 **Against the spec:** §8.4 lists only per-stage timeouts, and §4.1 has
 `timeouts.session` in its schema without saying what it bounds. "A hard ceiling on
@@ -2625,7 +2651,12 @@ that an over-long message is answered at the dot and the connection closed.
   is the one that went from failing to passing.
 - **The gates.** `cargo test`: 883 passed across 29 binaries, which is 880 plus
   these three. `clippy -D warnings` and `fmt` are clean.
-- **Not yet on the stack:** stress S8a.
+- **Stress S8a, on the stack**, on images rebuilt from `597b4a8`. One client
+  reaches `DATA` and sends 300 MiB with no line ending. Every check was `ok`,
+  including `memory`: peak cgroup anon was 5.5 MiB against the scenario's 96 MiB
+  bound. Its known-findings entry is gone, so this was a plain pass, not an XPASS.
+  The run went through a loopback forwarder, because the stress harness addresses
+  published ports on `127.0.0.1` and the jail cannot reach them.
 
 ## Still open — to settle at the start of the phase that needs them
 

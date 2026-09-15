@@ -182,6 +182,56 @@ async fn a_sink_that_loses_mail_is_caught_end_to_end() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_deadline_reaches_the_client_as_a_421() {
+    // Soak V4 in miniature (D-081): every message is held a second at the dot, so
+    // the 2 s session deadline passes during the second relay. That relay must
+    // finish and be answered 250, and the client's next command must be answered
+    // 421 — never a broken pipe, which is what V4's client got when the 421 came
+    // unprompted and the socket closed under its write.
+    let sink = sink(&[]);
+    let cfg = config_for(sink.addr, "").replace(
+        "timeouts: { command: 5s, data: 5s, session: 60s }",
+        "timeouts: { command: 5s, data: 5s, session: 2s }",
+    );
+    let simmer = Simmer::start(&cfg).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sent_path = dir.path().join("sent.jsonl");
+    loadgen(
+        simmer.addr.port(),
+        &sent_path,
+        &[
+            "--count",
+            "5",
+            "--concurrency",
+            "1",
+            "--per-session",
+            "5",
+            "--sink-script",
+            "slow@dot:1s",
+        ],
+    )
+    .await;
+
+    let sent: Vec<Sent> = read_jsonl(&std::fs::read_to_string(&sent_path).expect("sent records"));
+    let refused: Vec<&Sent> = sent
+        .iter()
+        .filter(|s| s.code == 421 && s.text.contains("session timeout"))
+        .collect();
+    assert_eq!(refused.len(), 1, "one 421 at the deadline: {sent:#?}");
+    assert!(
+        sent.iter()
+            .all(|s| s.code == 250 || s.code == 421 || s.stage == "not_sent"),
+        "only 250s, the one 421 and messages never begun: {sent:#?}"
+    );
+    let accepted = sent.iter().filter(|s| s.code == 250).count();
+    assert!(accepted >= 1, "{sent:#?}");
+
+    let received = settled(&sink.records, accepted);
+    let report = reconcile(&sent, &received, None);
+    assert!(report.is_clean(), "{:#?}", report.violations);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sink_that_stores_mail_twice_is_caught_end_to_end() {
     // Checking the check: every 20th message is recorded twice. A reconciler
     // that passes this run would pass a relay that sends duplicates (R2).
