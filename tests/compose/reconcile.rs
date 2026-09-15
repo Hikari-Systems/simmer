@@ -40,6 +40,10 @@ pub struct Received {
     /// the wrong envelope, which a pooled connection must never produce.
     #[serde(default)]
     pub mismatch: bool,
+    /// The `X-Simmer-Correlation` header, where the route stamps one: the id
+    /// Simmer logged this message under, so a slow one can be found in its log.
+    #[serde(default)]
+    pub correlation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

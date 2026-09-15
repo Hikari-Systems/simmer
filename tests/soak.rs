@@ -44,13 +44,33 @@
 //! what it costs over hours — in particular whether anything a cancellation
 //! strands is ever given back. `SOAK_V4=off` leaves it out, for a like-for-like
 //! comparison with a run from before it.
+//!
+//! ## At rest (step 5c)
+//!
+//! `soak_run` measures each instance before its first message and again once the
+//! run is over — the load stopped, V4 drained, [`REST_SETTLE`] waited out — and
+//! `soak_analyze` holds the second to the first (`soak/rest/baseline`): no
+//! session, reservation, or pooled or database connection still in use, no more
+//! threads or tasks than before, and no descriptor that was not open before and
+//! that no pool accounts for. The same measurement completes the trend gate for
+//! threads and descriptors, which move in whole units: a count that was back at
+//! its baseline at rest was a ratchet, not a leak
+//! (`leak::Verdict::released_at_rest`).
+//!
+//! ## Tracing a slow message
+//!
+//! Every soak route stamps `X-Simmer-Correlation: {{correlation_id}}` and the sink
+//! records it. `soak_run` copies out every message a client waited more than
+//! [`SLOW_MS`] for, and `soak_analyze` prints the slowest with the correlation id
+//! Simmer's own log lines carry — so a latency tail is followed message by
+//! message, where `docs/SOAK.md` §5 had to infer it from populations.
 
 mod compose;
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -105,6 +125,19 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// one more each for a sweep delayed by the shared database's stalls (§3a). A
 /// sweeper that fell behind would pass this within the hour.
 const V4_MAX_ROWS: u64 = 6;
+
+/// How long the instances are left once the load and V4's drain are over before
+/// they are measured at rest. Tokio's blocking pool keeps an idle thread for
+/// 10 s, so a thread count read any sooner is still the load's.
+const REST_SETTLE: Duration = Duration::from_secs(30);
+
+/// A message a client waited longer than this for is traced: `soak_run` copies
+/// out its loadgen record and its sink record, correlation id and all.
+const SLOW_MS: f64 = 200.0;
+
+/// At most this many slow messages per instance have their sink record copied
+/// out, the slowest first: a run gone badly wrong has thousands.
+const SLOW_TRACED: usize = 200;
 
 // ---------------------------------------------------------------------------
 // the one test that needs no Docker
@@ -189,6 +222,30 @@ fn the_soak_config_is_valid_and_cannot_run_out_of_allowance() {
         simmer::quota::reservation_expiry(cancel, 1) + SWEEP_INTERVAL < session,
         "a stranded reservation must be swept before the next session's cancellation"
     );
+
+    // Step 5c: every route stamps the id Simmer logs a message under, so a slow
+    // message can be followed from the loadgen's record into the server's log.
+    // Not declared in `unstable_headers`: §6.6's probe pins volatile variables,
+    // so the header is stable, and declaring it would draw the stale-declaration
+    // WARN instead.
+    for route in &cfg.routes {
+        assert!(
+            route
+                .identity
+                .set_headers
+                .iter()
+                .any(|(k, v)| k == "X-Simmer-Correlation" && v == "{{correlation_id}}"),
+            "{} does not stamp X-Simmer-Correlation",
+            route.name
+        );
+    }
+    let warnings = simmer::config::validate::warnings(&cfg);
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.path.ends_with("unstable_headers")),
+        "{warnings:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -217,8 +274,13 @@ fn soak_run() {
         let _ = fs::remove_file(csv_path(instance));
         let _ = fs::remove_file(final_path(instance));
         let _ = fs::remove_file(sample_path(&format!("v4-{instance}.jsonl")));
+        let _ = fs::remove_file(base_prom_path(instance));
+        let _ = fs::remove_file(rest_path(instance));
+        let _ = fs::remove_file(fds_path(instance, "base"));
+        let _ = fs::remove_file(fds_path(instance, "rest"));
+        let _ = fs::remove_file(sample_path(&format!("slow-{instance}.jsonl")));
     }
-    for file in ["metrics.csv", "v4.csv", "v4-sink.jsonl"] {
+    for file in ["metrics.csv", "v4.csv", "v4-sink.jsonl", "slow-sink.jsonl"] {
         let _ = fs::remove_file(sample_path(file));
     }
     recreate_instances();
@@ -231,6 +293,17 @@ fn soak_run() {
     for instance in INSTANCES {
         if let Some(sample) = sample_instance(instance) {
             append_sample(instance, 0.0, &sample);
+        }
+        // What `soak/rest/baseline` holds the end to: what each descriptor is,
+        // then the gauges — listed first so the scrape's own connection is not
+        // among them. `app2` is scraped here, before its first message, when the
+        // exporter holds nothing a scrape could drain; V2's asymmetry is about
+        // draining it (F8), so it is untouched.
+        if let Some(listing) = list_fds(instance) {
+            let _ = fs::write(fds_path(instance, "base"), listing);
+        }
+        if let Some(body) = scrape_in_container(instance) {
+            let _ = fs::write(base_prom_path(instance), body);
         }
     }
 
@@ -378,8 +451,26 @@ fn soak_run() {
         }
     }
 
-    // The only scrape `app2` ever gets, and the evidence the analyser reads for
-    // the state each instance was left in.
+    // At rest: the load over, V4 drained, and long enough since for the blocking
+    // pool's idle threads to have exited. Sampled before the final scrape, so
+    // the scrape's own connection is not among the descriptors.
+    thread::sleep(REST_SETTLE);
+    for instance in INSTANCES {
+        match sample_instance(instance) {
+            Some(sample) => append_sample_to(
+                &rest_path(instance),
+                started.elapsed().as_secs_f64(),
+                &sample,
+            ),
+            None => eprintln!("soak: {instance} could not be sampled at rest"),
+        }
+        if let Some(listing) = list_fds(instance) {
+            let _ = fs::write(fds_path(instance, "rest"), listing);
+        }
+    }
+
+    // The last scrape of each instance — `app2`'s only one since before its first
+    // message — and the evidence the analyser reads for the state each was left in.
     for instance in INSTANCES {
         match scrape_in_container(instance) {
             Some(body) => {
@@ -391,6 +482,7 @@ fn soak_run() {
     if v4 {
         copy_v4_evidence();
     }
+    copy_slow_evidence();
     eprintln!(
         "soak: finished after {:.1} minutes",
         started.elapsed().as_secs_f64() / 60.0
@@ -411,6 +503,8 @@ fn soak_analyze() {
     // inside the loop threw exactly that away, ending the run on the first
     // instance and leaving the comparison to be rebuilt by hand.
     let mut failures: Vec<String> = Vec::new();
+    let mut baseline: Vec<String> = Vec::new();
+    let mut baseline_judged = false;
     for instance in INSTANCES {
         let samples = read_samples(instance);
         if samples.is_empty() {
@@ -418,6 +512,7 @@ fn soak_analyze() {
             continue;
         }
         judged += 1;
+        let rest = read_rest(instance, &samples[0]);
 
         let span = samples.last().expect("samples").t - samples[0].t;
         let warmup = warmup_for(span);
@@ -444,7 +539,7 @@ fn soak_analyze() {
                 "threads/h",
             ),
         ] {
-            let v = leak::verdict(
+            let mut v = leak::verdict(
                 &series,
                 warmup,
                 FLOOR_WINDOW,
@@ -452,6 +547,27 @@ fn soak_analyze() {
                     slope_per_hour: limit,
                 },
             );
+            // Threads and descriptors move in whole units, so the trend alone
+            // cannot tell a ratchet from a climb: V4's hour failed on one +1
+            // that was gone at rest. A count back at its baseline once the load
+            // stopped was the former.
+            match (name, &rest) {
+                (
+                    "threads",
+                    Rest {
+                        threads: Some((before, after)),
+                        ..
+                    },
+                ) => v = v.released_at_rest(*before, *after, 0.0),
+                (
+                    "fds",
+                    Rest {
+                        unaccounted_fds: Some(extra),
+                        ..
+                    },
+                ) => v = v.released_at_rest(0.0, extra.len() as f64, 0.0),
+                _ => {}
+            }
             let scale = if unit == "MiB/h" { 1_048_576.0 } else { 1.0 };
             eprintln!(
                 "  {name:<8} slope {:+.2} {unit}, quartile step {:+.2}{}{}",
@@ -460,6 +576,8 @@ fn soak_analyze() {
                 if unit == "MiB/h" { " MiB" } else { "" },
                 if v.inconclusive {
                     "  (inconclusive: fewer than eight post-warm-up floors)"
+                } else if v.released {
+                    "  a ratchet: the trend rose, and it was back at its baseline at rest"
                 } else if v.leaking {
                     "  LEAKING"
                 } else {
@@ -485,6 +603,27 @@ fn soak_analyze() {
                 "{instance}: CLOSE_WAIT peaked at {peak_close_wait}, which is more sockets \
                  half-closed than every downstream pool put together"
             ));
+        }
+
+        let pair = |p: Option<(f64, f64)>| {
+            p.map_or("not measured".to_string(), |(before, after)| {
+                format!("{after} (before the first message: {before})")
+            })
+        };
+        eprintln!(
+            "  at rest: threads {}, tasks {}, unaccounted descriptors {}",
+            pair(rest.threads),
+            pair(rest.tasks),
+            rest.unaccounted_fds.as_ref().map_or(
+                "not measured (a run from before step 5c)".to_string(),
+                |extra| extra.len().to_string()
+            )
+        );
+        if rest.final_prom.is_some() {
+            baseline_judged = true;
+            baseline.extend(baseline_problems(instance, &rest));
+        } else {
+            eprintln!("  no final scrape of {instance}; its return to baseline is not judged");
         }
     }
     // F7 — `simmer_unmatched_sender_total{domain}` takes its label from a domain
@@ -538,6 +677,10 @@ fn soak_analyze() {
     }
 
     analyze_v4(&mut failures);
+    if baseline_judged {
+        verdict(&mut failures, "soak/rest/baseline", joined(baseline));
+    }
+    report_slow();
 
     assert!(judged > 0, "no samples at all; run soak_run first");
     assert!(
@@ -953,9 +1096,12 @@ fn read_sample_jsonl<T: serde::de::DeserializeOwned>(file: &str) -> Option<Vec<T
 }
 
 fn append_sample(instance: &str, t: f64, s: &Sample) {
-    let path = csv_path(instance);
+    append_sample_to(&csv_path(instance), t, s);
+}
+
+fn append_sample_to(path: &Path, t: f64, s: &Sample) {
     let fresh = !path.exists();
-    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) else {
+    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
     if fresh {
@@ -981,7 +1127,11 @@ fn append_sample(instance: &str, t: f64, s: &Sample) {
 }
 
 fn read_samples(instance: &str) -> Vec<Sample> {
-    let Ok(text) = fs::read_to_string(csv_path(instance)) else {
+    read_samples_from(&csv_path(instance))
+}
+
+fn read_samples_from(path: &Path) -> Vec<Sample> {
+    let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
     text.lines()
@@ -1011,6 +1161,253 @@ fn read_samples(instance: &str) -> Vec<Sample> {
 
 fn series(samples: &[Sample], pick: impl Fn(&Sample) -> f64) -> Vec<(f64, f64)> {
     samples.iter().map(|s| (s.t, pick(s))).collect()
+}
+
+// ---------------------------------------------------------------------------
+// at rest — the return to baseline (step 5c)
+// ---------------------------------------------------------------------------
+
+/// Each instance's `/metrics` before its first message.
+fn base_prom_path(instance: &str) -> PathBuf {
+    sample_path(&format!("base-{instance}.prom"))
+}
+
+/// One sample of each instance at rest, in the samples' own CSV format.
+fn rest_path(instance: &str) -> PathBuf {
+    sample_path(&format!("rest-{instance}.csv"))
+}
+
+/// `ls -l /proc/1/fd` before the first message (`base`) or at rest (`rest`).
+fn fds_path(instance: &str, when: &str) -> PathBuf {
+    sample_path(&format!("fds-{when}-{instance}.txt"))
+}
+
+/// What each descriptor is, not only how many, so a return-to-baseline failure
+/// names what was left open.
+fn list_fds(instance: &str) -> Option<String> {
+    let out = SOAK
+        .compose()
+        .args(["exec", "-T", instance, "ls", "-l", "/proc/1/fd"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// What an instance held before its first message and once the run was over.
+/// Every part is optional: a run from before step 5c has only the first sample
+/// and the final scrape, and is judged on what it has.
+struct Rest {
+    /// Threads before and after: the first sample's, and the rest sample's or,
+    /// failing that, the final scrape's `process_threads`.
+    threads: Option<(f64, f64)>,
+    /// `simmer_tasks_alive` before and after.
+    tasks: Option<(f64, f64)>,
+    /// Descriptors open at rest that nothing accounts for
+    /// ([`leak::unaccounted_fds`]).
+    unaccounted_fds: Option<Vec<String>>,
+    /// The final scrape, for the gauges that must simply be zero.
+    final_prom: Option<String>,
+}
+
+fn read_rest(instance: &str, first: &Sample) -> Rest {
+    let base_prom = fs::read_to_string(base_prom_path(instance)).ok();
+    let final_prom = fs::read_to_string(final_path(instance)).ok();
+    let threads_at_rest = read_samples_from(&rest_path(instance))
+        .pop()
+        .map(|s| s.threads as f64)
+        .or_else(|| metric(final_prom.as_deref()?, "process_threads"));
+    Rest {
+        threads: threads_at_rest.map(|after| (first.threads as f64, after)),
+        tasks: before_after(
+            base_prom.as_deref(),
+            final_prom.as_deref(),
+            "simmer_tasks_alive",
+        ),
+        unaccounted_fds: unaccounted_fds(instance, base_prom.as_deref(), final_prom.as_deref()),
+        final_prom,
+    }
+}
+
+fn before_after(before: Option<&str>, after: Option<&str>, series: &str) -> Option<(f64, f64)> {
+    Some((metric(before?, series)?, metric(after?, series)?))
+}
+
+fn unaccounted_fds(
+    instance: &str,
+    base_prom: Option<&str>,
+    final_prom: Option<&str>,
+) -> Option<Vec<String>> {
+    let base = leak::fd_kinds(&fs::read_to_string(fds_path(instance, "base")).ok()?);
+    let rest = leak::fd_kinds(&fs::read_to_string(fds_path(instance, "rest")).ok()?);
+    Some(leak::unaccounted_fds(
+        &base,
+        &rest,
+        pooled(base_prom?),
+        pooled(final_prom?),
+    ))
+}
+
+/// Every connection the downstream and database pools report holding; each is
+/// one socket.
+fn pooled(body: &str) -> f64 {
+    series_matching(body, "simmer_pool_connections{")
+        .chain(series_matching(body, "simmer_db_pool_connections{"))
+        .map(|(_, v)| v)
+        .sum()
+}
+
+/// Every series whose name, labels included, starts with `prefix`, and its value.
+fn series_matching<'a>(
+    body: &'a str,
+    prefix: &'a str,
+) -> impl Iterator<Item = (&'a str, f64)> + 'a {
+    body.lines()
+        .filter(move |l| l.starts_with(prefix))
+        .filter_map(|l| {
+            let (name, value) = l.rsplit_once(' ')?;
+            Some((name, value.trim().parse().ok()?))
+        })
+}
+
+/// The return to baseline, checked by hand after every run until step 5c: once
+/// the load has stopped, nothing is still held. `reservations_in_flight` is not
+/// here — under F2 it is not zero, and `soak/V4/registry` is where that is
+/// judged, so it is not counted twice.
+fn baseline_problems(instance: &str, rest: &Rest) -> Vec<String> {
+    let body = rest.final_prom.as_deref().unwrap_or_default();
+    let mut problems = Vec::new();
+    let mut held: Vec<(&str, f64)> = Vec::new();
+    for series in [
+        "simmer_sessions_active",
+        "simmer_db_pool_connections{state=\"in_use\"}",
+    ] {
+        match metric(body, series) {
+            Some(v) => held.push((series, v)),
+            None => problems.push(format!("{instance}: no {series} in the final scrape")),
+        }
+    }
+    // A check that finds no series to read passes, so an absent family is a
+    // failure rather than a silence.
+    for (family, pick) in [
+        ("simmer_quota_reserved{", ""),
+        ("simmer_pool_connections{", "state=\"active\""),
+    ] {
+        let found: Vec<(&str, f64)> = series_matching(body, family)
+            .filter(|(name, _)| name.contains(pick))
+            .collect();
+        if found.is_empty() {
+            problems.push(format!(
+                "{instance}: no {family}…}} series in the final scrape"
+            ));
+        }
+        held.extend(found);
+    }
+    for (series, v) in held {
+        if v != 0.0 {
+            problems.push(format!("{instance}: {series} is {v} at rest"));
+        }
+    }
+    if let Some((before, after)) = rest.threads {
+        if after > before {
+            problems.push(format!(
+                "{instance}: {after} threads at rest, against {before} before the first message"
+            ));
+        }
+    }
+    if let Some((before, after)) = rest.tasks {
+        if after > before {
+            problems.push(format!(
+                "{instance}: {after} tasks alive at rest, against {before} before the first \
+                 message"
+            ));
+        }
+    }
+    if let Some(extra) = &rest.unaccounted_fds {
+        if !extra.is_empty() {
+            problems.push(format!(
+                "{instance}: {} descriptors open at rest that were not open before the first \
+                 message and that no pool holds: {}",
+                extra.len(),
+                extra.join(", ")
+            ));
+        }
+    }
+    problems
+}
+
+// ---------------------------------------------------------------------------
+// tracing slow messages (step 5c)
+// ---------------------------------------------------------------------------
+
+/// Every V2/V3 message a client waited more than [`SLOW_MS`] for, and the sink's
+/// records of the slowest [`SLOW_TRACED`] per instance — filtered inside the
+/// results volume, because the whole sink file is ~70,000 lines an hour. V4's
+/// messages are held 15 s at the dot by design and are not among them.
+fn copy_slow_evidence() {
+    let mut ids = Vec::new();
+    for instance in INSTANCES {
+        let text = from_results(&format!(
+            "awk -F'\"latency_ms\":' 'NF > 1 {{ split($2, v, /[,}}]/); if (v[1] + 0 > {SLOW_MS}) print }}' \
+             /results/soak-{instance}.jsonl"
+        ));
+        let mut slow: Vec<Sent> = reconcile::read_jsonl(&text);
+        slow.sort_by(|a, b| b.latency_ms.total_cmp(&a.latency_ms));
+        ids.extend(slow.into_iter().take(SLOW_TRACED).map(|s| s.id));
+        let _ = fs::write(sample_path(&format!("slow-{instance}.jsonl")), text);
+    }
+    if ids.is_empty() {
+        return;
+    }
+    let patterns: String = ids
+        .iter()
+        .map(|id| format!(" -e '\"id\":\"{id}\"'"))
+        .collect();
+    let text = from_results(&format!("grep -F{patterns} /results/sink.jsonl || true"));
+    let _ = fs::write(sample_path("slow-sink.jsonl"), text);
+}
+
+/// The slowest messages, each with the correlation id Simmer logged it under —
+/// its `downstream accepted the message` line carries the same id, the route
+/// and Simmer's own `latency_ms` — so a tail is followed one message at a time.
+/// Reported, never judged.
+fn report_slow() {
+    let sink: Vec<Received> = read_sample_jsonl("slow-sink.jsonl").unwrap_or_default();
+    let mut shown = false;
+    for instance in INSTANCES {
+        let Some(mut slow) = read_sample_jsonl::<Sent>(&format!("slow-{instance}.jsonl")) else {
+            continue;
+        };
+        slow.sort_by(|a, b| b.latency_ms.total_cmp(&a.latency_ms));
+        eprintln!(
+            "\n{instance}: {} messages took more than {SLOW_MS} ms{}",
+            slow.len(),
+            if slow.is_empty() {
+                ""
+            } else {
+                "; the slowest:"
+            }
+        );
+        for s in slow.iter().take(10) {
+            let correlation = sink
+                .iter()
+                .find(|r| r.id == s.id)
+                .map_or("no sink record", |r| {
+                    r.correlation
+                        .as_deref()
+                        .unwrap_or("no X-Simmer-Correlation")
+                });
+            eprintln!(
+                "  {:>8.1} ms  {}  {} at {}  correlation {correlation}",
+                s.latency_ms, s.id, s.code, s.stage
+            );
+            shown = true;
+        }
+    }
+    if shown {
+        eprintln!("  (the server's side of one: docker compose logs app | grep <correlation>)");
+    }
 }
 
 // ---------------------------------------------------------------------------

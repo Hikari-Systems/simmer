@@ -29,6 +29,7 @@ fn got(id: &str, outcome: Outcome) -> Received {
         id: id.into(),
         outcome,
         mismatch: false,
+        correlation: None,
     }
 }
 
@@ -242,6 +243,119 @@ fn too_short_a_run_is_inconclusive_rather_than_passed() {
     let v = verdict(&series(200.0, 100.0)[..60], 60.0, 300.0, soak_limits());
     assert!(v.inconclusive);
     assert!(!v.leaking);
+}
+
+// -- at rest (step 5c) -----------------------------------------------------
+
+/// An hour of 10-second thread counts: `during` through the load, and one more
+/// from `step_at` seconds to the end.
+fn threads(during: f64, step_at: f64) -> Vec<(f64, f64)> {
+    (0..360)
+        .map(|i| {
+            let t = i as f64 * 10.0;
+            (t, if t >= step_at { during + 1.0 } else { during })
+        })
+        .collect()
+}
+
+fn one_per_hour() -> Limits {
+    Limits {
+        slope_per_hour: 1.0,
+    }
+}
+
+#[test]
+fn one_thread_held_from_mid_run_fails_the_trend_alone() {
+    // The soak's V4 hour on app2: 5 threads, then 6 from run-second 1,968. This
+    // pins the problem `released_at_rest` exists for, so a change that made the
+    // trend pass it on its own would show here first.
+    let v = verdict(&threads(5.0, 1968.0), 600.0, 300.0, one_per_hour());
+    assert!(v.leaking, "{v:?}");
+}
+
+#[test]
+fn a_ratchet_released_at_rest_is_not_a_leak() {
+    let v = verdict(&threads(5.0, 1968.0), 600.0, 300.0, one_per_hour())
+        .released_at_rest(3.0, 3.0, 0.0);
+    assert!(!v.leaking && v.released, "{v:?}");
+}
+
+#[test]
+fn a_climb_still_held_at_rest_is_a_leak() {
+    // A thread leaked every ten minutes and never given back.
+    let climb: Vec<(f64, f64)> = (0..360)
+        .map(|i| {
+            let t = i as f64 * 10.0;
+            (t, 5.0 + (t / 600.0).floor())
+        })
+        .collect();
+    let v = verdict(&climb, 600.0, 300.0, one_per_hour()).released_at_rest(3.0, 9.0, 0.0);
+    assert!(v.leaking && !v.released, "{v:?}");
+}
+
+#[test]
+fn release_leaves_a_pass_a_plain_pass() {
+    let v = verdict(&threads(5.0, f64::INFINITY), 600.0, 300.0, one_per_hour())
+        .released_at_rest(3.0, 3.0, 0.0);
+    assert!(!v.leaking && !v.released, "{v:?}");
+}
+
+const FDS_BASE: &str = "\
+total 0
+lr-x------ 1 app app 64 Sep 15 10:00 0 -> /dev/null
+l-wx------ 1 app app 64 Sep 15 10:00 1 -> pipe:[1001]
+lrwx------ 1 app app 64 Sep 15 10:00 3 -> anon_inode:[eventpoll]
+lrwx------ 1 app app 64 Sep 15 10:00 4 -> anon_inode:[eventfd]
+lrwx------ 1 app app 64 Sep 15 10:00 5 -> socket:[2001]
+lrwx------ 1 app app 64 Sep 15 10:00 6 -> socket:[2002]
+lrwx------ 1 app app 64 Sep 15 10:00 7 -> socket:[2003]
+";
+
+#[test]
+fn descriptor_kinds_drop_inode_numbers_but_keep_anon_inodes() {
+    assert_eq!(
+        compose::leak::fd_kinds(FDS_BASE),
+        [
+            "/dev/null",
+            "pipe",
+            "anon_inode:[eventpoll]",
+            "anon_inode:[eventfd]",
+            "socket",
+            "socket",
+            "socket"
+        ]
+    );
+}
+
+#[test]
+fn pooled_sockets_account_for_the_growth_at_rest() {
+    // Three sockets before the first message, one of them the database pool's;
+    // five at rest, three of them pooled. The two new ones are the pools'.
+    let base = compose::leak::fd_kinds(FDS_BASE);
+    let mut rest = base.clone();
+    rest.extend(["socket".to_string(), "socket".to_string()]);
+    assert!(compose::leak::unaccounted_fds(&base, &rest, 1.0, 3.0).is_empty());
+}
+
+#[test]
+fn one_leaked_descriptor_is_named() {
+    // The programme's "checking the checks": one leaked descriptor must fail the
+    // return to baseline — a file, a socket no pool holds, or a second copy of
+    // something that was already open.
+    let base = compose::leak::fd_kinds(FDS_BASE);
+    for (leaked, named) in [
+        ("/tmp/.tmpX1b2c3", "/tmp/.tmpX1b2c3"),
+        ("socket", "a socket no pool holds"),
+        ("anon_inode:[eventfd]", "anon_inode:[eventfd]"),
+    ] {
+        let mut rest = base.clone();
+        rest.push(leaked.to_string());
+        assert_eq!(
+            compose::leak::unaccounted_fds(&base, &rest, 1.0, 1.0),
+            [named],
+            "{leaked}"
+        );
+    }
 }
 
 // -- known findings --------------------------------------------------------

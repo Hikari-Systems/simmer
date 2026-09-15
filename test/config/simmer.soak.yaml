@@ -25,6 +25,11 @@
 #     steering here is recipient frequency's doing and never quota's. A soak that
 #     silently fell through to overflow after an hour would measure the wrong
 #     route for the other twenty-three.
+#   * `X-Simmer-Correlation: "{{correlation_id}}"` on every route, which the sink
+#     records: the id Simmer logs a message under, so a slow message can be
+#     followed into the server's log (step 5c). Not in `unstable_headers` —
+#     §6.6's probe pins volatile variables, so the header is stable, and
+#     declaring it would draw the stale-declaration WARN.
 
 server:
   listeners:
@@ -114,6 +119,7 @@ routes:
       envelope_from: "bounce@newbrand.com"
       set_headers:
         X-Simmer-Route: "{{route.name}}"
+        X-Simmer-Correlation: "{{correlation_id}}"
       body_rewrites:
         - pattern: 'https://oldbrand\.com/'
           replacement: "https://newbrand.com/"
@@ -150,6 +156,7 @@ routes:
       envelope_from: "bounce@cancel.newbrand.com"
       set_headers:
         X-Simmer-Route: "{{route.name}}"
+        X-Simmer-Correlation: "{{correlation_id}}"
     preflight:
       enabled: false
     warmup:
@@ -172,5 +179,6 @@ routes:
       envelope_from: "bounce@mail.established.com"
       set_headers:
         X-Simmer-Route: "{{route.name}}"
+        X-Simmer-Correlation: "{{correlation_id}}"
     preflight:
       enabled: false

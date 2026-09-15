@@ -92,6 +92,33 @@ pub struct Verdict {
     pub leaking: bool,
     /// Too few post-warm-up floors to judge: the checks report but cannot fail.
     pub inconclusive: bool,
+    /// The trend said leaking, and the count was back at its baseline once the
+    /// load had stopped. Only [`Verdict::released_at_rest`] sets it.
+    pub released: bool,
+}
+
+impl Verdict {
+    /// The second half of the rule for a small integer count — threads,
+    /// descriptors — whose trend cannot tell a ratchet from a climb.
+    ///
+    /// A count moves in whole units, so a single +1 held from mid-run to the end
+    /// clears both of [`verdict`]'s gates at once: the soak's V4 hour went from 5
+    /// threads to 6, once, was back at 3 at rest, and failed. What a ratchet does
+    /// that a leak does not is give the count back when the work stops — a pool
+    /// grows to its peak demand and shrinks at idle; a leaked thread or
+    /// descriptor stays. So a trend failure is cleared when the count after the
+    /// load (`at_rest`) is no higher than before it (`baseline`) plus
+    /// `allowance`, which is the part the caller can account for.
+    ///
+    /// Memory is deliberately not judged this way: an allocator keeps what it has
+    /// grown, so memory at rest says little either way.
+    pub fn released_at_rest(mut self, baseline: f64, at_rest: f64, allowance: f64) -> Verdict {
+        if self.leaking && at_rest <= baseline + allowance {
+            self.leaking = false;
+            self.released = true;
+        }
+        self
+    }
 }
 
 /// Judge `samples` after discarding the first `warmup` seconds.
@@ -114,6 +141,7 @@ pub fn verdict(samples: &[(f64, f64)], warmup: f64, floor_window: f64, limits: L
             quartile_step: 0.0,
             leaking: false,
             inconclusive: true,
+            released: false,
         };
     }
 
@@ -131,5 +159,55 @@ pub fn verdict(samples: &[(f64, f64)], warmup: f64, floor_window: f64, limits: L
         quartile_step,
         leaking: slope_per_hour > limits.slope_per_hour && quartile_step > step_gate,
         inconclusive: false,
+        released: false,
     }
+}
+
+/// What each descriptor in an `ls -l /proc/<pid>/fd` listing is. A socket's or a
+/// pipe's inode number is dropped, so two listings compare by what is open —
+/// `socket`, `pipe`, `anon_inode:[eventfd]`, a path — and not by which one.
+pub fn fd_kinds(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|l| l.split_once(" -> "))
+        .map(|(_, target)| {
+            let target = target.trim();
+            match target.split_once(":[") {
+                Some((kind, _)) if !target.starts_with("anon_inode:") => kind.to_string(),
+                _ => target.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// The descriptors open at rest that nothing accounts for: the return-to-baseline
+/// check on descriptors, where a count alone could not say what was left open.
+///
+/// Anything but a socket must have been open before the first message too —
+/// compared as a multiset, so a second copy of one file is caught. Sockets come
+/// and go with the pools, so they are judged by count: the sockets no pool holds
+/// (the listeners, mostly) must not have grown. `pooled_base` and `pooled_rest`
+/// are what the downstream and database pools reported holding at each moment.
+pub fn unaccounted_fds(
+    base: &[String],
+    rest: &[String],
+    pooled_base: f64,
+    pooled_rest: f64,
+) -> Vec<String> {
+    let mut before: Vec<&String> = base.iter().filter(|k| *k != "socket").collect();
+    let mut extra = Vec::new();
+    for kind in rest.iter().filter(|k| *k != "socket") {
+        match before.iter().position(|b| *b == kind) {
+            Some(i) => {
+                before.swap_remove(i);
+            }
+            None => extra.push(kind.clone()),
+        }
+    }
+    let sockets = |l: &[String]| l.iter().filter(|k| *k == "socket").count() as f64;
+    let unpooled = (sockets(rest) - pooled_rest) - (sockets(base) - pooled_base);
+    for _ in 0..unpooled.max(0.0) as usize {
+        extra.push("a socket no pool holds".to_string());
+    }
+    extra
 }

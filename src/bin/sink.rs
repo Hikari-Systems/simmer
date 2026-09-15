@@ -12,7 +12,9 @@
 //! - **What arrived, exactly once?** Every message is recorded against the
 //!   loadgen's test id — from the RCPT local part and the `X-Test-Id` header,
 //!   which must agree (a body on the wrong envelope is recorded as a mismatch).
-//!   `tests/compose/reconcile.rs` joins these records with the loadgen's.
+//!   `tests/compose/reconcile.rs` joins these records with the loadgen's. Where
+//!   a route stamps `X-Simmer-Correlation`, the record carries it too: the id
+//!   Simmer logged the message under, which is how the soak traces a slow one.
 //! - **How many connections at once?** Peak concurrent connections per listener
 //!   and per peer address, which is how §8.3's `max_connections` is measured from
 //!   the side it protects.
@@ -190,6 +192,7 @@ impl State {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         id: &str,
@@ -198,6 +201,7 @@ impl State {
         conn: u64,
         peer: &str,
         mismatch: bool,
+        correlation: Option<&str>,
     ) {
         let counter = match outcome {
             "delivered" => &self.outcomes.delivered,
@@ -211,10 +215,11 @@ impl State {
             self.outcomes.mismatches.fetch_add(1, Ordering::SeqCst);
         }
         let _ = self.records.send(format!(
-            r#"{{"id":{},"outcome":"{outcome}","listener":{},"conn":{conn},"peer":{},"mismatch":{mismatch},"at_ms":{}}}"#,
+            r#"{{"id":{},"outcome":"{outcome}","listener":{},"conn":{conn},"peer":{},"mismatch":{mismatch},"correlation":{},"at_ms":{}}}"#,
             json_string(id),
             json_string(listener),
             json_string(peer),
+            correlation.map_or_else(|| "null".to_string(), json_string),
             self.started.elapsed().as_millis()
         ));
     }
@@ -455,7 +460,15 @@ async fn serve(
         } else if upper.starts_with("RCPT") {
             let addr = between(&cmd, '<', '>').unwrap_or_default();
             if st.chance(st.opts.fail_rcpt_pct) {
-                st.record(&id_of(&addr), "rejected", listener, conn, &peer_ip, false);
+                st.record(
+                    &id_of(&addr),
+                    "rejected",
+                    listener,
+                    conn,
+                    &peer_ip,
+                    false,
+                    None,
+                );
                 reply(&mut io, "451 4.3.0 sink: scripted deferral at RCPT\r\n").await?;
             } else {
                 rcpt = Some(addr);
@@ -464,7 +477,15 @@ async fn serve(
         } else if upper.starts_with("DATA") {
             let envelope_id = rcpt.as_deref().map(id_of).unwrap_or_default();
             if st.chance(st.opts.fail_data_pct) {
-                st.record(&envelope_id, "rejected", listener, conn, &peer_ip, false);
+                st.record(
+                    &envelope_id,
+                    "rejected",
+                    listener,
+                    conn,
+                    &peer_ip,
+                    false,
+                    None,
+                );
                 reply(&mut io, "451 4.3.0 sink: scripted deferral at DATA\r\n").await?;
                 continue;
             }
@@ -482,11 +503,13 @@ async fn serve(
                     conn,
                     &peer_ip,
                     false,
+                    None,
                 );
                 return Ok(());
             }
 
-            let (header_id, script) = read_body(&mut io).await?;
+            let (header_id, correlation, script) = read_body(&mut io).await?;
+            let correlation = correlation.as_deref();
             let id = if envelope_id.is_empty() {
                 header_id.clone().unwrap_or_default()
             } else {
@@ -510,25 +533,69 @@ async fn serve(
 
             match script {
                 Script::Defer => {
-                    st.record(&id, "rejected", listener, conn, &peer_ip, mismatch);
+                    st.record(
+                        &id,
+                        "rejected",
+                        listener,
+                        conn,
+                        &peer_ip,
+                        mismatch,
+                        correlation,
+                    );
                     reply(&mut io, "451 4.3.0 sink: scripted deferral at the dot\r\n").await?;
                 }
                 Script::DropAfterDot => {
                     // Stored, then gone without a word: §10.2's window.
-                    st.record(&id, "dropped_after_dot", listener, conn, &peer_ip, mismatch);
+                    st.record(
+                        &id,
+                        "dropped_after_dot",
+                        listener,
+                        conn,
+                        &peer_ip,
+                        mismatch,
+                        correlation,
+                    );
                     return Ok(());
                 }
                 Script::Stall(d) => {
-                    st.record(&id, "stalled_at_dot", listener, conn, &peer_ip, mismatch);
+                    st.record(
+                        &id,
+                        "stalled_at_dot",
+                        listener,
+                        conn,
+                        &peer_ip,
+                        mismatch,
+                        correlation,
+                    );
                     tokio::time::sleep(d).await;
                     reply(&mut io, "250 2.0.0 stored (late)\r\n").await?;
                 }
                 Script::Slow(d) => {
                     tokio::time::sleep(d).await;
-                    deliver(st, &id, listener, conn, &peer_ip, mismatch, &mut io).await?;
+                    deliver(
+                        st,
+                        &id,
+                        listener,
+                        conn,
+                        &peer_ip,
+                        mismatch,
+                        correlation,
+                        &mut io,
+                    )
+                    .await?;
                 }
                 Script::None => {
-                    deliver(st, &id, listener, conn, &peer_ip, mismatch, &mut io).await?
+                    deliver(
+                        st,
+                        &id,
+                        listener,
+                        conn,
+                        &peer_ip,
+                        mismatch,
+                        correlation,
+                        &mut io,
+                    )
+                    .await?
                 }
             }
             rcpt = None;
@@ -546,6 +613,7 @@ async fn serve(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn deliver(
     st: &State,
     id: &str,
@@ -553,6 +621,7 @@ async fn deliver(
     conn: u64,
     peer: &str,
     mismatch: bool,
+    correlation: Option<&str>,
     io: &mut BufReader<TcpStream>,
 ) -> std::io::Result<()> {
     let n = st.delivered_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -563,17 +632,21 @@ async fn deliver(
     {
         st.outcomes.lost.fetch_add(1, Ordering::SeqCst);
     } else {
-        st.record(id, "delivered", listener, conn, peer, mismatch);
+        st.record(id, "delivered", listener, conn, peer, mismatch, correlation);
     }
     reply(io, "250 2.0.0 stored\r\n").await
 }
 
-/// Read to the terminating dot, keeping only the two headers the sink needs:
-/// `X-Test-Id` and `X-Sink-Script`. The body is discarded as it streams, so a
+/// Read to the terminating dot, keeping only the three headers the sink needs:
+/// `X-Test-Id`, `X-Simmer-Correlation` (where a route stamps one) and
+/// `X-Sink-Script`. The body is discarded as it streams, so a
 /// 25 MiB message costs one line buffer, not 25 MiB.
-async fn read_body(io: &mut BufReader<TcpStream>) -> std::io::Result<(Option<String>, Script)> {
+async fn read_body(
+    io: &mut BufReader<TcpStream>,
+) -> std::io::Result<(Option<String>, Option<String>, Script)> {
     let mut in_headers = true;
     let mut test_id = None;
+    let mut correlation = None;
     let mut script = Script::None;
     let mut line = Vec::with_capacity(1024);
     loop {
@@ -587,7 +660,7 @@ async fn read_body(io: &mut BufReader<TcpStream>) -> std::io::Result<(Option<Str
         let content = line.strip_suffix(b"\n").unwrap_or(&line);
         let content = content.strip_suffix(b"\r").unwrap_or(content);
         if content == b"." {
-            return Ok((test_id, script));
+            return Ok((test_id, correlation, script));
         }
         if in_headers {
             if content.is_empty() {
@@ -598,6 +671,8 @@ async fn read_body(io: &mut BufReader<TcpStream>) -> std::io::Result<(Option<Str
             if let Some((name, value)) = text.split_once(':') {
                 if name.eq_ignore_ascii_case("x-test-id") {
                     test_id = Some(value.trim().to_string());
+                } else if name.eq_ignore_ascii_case("x-simmer-correlation") {
+                    correlation = Some(value.trim().to_string());
                 } else if name.eq_ignore_ascii_case("x-sink-script") {
                     script = parse_script(value);
                 }
