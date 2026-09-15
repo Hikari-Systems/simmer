@@ -3396,9 +3396,10 @@ climb** — recorded, not waved through.
 | `src/bin/loadgen.rs` | V3 | One message in twenty from a fresh `u<n>.soak.test`, varying the envelope and `From:` both |
 | `src/smtp/buffer.rs` | F16 | **D-080**: the spill file's writes batched at 64 KiB |
 | `docs/SOAK.md` | — | **New.** Every run, what it established and what it did not |
+| `tests/compose/leak.rs`, `tests/soak.rs`, `src/bin/sink.rs`, `test/config/simmer.soak.yaml` | 5c | `released_at_rest` and `unaccounted_fds`; `soak/rest/baseline`; the `X-Simmer-Correlation` link, recorded by the sink (`docs/SOAK.md` §9) |
 
 `cargo test`: 869 passing across 29 binaries before `7bcbb87`, which changed
-nothing after that run but `docs/SOAK.md`. The soak's own config test runs in it;
+nothing after that run but `docs/SOAK.md`; 876 after step 5c's seven self-tests. The soak's own config test runs in it;
 `soak_run` and `soak_analyze` are behind `--ignored` and need the stress stack.
 
 ### What is tested
@@ -3430,15 +3431,17 @@ nothing after that run but `docs/SOAK.md`. The soak's own config test runs in it
 
 ### What is not tested
 
-- **Whether the V4 hour's threads step is benign.** Both instances went from 5 to 6
-  threads once, kept it until the load stopped and were at 3 at rest; the gate
-  failed `app2` on it. Tokio's blocking pool is the likely reading and it is not
-  established. The gate needs a rule that uses the at-rest count (§7).
+- **What adds the V4 hour's thread.** Both instances went from 5 to 6 threads once,
+  kept it until the load stopped and were at 3 at rest; the gate failed `app2` on
+  it. Step 5c settled the gate — a count back at its baseline at rest is a
+  ratchet, not a leak, and the hour now passes (`docs/SOAK.md` §9) — but which
+  blocking-pool job V4 adds is still not established.
 - **The V4 hour's latency tail**: a maximum of 538 ms against 263 ms, at the same
   moments on both instances, cause not found.
-- **Bursts, idle gaps (F10, CLOSE_WAIT), the 24-hour run**, return to baseline as
-  an analyser assertion rather than a reading by hand, and the `correlation_id` ↔
-  `X-Test-Id` link. All in `docs/SOAK.md` §7.
+- **Bursts, idle gaps (F10, CLOSE_WAIT) and the 24-hour run**, in `docs/SOAK.md`
+  §7. The return to baseline as an assertion and the `correlation_id` ↔
+  `X-Test-Id` link were built in step 5c, and one 20-minute run has passed them
+  (§9); the planted-defect controls against a live stack are still to run.
 - **`app2` while it runs.** Unscraped by design, so its registry is seen only in
   `final-app2.prom`.
 

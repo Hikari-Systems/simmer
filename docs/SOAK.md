@@ -6,10 +6,13 @@
 confirmed by a second clean hour in which no message took longer than 264 ms
 (§3b); V4 built and driving F2 in two 20-minute runs and an hour (§8) — F2 exactly
 as predicted, one stranded registry entry per cut, eleven per instance an hour —
-but the hour failed the threads gate on a single bounded step that the gate cannot
-tell from a climb (§8, §7); the burst/idle variants outstanding.** A one-page
+but the hour failed the threads gate on a single bounded step that the gate could
+not tell from a climb (§8). Step 5c (§9) fixed that gate with a reading at rest,
+made the return to baseline an assertion, and linked every message to the id Simmer
+logs it under; a fresh 20-minute run passed all three, and §8's hour, re-judged,
+now passes. The burst/idle variants are outstanding.** A one-page
 summary is at the end of `DECISIONS.md`, "Test programme step 5 summary". This document records what
-the soak tier is, what eight runs have established, and — at least as usefully —
+the soak tier is, what nine runs have established, and — at least as usefully —
 what they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
 configuration; the test programme's step 5 is the plan.
 
@@ -511,18 +514,16 @@ column.
 - ~~**V4**: relays cancelled by the session timeout, driving F2~~ — built, §8.
 - Bursts every 15 minutes; idle gaps every 30 minutes past `idle_ttl` with the sink
   closing idle connections at 45 s (CLOSE_WAIT, F10).
-- Return-to-baseline assertions, currently verified by hand (§3, §3a, §3b) rather
-  than by the analyser.
-- **The threads gate fails a bounded step** (§8's hour). Thread counts are
-  integers, so one +1 held from mid-window to the end clears both the slope limit
-  and the quartile step, although the count never went above 6 and was 3 at rest.
-  It needs a rule that tells a ratchet released at idle from a climb — the
-  at-rest count in `final-*.prom` is now there to use — and that rule wants its
-  own plan, not a limit raised to let one run through.
+- ~~Return-to-baseline assertions, currently verified by hand (§3, §3a, §3b)
+  rather than by the analyser~~ — `soak/rest/baseline`, step 5c (§9).
+- ~~**The threads gate fails a bounded step** (§8's hour)~~ — step 5c (§9): a
+  trend failure is cleared when the count is back at its baseline at rest. Thread
+  counts are integers, so one +1 held from mid-window to the end clears both the
+  slope limit and the quartile step; the count at rest is what tells a ratchet
+  from a climb, and no limit was raised.
 - ~~**F16**: buffer the §8.1 spill file's writes~~ — fixed by D-080 (§5).
-- The `correlation_id` ↔ `X-Test-Id` link. No longer the blocker §5 said it was —
-  F16 was found without it — but still the only way to trace one message through
-  the server log.
+- ~~The `correlation_id` ↔ `X-Test-Id` link~~ — step 5c (§9): every soak route
+  stamps `X-Simmer-Correlation` and the sink records it.
 - The 24-hour variant, and whether the CI runner permits a job that long.
 
 ---
@@ -760,3 +761,89 @@ One trap for whoever correlates these: the containers' clock ran about 7% slow
 against the loadgens' monotonic one — 3,355 s from first relay to last over a
 3,600 s load, and the sweeper's WARNs 279.6 s apart. Run-seconds cannot be turned
 into log timestamps by addition on this host.
+
+---
+
+## 9. Step 5c — the return to baseline asserted, and every message traceable
+
+Three changes to the harness — `tests/soak.rs`, `tests/compose/leak.rs`, the sink
+and the soak config — and none to the server.
+
+**The threads gate reads the count at rest.** `leak::Verdict::released_at_rest`
+clears a failing thread or descriptor trend when the count after the run is no
+higher than before the first message. "After the run" is the load stopped, V4
+drained, and `REST_SETTLE` (30 s, three times the blocking pool's idle keep-alive)
+waited out. A ratchet gives its count back at idle; a leaked thread does not.
+Memory is not judged this way, because an allocator keeps what it has grown. The
+self-tests pin both halves: the shape of §8's hour (5 threads, then 6 from 1,968 s)
+fails the trend alone and is released at rest, and a climb still held at rest is
+not. Re-judged from its files, §8's hour now reads `app2 threads … a ratchet: the
+trend rose, and it was back at its baseline at rest` (3 before, 3 at rest) and
+passes, with F7 and both F2 checks XFAIL as before.
+
+**The return to baseline is an assertion**, `soak/rest/baseline`, where §3, §3a
+and §3b read it by hand:
+
+- From the final scrape: `sessions_active`, every `quota_reserved`, every pool's
+  `active` and the database pool's `in_use` are 0. A family with no series at all
+  fails rather than passing for want of anything to read.
+- Threads and `tasks_alive` are no higher than before the first message.
+- No descriptor is open that was not open before and that no pool holds.
+  Descriptors are compared **by kind**, from `ls -l /proc/1/fd` before and after:
+  anything but a socket as a multiset, sockets by count against what the
+  downstream and database pools report holding (`leak::unaccounted_fds`). The
+  self-tests plant one leaked file, one socket no pool holds and a second eventfd,
+  and each is named.
+- `reservations_in_flight` is left to `soak/V4/registry`, so F2 is not counted
+  twice.
+
+`app2` is now scraped once, before its first message, for its baseline gauges. The
+exporter holds nothing then for a scrape to drain, so V2's asymmetry (F8) is
+untouched.
+
+**Every message carries the id Simmer logged it under.** The soak routes stamp
+`X-Simmer-Correlation: "{{correlation_id}}"` and the sink records it. It is not in
+`unstable_headers`: §6.6's probe pins volatile variables, so the header is stable,
+and declaring it would draw the stale-declaration WARN — the config test asserts
+there is none. `soak_run` copies out every V2/V3 message over 200 ms with its sink
+record, and `soak_analyze` prints the slowest with their correlation ids.
+
+### The 20-minute run
+
+2026-09-15, 09:37–09:57 UTC, on images freshly built from `83a8c68` plus these
+changes. The config was verified in the volume (the header on all three routes)
+and by `"senders": 2` in both instances' startup lines (§6's trap).
+
+| | `app` | `app2` |
+|---|---|---|
+| accepted | 12,010 of 12,010 | 12,010 of 12,010 |
+| p50 / p99 / max | 8.4 / 48.5 / 89.9 ms | 8.7 / 51.5 / 90.5 ms |
+| threads, before → at rest | 3 → 3 | 3 → 3 |
+| `tasks_alive`, before → at rest | 11 → 11 | 11 → 11 |
+| descriptors, before → at rest | 15 → 19 | 15 → 19 |
+| of which sockets, and what the pools hold | 9 and 2 → 13 and 6 | 9 and 2 → 13 and 6 |
+| unaccounted descriptors | 0 | 0 |
+
+`soak/rest/baseline` passed. The leak verdicts were inconclusive, as a 20-minute
+run's must be. F7 and both F2 checks XFAILed — three cuts per instance and
+`reservations_in_flight` 3 after the drain on each. The four new descriptors on
+each instance are exactly the four sockets the pools gained; every other kind is
+identical before and after.
+
+**The link, end to end.** All 24,140 sink records carry a correlation id; none is
+null. No message took over 200 ms, so the slow report printed nothing, and the link
+was checked by hand instead: `soak-app-5000` in the sink gives `1f5e7802-…`, and
+`app`'s log has its `relaying` line and its `downstream accepted the message` line
+(`overflow-established`, `latency_ms: 1`).
+
+### What this run did not establish
+
+- **The link has not yet traced a slow message.** §8's 538 ms tail did not recur —
+  this run's maximum was 90 ms — so the report is proven only on a run with nothing
+  to report. The next hour will exercise it.
+- **The at-rest checks have one clean run behind them.** A task started lazily, or
+  a descriptor opened on first use and kept, would fail `soak/rest/baseline`
+  without being a leak. Neither happened here; a second run is the confirmation.
+- **The checks were checked on synthetic series and listings only.** The
+  programme's planted-defect controls on a throwaway branch — a leaked task per
+  message, one leaked descriptor — are still to be run against a live stack.
