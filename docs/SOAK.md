@@ -14,8 +14,9 @@ now passes. A clean hour then passed them again, with conclusive no-leak verdict
 and the link traced that hour's 9–16 s tail to database stalls both instances
 waited out, cause on the host not established (§9). F2 has since been fixed by
 D-081, and V4 and stress S9 are now its regression checks, not yet re-run on the
-stack. The planted-defect controls (§10) have begun: duplicate delivery and run B
-fail exactly as planted, and run A is running. The burst/idle variants are
+stack. In the planted-defect controls (§10), duplicate delivery and run B fail exactly
+as planted, but run A, a 64-byte-per-message leak, was **not** caught: the
+one-hour memory gate lacks the power its self-test claims. The burst/idle variants are
 outstanding.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
 step 5 summary". This document records what
 the soak tier is, what ten runs have established, and — at least as usefully —
@@ -977,10 +978,50 @@ Exactly one check failed, and it failed on both plants, on both instances:
 3 → 3, all 3,010 messages were accepted on each instance, and F7 XFAILed as always.
 The leak verdicts were inconclusive, as a five-minute run's must be.
 
-**Run A — a 64-byte leak per message must fail the memory slope.** It runs
-separately from B, because leaked tasks cost memory of their own and would confound
-it. The plant is only
+**Run A — a 64-byte leak per message was not caught. The memory gate lacks the
+power it was calibrated for.** It ran separately from B, because leaked tasks cost
+memory of their own and would confound it. The plant was only
 `std::hint::black_box(Box::leak(vec![1u8; 64].into_boxed_slice()))` per relayed
-message, about 2.2 MiB an hour at 10 msg/s, the calibration target in
-`tests/compose/leak.rs`. It needs a full hour. If the gate misses it, that is a
-finding about the gate's power, recorded rather than tuned away.
+message. At 36,010 messages per instance that is 2.2 MiB an hour, the calibration
+target in `tests/compose/leak.rs`.
+
+It ran on 2026-09-15, 11:26–12:23 UTC, with V4 off, because the planted branch
+predates D-081. Both containers ran the planted image, `7df0fef77915`. Everything
+else was clean: all 36,010 messages were accepted on each instance,
+`soak/rest/baseline` passed, and F7 XFAILed. And the memory gate passed both
+instances:
+
+| | anon slope | quartile step | verdict |
+|---|---|---|---|
+| `app` | +2.08 MiB/h | −1.17 MiB | slope just over the 2.0 limit, step below the ~0.7 MiB gate: passed |
+| `app2` | −3.19 MiB/h | −1.70 MiB | passed |
+
+**Why: the real floors are noisy, and the self-test's are not.** The calibration
+series in `tests/harness_selftest.rs` adds `i % 7` MiB of "bursts". Every
+five-minute window of it contains a sample with `i % 7 == 0`, so its floors lie
+exactly on the planted line: the self-test calibrated the gate against a
+noise-free leak.
+
+The real floors scatter about a line by 2.4–2.8 MiB, in both hours and on both
+instances. That puts a one-hour slope's standard error at 3.2–3.8 MiB/h, more than
+the whole 2.2 MiB/h signal. Run A's floors cannot be told from the clean hour's
+(§9): 11–19 MiB, against 19–28 and 10–19. `process_resident_memory_bytes` does not
+separate them either: 10.8 MiB rising to 30.5 and 25.6, against 10.9 rising to
+23.4 and 28.1.
+
+**What it means: a one-hour soak cannot tell a 2.2 MiB/h leak from no leak.** The
+"no leak" verdicts of §3a, §3b and §9 mean "no leak much above about 6 MiB/h"
+(twice the standard error), not "none". A gross leak is caught in the self-test,
+but on a live stack that is not shown either. With the same noise, two hours of
+floors would put 2.2 MiB/h at about 2.5 standard errors, and four hours at about
+7. That is an estimate that assumes independent residuals, not a measurement.
+
+The limit was not tuned to make this run pass. What would restore the gate's power
+is a decision for the plan, not a change made here:
+
+- a longer judged run, such as the 24-hour variant, which is already outstanding;
+- a quieter series than cgroup anon. The allocator's own count of allocated bytes
+  rises by exactly a leak's size, and churn does not move it. It would need a
+  gauge on `/metrics`, which is a server change;
+- a self-test whose noise the floors cannot remove, so that the calibration claim
+  is tested against something like the real series.

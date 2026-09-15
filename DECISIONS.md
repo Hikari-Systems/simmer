@@ -3533,7 +3533,9 @@ nothing after that run but `docs/SOAK.md`; 876 after step 5c's seven self-tests.
   `mismatch:false`, joined by id: 0 duplicates, 0 answered `250` and never
   delivered. The killed hour's 67,443 agree.
 - **No leak, twice.** Memory, descriptors and threads flat on both instances —
-  scraped and unscraped — over §3a's and §3b's hours. A verdict needs eight
+  scraped and unscraped — over §3a's and §3b's hours. For memory, that means no
+  leak much above about 6 MiB/h: run A (`docs/SOAK.md` §10) showed that a one-hour
+  run cannot see 2.2 MiB/h. A verdict needs eight
   five-minute floors after the warm-up, so a 20-minute run is `inconclusive` by
   design, and §4 records the one false `fds LEAKING` so it is not rediscovered.
 - **Return to baseline**, checked by hand after every run: no sessions, nothing
@@ -3571,8 +3573,14 @@ nothing after that run but `docs/SOAK.md`; 876 after step 5c's seven self-tests.
 - **Bursts, idle gaps (F10, CLOSE_WAIT) and the 24-hour run**, in `docs/SOAK.md`
   §7. The return to baseline as an assertion and the `correlation_id` ↔
   `X-Test-Id` link were built in step 5c, and a 20-minute run and a clean hour have
-  passed them (§9). The planted-defect controls against a live stack are still to
-  run.
+  passed them (§9).
+- **A small memory leak.** The planted-defect controls have run (§10). Duplicate
+  delivery is caught, and so are a leaked task and a leaked descriptor, each on
+  exactly its own check. **A 2.2 MiB/h memory leak is not caught.** The one-hour
+  gate's slope error, 3.2–3.8 MiB/h on real floors, is larger than the leak,
+  because its self-test calibrated it against floors with no noise in them. What
+  would restore the power is open: a longer judged run, an allocated-bytes gauge on
+  `/metrics`, and a self-test with realistic noise.
 - **`app2` while it runs.** Unscraped by design, so its registry is seen only in
   `final-app2.prom`.
 
