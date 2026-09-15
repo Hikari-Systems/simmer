@@ -10,9 +10,12 @@ but the hour failed the threads gate on a single bounded step that the gate coul
 not tell from a climb (§8). Step 5c (§9) fixed that gate with a reading at rest,
 made the return to baseline an assertion, and linked every message to the id Simmer
 logs it under; a fresh 20-minute run passed all three, and §8's hour, re-judged,
-now passes. The burst/idle variants are outstanding.** A one-page
-summary is at the end of `DECISIONS.md`, "Test programme step 5 summary". This document records what
-the soak tier is, what nine runs have established, and — at least as usefully —
+now passes. A clean hour then passed them again, with conclusive no-leak verdicts,
+and the link traced that hour's 9–16 s tail to database stalls both instances
+waited out, cause on the host not established (§9). The burst/idle variants are
+outstanding.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
+step 5 summary". This document records what
+the soak tier is, what ten runs have established, and — at least as usefully —
 what they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
 configuration; the test programme's step 5 is the plan.
 
@@ -847,3 +850,89 @@ was checked by hand instead: `soak-app-5000` in the sink gives `1f5e7802-…`, a
 - **The checks were checked on synthetic series and listings only.** The
   programme's planted-defect controls on a throwaway branch — a leaked task per
   message, one leaked descriptor — are still to be run against a live stack.
+
+### The hour
+
+2026-09-15, 10:09:46–11:07:26 UTC, on the same images as the 20-minute run (built
+from `d74abc0`). The config was verified in the volume (the header on all three
+routes) and by `"senders": 2` in both startup lines. Nothing else was built on the
+host while it ran.
+
+| | `app` | `app2` |
+|---|---|---|
+| accepted | 36,010 of 36,010 | 36,010 of 36,010 |
+| p50 / p90 / p99 / max | 11.5 / 41.5 / 152.3 / 12,316 ms | 12.0 / 43.9 / 141.9 / 16,007 ms |
+| anon slope, quartile step | −5.20 MiB/h, −3.63 MiB | −3.35 MiB/h, −2.51 MiB |
+| descriptors, threads slope | −12.00 /h, 0 /h | −12.00 /h, 0 /h |
+| threads, before → at rest | 3 → 3 | 3 → 3 |
+| `tasks_alive`, before → at rest | 11 → 11 | 11 → 11 |
+| descriptors, before → at rest | 15 → 19 | 15 → 19 |
+| of which sockets | 9 → 13 | 9 → 13 |
+| unaccounted descriptors | 0 | 0 |
+| peak ESTABLISHED / CLOSE_WAIT | 30 / 0 | 30 / 0 |
+| log lines, ERROR | 79,744, 0 | 79,755, 0 |
+
+**No leak, conclusively, and the return to baseline asserted a second time.**
+Memory, descriptors and threads are flat on both instances after a 10-minute
+warm-up. `soak/rest/baseline` passed. As in the 20-minute run, the four new
+descriptors per instance are sockets the pools hold, and every other kind is
+identical before and after. F7 XFAILed: unmatched-sender series went from 304 to
+1,800 over the 50 post-warm-up minutes. Both F2 checks XFAILed, exactly as §8's
+hour did. Each instance had 11 relays cut by the session timeout, all 11 stored by
+the sink and told `421`, and `reservations_in_flight` stood at 11 after the drain.
+The warming-cancel ledger committed 418 of the 440 V4 messages the sink stored,
+and the sweeper expired 22 reservations.
+
+**The tail, traced: the link's first real use.** 282 messages on `app` and 285 on
+`app2` took over 200 ms, the slowest 12.3 s and 16.0 s. This is not F16 returning.
+Two greps settled where the time went:
+
+- `soak-app-2390` (12,316 ms) is `c8392643-…`. `app` logs its `relaying` at
+  10:14:04.516, and `downstream accepted the message` 144 ms later.
+- `soak-app2-2410` (16,007 ms) is `7af87612-…`. The downstream accepted it in 1 ms.
+
+So the time was spent before the relay began. The loadgen times each message from
+its *scheduled* instant, so a stall anywhere upstream is charged to every message
+queued behind it.
+
+The slow messages come in bursts, and in the same minutes of the load on both
+instances:
+
+| minute of the load | 3 | 4 | 18 | 19 | 21 | 27 | 30 | 33 |
+|---|---|---|---|---|---|---|---|---|
+| `app` over 200 ms | 15 | 181 | 1 | 37 | 8 | 33 | 1 | 6 |
+| `app2` over 200 ms | 21 | 170 | 1 | 40 | 12 | 34 | 1 | 6 |
+
+Both instances log §7.4 slow statements against the shared database in three
+clusters, counting slow pool acquires with them: 10:13–10:14 (53 on `app`, 51 on
+`app2`), 10:28 (8 and 10) and 10:36 (6 and 6). They are `COMMIT`s of 2–5 s, and the
+quota `INSERT` and commit `UPDATE`, the worst 9.1 s on `app` and 15.4 s on `app2`.
+15 of them are pool acquires of over 2 s. The clusters are spaced like the three large bursts (15 minutes, then
+8), and the traced message relayed at 10:14:04, inside the first. Don't convert
+the loadgen's `sent_ms` to wall-clock by arithmetic to match them, because the
+loadgen's clock is its own (§8). The instances share only the database, the host
+and a sink that answered in milliseconds. So the tail is **database stalls,
+waited out**. With no `statement_timeout` (F4) a stall is simply waited for, on
+every message queued behind it. The bursts at minutes 21 and 33 have no slow
+statement at all, so those stalls stayed under the 1 s threshold.
+
+**What stalled the database is not established.** It is not the checkpointer.
+Postgres checkpointed every five minutes all hour, each checkpoint's writes spread
+over 45–115 s and every sync 0.061 s or less. The stalls do not follow the
+checkpoints: 10:36 falls between two, and six other checkpoints had none. The host
+is shared, with about twenty other database containers on it. One of them,
+`vehicle-data-service-db`, went through crash recovery at 10:18:48 and shut down at
+10:29:56, inside the hour. So §6's warning is the likely explanation, but
+`docker events` kept no history for the window, and "likely" is as far as the
+evidence goes. §8's 538 ms tail, "at the same moments on both instances", has the
+same shape at a smaller size. It is probably the same mechanism, but its logs
+predate the link, so it has not been re-checked.
+
+### What the hour did not establish
+
+- **The cause of the stalls.** Showing it needs evidence the harness does not
+  collect: host I/O pressure (`/proc/pressure/io`) in the sampler, and the
+  database's wait events while a statement is slow.
+- **The planted-defect controls against a live stack.** They are still to run.
+  The 20-minute run's other two open points are closed: the link has traced a slow
+  message, and the at-rest checks now have a second clean run behind them.

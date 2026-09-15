@@ -3436,12 +3436,18 @@ nothing after that run but `docs/SOAK.md`; 876 after step 5c's seven self-tests.
   it. Step 5c settled the gate — a count back at its baseline at rest is a
   ratchet, not a leak, and the hour now passes (`docs/SOAK.md` §9) — but which
   blocking-pool job V4 adds is still not established.
-- **The V4 hour's latency tail**: a maximum of 538 ms against 263 ms, at the same
-  moments on both instances, cause not found.
+- **What stalls the shared database.** Step 5c's hour traced its 9–16 s tail
+  through the link. Simmer's downstream time for the slowest messages was 144 ms and
+  1 ms. The time went to §7.4 statements waiting on Postgres: `COMMIT`s of 2–5 s and
+  up to 15.4 s, on both instances at once, in three clusters (`docs/SOAK.md` §9).
+  It is not the checkpointer. Contention from other workloads on the shared host is
+  the suspicion, and it is not shown. The V4 hour's 538 ms tail, at the same moments
+  on both instances, is probably the same thing and has not been re-checked.
 - **Bursts, idle gaps (F10, CLOSE_WAIT) and the 24-hour run**, in `docs/SOAK.md`
   §7. The return to baseline as an assertion and the `correlation_id` ↔
-  `X-Test-Id` link were built in step 5c, and one 20-minute run has passed them
-  (§9); the planted-defect controls against a live stack are still to run.
+  `X-Test-Id` link were built in step 5c, and a 20-minute run and a clean hour have
+  passed them (§9). The planted-defect controls against a live stack are still to
+  run.
 - **`app2` while it runs.** Unscraped by design, so its registry is seen only in
   `final-app2.prom`.
 
