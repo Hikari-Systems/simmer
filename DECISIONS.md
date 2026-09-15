@@ -2604,9 +2604,23 @@ is recorded here, not as an amendment, as agreed with the project owner on
 - **The gates.** `cargo test`: 880 passed across 29 binaries, which is 876 before
   plus these three and the duplicate-delivery control. `clippy -D warnings` and
   `fmt` are clean.
-- **Not yet on the stack.** Stress S9 and a soak V4 run, as regression checks, and
-  the compose gate follow the planted-defect control that is running on the host
-  now.
+- **On the stack**, on images rebuilt from the final build (`simmer-app`
+  `1bcb1c078a90`):
+  - **The compose gate:** the stress stack came up with `--wait`, healthy.
+  - **Stress S9,** with a 25 s hold against a 20 s deadline: every check `ok`.
+    Four relays finished past the deadline and were answered `250`. Four were
+    deferred because the pool was full (§8.3). `baseline` and `accounting` were
+    clean.
+  - **Soak V4, 20 minutes (13:37–13:57 UTC): every check passed.** On each
+    instance there were 3 sessions. Each was ended by `421 4.4.2 session timeout`
+    in answer to the client's `RSET`: none at the dot, and nothing stored without
+    a reply. The warming-cancel ledger committed 120, exactly what was stored.
+    `reservations_in_flight` was 0 after the drain, and the at-rest checks were
+    back at baseline.
+
+  Two V4 runs before that one failed; `docs/SOAK.md` §8 records both. The first
+  failed on the unprompted `421`, which is what led to the grace. The second was
+  spoiled by leftover loadgens from its own harness.
 
 ### D-082 — A `DATA` line is read at most one byte past `MAX_DATA_LINE` (finding F1)
 

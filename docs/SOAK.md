@@ -13,8 +13,8 @@ logs it under; a fresh 20-minute run passed all three, and §8's hour, re-judged
 now passes. A clean hour then passed them again, with conclusive no-leak verdicts,
 and the link traced that hour's 9–16 s tail to database stalls both instances
 waited out, cause on the host not established (§9). F2 has since been fixed by
-D-081, and V4 and stress S9 are now its regression checks, not yet re-run on the
-stack. In the planted-defect controls (§10), duplicate delivery and run B fail exactly
+D-081. V4 and stress S9 are now its regression checks, and both pass on the
+stack (§8). In the planted-defect controls (§10), duplicate delivery and run B fail exactly
 as planted, but run A, a 64-byte-per-message leak, was **not** caught: the
 one-hour memory gate lacks the power its self-test claims. The burst/idle variants are
 outstanding.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
@@ -507,6 +507,13 @@ alongside two loadgens, two Simmer instances, a sink and Postgres. Other session
 share the host as well, and nothing in the harness can stop them: §3a's
 19-second database stall is the likely cost of one.
 
+**Stopping `soak_run` does not stop its loadgens.** The loadgens are
+`docker compose run -d` containers. Killing the test process leaves them sending
+for the rest of their `--duration`, into the next run's sink and quota rows. §8's
+F2 re-run found 48 phantom messages per instance that way, and a ledger 97 over.
+After an interrupted run, check `docker ps` for loadgen containers and stop them
+before starting another.
+
 **The loadgen containers report `unhealthy`, and it means nothing.** The
 `acceptance` stage is `FROM runtime`, so it inherits the server's `HEALTHCHECK`
 (`/app/server healthcheck`, probing 8080), which a loadgen never serves. The
@@ -773,6 +780,107 @@ One trap for whoever correlates these: the containers' clock ran about 7% slow
 against the loadgens' monotonic one — 3,355 s from first relay to last over a
 3,600 s load, and the sweeper's WARNs 279.6 s apart. Run-seconds cannot be turned
 into log timestamps by addition on this host.
+
+---
+
+### F2 fixed — the first runs against D-081, and what they found
+
+2026-09-15, on images built from `597b4a8` (D-081 and D-082).
+
+**V4, 20 minutes, 12:35–12:55 UTC.** On everything F2 is about, it passed:
+
+- No relay was cut. `reservations_in_flight` was 0 throughout, on both instances.
+- The warming-cancel ledger committed 120, exactly the 60 + 60 messages accepted,
+  and the sweeper expired nothing.
+- On the main load, 12,010 of 12,010 were accepted on each instance, and both came
+  back to baseline at rest.
+
+It **failed `soak/V4/driven`**: "the session timeout fired in 0 of 3 sessions".
+Each session was 20 accepted messages, then five that never got a reply. The 21st
+was recorded as `transport: write: Broken pipe`, and the rest as `not_sent`. Two
+things combined:
+
+- **Simmer, at the boundary.** The first build refused unprompted. The moment the
+  20th relay finished, past the 300 s deadline, it sent `250`, then `421`, and
+  closed the socket. The client, already starting its next message, wrote into a
+  socket that had just been closed, and got a broken pipe instead of the `421`.
+  D-081 now waits up to 2 s for the next command and answers that command `421`.
+- **The loadgen.** Between messages it writes `RSET`, and it read the reply
+  without looking at the code. Even with the refusal answering `RSET`, it would
+  have written `MAIL FROM` into the closed connection and recorded a transport
+  failure. It now records a non-`250` reply to `RSET` with its code and stage
+  `rset`, and ends the session there, like any other refusal.
+
+**Neither shows up on loopback.** A V4-shaped test in `tests/loadgen_sink.rs`,
+with the real loadgen and sink, a 2 s session and a 1 s hold at the dot, passes
+with the grace disabled: there, only the loadgen fix is needed. So the grace is
+proven by V4 on the stack, and nowhere else.
+
+**Stress S8a** passed every check, with peak anon at 5.5 MiB against a 96 MiB
+bound. That confirms D-082 on the stack.
+
+**Stress S9 took three attempts, and none of the failures was F2:**
+
+1. **Setup failed:** "the sink never answered its stats". The harness addressed
+   the stack's published ports on `127.0.0.1`, and the jail these runs are driven
+   from cannot reach them: the same trap as §6's `app` scraping. Two variables now
+   override those addresses, `SIMMER_TEST_ADMIN` and `SIMMER_TEST_SINK_STATS`.
+   They default to the loopback, and from the jail they name the containers on the
+   Docker network.
+2. **With a 30 s hold at the dot**, the relays were no longer cut at the 20 s
+   deadline. They finished with `250` at 30,003 ms, milliseconds after the
+   loadgen's own 30 s wait had expired. `bare-close` and `accounting` failed, and
+   the sink had four messages stored that no client heard about. The scenario
+   itself broke the README's "Timeout budget" rule. Its hold is now 25 s, and
+   D-081 records the lesson.
+3. **With a 25 s hold,** only `accounting` failed. The reconciler counted every
+   stalled message as ambiguous, which was true in S9 only while the old code cut
+   them all. Simmer answers a client `2xx` only after the downstream's own `2xx`,
+   so a stall whose client was told `2xx` had its late reply seen in time, and is
+   no longer counted. A stall answered `4xx` still is. A self-test pins both.
+
+**V4 on the final build, 13:15–13:35 UTC, detached: clean for Simmer, spoiled by
+its own harness.** For this run's own traffic, D-081 behaved exactly as intended
+on both instances:
+
+- There were 3 sessions, and each was ended by `421 4.4.2 session timeout` in
+  answer to the client's `RSET` (stage `rset`), with the rest of the session
+  `not_sent`.
+- No relay was cut at the dot, and nothing was stored without a reply.
+- `reservations_in_flight` was 0 after the drain, and `driven` passed.
+
+Two checks failed, both on traffic that was not this run's:
+
+- `delivery` found 48 phantom V4 messages per instance: ids 9017–9069 and
+  5792–5844, where this run's were 0–74.
+- `accounting` found the ledger at 217, against the 120 the sink stored for this
+  run. That is the same 96 messages, plus one.
+
+They came from the first attempt's V4 loadgens. That attempt was stopped after
+four minutes so it could be relaunched detached. Stopping it killed `soak_run`,
+but not the loadgen containers `soak_run` had started with `docker compose run -d`
+(§6). Those went on sending their 15-minute stream into the same sink and the same
+quota row until about 13:27. A third run, with no loadgen container left running,
+gives the verdict.
+
+**V4 run 3, 13:37–13:57 UTC: passed.** It used the same images, with no loadgen
+left over, and every check passed on both instances:
+
+| | `app` | `app2` |
+|---|---|---|
+| V4 messages | 75, in 3 sessions | 75, in 3 sessions |
+| `250` at the dot | 60 | 60 |
+| `421 session timeout` at `rset` | 3, one per session | 3 |
+| relays cut at the dot | 0 | 0 |
+| stored without a reply | 0 | 0 |
+| `reservations_in_flight` after the drain | 0 | 0 |
+| main load accepted | 12,010 of 12,010 | 12,010 of 12,010 |
+| threads and tasks, before → at rest | 3 → 3, 11 → 11 | 3 → 3, 11 → 11 |
+
+The warming-cancel ledger committed 120, exactly the messages stored, and the
+sweeper expired nothing. F7 XFAILed as always. `app`'s last scrape during the load
+read a `reservations_in_flight` of 1, which was a relay in flight at that moment;
+after the drain it was 0. F2 is fixed, and V4 now checks that on every run.
 
 ---
 
