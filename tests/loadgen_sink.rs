@@ -182,6 +182,31 @@ async fn a_sink_that_loses_mail_is_caught_end_to_end() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sink_that_stores_mail_twice_is_caught_end_to_end() {
+    // Checking the check: every 20th message is recorded twice. A reconciler
+    // that passes this run would pass a relay that sends duplicates (R2).
+    let report = run(
+        &["--duplicate-every", "20"],
+        &["--count", "200", "--concurrency", "16"],
+        210,
+    )
+    .await;
+    let duplicated = report
+        .violations
+        .iter()
+        .filter(|v| v.contains("stored 2 times (duplicate delivery)"))
+        .count();
+    assert_eq!(duplicated, 10, "{:#?}", report.violations);
+    assert_eq!(
+        report.violations.len(),
+        10,
+        "a duplicate is the only fault planted: {:#?}",
+        report.violations
+    );
+    assert_eq!(report.accepted, 200, "{report:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_downstream_that_hangs_up_after_the_dot_is_ambiguous_not_lost() {
     // §10.2: the sink stores one message in ten and hangs up before answering.
     // Simmer cannot know, so it must answer 451 — never 250 — and never retry

@@ -53,6 +53,7 @@ struct Opts {
     slow: Duration,
     idle_close: Option<Duration>,
     lose_every: Option<u64>,
+    duplicate_every: Option<u64>,
 }
 
 fn opts() -> Opts {
@@ -70,6 +71,7 @@ fn opts() -> Opts {
         slow: Duration::ZERO,
         idle_close: None,
         lose_every: None,
+        duplicate_every: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -104,6 +106,11 @@ fn opts() -> Opts {
             // The self-check mode: answer 250 and record nothing, every Nth
             // message. A reconciler that passes this run is broken.
             "--lose-every" => o.lose_every = Some(value().parse().expect("--lose-every")),
+            // The other self-check: record the same message twice, every Nth.
+            // A reconciler that passes this run misses duplicate delivery.
+            "--duplicate-every" => {
+                o.duplicate_every = Some(value().parse().expect("--duplicate-every"))
+            }
             other => panic!("unknown argument {other}"),
         }
         i += 2;
@@ -152,6 +159,7 @@ struct Outcomes {
     dropped_after_dot: AtomicU64,
     stalled_at_dot: AtomicU64,
     lost: AtomicU64,
+    duplicated: AtomicU64,
     mismatches: AtomicU64,
 }
 
@@ -239,7 +247,7 @@ impl State {
             .collect();
         let o = &self.outcomes;
         format!(
-            r#"{{"listeners":{{{}}},"peers":{{{}}},"outcomes":{{"delivered":{},"rejected":{},"dropped_before_dot":{},"dropped_after_dot":{},"stalled_at_dot":{},"lost":{},"mismatches":{}}}}}"#,
+            r#"{{"listeners":{{{}}},"peers":{{{}}},"outcomes":{{"delivered":{},"rejected":{},"dropped_before_dot":{},"dropped_after_dot":{},"stalled_at_dot":{},"lost":{},"duplicated":{},"mismatches":{}}}}}"#,
             listeners.join(","),
             peers.join(","),
             o.delivered.load(Ordering::SeqCst),
@@ -248,6 +256,7 @@ impl State {
             o.dropped_after_dot.load(Ordering::SeqCst),
             o.stalled_at_dot.load(Ordering::SeqCst),
             o.lost.load(Ordering::SeqCst),
+            o.duplicated.load(Ordering::SeqCst),
             o.mismatches.load(Ordering::SeqCst),
         )
     }
@@ -633,6 +642,14 @@ async fn deliver(
         st.outcomes.lost.fetch_add(1, Ordering::SeqCst);
     } else {
         st.record(id, "delivered", listener, conn, peer, mismatch, correlation);
+        if st
+            .opts
+            .duplicate_every
+            .is_some_and(|every| every > 0 && n.is_multiple_of(every))
+        {
+            st.outcomes.duplicated.fetch_add(1, Ordering::SeqCst);
+            st.record(id, "delivered", listener, conn, peer, mismatch, correlation);
+        }
     }
     reply(io, "250 2.0.0 stored\r\n").await
 }

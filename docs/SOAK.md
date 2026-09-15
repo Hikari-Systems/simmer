@@ -936,3 +936,43 @@ predate the link, so it has not been re-checked.
 - **The planted-defect controls against a live stack.** They are still to run.
   The 20-minute run's other two open points are closed: the link has traced a slow
   message, and the at-rest checks now have a second clean run behind them.
+
+---
+
+## 10. Checking the checks — the planted-defect controls
+
+A check that has never failed has not shown it can. The test programme's
+Verification asks for each check to be seen failing on the defect it exists for. Two
+already had been: the CA negative control (`tests/acceptance.rs`) and planted loss
+(`--lose-every`, in `tests/loadgen_sink.rs` and stress). Three more follow. Runs B
+and A were planted on a throwaway branch that was never pushed and built as the
+soak's images.
+
+**Duplicate delivery fails U3.** `sink --duplicate-every N` records every Nth
+delivery twice. `a_sink_that_stores_mail_twice_is_caught_end_to_end` sends 200
+messages with N = 20. It passes only on exactly ten `stored 2 times (duplicate
+delivery)` violations, nothing else, and all 200 accepted, and it does pass. It is in
+`cargo test` and needs no Docker.
+
+**Run B — a leaked task per message and one leaked descriptor fail
+`soak/rest/baseline`.** The plant: `tokio::spawn(std::future::pending::<()>())`
+after every relay's commit or release, and `/proc/self/stat` opened and forgotten
+once per process. It ran on 2026-09-15, 11:13–11:19 UTC, for five minutes with V4
+off. Both containers ran the planted image, `cc3171f78421`, per `docker inspect`.
+Exactly one check failed, and it failed on both plants, on both instances:
+
+> soak/rest/baseline failed: app: 3021 tasks alive at rest, against 11 before the
+> first message; app: 1 descriptors open at rest that were not open before the first
+> message and that no pool holds: /proc/1/stat; app2: *the same*
+
+3,021 − 11 = 3,010: one task per message relayed. Nothing else failed. Threads went
+3 → 3, all 3,010 messages were accepted on each instance, and F7 XFAILed as always.
+The leak verdicts were inconclusive, as a five-minute run's must be.
+
+**Run A — a 64-byte leak per message must fail the memory slope.** It runs
+separately from B, because leaked tasks cost memory of their own and would confound
+it. The plant is only
+`std::hint::black_box(Box::leak(vec![1u8; 64].into_boxed_slice()))` per relayed
+message, about 2.2 MiB an hour at 10 msg/s, the calibration target in
+`tests/compose/leak.rs`. It needs a full hour. If the gate misses it, that is a
+finding about the gate's power, recorded rather than tuned away.
