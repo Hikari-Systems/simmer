@@ -291,10 +291,11 @@ fn s5b_an_auth_storm_on_eight_cpus_stays_within_memory() {
 #[test]
 #[ignore = "needs the stress compose profile"]
 fn s8a_a_data_line_with_no_terminator_is_bounded(/* F1 */) {
-    // One client reaches DATA and sends 300 MiB with no line ending. Finding F1:
-    // the line is buffered whole because MAX_DATA_LINE is checked only after the
-    // read, so anon climbs past the bound. A known finding until the length is
-    // checked as the line is read.
+    // One client reaches DATA and sends 300 MiB with no line ending. Until D-082
+    // (finding F1) the line was buffered whole, because MAX_DATA_LINE was checked
+    // only after the read, and anon climbed past the bound. Now each read stops
+    // one byte past the cap and the rest of the line is discarded as it arrives,
+    // so the memory check is the regression.
     let _logs = STRESS.logs_on_failure();
     let mut s = Scenario::sending(
         "S8a",
@@ -313,9 +314,10 @@ fn s8a_a_data_line_with_no_terminator_is_bounded(/* F1 */) {
         ],
     );
     s.max_anon_mib = Some(96.0);
-    // F1's other face: the session is buffering the whole line, so it ends by
-    // dropping the client rather than answering — tolerated here (the memory
-    // bound is the gate), and how Simmer logs it is not U7's business.
+    // With no LF ever sent, the session ends at its data timeout or at the
+    // client's hold, whichever comes first, so a close with no reply is still
+    // tolerated here. The memory bound is the gate, and how Simmer logs the end
+    // is not U7's business.
     s.bare_close_ok = true;
     s.expected_errors = &["data line too long", "MAX_DATA_LINE"];
     let seen = run(&s);

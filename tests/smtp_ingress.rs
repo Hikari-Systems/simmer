@@ -779,6 +779,67 @@ async fn the_session_deadline_cuts_a_data_transfer_short() {
 }
 
 // ---------------------------------------------------------------------------
+// §5.5 — the DATA line limit (D-082, finding F1)
+// ---------------------------------------------------------------------------
+
+/// A message whose body is one line of `len` bytes, its CRLF included.
+fn one_long_line(len: usize) -> String {
+    format!(
+        "From: jane@oldbrand.com\r\nSubject: long\r\n\r\n{}\r\n",
+        "a".repeat(len - 2)
+    )
+}
+
+#[tokio::test]
+async fn a_data_line_at_the_limit_is_accepted() {
+    // 65,536 bytes with its CRLF is MAX_DATA_LINE exactly: accepted before D-082,
+    // and still.
+    let down = FakeDownstream::start(Script::default()).await;
+    let simmer = Simmer::start(&config_for(down.addr, "")).await;
+
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    let r = c
+        .deliver("jane@oldbrand.com", "bob@gmail.com", &one_long_line(65_536))
+        .await;
+    assert_eq!(r.code, 250, "{r:?}");
+}
+
+#[tokio::test]
+async fn a_data_line_one_byte_over_the_limit_is_refused_at_the_dot() {
+    // The read's cap is MAX_DATA_LINE + 1, so this line's LF is still inside it.
+    let down = FakeDownstream::start(Script::default()).await;
+    let simmer = Simmer::start(&config_for(down.addr, "")).await;
+
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    let r = c
+        .deliver("jane@oldbrand.com", "bob@gmail.com", &one_long_line(65_537))
+        .await;
+    assert_eq!(r.code, 552, "{r:?}");
+    assert!(c.is_closed().await, "D-020: the connection is closed");
+    assert!(down.last().is_none(), "an over-long message is not relayed");
+}
+
+#[tokio::test]
+async fn a_data_line_past_the_read_cap_is_discarded_and_refused_at_the_dot() {
+    // The capped read stops short of this line's LF, so the rest is discarded up
+    // to it. The 552 shows the discard stopped there: otherwise the dot would
+    // never be seen, and the data timeout would answer instead.
+    let down = FakeDownstream::start(Script::default()).await;
+    let simmer = Simmer::start(&config_for(down.addr, "")).await;
+
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    let r = c
+        .deliver("jane@oldbrand.com", "bob@gmail.com", &one_long_line(70_000))
+        .await;
+    assert_eq!(r.code, 552, "{r:?}");
+    assert!(c.is_closed().await, "D-020: the connection is closed");
+    assert!(down.last().is_none(), "an over-long message is not relayed");
+}
+
+// ---------------------------------------------------------------------------
 // §5.4 — routing decisions surfaced to the client
 // ---------------------------------------------------------------------------
 

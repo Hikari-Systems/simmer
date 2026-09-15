@@ -2582,6 +2582,51 @@ is recorded here, not as an amendment, as agreed with the project owner on
   the compose gate follow the planted-defect control that is running on the host
   now.
 
+### D-082 — A `DATA` line is read at most one byte past `MAX_DATA_LINE` (finding F1)
+
+**Found:** by the test programme, in `tests/finding_f1_data_line.rs` and stress
+S8a. `read_data_inner` read each line with `read_until(b'\n')` and no `take()`, so
+`MAX_DATA_LINE` (64 KiB) was checked only once the whole line was in memory. One
+client on an allowed address could grow a session's line buffer for as long as
+`timeouts.data` allowed. The finding's test saw peak resident memory grow past its
+16 MiB allowance on a 64 MiB line, and S8a's 300 MiB line pushed cgroup anon past
+its bound. `max_message_bytes` did not help: it limits what is kept, not what is
+read into the line.
+
+**Decision:** the command reader's pattern (`take(MAX_COMMAND_LINE)`). Each read
+takes at most `MAX_DATA_LINE + 1` bytes, and a line longer than the cap marks the
+message over-long. If the cap stopped the read short of the line's LF, the rest of
+the line is read and dropped a buffer at a time, up to and including that LF. It
+cannot hold the terminator, which is a line of its own.
+
+Nothing a client sees changes. The reply is still `552` at the terminating dot,
+with the connection closed (D-020), exactly as for a long line that fitted in
+memory. The limit is where it was: a line of 65,536 bytes with its CRLF is
+accepted, and one byte more is not.
+
+**Not chosen:** answering as soon as the line overflows, mid-`DATA`. A reply
+before the dot puts a pipelining client out of step, and D-020 already settled
+that an over-long message is answered at the dot and the connection closed.
+
+**Verified:**
+
+- **`tests/finding_f1_data_line.rs`, without its `xfail`.** A 64 MiB line with no
+  LF, then the dot, gets `552`, and peak resident memory grows by less than the
+  test's 16 MiB allowance. Before the fix this assertion failed, and the test
+  passed only because it was wrapped in `xfail`.
+- **Three §5.5 tests in `tests/smtp_ingress.rs`** pin the limit where it was:
+  - 65,536 bytes with the CRLF is accepted.
+  - 65,537 bytes is refused `552` at the dot. The capped read still reaches the LF.
+  - 70,000 bytes is refused `552` at the dot. This one goes through the discard
+    path.
+
+  Both refusals close the connection and relay nothing. These tests pin behaviour
+  that did not change, so they would have passed before the fix too. The F1 test
+  is the one that went from failing to passing.
+- **The gates.** `cargo test`: 883 passed across 29 binaries, which is 880 plus
+  these three. `clippy -D warnings` and `fmt` are clean.
+- **Not yet on the stack:** stress S8a.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

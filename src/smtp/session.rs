@@ -865,8 +865,11 @@ impl Session {
 
         loop {
             line.clear();
-            let n = self
-                .io
+            // D-082 (finding F1): at most one byte past the cap, so an over-long
+            // line is known to be one without being held whole. `read_until`
+            // alone kept a line with no LF for as long as the client kept sending.
+            let n = (&mut self.io)
+                .take(MAX_DATA_LINE as u64 + 1)
                 .read_until(b'\n', &mut line)
                 .await
                 .map_err(|_| DataError::Io)?;
@@ -879,6 +882,13 @@ impl Session {
 
             if line.len() > MAX_DATA_LINE {
                 over = true;
+                // If the cap stopped the read short of the LF, the rest of the
+                // line is still in the stream, and is thrown away as it arrives.
+                // It cannot hold the terminator, which is a line of its own.
+                if !line.ends_with(b"\n") {
+                    self.discard_line().await?;
+                }
+                continue;
             }
 
             // Strip the line ending. A bare LF is promoted to CRLF by virtue of
@@ -907,6 +917,25 @@ impl Session {
             if !over {
                 body.append(content).await.map_err(|_| DataError::Io)?;
                 body.append(b"\r\n").await.map_err(|_| DataError::Io)?;
+            }
+        }
+    }
+
+    /// The rest of an over-long `DATA` line, up to and including its LF, read and
+    /// dropped a buffer at a time (D-082).
+    async fn discard_line(&mut self) -> Result<(), DataError> {
+        loop {
+            let buf = self.io.fill_buf().await.map_err(|_| DataError::Io)?;
+            if buf.is_empty() {
+                return Err(DataError::Closed);
+            }
+            let (used, done) = match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (buf.len(), false),
+            };
+            self.io.consume(used);
+            if done {
+                return Ok(());
             }
         }
     }

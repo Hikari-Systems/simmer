@@ -1,13 +1,5 @@
 [
   {
-    "id": "F1",
-    "check": "stress/S8a/memory",
-    "because": [
-      "cgroup anon peaked"
-    ],
-    "note": "A DATA line with no LF is buffered whole (src/smtp/session.rs read_until without take), so a 300 MiB no-LF line grows anon well past the bound before MAX_DATA_LINE is checked. Also pinned in cargo test: tests/finding_f1_data_line.rs."
-  },
-  {
     "id": "F7",
     "check": "soak/V3/metric-series",
     "because": [
