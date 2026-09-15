@@ -677,6 +677,107 @@ async fn a_stalled_data_transfer_times_out_with_421() {
     );
 }
 
+#[tokio::test]
+async fn a_client_that_keeps_busy_is_still_refused_at_the_session_deadline() {
+    // `timeouts.session` exists for this client: every command well inside the
+    // per-command budget, so only the session's own deadline ever ends it.
+    let down = FakeDownstream::start(Script::default()).await;
+    let cfg = config_for(down.addr, "").replace(
+        "timeouts: { command: 5s, data: 5s, session: 60s }",
+        "timeouts: { command: 5s, data: 5s, session: 2s }",
+    );
+    let simmer = Simmer::start(&cfg).await;
+
+    let started = std::time::Instant::now();
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    for _ in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(c.command("NOOP").await.code, 250);
+    }
+
+    // Now idle. The command budget would allow five more seconds; the session's
+    // deadline allows well under one.
+    let r = c.read_reply().await;
+    assert_eq!(r.code, 421, "{r:?}");
+    assert!(r.contains("session timeout"), "{r:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "refused after {:?}; the deadline was 2 s",
+        started.elapsed()
+    );
+    assert!(c.is_closed().await, "421 closes the connection");
+}
+
+#[tokio::test]
+async fn a_command_pipelined_past_the_session_deadline_is_not_served() {
+    // D-081: with no time left, a command already buffered is refused rather than
+    // read — otherwise a client that keeps its pipe full is never refused. The
+    // relay runs past the deadline with a NOOP queued behind its dot.
+    let down = FakeDownstream::start(Script::with(|s| {
+        s.final_dot_delay = Some(std::time::Duration::from_secs(2));
+    }))
+    .await;
+    let cfg = config_for(down.addr, "")
+        .replace(
+            "timeouts: { command: 5s, data: 5s, session: 60s }",
+            "timeouts: { command: 5s, data: 5s, session: 1s }",
+        )
+        .replace(
+            "timeouts: { connect: 2s, command: 2s, data: 2s }",
+            "timeouts: { connect: 2s, command: 2s, data: 5s }",
+        );
+    let simmer = Simmer::start(&cfg).await;
+
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    assert_eq!(c.command("MAIL FROM:<jane@oldbrand.com>").await.code, 250);
+    assert_eq!(c.command("RCPT TO:<bob@gmail.com>").await.code, 250);
+    assert_eq!(c.command("DATA").await.code, 354);
+    c.send_raw(b"From: jane@oldbrand.com\r\nSubject: hi\r\n\r\nhello\r\n.\r\nNOOP\r\n")
+        .await;
+
+    let dot = c.read_reply().await;
+    assert_eq!(dot.code, 250, "the relay finishes and is answered: {dot:?}");
+    let r = c.read_reply().await;
+    assert_eq!(r.code, 421, "the pipelined NOOP must not be served: {r:?}");
+    assert!(r.contains("session timeout"), "{r:?}");
+}
+
+#[tokio::test]
+async fn the_session_deadline_cuts_a_data_transfer_short() {
+    // D-081 caps every wait on the client by the time the session has left, so a
+    // data budget longer than that does not outlive it.
+    let down = FakeDownstream::start(Script::default()).await;
+    let cfg = config_for(down.addr, "").replace(
+        "timeouts: { command: 5s, data: 5s, session: 60s }",
+        "timeouts: { command: 5s, data: 5s, session: 1s }",
+    );
+    let simmer = Simmer::start(&cfg).await;
+
+    let started = std::time::Instant::now();
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    assert_eq!(c.command("MAIL FROM:<jane@oldbrand.com>").await.code, 250);
+    assert_eq!(c.command("RCPT TO:<bob@gmail.com>").await.code, 250);
+    assert_eq!(c.command("DATA").await.code, 354);
+    c.send_raw(b"From: jane@oldbrand.com\r\nSubject: never finished\r\n")
+        .await;
+
+    let r = c.read_reply().await;
+    assert_eq!(r.code, 421, "{r:?}");
+    assert!(r.contains("session timeout"), "{r:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "refused after {:?}; the deadline was 1 s and the data budget 5 s",
+        started.elapsed()
+    );
+    assert!(
+        down.last().is_none(),
+        "an unfinished message must not be relayed"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // §5.4 — routing decisions surfaced to the client
 // ---------------------------------------------------------------------------

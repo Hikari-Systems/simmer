@@ -95,6 +95,9 @@ pub struct Session {
     transaction: Option<Transaction>,
     /// §9.5 — one per message, regenerated at each `MAIL FROM`.
     correlation_id: String,
+    /// D-081 — when `timeouts.session` runs out. Every wait on the client is
+    /// capped by it; a relay in flight never is.
+    deadline: tokio::time::Instant,
 }
 
 /// State between `MAIL FROM` and the final dot.
@@ -129,6 +132,8 @@ impl Session {
         verifies: VerifyLimit,
         policy: Arc<Policy>,
     ) -> Self {
+        // D-081 — from here, the instant the caller's timer used to start.
+        let deadline = tokio::time::Instant::now() + engine.config.server.timeouts.session;
         Self {
             io: BufReader::new(io),
             peer,
@@ -144,11 +149,26 @@ impl Session {
             auth_state: None,
             transaction: None,
             correlation_id: new_correlation_id(),
+            deadline,
         }
     }
 
     fn config(&self) -> &Config {
         &self.engine.config
+    }
+
+    /// D-081 — how long a wait may take: a stage's own budget, or what is left of
+    /// `timeouts.session` if that is shorter. The flag says the deadline is what
+    /// bounds it, so its expiry is reported as the session's and not the stage's.
+    fn budget(&self, stage: Duration) -> (Duration, bool) {
+        let left = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        if left < stage {
+            (left, true)
+        } else {
+            (stage, false)
+        }
     }
 
     fn encrypted(&self) -> bool {
@@ -172,8 +192,10 @@ impl Session {
 
     /// Drive the session to completion.
     ///
-    /// The whole thing is wrapped in `timeouts.session` by the caller, so this
-    /// only handles the per-command budget.
+    /// `timeouts.session` is enforced here rather than by the caller (D-081):
+    /// every wait on the client is capped by what the session has left, and a
+    /// relay in flight is never cut. A session can therefore overrun its deadline
+    /// by one relay's downstream budget, and by no more.
     pub async fn run(&mut self) -> SessionEnd {
         let hostname = self.config().server.hostname.clone();
         if self.send(&reply::greeting(&hostname)).await.is_err() {
@@ -187,6 +209,10 @@ impl Session {
                 Err(ReadError::Timeout) => {
                     let _ = self.send(&reply::command_timeout()).await;
                     return SessionEnd::CommandTimeout;
+                }
+                Err(ReadError::SessionTimeout) => {
+                    let _ = self.send(&reply::session_timeout()).await;
+                    return SessionEnd::SessionTimeout;
                 }
                 Err(ReadError::TooLong) => {
                     // Do not close: RFC 2920 wants us to stay in step. But the
@@ -363,7 +389,9 @@ impl Session {
             return Ok(Some(SessionEnd::TlsFailed));
         };
 
-        let timeout = self.config().server.timeouts.command;
+        // A handshake that the deadline cuts short ends like one that timed out:
+        // there is no channel left to report on either way.
+        let (timeout, _) = self.budget(self.config().server.timeouts.command);
         match tokio::time::timeout(timeout, acceptor.accept(tcp)).await {
             Ok(Ok(tls)) => *self.io.get_mut() = Stream::Tls(Box::new(tls.into())),
             // There is no channel left to report on: the TLS layer owns the
@@ -477,7 +505,13 @@ impl Session {
                 // D-079 — and not more than the verification bound at once.
                 let verifier = Arc::clone(&self.verifier);
                 let u = username.clone();
-                let permit = self.verifies.acquire().await;
+                // D-081 — waiting for a permit is not waiting on the client, but
+                // it is a wait inside the session, so the deadline bounds it too.
+                let (left, _) = self.budget(Duration::MAX);
+                let Ok(permit) = tokio::time::timeout(left, self.verifies.acquire()).await else {
+                    let _ = self.send(&reply::session_timeout()).await;
+                    return Ok(Some(SessionEnd::SessionTimeout));
+                };
                 let ok =
                     tokio::task::spawn_blocking(move || verifier.verify_blocking(&u, &password))
                         .await
@@ -665,6 +699,11 @@ impl Session {
                 let _ = self.send(&reply::data_timeout()).await;
                 return Ok(Some(SessionEnd::CommandTimeout));
             }
+            Err(DataError::SessionTimeout) => {
+                self.reset_transaction();
+                let _ = self.send(&reply::session_timeout()).await;
+                return Ok(Some(SessionEnd::SessionTimeout));
+            }
             Err(DataError::Closed) => return Ok(Some(SessionEnd::ClientClosed)),
             Err(DataError::Io) => return Err(()),
         }
@@ -760,7 +799,13 @@ impl Session {
     // -- I/O -------------------------------------------------------------
 
     async fn read_command_line(&mut self) -> Result<Option<String>, ReadError> {
-        let timeout = self.config().server.timeouts.command;
+        let (timeout, by_deadline) = self.budget(self.config().server.timeouts.command);
+        // `timeout` polls the read once before looking at the clock, so a command
+        // already pipelined would still be served with no time left. Without this,
+        // a client that keeps its pipe full is never refused.
+        if by_deadline && timeout.is_zero() {
+            return Err(ReadError::SessionTimeout);
+        }
         let read = async {
             let mut line = String::new();
             let n = (&mut self.io)
@@ -771,6 +816,7 @@ impl Session {
         };
 
         match tokio::time::timeout(timeout, read).await {
+            Err(_) if by_deadline => Err(ReadError::SessionTimeout),
             Err(_) => Err(ReadError::Timeout),
             Ok((Err(_), _)) => Err(ReadError::Io),
             Ok((Ok(0), _)) => Ok(None),
@@ -788,14 +834,22 @@ impl Session {
     ///
     /// The whole transfer shares one `timeouts.data` budget rather than one per
     /// line: a per-line timeout cannot distinguish a slow link from a stalled one
-    /// on a message with a million lines.
+    /// on a message with a million lines. It is capped by what the session has
+    /// left (D-081).
     async fn read_data(
         &mut self,
         body: &mut MessageBuffer,
         max: u64,
         timeout: Duration,
     ) -> Result<(), DataError> {
-        match tokio::time::timeout(timeout, self.read_data_inner(body, max)).await {
+        let (budget, by_deadline) = self.budget(timeout);
+        // As in `read_command_line`: a body already buffered is not read with no
+        // time left.
+        if by_deadline && budget.is_zero() {
+            return Err(DataError::SessionTimeout);
+        }
+        match tokio::time::timeout(budget, self.read_data_inner(body, max)).await {
+            Err(_) if by_deadline => Err(DataError::SessionTimeout),
             Err(_) => Err(DataError::Timeout),
             Ok(r) => r,
         }
@@ -870,9 +924,9 @@ impl Session {
         self.transaction = None;
     }
 
-    /// Emit a final reply on a session being terminated from outside — §10.4
-    /// shutdown, or the `timeouts.session` ceiling. Best-effort: the peer may
-    /// already be gone, and there is nothing useful to do if it is.
+    /// Emit a final reply on a session being terminated from outside — §10.4's
+    /// hard stop. Best-effort: the peer may already be gone, and there is nothing
+    /// useful to do if it is.
     pub async fn refuse(&mut self, r: &Reply) {
         let _ = self.send(r).await;
     }
@@ -892,12 +946,16 @@ impl Session {
 
 enum ReadError {
     Timeout,
+    /// D-081 — the session's deadline ran out, not the command budget.
+    SessionTimeout,
     TooLong,
     Io,
 }
 
 enum DataError {
     Timeout,
+    /// D-081 — the session's deadline ran out, not the data budget.
+    SessionTimeout,
     TooLarge,
     Closed,
     Io,

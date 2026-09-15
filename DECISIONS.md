@@ -2503,6 +2503,85 @@ separate decision.
 - `cargo test` 869 passed across 29 binaries, `clippy -D warnings`, `fmt` and
   `cargo deny check` clean.
 
+### D-081 — `timeouts.session` is enforced at waits on the client, never mid-relay (finding F2)
+
+**Found:** by the test programme — `tests/findings.rs`, stress S9 and soak V4
+(`docs/SOAK.md` §8). The session ceiling was a `tokio::select!` around the whole
+session in `smtp::handle`, and when it fired during the downstream conversation it
+dropped the relay future:
+
+- The downstream had stored the message, and the client was told `421`. It would
+  retry, so the recipient got the message twice.
+- `reserve_relay_commit`'s commit or release never ran. The route's ledger was
+  short by every cut, and the reservation row waited for the sweeper, which
+  releases it as if the send had failed.
+- The entry stayed in the §10.4 registry for the life of the process, so
+  `simmer_reservations_in_flight` climbed by one per cut: eleven an hour per
+  instance in V4's hours.
+
+**Decision:** the deadline is a field of the session, fixed when the session
+starts, and it caps every wait inside the session: the command read, the `DATA`
+read, the `STARTTLS` handshake and D-079's permit wait. When the cap, not the
+stage's own budget, is what runs out, the reply is `421 4.4.2 session timeout`, as
+before.
+
+With no time left, a read is refused outright rather than attempted.
+`tokio::time::timeout` polls its future once before it looks at the clock, so a
+command the client had already pipelined would still be served, and a client that
+kept its pipe full would never be refused.
+
+A relay in flight is never cut. It finishes, the client gets the real reply, and
+the next wait on the client is refused at once. The timer arm of `handle`'s
+`select!` is gone. §10.4's hard stop stays.
+
+**What it costs:** a session can outlive `timeouts.session` by one relay, and a
+relay is bounded. The pool checkout waits at most the route's `connect` budget
+(`pool.rs`), and the conversation itself is bounded by `connect`, `command` and
+`data` (§8.4). The README's "Timeout budget" puts the conversation at 160 s at the
+shipped defaults, so the overrun is at most 170 s, against a 600 s ceiling. The
+quota statements on either side of the conversation have no timeout until F4 is
+fixed, so a stalled database stretches the overrun as it stretches everything else.
+
+**Against the spec:** §8.4 lists only per-stage timeouts, and §4.1 has
+`timeouts.session` in its schema without saying what it bounds. "A hard ceiling on
+the whole conversation" was this code's own comment, not the spec's. So the change
+is recorded here, not as an amendment, as agreed with the project owner on
+2026-09-15.
+
+**Not chosen:**
+
+- **Running the relay as its own task,** so that commit or release always runs.
+  That fixes the ledger and the registry, but it still tells the client `421` for a
+  stored message, so the duplicate stays.
+- **A guard that removes the reservation from the registry when the relay is
+  dropped.** This was approved alongside the decision as defence in depth, then
+  left out. After this change the only relay still dropped mid-flight is the §10.4
+  hard stop's, and that is the one case the registry exists for
+  (`quota/registry.rs`): `main` fires `hard_stop` and then drains the registry to
+  release what the cut sessions held. A guard removing the entry on drop would race
+  that drain, and any reservation it won would wait for the sweeper instead of being
+  released at shutdown.
+
+**Verified:**
+
+- **`tests/findings.rs`'s F2 test, without its `xfail`.** The downstream holds the
+  dot for 3 s against a 1 s session. The client is told `250`. The next reply is an
+  unprompted `421 … session timeout`, followed by a close. The reservation is
+  committed once and never released, and the registry is empty.
+- **Three §8.4 tests in `tests/smtp_ingress.rs`:**
+  - A client sending `NOOP` every 400 ms is still refused within its 2 s deadline,
+    well inside the 5 s command budget.
+  - A `DATA` transfer is cut at a 1 s deadline despite a 5 s data budget.
+  - A `NOOP` pipelined behind a dot whose relay outlives the deadline gets `421`,
+    not `250`. This one was seen red before green: with the zero-budget refusal
+    disabled, the `NOOP` was served `250 2.0.0 ok`.
+- **The gates.** `cargo test`: 880 passed across 29 binaries, which is 876 before
+  plus these three and the duplicate-delivery control. `clippy -D warnings` and
+  `fmt` are clean.
+- **Not yet on the stack.** Stress S9 and a soak V4 run, as regression checks, and
+  the compose gate follow the planted-defect control that is running on the host
+  now.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

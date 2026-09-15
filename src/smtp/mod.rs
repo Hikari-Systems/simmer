@@ -348,7 +348,6 @@ async fn handle(
         Stream::Plain(stream)
     };
 
-    let session_timeout = cfg.server.timeouts.session;
     let mut session = session::Session::new(
         stream,
         peer,
@@ -360,15 +359,12 @@ async fn handle(
     );
 
     let end = tokio::select! {
+        // §8.4 / §4.1 `timeouts.session` is enforced inside `run`, at every wait
+        // on the client and never mid-relay (D-081). It was a timer here, and
+        // when it fired during a relay it dropped the relay future: the client
+        // was told `421` for a message the downstream had stored, and the
+        // reservation was never resolved (F2).
         end = session.run() => end,
-
-        // §8.4 / §4.1 `timeouts.session` — a hard ceiling on the whole
-        // conversation, independent of the per-command budget. Without it a
-        // client that sends NOOP every 29 seconds holds a slot forever.
-        _ = tokio::time::sleep(session_timeout) => {
-            session.refuse(&reply::session_timeout()).await;
-            session::SessionEnd::SessionTimeout
-        }
 
         // §10.4 — "Sessions exceeding the grace period receive 421 and are
         // closed." Cutting the socket instead would leave a client unable to

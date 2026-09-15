@@ -900,12 +900,13 @@ fn sink_peer_peaks(stats: &serde_json::Value, port: &str) -> Vec<(String, u64)> 
 
 #[test]
 #[ignore = "needs the stress compose profile"]
-fn s9_a_relay_cancelled_by_the_session_timeout_is_accounted_for() {
-    // The session timeout runs from connect, so a short one fires while a relay is
-    // still in flight: the sink holds the dot for 30 s, the session is cut at 20.
-    // Finding F2: the downstream has the message, the client is told 421, and the
-    // reservation is left behind — loss and leak, both of which the accounting and
-    // baseline checks see.
+fn s9_the_session_timeout_waits_for_a_relay_in_flight() {
+    // A short session timeout expires while a relay is still in flight: the sink
+    // holds the dot for 30 s, and the session's deadline is 20 s. Until D-081 the
+    // relay was cut there (F2): the downstream had the message, the client was
+    // told 421, and the reservation was left behind. Now the relay finishes
+    // inside the route's 60 s data budget, the client is told 250, and the next
+    // command is refused. The accounting and baseline checks are the regression.
     let _logs = STRESS.logs_on_failure();
     let mut s = Scenario::sending(
         "S9",
@@ -913,7 +914,8 @@ fn s9_a_relay_cancelled_by_the_session_timeout_is_accounted_for() {
         &["--count", "8", "--concurrency", "8"],
     );
     s.app_env = &[("SIMMER_SESSION_TIMEOUT", "20s")];
-    s.expected_errors = &["session timeout", "reservation"];
+    // No longer "reservation": with nothing cut, nothing is left to resolve badly.
+    s.expected_errors = &["session timeout"];
     // The sink stalls *every* message at the dot, so a probe would be answered by
     // the injected fault rather than by Simmer's state. The rest of U5 — the
     // reservations, the rows, the pool — is what this scenario is about.

@@ -745,8 +745,9 @@ fn analyze_v4(failures: &mut Vec<String>) {
             .filter(|r| r.id.starts_with(&prefix))
             .cloned()
             .collect();
-        // Cut by the session timeout: `421 … session timeout`, at whatever stage
-        // it caught the client. At the dot, it caught a relay.
+        // Refused by the session timeout: `421 … session timeout`, at whatever
+        // stage it caught the client. At the dot, it cut a relay in flight — F2,
+        // which D-081 fixed, so V4 is now its regression check.
         let cut: BTreeSet<&str> = sent
             .iter()
             .filter(|s| s.code == 421 && s.text.contains("session timeout"))
@@ -783,11 +784,22 @@ fn analyze_v4(failures: &mut Vec<String>) {
             report.transport
         );
 
-        if cut_at_dot == 0 || cut_at_dot * 2 < sessions.len() {
+        // Every session outlives its deadline, so the timeout must fire in almost
+        // every one. The sink holds each message at the dot for most of a session,
+        // so when it fires a relay is almost always in flight — and where the 421
+        // lands is the point: at the next command, never at the dot.
+        if cut.len() * 2 < sessions.len() {
             driven.push(format!(
-                "{instance}: {cut_at_dot} relays cut at the dot in {} sessions; the session \
-                 timeout is not cancelling relays, so F2 is not being driven",
+                "{instance}: the session timeout fired in {} of {} sessions, so V4 is not \
+                 exercising it",
+                cut.len(),
                 sessions.len()
+            ));
+        }
+        if cut_at_dot > 0 {
+            accounting.push(format!(
+                "{instance}: {cut_at_dot} relays cut at the dot by the session timeout — the \
+                 deadline must wait for a relay in flight (D-081, F2)"
             ));
         }
         // Accepted, cut by the timeout, or never sent because the timeout closed
@@ -908,8 +920,8 @@ fn analyze_v4(failures: &mut Vec<String>) {
 
     verdict(failures, "soak/V4/driven", joined(driven.clone()));
     verdict(failures, "soak/V4/delivery", joined(delivery));
-    // With nothing cancelled, the F2 checks would pass for want of a cancellation
-    // and report an XPASS that means nothing; `driven` has already failed.
+    // With the timeout not firing, these would pass for want of anything to
+    // judge; `driven` has already failed.
     if driven.is_empty() {
         verdict(failures, "soak/V4/accounting", joined(accounting));
         if registry_judged {
