@@ -12,7 +12,10 @@ made the return to baseline an assertion, and linked every message to the id Sim
 logs it under; a fresh 20-minute run passed all three, and §8's hour, re-judged,
 now passes. A clean hour then passed them again, with conclusive no-leak verdicts,
 and the link traced that hour's 9–16 s tail to database stalls both instances
-waited out, cause on the host not established (§9). The burst/idle variants are
+waited out, cause on the host not established (§9). F2 has since been fixed by
+D-081, and V4 and stress S9 are now its regression checks, not yet re-run on the
+stack. The planted-defect controls (§10) have begun: duplicate delivery and run B
+fail exactly as planted, and run A is running. The burst/idle variants are
 outstanding.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
 step 5 summary". This document records what
 the soak tier is, what ten runs have established, and — at least as usefully —
@@ -56,7 +59,7 @@ at all, which is why the A/B pair was worth building before any variant.
 |---|---|---|
 | **V2** | `app` scraped, `app2` never — isolates F8 | built, exercised |
 | **V3** | one message in twenty from a fresh `u<n>.soak.test` sender — F7 | built, **drives the defect** |
-| **V4** | relays cancelled by the session timeout — F2 | built (§8) |
+| **V4** | the session timeout against relays in flight — F2, and since D-081 its regression check | built (§8) |
 | bursts | 60 s at 70 clients every 15 min | outstanding |
 | idle gaps | 3 min past `idle_ttl`, sink closing idle at 45 s — F10/CLOSE_WAIT | outstanding |
 
@@ -532,6 +535,11 @@ column.
 ---
 
 ## 8. V4 — relays cancelled by the session timeout (F2)
+
+*F2 was fixed by D-081 after the runs below. The session deadline now caps waits
+on the client and never a relay, so V4 checks that it stays fixed: `driven` means
+the timeout fired in the sessions, and a relay cut at the dot fails `accounting`.
+What follows is the record of the defect as it was.*
 
 S9 shows F2 exists: `timeouts.session` runs from connect, and when it fires during
 the downstream conversation the relay future is simply dropped. V4 asks what that

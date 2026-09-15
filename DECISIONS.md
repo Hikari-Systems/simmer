@@ -3502,7 +3502,8 @@ nothing after that run but `docs/SOAK.md`; 876 after step 5c's seven self-tests.
   stored by the sink and told `421`, so a client retry delivers it twice; the ledger
   short by exactly the cuts; the §10.4 registry keeping one entry per cut for the
   life of the process — a staircase, never a sawtooth. The database side is
-  bounded: at most 4 rows, all swept.
+  bounded: at most 4 rows, all swept. **Fixed since by D-081**, and V4 and stress
+  S9 are now its regression checks.
 - **The harness guards itself.** An unexpected pass fails the run, which forces a
   fixed finding out of `known-findings.json`; the F2 checks are judged only once
   `driven` passes, so "not reproduced" cannot read as "fixed"; a run in which `app`
