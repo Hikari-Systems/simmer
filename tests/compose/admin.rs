@@ -5,7 +5,12 @@ use std::sync::OnceLock;
 
 use super::stack::Stack;
 
-pub const BASE: &str = "http://127.0.0.1:8080";
+/// Where `app`'s admin API answers: the port `docker-compose.yml` publishes on the
+/// host's loopback, or `SIMMER_TEST_ADMIN` from somewhere that cannot reach it —
+/// a container or a jail on the stack's network, as `http://simmer-app-1:8080`.
+pub fn base() -> String {
+    std::env::var("SIMMER_TEST_ADMIN").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+}
 
 /// The token `app` is running with, read from the container rather than
 /// repeated here.
@@ -36,7 +41,7 @@ pub fn post(stack: &Stack, path: &str, body: &serde_json::Value) -> (u16, serde_
 /// `series` is the name with its labels exactly as exported.
 pub fn metric(series: &str) -> f64 {
     let out = Command::new("curl")
-        .args(["-sf", &format!("{BASE}/metrics")])
+        .args(["-sf", &format!("{}/metrics", base())])
         .output()
         .expect("curl");
     assert!(out.status.success(), "GET /metrics failed");
@@ -60,7 +65,7 @@ fn request(
         cmd.args(["-H", "Content-Type: application/json"])
             .args(["--data-binary", &body.to_string()]);
     }
-    let out = cmd.arg(format!("{BASE}{path}")).output().expect("curl");
+    let out = cmd.arg(format!("{}{path}", base())).output().expect("curl");
     assert!(out.status.success(), "{method} {path}: curl failed");
 
     let text = String::from_utf8_lossy(&out.stdout);

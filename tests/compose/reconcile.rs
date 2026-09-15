@@ -20,8 +20,9 @@ pub struct Sent {
     pub id: String,
     /// The final reply's code; `0` for a transport failure (no reply at all).
     pub code: u16,
-    /// Where the conversation ended: `banner`, `tls`, `auth`, `mail`, `rcpt`,
-    /// `data`, `dot` (the final reply), or `transport`.
+    /// Where the conversation ended: `banner`, `tls`, `auth`, `rset` (a later
+    /// message refused before it began, as at D-081's session deadline), `mail`,
+    /// `rcpt`, `data`, `dot` (the final reply), `transport`, or `not_sent`.
     pub stage: String,
     #[serde(default)]
     pub text: String,
@@ -150,7 +151,15 @@ pub fn reconcile(sent: &[Sent], received: &[Received], ambiguous_delta: Option<u
                 .push(format!("{id}: stored {copies} times (duplicate delivery)"));
         }
 
-        let ambiguous = outcomes.iter().any(|o| o.ambiguous());
+        // A stall is ambiguous only if Simmer gave up on it. Simmer tells a client
+        // 2xx only after the downstream's own 2xx (§7.4, §10.1), so a stalled
+        // message its client was told 2xx for had its late reply seen in time.
+        // Until D-081, S9's stalls were all cut, which made "every stall is
+        // ambiguous" true there by accident.
+        let ambiguous = outcomes.iter().any(|o| match o {
+            Outcome::StalledAtDot => !(200..=299).contains(&s.code),
+            o => o.ambiguous(),
+        });
         if ambiguous {
             ambiguous_seen += 1;
         }

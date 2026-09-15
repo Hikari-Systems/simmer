@@ -14,6 +14,18 @@
 //! SIMMER_CONFIG=/config/simmer.stress.yaml $C up -d --wait app sink
 //! cargo test --test stress -- --ignored --test-threads=1 --nocapture
 //! ```
+//!
+//! The harness reaches `app`'s admin API and the sink's stats on the ports the
+//! stack publishes on the host's loopback. From somewhere that cannot reach
+//! those — a container, or a jail joined to the stack's network — address the
+//! services by name over the Docker network instead:
+//!
+//! ```sh
+//! SIMMER_TEST_ADMIN=http://simmer-app-1:8080 \
+//! SIMMER_TEST_SINK_STATS=http://simmer-sink-1:8081/ \
+//! DATABASE_URL=postgres://simmer:simmer@simmer-simmer-db-1:5432/simmer \
+//! cargo test --test stress -- --ignored --test-threads=1 --nocapture
+//! ```
 
 mod compose;
 
@@ -32,7 +44,12 @@ use compose::stack::STRESS;
 const STRESS_CONFIG: &str = "test/config/simmer.stress.yaml";
 
 /// The sink's stats, published by `test/compose/stress.yml`.
-const SINK_STATS: &str = "http://127.0.0.1:18081/";
+/// Or `SIMMER_TEST_SINK_STATS`, from where the published port cannot be reached
+/// (see the module comment).
+fn sink_stats() -> String {
+    std::env::var("SIMMER_TEST_SINK_STATS")
+        .unwrap_or_else(|_| "http://127.0.0.1:18081/".to_string())
+}
 
 /// Every Simmer instance the stress stack can run. A scenario names the ones it
 /// needs in `app_services`; [`recreate_app`] stops the rest.
@@ -904,15 +921,22 @@ fn sink_peer_peaks(stats: &serde_json::Value, port: &str) -> Vec<(String, u64)> 
 #[ignore = "needs the stress compose profile"]
 fn s9_the_session_timeout_waits_for_a_relay_in_flight() {
     // A short session timeout expires while a relay is still in flight: the sink
-    // holds the dot for 30 s, and the session's deadline is 20 s. Until D-081 the
+    // holds the dot for 25 s, and the session's deadline is 20 s. Until D-081 the
     // relay was cut there (F2): the downstream had the message, the client was
     // told 421, and the reservation was left behind. Now the relay finishes
     // inside the route's 60 s data budget, the client is told 250, and the next
     // command is refused. The accounting and baseline checks are the regression.
+    //
+    // The stall must stay under the loadgen's own 30 s wait for a reply. It was
+    // 30 s until D-081, when the 20 s cut answered first; once the relay was
+    // allowed to finish, the client timed out milliseconds before its 250 and
+    // the sink had four messages stored without a reply. That is the README's
+    // "Timeout budget" rule (the downstream budget under the client's timeout)
+    // broken by the scenario itself, not F2.
     let _logs = STRESS.logs_on_failure();
     let mut s = Scenario::sending(
         "S9",
-        "--stall-at-dot-pct 100 --stall-secs 30",
+        "--stall-at-dot-pct 100 --stall-secs 25",
         &["--count", "8", "--concurrency", "8"],
     );
     s.app_env = &[("SIMMER_SESSION_TIMEOUT", "20s")];
@@ -1053,7 +1077,7 @@ fn run(s: &Scenario) -> Seen {
     }
     let received = settled_sink_records();
     let sink: serde_json::Value =
-        serde_json::from_str(&compose::traps::get(SINK_STATS)).expect("sink stats JSON");
+        serde_json::from_str(&compose::traps::get(&sink_stats())).expect("sink stats JSON");
     let after = Baseline::read(&after_metrics);
     // U5's probe: a message after the load stops still gets through.
     let probe = if s.probe {
@@ -1490,7 +1514,7 @@ fn healthcheck_ms() -> Option<f64> {
     let start = Instant::now();
     let ok = Command::new("curl")
         .args(["-sf", "-o", "/dev/null", "--max-time", "5"])
-        .arg(format!("{}/healthcheck", admin::BASE))
+        .arg(format!("{}/healthcheck", admin::base()))
         .status()
         .ok()?
         .success();
@@ -1627,7 +1651,7 @@ fn fresh_sink(sink_args: &str) {
     );
     let deadline = Instant::now() + Duration::from_secs(30);
     while !Command::new("curl")
-        .args(["-sf", SINK_STATS])
+        .args(["-sf", &sink_stats()])
         .output()
         .is_ok_and(|o| o.status.success())
     {
@@ -1789,7 +1813,7 @@ fn try_scrape() -> Option<String> {
             "-sf",
             "--max-time",
             "10",
-            &format!("{}/metrics", admin::BASE),
+            &format!("{}/metrics", admin::base()),
         ])
         .output()
         .ok()?;

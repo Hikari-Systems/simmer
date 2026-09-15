@@ -121,6 +121,34 @@ fn an_ambiguous_delivery_is_allowed_only_if_simmer_counted_it() {
 }
 
 #[test]
+fn a_stall_is_ambiguous_only_if_simmer_gave_up_on_it() {
+    // A stall the downstream answered in time: Simmer saw the 2xx, told the
+    // client 250 and counted nothing ambiguous. S9's shape once D-081 let its
+    // relays finish.
+    let answered = reconcile(
+        &[sent("a", 250)],
+        &[got("a", Outcome::StalledAtDot)],
+        Some(0),
+    );
+    assert!(answered.is_clean(), "{:?}", answered.violations);
+
+    // A stall Simmer gave up on: the client was told 451, the downstream kept it,
+    // and Simmer must have counted it.
+    let s = [sent("b", 451)];
+    let r = [got("b", Outcome::StalledAtDot)];
+    assert!(reconcile(&s, &r, Some(1)).is_clean());
+    let uncounted = reconcile(&s, &r, Some(0));
+    assert!(
+        uncounted
+            .violations
+            .iter()
+            .any(|v| v.contains("simmer_ambiguous_delivery_total")),
+        "{:?}",
+        uncounted.violations
+    );
+}
+
+#[test]
 fn a_phantom_and_a_crossed_envelope_are_caught() {
     let mut crossed = got("a", Outcome::Delivered);
     crossed.mismatch = true;
