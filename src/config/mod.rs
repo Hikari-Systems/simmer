@@ -36,8 +36,8 @@ pub struct Config {
     #[serde(default)]
     pub logging: Logging,
 
-    /// D-083 — the optional HTTP forwarder for tracking and unsubscribe links.
-    /// Not in `SPEC.md`. Absent means no listener and nothing started.
+    /// §5.7 (D-083) — the optional HTTP forwarder for tracking and unsubscribe
+    /// links. Absent means no listener and nothing started.
     #[serde(default)]
     pub link_proxy: Option<LinkProxy>,
 

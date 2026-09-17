@@ -19,7 +19,8 @@ marker saying what it used to say. The rule that came out of it: **a divergence
 becomes a spec amendment only when its question has been put to the author and
 answered.** Everything else stays a `DECISIONS.md` entry. See "The spec
 settlements (after phase 10)" for what changed and what was deliberately left
-alone.
+alone. The same rule produced the 2026-09-17 amendment for the link proxy
+(§5.7, and the sections D-083 lists), after O-13 was put to the author.
 
 ## The four things that will bite you
 
@@ -196,7 +197,7 @@ src/models/recipient_event.rs  §7.3's rows. A key is 16 bytes and never plainte
 src/models/instance_config.rs  §7.3's salt: insert-if-absent, then read (D-050)
 src/db.rs                pool + migrations
 src/hash_password.rs     `server hash-password`. Reads stdin, never argv
-src/link_proxy/mod.rs    D-083 — optional HTTP link forwarder; NOT in SPEC.md. The
+src/link_proxy/mod.rs    §5.7 (D-083) — the optional HTTP link forwarder. The
                          forwarding is axum-reverse-proxy's; the listener, the
                          no-store rule and the query-free logging are ours
 src/link_proxy/rewrite.rs  Location / Set-Cookie back to the public name, and the

@@ -2678,11 +2678,21 @@ that an over-long message is answered at the dot and the connection closed.
 
 ### D-083 — An optional HTTP forwarder for tracking and unsubscribe links
 
-**Not in `SPEC.md`.** §2.1 lists no HTTP listener beyond the admin API, and §2.3
-puts the container on a trusted segment. Requested on 2026-09-17: route rewrites
-point a message's tracking and unsubscribe links at a public name
-(`click.newbrand.com`), and that name has to answer somewhere. Recorded here
-rather than amended into the spec; see O-13.
+**Now in `SPEC.md` as §5.7.** Requested on 2026-09-17: route rewrites point a
+message's tracking and unsubscribe links at a public name (`click.newbrand.com`),
+and that name has to answer somewhere. At the time, §2.1 listed no HTTP listener
+beyond the admin API, and §2.3 put the container on a trusted segment, so this was
+first recorded here and raised as O-13. The spec's author settled O-13 the same
+day by asking for the amendment:
+
+- §2.1 lists the proxy, and §2.2 notes that it has no TLS.
+- §2.3 names the load balancer as the trust boundary.
+- §4.1 carries the example block, and §4.2 the rules.
+- §5.7 is the behaviour.
+- §9.1 lists the metrics, and §9.5 the logging rule.
+- §10.4 covers the shutdown, §12.1 the crates, and §13 adds phase 12.
+
+Each amendment is marked with a pointer here.
 
 **Decision.** An optional `link_proxy:` block. When it is present, Simmer binds
 an HTTP/1.x listener that sends every request, unchanged, to one configured
@@ -2838,7 +2848,7 @@ the phase that depends on each.
 | ~~O-10~~ | *Settled in phase 2 — see **D-018**. The working assumption did not survive: the route is not known at `MAIL FROM`. Replaced by a config-declared capability.* | | |
 | ~~O-11~~ | *Settled in phase 7 — see **D-053**. Named `admin.tokens` alongside `auth_token`, which is the token named `default`. The working assumption held: named tokens, not dropped wording.* | | |
 | ~~O-12~~ | *Settled in phase 3: DST transitions both directions, a start inside a DST gap, and a future start are all tested; the leap-second case is asserted to be a no-op rather than merely argued.* | | |
-| O-13 | D-083's link proxy is outside §2.1 and stretches §2.3: the listener is reached from the internet through a load balancer. Amend §2.1/§2.3 to include it, or keep it as a decision record only? | Decision record only, with `allowed_cidrs` required and the load balancer as the trust boundary. Needs the spec's author. | Before production use of `link_proxy` |
+| ~~O-13~~ | *Settled 2026-09-17 by the spec's author: amend the spec. §2.1, §2.2, §2.3, §4.1, §4.2, §5.7 (new), §9.1, §9.5, §10.4, §12.1 and §13 now carry the link proxy — see **D-083**.* | | |
 
 
 ---

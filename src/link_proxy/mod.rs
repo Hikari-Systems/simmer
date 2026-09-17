@@ -1,6 +1,7 @@
-//! D-083 — an optional HTTP/1.x forwarder for tracking and unsubscribe links.
+//! §5.7 — an optional HTTP/1.x forwarder for tracking and unsubscribe links.
+//! See `DECISIONS.md` D-083.
 //!
-//! Not in `SPEC.md`. Route rewrites point a message's links at a public name
+//! Route rewrites point a message's links at a public name
 //! (`click.newbrand.com`); a TLS-terminating load balancer sends that name's
 //! traffic here; this sends every request, unchanged, to one upstream
 //! (`https://link.esp.example`) and relays the response.

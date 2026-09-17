@@ -68,6 +68,8 @@ applies to the domain, not to whether Simmer altered the message.
 - Postgres-backed quota accounting with reservation semantics.
 - Admin HTTP API, Prometheus metrics, structured logging.
 - DNS preflight validation of SPF/DKIM/DMARC for warming routes.
+- An optional HTTP/1.x link proxy that forwards the tracking and unsubscribe links in rewritten
+  messages to one upstream (§5.7). *(Added. See `DECISIONS.md` D-083.)*
 
 ### 2.2 Explicitly out of scope
 
@@ -81,7 +83,8 @@ Simmer is **not an MTA**. It does not own messages.
 - **No DKIM signing and no key material.** Downstreams sign. See §6.5.
 - **No ACME and no certificate reload.** Inbound TLS uses one PEM certificate and key read at
   startup (§5.1); rotation is a restart, like any other configuration change. *(Amended — was
-  "No inbound TLS". See `DECISIONS.md` D-070 and `docs/INGRESS.md`.)*
+  "No inbound TLS". See `DECISIONS.md` D-070 and `docs/INGRESS.md`.)* The §5.7 link proxy has
+  no TLS at all: a load balancer in front of it terminates HTTPS.
 - **No `CHUNKING`/`BDAT`, no `DSN` extension.**
 - **No multi-instance clustering.** v1 runs a single instance; the storage layer is safe for
   more. Quota state is owned by Postgres, not by a process: §7.4's reservation performs its
@@ -123,6 +126,20 @@ Neither is fixed by a lock, and neither is a quota-overshoot window:
    it.
 
 *(Added — see `docs/MULTI_INSTANCE.md`, which measures both.)*
+
+**The link proxy is the one listener reached from an untrusted network**, and only indirectly.
+Recipients click tracking and unsubscribe links from anywhere, so §5.7's listener sits behind
+an internet-facing, TLS-terminating layer 7 load balancer, and that load balancer is the trust
+boundary:
+
+- `link_proxy.allowed_cidrs` is required and lists the load balancer's subnets. A connection
+  from anywhere else is closed before a byte is read.
+- Only the link proxy's port is placed in the load balancer's target group. An SMTP port or
+  the admin port never is, so everything above about the SMTP listeners still holds.
+- The target group's health check uses the admin listener's `/health`, on the internal
+  segment, so the proxy reserves no path of its own.
+
+*(Added. See `DECISIONS.md` D-083.)*
 
 ---
 
@@ -230,6 +247,19 @@ admin:
 logging:
   level: info
   format: json
+
+link_proxy:                            # optional; absent => no listener (§5.7)
+  listen: "0.0.0.0:80"
+  upstream: "https://link.esp.example/tracking"   # a path is a prefix; no query
+  public_scheme: https                 # what the load balancer terminates
+  allowed_cidrs: ["10.0.0.0/8"]        # the load balancer's subnets; required
+  max_request_bytes: 1048576
+  max_connections: 512
+  timeouts:
+    header_read: 10s
+    upstream_connect: 5s
+    upstream_response: 30s             # to response headers; 504 after
+    idle: 60s
 
 domain_groups:
   - name: google
@@ -363,6 +393,12 @@ this inverts: plaintext AUTH is now refused unless allowed. The rest are new. Se
   overflow route.
 - Any route's `identity.envelope_from` has a **domain that is not a literal** — that is, the
   part after the final `@` contains a template variable. *(Added; see the note below.)*
+- `link_proxy` is present and any of the following hold *(added, see `DECISIONS.md` D-083)*:
+  - `upstream` is not an absolute `http` or `https` URI with a host, or it carries
+    credentials, a query or a fragment.
+  - `listen` is not a valid address, or it duplicates `admin.listen` or an SMTP listener.
+  - `allowed_cidrs` is empty or contains an invalid block.
+  - `max_connections`, `max_request_bytes` or any timeout is zero.
 
 **Note on `envelope_from`, added after implementation.** The example in §4.1 originally read
 `bounce+{{original.envelope_from.local}}@newbrand.com`. That is a *relative transformation* —
@@ -526,6 +562,60 @@ true, with a result-collapse table for the false case, and §13 scheduled the sp
 as phase 9. The switch, the table and the phase are all deleted. `simmer_partial_delivery_total`
 in §9.1 is consequently unreachable and is retained only so the list matches the original.
 See `DECISIONS.md` D-047 and `docs/RECIPIENTS.md`, which is the long form.)*
+
+### 5.7 Link proxy
+
+*(Added. See `DECISIONS.md` D-083.)*
+
+Route rewrites point a message's tracking and unsubscribe links at a public name
+(`https://click.newbrand.com/…`), and that name has to answer somewhere. When `link_proxy` is
+configured, Simmer binds an HTTP listener that forwards every request to one upstream and
+relays the response. Deployment is §2.3's: behind a TLS-terminating load balancer.
+
+**Forwarding.** The request's method, path, query, body, cookies and end-to-end headers reach
+the upstream unchanged. A path on `upstream` is a prefix: with
+`upstream: https://link.esp.example/tracking`, a request for `/test?abc=123` is forwarded to
+`/tracking/test?abc=123`. The target is always `upstream`: an absolute-form request target
+contributes only its path and query, so the proxy can never be aimed at another host.
+
+- `Host` is the upstream's.
+- Hop-by-hop headers (RFC 9110 §7.6.1) are removed, and so are `Proxy-Authorization` and
+  `Upgrade`.
+- `X-Forwarded-For` has the peer address appended. `X-Forwarded-Host` and
+  `X-Forwarded-Proto` are kept from the load balancer, or else set from `Host` and
+  `public_scheme`.
+- `Via: 1.1 simmer` is added. A request that already carries it is answered `508`.
+
+**Responses** are relayed and streamed, never buffered. Three headers are rewritten to the
+public origin, meaning the load balancer's `X-Forwarded-Proto` and `X-Forwarded-Host`, or else
+`public_scheme` and `Host`:
+
+- `Location` and `Content-Location`, when they name the upstream: same host
+  (case-insensitive), same effective port, and inside the prefix at a segment boundary. With a
+  prefix, an absolute path inside it loses the prefix, and one outside it becomes an absolute
+  upstream URL.
+- `Set-Cookie`: a `Domain` equal to the upstream host or a parent domain becomes the public
+  host (dropped when the public host is an IP literal). With a prefix, a `Path` inside it loses
+  the prefix.
+
+Anything else, and in particular the redirect to the click's real destination, passes through
+byte for byte. Response bodies are never rewritten, and redirects are never followed.
+
+**Limits and refusals.**
+
+- Only HTTP/1.0 and HTTP/1.1 are accepted. HTTP/2 is refused.
+- `CONNECT` is answered `501`. Upgrades are never completed: a WebSocket request is forwarded
+  as a plain request.
+- A request whose headers are not complete within `timeouts.header_read` is disconnected.
+- A body over `max_request_bytes` is `413`.
+- More than `max_connections` open connections is `503`.
+- An unreachable upstream, or one whose certificate does not verify against the platform root
+  store, is `502`. No response headers within `timeouts.upstream_response` is `504`.
+
+**§14.1 applied to HTTP.** Every response the proxy generates itself carries
+`Cache-Control: no-store`, so a browser or intermediary never remembers a bad minute as the
+answer for a link in someone's inbox. Nothing is retried. A one-click unsubscribe (RFC 8058) is
+a `POST`, and replaying it is the §10.2 hazard in another protocol.
 
 ---
 
@@ -872,6 +962,13 @@ Prometheus exposition on the admin listener. At minimum:
   continuity with the original list
 - `simmer_reservation_expired_total{route}`
 - `simmer_body_rewrite_skipped_total{route,reason}`
+- `simmer_link_proxy_requests_total{status_class,origin}` — origin: `upstream`, or `proxy` for
+  a response the proxy generated (§5.7)
+- `simmer_link_proxy_duration_seconds` — histogram, to response headers
+- `simmer_link_proxy_connections`
+- `simmer_link_proxy_connections_refused_total{reason}` — reason: `cidr`, `limit`
+
+*(The four `simmer_link_proxy_*` metrics are added. See `DECISIONS.md` D-083.)*
 
 ### 9.2 Read API
 
@@ -912,6 +1009,10 @@ Structured JSON. Every message carries a `correlation_id` propagated through eve
 and emitted as `X-Simmer-Correlation-Id` when configured. Log the incoming identity, matched
 rule, chain evaluation with skip reasons, selected route, downstream reply code and text, and
 total latency. Message bodies are never logged; recipient addresses are logged only at `DEBUG`.
+
+A link proxy request (§5.7) is logged with its method, path, status and latency only. The query
+string, cookies and body are never logged, because a tracking token identifies a recipient.
+*(Added. See `DECISIONS.md` D-083.)*
 
 ---
 
@@ -977,6 +1078,10 @@ On `SIGTERM`: stop accepting connections, allow in-flight sessions to complete u
 period (default 30s), release any reservations still outstanding, drain pools, exit. Sessions
 exceeding the grace period receive `421` and are closed.
 
+The link proxy (§5.7) stops accepting at the same moment, and its in-flight requests share the
+same grace period. Idle keep-alive connections close at once. Requests still running when the
+grace period ends are cut. *(Added. See `DECISIONS.md` D-083.)*
+
 ---
 
 ## 11. Storage
@@ -1009,6 +1114,9 @@ alternative backend is implemented in v1.
 Suggested, not mandated: `tokio`, `rustls`/`tokio-rustls`, `sqlx` (or the pattern's
 established client), `serde`/`serde_yaml`, `regex`, `argon2`, `hickory-resolver`, `tracing`,
 `axum` for the admin listener, `metrics`/`prometheus`, and a MIME parsing/building library.
+For §5.7, `axum-reverse-proxy` with default features off (its default TLS stack is `aws-lc-rs`)
+over a `hyper-rustls` connector built on the same ring provider and platform roots as §8.2.
+*(Added. See `DECISIONS.md` D-083 and `LICENSES.md` §8.)*
 
 **Licence check required before adopting any parsing crate.** Several of the well-known mail
 crates in the Rust ecosystem are AGPL-licensed or have changed licence between versions.
@@ -1060,6 +1168,7 @@ Each phase should end in a working, testable artefact.
 10. Hardening: pooling refinements, graceful shutdown, acceptance suite, README.
 11. Inbound listeners on 25/465/587, inbound TLS, and the sender ACL (§5.1, §5.3).
     *(Added — beyond the original ten. See `DECISIONS.md` D-070, D-071 and `docs/INGRESS.md`.)*
+12. The optional link proxy (§5.7). *(Added. See `DECISIONS.md` D-083.)*
 
 ---
 

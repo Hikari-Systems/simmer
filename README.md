@@ -390,7 +390,7 @@ retrying would send it twice.
 ### Link proxy
 
 An optional HTTP forwarder for the tracking and unsubscribe links your routes
-rewrite (`DECISIONS.md` D-083; not part of the spec). The links point at a
+rewrite (spec §5.7, `DECISIONS.md` D-083). The links point at a
 public name such as `click.newbrand.com`; a TLS-terminating load balancer sends
 that name to `link_proxy.listen`; Simmer sends every request to one upstream
 and relays the response:
