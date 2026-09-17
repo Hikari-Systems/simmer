@@ -160,6 +160,13 @@ impl TlsConfigs {
         ))
     }
 
+    /// The verifying configuration: platform roots, ring. D-083's link proxy
+    /// dials its upstream with it, so an `https://` upstream is checked exactly
+    /// as a `required_verify` route is.
+    pub fn verifying(&self) -> Arc<ClientConfig> {
+        Arc::clone(&self.verifying)
+    }
+
     fn connector(&self, mode: TlsMode) -> tokio_rustls::TlsConnector {
         let cfg = match mode {
             TlsMode::RequiredVerify => Arc::clone(&self.verifying),

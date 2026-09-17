@@ -212,6 +212,41 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
 # can be turned on through `_RJEM_MALLOC_CONF` without a rebuild.
 tikv-jemallocator = "0.7"
 
+# --- the link proxy (D-083) -----------------------------------------------
+
+# D-083: an optional HTTP/1.x listener that forwards tracking and unsubscribe
+# clicks to one upstream. Off the shelf, per the request: hop-by-hop stripping,
+# X-Forwarded-*, the upstream timeout, the body cap and loop detection are all
+# the crate's. `MIT`. Pinned to the minor because `ProxyPolicy`'s defaults are
+# behaviour, and a minor release may move them.
+#
+# `default-features = false` is load-bearing: its `tls` feature pulls
+# `hyper-rustls` with *that* crate's defaults, which are aws-lc-rs (cmake and a C
+# toolchain in the builder — see the `rustls` entry above) and webpki-roots
+# rather than §8.2's platform store. The client is built here instead and handed
+# to `ReverseProxy::new_with_client`.
+axum-reverse-proxy = { version = "~2.2", default-features = false }
+# The upstream connector for the above, HTTP/1 only. `Apache-2.0 OR ISC OR MIT`.
+# It is handed `TlsConfigs`' verifying `ClientConfig` — the same ring provider
+# and the same platform root store as `tls: required_verify` routes (§8.2) — so
+# it needs neither `native-tokio` nor `webpki-roots`.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "ring",
+    "http1",
+    "tls12",
+    "logging",
+] }
+# Both already in the graph via axum; named here for the features the listener
+# (`http1::Builder` with a header-read timeout) and the client need.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = [
+    "client-legacy",
+    "http1",
+    "tokio",
+    "service",
+] }
+http-body-util = "0.1"
+
 [profile.release]
 strip = true
 lto = true

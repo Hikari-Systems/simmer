@@ -17,6 +17,7 @@ pub mod downstream;
 pub mod frequency;
 pub mod hash_password;
 pub mod healthcheck;
+pub mod link_proxy;
 pub mod logging;
 pub mod metrics;
 pub mod models;

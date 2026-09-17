@@ -18,6 +18,9 @@ services:
       # plaintext AUTH, so it must never be bound to a routable interface.
       # - '127.0.0.1:2525:25'
       - '127.0.0.1:8080:8080'   # admin API (§9)
+      # D-083's link proxy, when `link_proxy:` is configured. Not published by
+      # default; NET_BIND_SERVICE below already covers port 80.
+      # - '127.0.0.1:8081:80'
     volumes:
       # §5.1's certificate for the acceptance stack (D-070), minted per run by
       # `tls-init`. Mounted in local development too, where it is empty and

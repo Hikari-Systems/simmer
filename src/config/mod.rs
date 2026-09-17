@@ -36,6 +36,11 @@ pub struct Config {
     #[serde(default)]
     pub logging: Logging,
 
+    /// D-083 — the optional HTTP forwarder for tracking and unsubscribe links.
+    /// Not in `SPEC.md`. Absent means no listener and nothing started.
+    #[serde(default)]
+    pub link_proxy: Option<LinkProxy>,
+
     pub domain_groups: Vec<DomainGroup>,
     pub senders: Vec<SenderRule>,
 
@@ -588,6 +593,114 @@ pub struct DownstreamTimeouts {
     pub command: Option<Duration>,
     #[serde(default, deserialize_with = "duration::deserialize_opt")]
     pub data: Option<Duration>,
+}
+
+// ---------------------------------------------------------------------------
+// link_proxy (D-083)
+// ---------------------------------------------------------------------------
+
+/// D-083. An HTTP/1.x listener that forwards every request, unchanged, to one
+/// upstream. It sits behind a TLS-terminating load balancer, which is why it
+/// speaks plain HTTP and why `allowed_cidrs` has no default: the only peers it
+/// should ever see are that load balancer's addresses.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkProxy {
+    pub listen: String,
+    /// Scheme, authority and an optional path prefix, e.g.
+    /// `https://link.esp.example/tracking`. The request's path is appended to
+    /// the prefix and its query kept unchanged, so `/test?abc=123` goes to
+    /// `/tracking/test?abc=123`. No query.
+    pub upstream: String,
+    /// What the load balancer terminates. Sent as `X-Forwarded-Proto` when the
+    /// load balancer did not set one, and used as the scheme of a rewritten
+    /// `Location`.
+    #[serde(default)]
+    pub public_scheme: PublicScheme,
+    pub allowed_cidrs: Vec<String>,
+    #[serde(default = "default_link_proxy_max_request_bytes")]
+    pub max_request_bytes: u64,
+    #[serde(default = "default_link_proxy_max_connections")]
+    pub max_connections: usize,
+    #[serde(default)]
+    pub timeouts: LinkProxyTimeouts,
+}
+
+fn default_link_proxy_max_request_bytes() -> u64 {
+    // A tracking click is a GET and a one-click unsubscribe (RFC 8058) is a
+    // one-line form POST; 1 MiB is generous for both.
+    1024 * 1024
+}
+
+fn default_link_proxy_max_connections() -> usize {
+    512
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PublicScheme {
+    Http,
+    #[default]
+    Https,
+}
+
+impl PublicScheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinkProxyTimeouts {
+    /// A client that has not finished sending request headers by then is
+    /// disconnected.
+    #[serde(
+        default = "default_header_read",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub header_read: Duration,
+    #[serde(
+        default = "default_upstream_connect",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub upstream_connect: Duration,
+    /// Until the upstream's response *headers*; `504` after. Bodies stream.
+    #[serde(
+        default = "default_upstream_response",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub upstream_response: Duration,
+    /// Idle pooled upstream connections are closed after this.
+    #[serde(default = "default_idle", deserialize_with = "duration::deserialize")]
+    pub idle: Duration,
+}
+
+impl Default for LinkProxyTimeouts {
+    fn default() -> Self {
+        Self {
+            header_read: default_header_read(),
+            upstream_connect: default_upstream_connect(),
+            upstream_response: default_upstream_response(),
+            idle: default_idle(),
+        }
+    }
+}
+
+fn default_header_read() -> Duration {
+    Duration::from_secs(10)
+}
+fn default_upstream_connect() -> Duration {
+    Duration::from_secs(5)
+}
+fn default_upstream_response() -> Duration {
+    Duration::from_secs(30)
+}
+fn default_idle() -> Duration {
+    Duration::from_secs(60)
 }
 
 // ---------------------------------------------------------------------------

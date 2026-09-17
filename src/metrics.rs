@@ -44,6 +44,10 @@ pub fn install() -> Result<PrometheusHandle, BuildError> {
             Matcher::Full("simmer_downstream_latency_seconds".to_string()),
             LATENCY_BUCKETS,
         )?
+        .set_buckets_for_metric(
+            Matcher::Full("simmer_link_proxy_duration_seconds".to_string()),
+            LINK_PROXY_BUCKETS,
+        )?
         .install_recorder()?;
 
     describe();
@@ -64,6 +68,13 @@ pub fn install() -> Result<PrometheusHandle, BuildError> {
 /// latency rather than only as errors.
 const LATENCY_BUCKETS: &[f64] = &[
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+];
+
+/// Buckets for `simmer_link_proxy_duration_seconds` (D-083): a click is one HTTP
+/// round trip to a tracking service, and the top bucket sits above the default
+/// `upstream_response` timeout of 30 s.
+const LINK_PROXY_BUCKETS: &[f64] = &[
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
 /// Register a description for every metric §9.1 asks for.
@@ -239,6 +250,25 @@ fn describe() {
          pinned at simmer_db_pool_max precedes 451 4.3.0 (§7.5)"
     );
     describe_gauge!("simmer_db_pool_max", "database.max_connections");
+    describe_counter!(
+        "simmer_link_proxy_requests_total",
+        "D-083 link proxy requests by status class and origin: upstream (the upstream's \
+         own response) or proxy (502, 504, 413, 501 or 508 answered by Simmer itself)"
+    );
+    describe_histogram!(
+        "simmer_link_proxy_duration_seconds",
+        Unit::Seconds,
+        "D-083 link proxy time to response headers"
+    );
+    describe_counter!(
+        "simmer_link_proxy_connections_refused_total",
+        "D-083 link proxy connections refused before a request: outside \
+         link_proxy.allowed_cidrs (cidr) or over link_proxy.max_connections (limit)"
+    );
+    describe_gauge!(
+        "simmer_link_proxy_connections",
+        "D-083 open link proxy client connections"
+    );
     describe_gauge!(
         "simmer_tasks_alive",
         "Live tokio tasks: one per session plus the accept loops, sweepers and admin \
@@ -632,4 +662,28 @@ pub fn recipient_events_evicted(count: u64) {
 /// from a downstream outage in the metrics.
 pub fn quota_unavailable(route: &str) {
     counter!("simmer_quota_unavailable_total", "route" => route.to_string()).increment(1);
+}
+
+/// D-083 — one link proxy request. `origin` is `upstream` or `proxy`.
+pub fn link_proxy_request(status: u16, origin: &'static str, seconds: f64) {
+    let class = match status {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        _ => "5xx",
+    };
+    counter!("simmer_link_proxy_requests_total", "status_class" => class, "origin" => origin)
+        .increment(1);
+    metrics::histogram!("simmer_link_proxy_duration_seconds").record(seconds);
+}
+
+/// D-083 — a link proxy connection refused before any request was read.
+pub fn link_proxy_connection_refused(reason: &'static str) {
+    counter!("simmer_link_proxy_connections_refused_total", "reason" => reason).increment(1);
+}
+
+/// D-083 — open link proxy client connections.
+pub fn link_proxy_connections(open: usize) {
+    metrics::gauge!("simmer_link_proxy_connections").set(open as f64);
 }

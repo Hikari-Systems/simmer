@@ -245,12 +245,32 @@ async fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("binding admin listener {}: {e}", config.admin.listen))?;
     info!(addr = %config.admin.listen, "admin listener bound");
 
+    // D-083 — the optional link proxy. Bound here, with the other listeners and
+    // before readiness, so a port clash is a startup failure. It dials its
+    // upstream with the same verifying TLS configuration as a `required_verify`
+    // route.
+    let link_proxy = match &config.link_proxy {
+        Some(cfg) => {
+            let listener =
+                simmer::link_proxy::Listener::bind(cfg, (*engine.tls.verifying()).clone()).await?;
+            info!(
+                addr = %listener.local_addr()?,
+                upstream = %cfg.upstream,
+                "link proxy listener bound"
+            );
+            Some(listener)
+        }
+        None => None,
+    };
+
     // §10.4 is two-phase: `stop_accepting` breaks both accept loops, then after
     // the grace period `hard_stop` makes any session still running emit `421`.
     let stop_accepting = smtp::Shutdown::new();
     let hard_stop = smtp::Shutdown::new();
 
     let smtp_task = tokio::spawn(smtp.serve(stop_accepting.clone(), hard_stop.clone()));
+    let mut link_proxy_task =
+        link_proxy.map(|l| tokio::spawn(l.serve(stop_accepting.clone(), hard_stop.clone())));
 
     // §7.4 — release reservations stranded by a crash mid-send. In steady state
     // it should sweep nothing; a nonzero rate is the signal §7.4 asks for.
@@ -316,8 +336,17 @@ async fn run() -> anyhow::Result<()> {
     // 30s)". Acquiring every session permit is exactly the condition "no session
     // is in flight", so there is nothing else to track.
     let max = u32::try_from(config.server.max_concurrent_sessions).unwrap_or(u32::MAX);
-    match tokio::time::timeout(SHUTDOWN_GRACE, sessions.acquire_many(max)).await {
-        Ok(_) => info!("all sessions drained"),
+    //
+    // D-083: the link proxy's requests in flight get the same grace. Its task
+    // returns once they have, so waiting on it is that condition.
+    let drained = async {
+        let _ = sessions.acquire_many(max).await;
+        if let Some(task) = link_proxy_task.take() {
+            let _ = task.await;
+        }
+    };
+    match tokio::time::timeout(SHUTDOWN_GRACE, drained).await {
+        Ok(()) => info!("all sessions drained"),
         Err(_) => warn!(
             grace_secs = SHUTDOWN_GRACE.as_secs(),
             "grace period expired with sessions in flight; sending 421"
@@ -337,6 +366,9 @@ async fn run() -> anyhow::Result<()> {
     pools.drain().await;
 
     let _ = smtp_task.await;
+    if let Some(task) = link_proxy_task {
+        let _ = task.await;
+    }
     let _ = sweeper.await;
     if let Some(task) = frequency_sweeper {
         let _ = task.await;

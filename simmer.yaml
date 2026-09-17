@@ -98,6 +98,30 @@ logging:
   level: info
   format: json                       # §9.5; `text` for local terminals
 
+# D-083 — an optional HTTP/1.x forwarder for the tracking and unsubscribe links
+# the routes below rewrite. Absent means no listener. It belongs behind a
+# TLS-terminating load balancer: put ONLY this port in the load balancer's target
+# group, never an SMTP port (§2.3), and health-check the admin port's /health.
+#
+# Every request goes to `upstream` with its method, path, query, cookies and body
+# unchanged; a path on `upstream` prefixes every forwarded path, so with the
+# example below `/test?abc=123` becomes `/tracking/test?abc=123`. Location,
+# Content-Location and Set-Cookie naming the upstream are rewritten back to the
+# public name, and redirects are never followed.
+#
+# link_proxy:
+#   listen: "0.0.0.0:80"
+#   upstream: "https://link.domain2.com/tracking"
+#   public_scheme: https             # what the load balancer terminates
+#   allowed_cidrs: ["10.0.0.0/8"]    # the load balancer's subnets; required
+#   max_request_bytes: 1048576
+#   max_connections: 512
+#   timeouts:
+#     header_read: 10s
+#     upstream_connect: 5s
+#     upstream_response: 30s         # to response headers; 504 after
+#     idle: 60s
+
 # §3.1: the second axis of the quota key. Literal domains only — no MX-based or
 # heuristic grouping (§14.3), so Google Workspace custom domains land in the
 # catch-all rather than being tracked against Google.

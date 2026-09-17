@@ -161,6 +161,7 @@ pub fn validate(cfg: &Config) -> ViolationList {
     check_routes(cfg, &mut v);
     check_chains(cfg, &mut v);
     check_default_chain(cfg, &mut v);
+    check_link_proxy(cfg, &mut v);
 
     v
 }
@@ -218,6 +219,20 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
                         .to_string(),
                 });
             }
+        }
+    }
+
+    // D-083 — the load balancer terminates TLS for the click, so an `http://`
+    // upstream means the recipient's tracking token crosses the network in the
+    // clear on the second leg. Legitimate for an upstream on the same segment.
+    if let Some(lp) = &cfg.link_proxy {
+        if lp.upstream.to_ascii_lowercase().starts_with("http://") {
+            out.push(Warning {
+                path: "link_proxy.upstream".to_string(),
+                message: "is http://, so forwarded clicks, their cookies and their tracking \
+                          tokens reach the upstream unencrypted"
+                    .to_string(),
+            });
         }
     }
 
@@ -524,6 +539,116 @@ fn check_cidrs(cfg: &Config, v: &mut ViolationList) {
             );
         }
     }
+}
+
+/// D-083. Everything `link_proxy::Listener::bind` and the crate's
+/// `ReverseProxy::new_with_client` rely on — the latter *panics* on a target it
+/// cannot parse, so a URI that reaches it has to have passed here first.
+fn check_link_proxy(cfg: &Config, v: &mut ViolationList) {
+    let Some(lp) = &cfg.link_proxy else {
+        return;
+    };
+
+    match lp.listen.parse::<SocketAddr>() {
+        Err(_) => v.push(
+            "link_proxy.listen",
+            format!("'{}' is not a valid host:port address", lp.listen),
+        ),
+        Ok(addr) if addr.port() != 0 => {
+            let smtp = cfg
+                .server
+                .listeners
+                .iter()
+                .position(|l| l.address.parse::<SocketAddr>().ok() == Some(addr));
+            if let Some(i) = smtp {
+                v.push(
+                    "link_proxy.listen",
+                    format!("'{addr}' duplicates server.listeners[{i}]"),
+                );
+            }
+            if cfg.admin.listen.parse::<SocketAddr>().ok() == Some(addr) {
+                v.push(
+                    "link_proxy.listen",
+                    format!("'{addr}' duplicates admin.listen"),
+                );
+            }
+        }
+        Ok(_) => {}
+    }
+
+    if let Some(problem) = upstream_problem(&lp.upstream) {
+        v.push(
+            "link_proxy.upstream",
+            format!("'{}' {problem}", lp.upstream),
+        );
+    }
+
+    if lp.allowed_cidrs.is_empty() {
+        v.push(
+            "link_proxy.allowed_cidrs",
+            "is empty, so every connection would be refused. List the load balancer's subnets",
+        );
+    }
+    for (i, cidr) in lp.allowed_cidrs.iter().enumerate() {
+        if cidr.parse::<ipnet::IpNet>().is_err() {
+            v.push(
+                format!("link_proxy.allowed_cidrs[{i}]"),
+                format!("'{cidr}' is not a valid CIDR block"),
+            );
+        }
+    }
+
+    if lp.max_connections == 0 {
+        v.push("link_proxy.max_connections", "must be at least 1");
+    }
+    if lp.max_request_bytes == 0 {
+        v.push("link_proxy.max_request_bytes", "must be greater than zero");
+    }
+    let t = &lp.timeouts;
+    for (name, d) in [
+        ("header_read", t.header_read),
+        ("upstream_connect", t.upstream_connect),
+        ("upstream_response", t.upstream_response),
+        ("idle", t.idle),
+    ] {
+        if d.is_zero() {
+            v.push(
+                format!("link_proxy.timeouts.{name}"),
+                "must be greater than zero",
+            );
+        }
+    }
+}
+
+/// Why `upstream` is not `scheme://host[:port][/prefix]`, or `None` if it is.
+fn upstream_problem(upstream: &str) -> Option<&'static str> {
+    // `http::Uri` discards a fragment rather than refusing it.
+    if upstream.contains('#') {
+        return Some("must not carry a fragment");
+    }
+    let Ok(uri) = upstream.parse::<axum::http::Uri>() else {
+        return Some("is not a valid URI");
+    };
+    match uri.scheme_str() {
+        Some("http" | "https") => {}
+        Some(_) => return Some("must use the http or https scheme"),
+        None => return Some("must be an absolute URI such as https://link.example.com"),
+    }
+    let Some(authority) = uri.authority() else {
+        return Some("has no host");
+    };
+    if authority.as_str().contains('@') {
+        return Some("must not carry credentials");
+    }
+    if authority.host().is_empty() {
+        return Some("has no host");
+    }
+    // A path is a prefix for every forwarded request's path. A query has no
+    // equivalent: the proxy would silently drop it.
+    if uri.query().is_some() {
+        return Some("must not carry a query; a path prefix is allowed, a query is not");
+    }
+    None
 }
 
 /// §5.1's certificate, loaded exactly as the listener will load it, so a file
