@@ -387,6 +387,55 @@ retry is deliberately never attempted after the message body has been sent
 (`DECISIONS.md` D-068): past that point a delivery may already have happened, and
 retrying would send it twice.
 
+### Link proxy
+
+An optional HTTP forwarder for the tracking and unsubscribe links your routes
+rewrite (`DECISIONS.md` D-083; not part of the spec). The links point at a
+public name such as `click.newbrand.com`; a TLS-terminating load balancer sends
+that name to `link_proxy.listen`; Simmer sends every request to one upstream
+and relays the response:
+
+```yaml
+link_proxy:
+  listen: "0.0.0.0:80"
+  upstream: "https://link.domain2.com/tracking"   # a path prefix is optional
+  allowed_cidrs: ["10.0.0.0/8"]                   # the load balancer's subnets
+```
+
+`http://click.newbrand.com/test?abc=123` arrives at the upstream as
+`GET /tracking/test?abc=123` with `Host: link.domain2.com`.
+
+- **Unchanged:** method, path, query, body, cookies and every end-to-end header.
+- **Added:** `X-Forwarded-For` (the load balancer's value, with the load
+  balancer's address appended), `X-Forwarded-Host` and `X-Forwarded-Proto`,
+  where the load balancer did not set them, and `Via: 1.1 simmer`.
+- **Rewritten on the way back:** a `Location` or `Content-Location` naming the
+  upstream, a `Set-Cookie` with `Domain=` the upstream (or a parent domain), and,
+  with a prefix, a `Location: /tracking/…` or cookie `Path=/tracking…`. Each is
+  pointed at the public name the browser used. Anything naming another host —
+  the redirect to the click's real destination — passes through untouched.
+  Redirects are never followed.
+- **Refused:** HTTP/2 (HTTP/1.0 and 1.1 only), `CONNECT` (`501`), bodies over
+  `max_request_bytes` (`413`), and connections from outside `allowed_cidrs`,
+  which are closed before anything is read. WebSocket upgrades are forwarded as
+  plain requests, never tunnelled.
+- **Failures** are `502` (upstream unreachable, or its certificate does not
+  verify against the platform roots) and `504` (no response headers within
+  `timeouts.upstream_response`). Anything Simmer answers itself carries
+  `Cache-Control: no-store`, and nothing is retried: a one-click unsubscribe is
+  a POST.
+
+It logs method, path and status, never the query string or cookies, which carry
+recipient-identifying tokens. It exports metrics as
+`simmer_link_proxy_requests_total{status_class,origin}`,
+`simmer_link_proxy_duration_seconds`, `simmer_link_proxy_connections` and
+`simmer_link_proxy_connections_refused_total{reason}`.
+
+**Deploying it:** put only the link proxy's port in the load balancer's target
+group, never an SMTP port, and point the target group's health check at the
+admin port's `/health`. The proxy reserves no path of its own. At cutover,
+repoint the public name at the upstream directly and remove the block.
+
 ## Control plane
 
 On `admin.listen`, port 8080 by default. `/health`, `/healthcheck` and `/metrics`

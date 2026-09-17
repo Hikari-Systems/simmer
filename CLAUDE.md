@@ -196,6 +196,11 @@ src/models/recipient_event.rs  §7.3's rows. A key is 16 bytes and never plainte
 src/models/instance_config.rs  §7.3's salt: insert-if-absent, then read (D-050)
 src/db.rs                pool + migrations
 src/hash_password.rs     `server hash-password`. Reads stdin, never argv
+src/link_proxy/mod.rs    D-083 — optional HTTP link forwarder; NOT in SPEC.md. The
+                         forwarding is axum-reverse-proxy's; the listener, the
+                         no-store rule and the query-free logging are ours
+src/link_proxy/rewrite.rs  Location / Set-Cookie back to the public name, and the
+                         path prefix undone. Exact upstream match only
 src/admin/view.rs        §9.2's projections. The row wins over the schedule (D-026)
 src/admin/auth.rs        §9.3's token. Reads need it too (D-055); named (D-053)
 src/admin/mutate.rs      §9.3. Every mutation says which chains it just emptied
@@ -214,6 +219,7 @@ tests/ingress_tls.rs     §5.1/§5.3 end to end. Every handshake VERIFIES agains
                          per-test CA (support::TestPki); an unverified one proves little
 tests/admin_api.rs       §9. Pins dry run against the REAL walk, step for step
 tests/metrics_endpoint.rs  §9.1. Its own binary — one global recorder per process
+tests/link_proxy.rs      D-083 on the wire: raw client, recording upstream
 tests/acceptance.rs      §12.3 against real mail servers; behind --ignored
 simmer.acceptance.yaml   the acceptance stack's config (D-042)
 ```

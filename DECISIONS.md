@@ -2672,6 +2672,153 @@ that an over-long message is answered at the dot and the connection closed.
   The run went through a loopback forwarder, because the stress harness addresses
   published ports on `127.0.0.1` and the jail cannot reach them.
 
+---
+
+## After the test programme — the link proxy
+
+### D-083 — An optional HTTP forwarder for tracking and unsubscribe links
+
+**Not in `SPEC.md`.** §2.1 lists no HTTP listener beyond the admin API, and §2.3
+puts the container on a trusted segment. Requested on 2026-09-17: route rewrites
+point a message's tracking and unsubscribe links at a public name
+(`click.newbrand.com`), and that name has to answer somewhere. Recorded here
+rather than amended into the spec; see O-13.
+
+**Decision.** An optional `link_proxy:` block. When it is present, Simmer binds
+an HTTP/1.x listener that sends every request, unchanged, to one configured
+upstream and relays the response:
+
+- `http://domain1.com/test?abc=123` goes to `https://link.domain2.com/test?abc=123`.
+- A path on `upstream` is a prefix: with `https://link.domain2.com/tracking`, the
+  same request goes to `/tracking/test?abc=123`.
+- When the block is absent, nothing binds and nothing starts.
+
+**Deployment, as settled with the requester.** An internet-facing layer 7 load
+balancer terminates HTTPS and forwards plain HTTP to this listener. That is what
+keeps §2.2's "no ACME" and §2.3's trusted segment both true:
+
+- The listener never handles TLS.
+- Its only peers are the load balancer, enforced by `link_proxy.allowed_cidrs`,
+  which is required and has no default.
+- Only this port goes in the load balancer's target group, never an SMTP port.
+- The target group's health check uses the admin port's `/health`, so the proxy
+  reserves no path and stays transparent.
+
+**Off the shelf, as requested: `axum-reverse-proxy` 2.2.** It provides:
+
+- hop-by-hop stripping (RFC 9110 §7.6.1)
+- `Host` replaced with the upstream's
+- `X-Forwarded-For` appended
+- `X-Forwarded-Host` and `-Proto` kept from the load balancer, or set
+- `504` on the response-header timeout and `413` on the body cap
+- `Via` with `508` loop detection
+- `501` for `CONNECT`
+- building the upstream URI from the path and query only, so an absolute-form
+  target cannot aim it elsewhere
+
+`LICENSES.md` §8 records the alternatives and why each was not chosen.
+
+It is taken with `default-features = false`. Its TLS feature would bring in
+aws-lc-rs and a webpki-roots connector. Instead, the upstream client is built
+here on `hyper-rustls` over `TlsConfigs::verifying()`: the same ring provider and
+platform roots as a `required_verify` route (§8.2).
+
+**What Simmer adds, and why:**
+
+1. **Its own listener**, not `axum::serve`:
+   - It uses hyper's HTTP/1 connection builder, so HTTP/2 is refused by
+     construction, and `header_read_timeout` bounds a slow client (axum's `serve`
+     exposes no such setting).
+   - `allowed_cidrs` is checked before a byte is read.
+   - `max_connections` is a semaphore, and over it the answer is `503`.
+   - Upgrades are **never** enabled on the connection. The crate would otherwise
+     open a WebSocket to the upstream itself, so the `Upgrade` header is removed
+     and such a request is forwarded as a plain one. `Proxy-Authorization` is
+     removed too, since it is addressed to a proxy rather than through one.
+2. **The response rewrites** (`link_proxy::rewrite`), which no crate offered, in
+   three places:
+   - `Location` and `Content-Location` naming the upstream point at the public
+     origin, taken from the load balancer's `X-Forwarded-Host`/`-Proto`, falling
+     back to `Host` and `public_scheme`.
+   - A `Set-Cookie` `Domain=` the upstream, or a parent domain of it, becomes the
+     public host.
+   - With a prefix, a `Location` or cookie `Path` inside the prefix loses it. A
+     `Location` that is an absolute path outside the prefix becomes an absolute
+     upstream URL, because otherwise the browser would request it back through
+     the proxy with the prefix added a second time.
+
+   Every rewrite requires an **exact** match on the upstream (host, effective
+   port, prefix at a segment boundary). The redirect a tracking link exists to
+   issue, to the click's real destination, must pass through byte for byte.
+   Redirects are never followed.
+3. **§14.1 applied to HTTP.** Anything the proxy answers itself (`413`, `501`,
+   `502`, `503`, `504`, `508`) carries `Cache-Control: no-store`. A `502` from a
+   bad minute must not become the remembered answer for a link in someone's
+   inbox, and `501` is cacheable by default under RFC 9110. There are **no
+   retries**, including the pooled client's replay of cancelled requests: a
+   one-click unsubscribe (RFC 8058) is a POST. This is D-068's reasoning again.
+
+   Proxy-originated responses are recognised by the crate's `ProxyError`
+   extension or by the absence of our `Via` pseudonym, which the crate adds to
+   every relayed response and to none of its own. The tests pin this: a planted
+   defect that dropped `no-store` failed five of them.
+4. **Logging that does not leak.** Method, path, status and time, never the query,
+   cookies or body. A tracking token identifies a recipient, which is §7.3's
+   reason for hashing addresses and the admin API's reason for never emitting an
+   `@`.
+5. **§10.4.** The listener stops accepting with the SMTP listeners. Requests in
+   flight share the same grace period, because `main` waits on both before
+   `hard_stop`. Idle keep-alive connections close at once.
+
+**Cost.** `tokio-tungstenite` and `rand` are non-optional dependencies of the
+crate, so they are compiled but never reached, because the connection builder
+has no upgrades. `axum-reverse-proxy` is pinned `~2.2`, because `ProxyPolicy`'s
+defaults are behaviour.
+
+**Not chosen:**
+
+- **Per-`Host` mapping to several upstreams.** One upstream, as requested. A
+  second brand is a second block's worth of work, not a schema break.
+- **Rewriting response bodies.** A tracking service's HTML naming its own host is
+  the upstream's business. Rewriting it would mean decompressing and re-encoding,
+  the thing D-043 exists to avoid.
+- **TLS on the listener.** §2.2 has no ACME and no certificate reload, and the
+  load balancer already terminates TLS.
+
+**Verified:**
+
+- **`src/link_proxy/rewrite.rs`**: 21 unit tests.
+- **`tests/link_proxy.rs`**: 20 tests on the wire, using a raw client and an
+  upstream that records the bytes it received. They cover:
+  - byte-equal forwarding, the path prefix, and the forwarded headers
+  - HTTP/1.0, and an HTTPS upstream that verifies against a test CA, with `502`
+    when the CA is untrusted
+  - the redirect and cookie rewrites, the destination redirect passing through,
+    and streaming
+  - the absolute-form target, `CONNECT`, WebSocket, the HTTP/2 preface, the CIDR
+    drop, `413`, `502`, `504`, the slow header read, `503`, and shutdown
+- **Planted defects.** Removing the rewrite failed the redirect test. Dropping
+  `no-store` failed five tests.
+- **`tests/config_validation.rs`**: seven tests covering each new §4.2 rule,
+  including one that reports all of them at once.
+- **The gates.**
+  - `cargo test`: 934 passed, which is the 886 from before plus these 48.
+  - `clippy -D warnings`, `fmt` and `cargo deny check` are clean.
+  - `cargo tree` has no `aws-lc-rs`.
+- **Live, 2026-09-17.** The `runtime` image ran on `simmer_default` with
+  `upstream: https://httpbin.org/anything`:
+  - A `POST /test?abc=123` with cookies and a form body arrived as
+    `/anything/test?abc=123`, with `Host: httpbin.org`, the body, the cookies and
+    `X-Forwarded-Host` intact, over TLS verified against the platform roots.
+  - `CONNECT` got `501` with `no-store`, and HTTP/2 prior knowledge was refused.
+  - `/metrics` showed the new series, and the log line carried `path: /test`
+    with no query.
+  - Not observable there: httpbin's own load balancer rewrites
+    `X-Forwarded-For`, `-Proto` and `Via`, so those rest on the tests above.
+- **Not run:** the §12.3 acceptance suite. Nothing on the SMTP path changed
+  beyond `main` binding one more optional listener and waiting on it at
+  shutdown.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -2691,6 +2838,7 @@ the phase that depends on each.
 | ~~O-10~~ | *Settled in phase 2 — see **D-018**. The working assumption did not survive: the route is not known at `MAIL FROM`. Replaced by a config-declared capability.* | | |
 | ~~O-11~~ | *Settled in phase 7 — see **D-053**. Named `admin.tokens` alongside `auth_token`, which is the token named `default`. The working assumption held: named tokens, not dropped wording.* | | |
 | ~~O-12~~ | *Settled in phase 3: DST transitions both directions, a start inside a DST gap, and a future start are all tested; the leap-second case is asserted to be a no-op rather than merely argued.* | | |
+| O-13 | D-083's link proxy is outside §2.1 and stretches §2.3: the listener is reached from the internet through a load balancer. Amend §2.1/§2.3 to include it, or keep it as a decision record only? | Decision record only, with `allowed_cidrs` required and the load balancer as the trust boundary. Needs the spec's author. | Before production use of `link_proxy` |
 
 
 ---

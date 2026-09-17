@@ -469,6 +469,33 @@ mimalloc (`MIT` in all 53 and 50 published versions of `mimalloc` and
 `libmimalloc-sys`) was adopted first and replaced after the measured comparison in
 D-078, before either was pushed. It is not in the graph.
 
+## 8. D-083 — the link proxy
+
+Adopted for the optional HTTP forwarder, on the instruction to use an
+off-the-shelf library for the proxying. Checked against crates.io on 2026-09-17:
+
+| Crate | Version | Licence | Role |
+|---|---|---|---|
+| `axum-reverse-proxy` | 2.2.0 | `MIT` | the forwarding: hop-by-hop, `X-Forwarded-*`, timeouts, body cap, `Via` |
+| `hyper-rustls` | 0.27.9 | `Apache-2.0 OR ISC OR MIT` | the upstream connector, over the existing ring `ClientConfig` |
+| `tokio-tungstenite`, `tungstenite` | 0.28 | `MIT` | non-optional dependencies of the proxy crate; compiled, never reached (D-083) |
+| `rand`, `url`, `percent-encoding`, `futures-util` | — | `MIT OR Apache-2.0` | likewise transitive |
+
+No AGPL, GPL or LGPL crate enters the graph; `cargo deny check` is the gate.
+`hyper`, `hyper-util` and `http-body-util` were already in the graph via axum and
+the dev-dependencies, and are now named directly for their features.
+
+`axum-reverse-proxy` is taken with `default-features = false`. Its `tls` feature
+would bring in `hyper-rustls` with *that* crate's defaults — `aws-lc-rs`, which
+needs cmake and a C toolchain in the builder (the reason the `rustls` entry in
+`Cargo.toml` chose ring), and a connector built on `webpki-roots` rather than
+the platform store. `cargo tree -i aws-lc-rs` must stay empty.
+
+Rejected: `tower-proxy` 0.10 (`MIT OR Apache-2.0`; no `X-Forwarded-*`, timeouts
+or body cap), `pingora-proxy` 0.9 (`Apache-2.0`; a whole server framework and
+runtime), `hyper-reverse-proxy` (last released 2022, hyper 0.14), and `sozu`
+(AGPL).
+
 ## How to re-check
 
 `cargo-deny` is the gate in CI:
