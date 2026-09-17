@@ -938,3 +938,115 @@ fn the_violation_report_is_readable() {
         "report does not name the offending path:\n{rendered}"
     );
 }
+
+// -- D-083: link_proxy ----------------------------------------------------
+
+fn with_link_proxy(block: &str) -> String {
+    format!("{BASE}link_proxy:\n{block}")
+}
+
+#[test]
+fn link_proxy_is_optional_and_absent_by_default() {
+    assert!(load(BASE).unwrap().link_proxy.is_none());
+}
+
+#[test]
+fn accepts_a_link_proxy_with_defaults_and_with_a_path_prefix() {
+    for upstream in [
+        "https://link.domain2.com",
+        "https://link.domain2.com/",
+        "https://link.domain2.com/tracking",
+        "http://10.0.0.9:8080/a/b/",
+    ] {
+        let cfg = load(&with_link_proxy(&format!(
+            "  listen: \"0.0.0.0:80\"\n  upstream: \"{upstream}\"\n  allowed_cidrs: [\"10.0.0.0/8\"]\n"
+        )))
+        .unwrap_or_else(|e| panic!("{upstream}: {e}"));
+        let lp = cfg.link_proxy.unwrap();
+        assert_eq!(lp.public_scheme.as_str(), "https");
+        assert_eq!(lp.max_request_bytes, 1024 * 1024);
+        assert_eq!(lp.max_connections, 512);
+        assert_eq!(
+            lp.timeouts.upstream_response,
+            std::time::Duration::from_secs(30)
+        );
+    }
+}
+
+#[test]
+fn rejects_an_unusable_link_proxy_upstream() {
+    for (upstream, needle) in [
+        ("link.domain2.com", "absolute URI"),
+        ("ftp://link.domain2.com", "http or https"),
+        ("https://user:pw@link.domain2.com", "credentials"),
+        ("https://link.domain2.com/t?x=1", "query"),
+        ("https://link.domain2.com/t#frag", "fragment"),
+        ("https:///path", "link_proxy.upstream"),
+    ] {
+        rejected_for(
+            &with_link_proxy(&format!(
+                "  listen: \"0.0.0.0:80\"\n  upstream: \"{upstream}\"\n  allowed_cidrs: [\"10.0.0.0/8\"]\n"
+            )),
+            needle,
+        );
+    }
+}
+
+#[test]
+fn rejects_a_link_proxy_listen_that_clashes_with_another_listener() {
+    rejected_for(
+        &with_link_proxy(
+            "  listen: \"127.0.0.1:25\"\n  upstream: \"https://l.example\"\n  allowed_cidrs: [\"10.0.0.0/8\"]\n",
+        ),
+        "duplicates server.listeners[0]",
+    );
+    rejected_for(
+        &with_link_proxy(
+            "  listen: \"127.0.0.1:8080\"\n  upstream: \"https://l.example\"\n  allowed_cidrs: [\"10.0.0.0/8\"]\n",
+        ),
+        "duplicates admin.listen",
+    );
+}
+
+#[test]
+fn reports_every_link_proxy_violation_at_once() {
+    let yaml = with_link_proxy(
+        "  listen: \"nowhere\"\n  upstream: \"ftp://x\"\n  allowed_cidrs: [\"not-a-cidr\"]\n  \
+         max_connections: 0\n  max_request_bytes: 0\n  timeouts: { header_read: 0s }\n",
+    );
+    for needle in [
+        "link_proxy.listen",
+        "link_proxy.upstream",
+        "link_proxy.allowed_cidrs[0]",
+        "link_proxy.max_connections",
+        "link_proxy.max_request_bytes",
+        "link_proxy.timeouts.header_read",
+    ] {
+        rejected_for(&yaml, needle);
+    }
+    rejected_for(
+        &with_link_proxy(
+            "  listen: \"0.0.0.0:80\"\n  upstream: \"https://l.example\"\n  allowed_cidrs: []\n",
+        ),
+        "link_proxy.allowed_cidrs",
+    );
+}
+
+#[test]
+fn rejects_an_unknown_link_proxy_key() {
+    assert!(load(&with_link_proxy(
+        "  listen: \"0.0.0.0:80\"\n  upstream: \"https://l.example\"\n  allowed_cidrs: [\"10.0.0.0/8\"]\n  upstream_host: x\n"
+    ))
+    .is_err());
+}
+
+#[test]
+fn warns_about_a_plaintext_link_proxy_upstream() {
+    let cfg = load(&with_link_proxy(
+        "  listen: \"0.0.0.0:80\"\n  upstream: \"http://l.example\"\n  allowed_cidrs: [\"10.0.0.0/8\"]\n",
+    ))
+    .unwrap();
+    assert!(config::validate::warnings(&cfg)
+        .iter()
+        .any(|w| w.path == "link_proxy.upstream"));
+}

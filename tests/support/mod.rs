@@ -1062,15 +1062,39 @@ impl TestPki {
 
     /// A verifying client that trusts this CA and nothing else.
     fn connector(&self) -> tokio_rustls::TlsConnector {
+        tokio_rustls::TlsConnector::from(Arc::new(self.client_config()))
+    }
+
+    /// The configuration behind [`connector`](Self::connector), for a client
+    /// that is not a raw stream — D-083's link proxy dialling an HTTPS upstream.
+    pub fn client_config(&self) -> rustls::ClientConfig {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(self.ca.clone()).expect("add CA");
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider)
+        rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .expect("protocol versions")
             .with_root_certificates(roots)
-            .with_no_client_auth();
-        tokio_rustls::TlsConnector::from(Arc::new(config))
+            .with_no_client_auth()
+    }
+
+    /// A server presenting this leaf: D-083's tests stand up an HTTPS upstream.
+    pub fn acceptor(&self) -> tokio_rustls::TlsAcceptor {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let certs = CertificateDer::pem_file_iter(self.cert_path())
+            .expect("read cert")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse cert");
+        let key = PrivateKeyDer::from_pem_file(self.key_path()).expect("read key");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server config");
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
     }
 }
 
