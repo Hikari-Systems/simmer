@@ -2930,8 +2930,11 @@ Otherwise:
 
 - `argon2` needed its `std` feature named. `hash-password`'s `OsRng` had only
   ever compiled because sqlx's feature unification switched it on.
-- `build.yml` used the raw branch name as an image tag, so any branch with a
-  `/` would have failed its GHCR copy. Nothing had pushed one.
+- `build.yml` uses the branch name as an image tag, and a `/` is not legal in
+  one. It cannot bite today: the trigger is `branches: ['*']`, and GitHub's `*`
+  does not match `/`, so a branch like `feat/x` never builds at all. The name is
+  sanitised anyway, so that widening the trigger to `'**'` does not break the
+  GHCR copy.
 
 ## Still open — to settle at the start of the phase that needs them
 

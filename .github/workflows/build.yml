@@ -181,8 +181,9 @@ jobs:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
 
-      # A branch name is not always a valid image tag: `feat/mssql` has a slash.
-      # Anything outside the tag alphabet becomes `-`.
+      # A branch name is not always a valid image tag. `on.push.branches: '*'`
+      # does not match a `/` today, so no such branch reaches here, but anything
+      # outside the tag alphabet becomes `-` in case the trigger is widened.
       - name: Make branch name
         run: echo "BRANCH_NAME=$(echo ${{ github.ref }} | sed -e 's/^refs\/heads\///' -e 's/[^A-Za-z0-9_.-]/-/g')" >> $GITHUB_ENV
 
