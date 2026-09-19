@@ -1,0 +1,152 @@
+name: release
+
+# On a vX.Y.Z tag: promote the image build.yml already built for the tagged commit
+# to a release, and create the GitHub release. Slater's tagging scheme, with one
+# difference — slater rebuilds on the tag, simmer does not. build.yml has already
+# run the `check` job (fmt, clippy, the Postgres-backed tests, cargo deny) against
+# this commit and pushed ghcr.io/hikari-systems/simmer:<sha>; a release is those
+# exact bytes, re-tagged. Rebuilding would ship an image nothing had tested.
+#
+#   * Docker Hub: hikarisystems/simmer:<tag> + :latest   (releases only)
+#   * GHCR:       ghcr.io/hikari-systems/simmer:<tag>    (alongside build.yml's tags)
+#   * GitHub:     a release whose notes are the tag annotation + generated changelog
+#
+# Can also be run manually against an existing tag from the Actions tab, e.g.
+# `gh workflow run release.yml -f tag=v0.1.0`.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g. v0.1.0)'
+        required: true
+
+# A release must never cancel itself mid-publish.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Most of this is the wait for build.yml below, when the tag was pushed
+    # together with the commit it names.
+    timeout-minutes: 75
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - name: Make repo name
+        run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
+
+      - name: Checkout the tag
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          # Full history + tags: the ancestry check and the tag annotation need both.
+          fetch-depth: 0
+
+      # git tags sort lexically, so tools that read the raw tag order mis-report
+      # the version. The authoritative version is a literal in README.md and
+      # DOCKERHUB.md ("Current version: `vX.Y.Z`") and in Cargo.toml. This is the
+      # non-bypassable backstop to .githooks/pre-push, which `--no-verify` and an
+      # unset hooksPath skip.
+      - name: Version tag matches README + DOCKERHUB + Cargo.toml
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          doc_ver() { grep -oE 'Current version: `v[0-9]+\.[0-9]+\.[0-9]+`' "$1" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true; }
+          readme="$(doc_ver README.md)"
+          docker="$(doc_ver DOCKERHUB.md)"
+          cargo="$(grep -m1 -E '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+          echo "tag=$ver  README=${readme:-<none>}  DOCKERHUB=${docker:-<none>}  Cargo.toml=${cargo:-<none>}"
+          if [ "$ver" != "$readme" ] || [ "$ver" != "$docker" ] || [ "$ver" != "$cargo" ]; then
+            echo "::error::version mismatch — tag $ver, README ${readme:-<none>}, DOCKERHUB ${docker:-<none>}, Cargo.toml ${cargo:-<none>}. Bump the 'Current version' line in README.md and DOCKERHUB.md, and Cargo.toml, to $ver before tagging."
+            exit 1
+          fi
+
+      # Only main's builds are releasable. A tag on a feature-branch commit would
+      # find a GHCR image too (build.yml builds every branch), but one that was
+      # never merged.
+      - name: Tagged commit is on main
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse "${TAG}^{commit}")"
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::$TAG points at $SHA, which is not on main. Merge it to main, let build.yml finish, and re-tag."
+            exit 1
+          fi
+
+      - name: Install skopeo
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y skopeo
+
+      - name: Log in to GHCR and Docker Hub via skopeo
+        run: |
+          skopeo login ghcr.io \
+            --username ${{ github.actor }} \
+            --password ${{ secrets.GH_TOKEN }}
+          skopeo login index.docker.io \
+            --username ${{ secrets.DOCKERHUB_USERNAME }} \
+            --password ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Pushing the release commit and its tag together is the normal flow, and
+      # then build.yml is still running. Wait for its image rather than failing;
+      # 60 minutes is well past build.yml's own 25 + 40 + 10 minute job timeouts.
+      - name: Wait for build.yml's image of the tagged commit
+        run: |
+          set -euo pipefail
+          src="docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${SHA}"
+          for i in $(seq 1 120); do
+            if skopeo inspect --raw "$src" >/dev/null 2>&1; then
+              echo "found $src"
+              exit 0
+            fi
+            echo "waiting for $src ($i/120)"
+            sleep 30
+          done
+          echo "::error::no image at $src after 60 minutes. Check build.yml's run for $SHA, then re-run this workflow."
+          exit 1
+
+      - name: Promote to the release tags
+        run: |
+          set -euo pipefail
+          src="docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${SHA}"
+          skopeo copy --all "$src" "docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${TAG}"
+          for T in "${TAG}" latest; do
+            skopeo copy --all "$src" "docker://hikarisystems/${{ env.REPO_NAME }}:${T}"
+          done
+
+      # The annotated tag's message is the human-written release description,
+      # prepended to the generated changelog. A lightweight tag falls back to the
+      # generated notes alone.
+      - name: Derive release notes from the tag annotation
+        id: notes
+        run: |
+          set -euo pipefail
+          body="$(git for-each-ref "refs/tags/${TAG}" --format='%(contents)')"
+          if [ -z "${body//[[:space:]]/}" ]; then
+            echo "::warning::tag ${TAG} has no annotation — falling back to generated notes only. Tag with 'git tag -a ${TAG} -m \"…\"' for a proper description."
+          fi
+          {
+            echo "body<<__RELEASE_NOTES__"
+            echo "$body"
+            echo ""
+            echo "Image: \`hikarisystems/${{ env.REPO_NAME }}:${TAG}\` (also \`ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${TAG}\`), built from \`${SHA}\`."
+            echo "__RELEASE_NOTES__"
+          } >> "$GITHUB_OUTPUT"
+
+      # Simmer ships as an image, so unlike slater there are no binaries to attach.
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          tag_name: ${{ env.TAG }}
+          body: ${{ steps.notes.outputs.body }}
+          generate_release_notes: true

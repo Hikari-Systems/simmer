@@ -1,0 +1,41 @@
+name: Sync Docker Hub description
+
+# Push DOCKERHUB.md to the Docker Hub repository overview. Runs on every push to
+# main (keeps the overview in lockstep with the repo), and can be triggered
+# manually from the Actions tab (or with `gh workflow run
+# dockerhub-description.yml`). Decoupled from the image push in release.yml so
+# overview edits propagate without waiting for a release; the sync is
+# idempotent, so a push that doesn't touch DOCKERHUB.md just re-pushes the same
+# text. Copied from slater's.
+#
+# The Docker Hub repository is created by the first release's push to it. Until
+# then this job fails on a repository that does not exist; re-run it after the
+# first release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# The push to Docker Hub authenticates with DOCKERHUB_USERNAME/TOKEN secrets, not
+# GITHUB_TOKEN; the job only checks out the repo. Pin the token to read-only.
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Make repo name
+        run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Update Docker Hub overview from DOCKERHUB.md
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: hikarisystems/${{ env.REPO_NAME }}
+          readme-filepath: ./DOCKERHUB.md

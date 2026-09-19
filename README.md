@@ -2,6 +2,9 @@
 
 An SMTP relay facade that applies a domain reputation warm-up ramp.
 
+<!-- current-version: source of truth for the release number. Keep in sync with the git tag, DOCKERHUB.md, and Cargo.toml; enforced by .githooks/pre-push and the release CI. -->
+**Current version: `v0.1.0`** — [all releases](https://github.com/Hikari-Systems/simmer/releases).
+
 Simmer sits between an application and one or more real SMTP providers. It
 accepts a message, selects an outbound route according to quota state, rewrites
 the message's identity to match that route, forwards it synchronously, and
@@ -513,6 +516,31 @@ pause a route, and a run of those is somebody guessing.
 pinned at the maximum comes before `451 4.3.0`; and `simmer_tasks_alive`. The
 exporter's buffered histogram samples are drained every 5 s whether or not anything
 scrapes (D-076).
+
+## Releasing
+
+Releases follow slater's scheme. The version is a literal in three places — the
+"Current version" line above, the same line in `DOCKERHUB.md`, and `Cargo.toml` —
+because `git tag` sorts lexically and buries the newest tag mid-list. A `vX.Y.Z`
+tag releases the commit it points at:
+
+```sh
+git config core.hooksPath .githooks        # once per clone
+# bump all three to X.Y.Z, commit, and push to main; wait for build.yml
+git tag -a vX.Y.Z -m "what this release is"
+git push origin vX.Y.Z
+```
+
+`.githooks/pre-push` refuses the tag push if any of the three disagree with it, and
+`release.yml` checks again (the hook can be skipped; CI cannot). The release does
+**not rebuild**: it promotes the image `build.yml` already built and tested for that
+commit on `main`, so the tagged commit must be on `main`, and the job waits for
+that build if it is still running. It tags the image `:vX.Y.Z` and `:latest` on
+Docker Hub (`hikarisystems/simmer`) and `:vX.Y.Z` on GHCR, then creates the GitHub
+release, with the tag annotation followed by the generated changelog as its notes.
+
+Docker Hub carries releases only. GHCR still gets `:<sha>`, `:<branch>` and
+`:latest` from every branch push, as before.
 
 ## Development
 
