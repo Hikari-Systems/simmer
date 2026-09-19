@@ -20,6 +20,17 @@ path = "src/lib.rs"
 name = "server"
 path = "src/main.rs"
 
+# D-084: the storage backend is chosen at compile time, one per image. The
+# default build is Postgres, exactly as before; the SQL Server image is built
+# with `--no-default-features --features mssql` and published as
+# `hikarisystems/simmer:vX.Y.Z-mssql`. Exactly one must be enabled —
+# `src/db/mod.rs` refuses to compile otherwise, so a build can never carry two
+# storage layers and pick between them at runtime.
+[features]
+default = ["postgres"]
+postgres = ["dep:sqlx"]
+mssql = ["dep:tiberius", "dep:bb8", "dep:tokio-util"]
+
 [dependencies]
 # Runtime. `rt-multi-thread` + `net` + `signal` because main owns a set of peer
 # tasks (SMTP listener, admin server, sweepers) joined under one shutdown.
@@ -28,13 +39,37 @@ tokio = { version = "1", features = ["full"] }
 # Storage. `runtime-tokio-rustls` is deliberate and matches the house pattern:
 # it keeps openssl/pkg-config out of the build entirely, so the bookworm-slim
 # runtime image needs nothing beyond libc.
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.8", optional = true, features = [
     "postgres",
     "runtime-tokio-rustls",
     "uuid",
     "chrono",
     "migrate",
 ] }
+
+# D-084, the `mssql` feature only. sqlx dropped its SQL Server driver in 0.7, so
+# this is tiberius, the async TDS client. `MIT/Apache-2.0`.
+#
+# `native-tls` — OpenSSL on Linux — and not the `rustls` feature, which is what
+# the rest of this crate would suggest. tiberius 0.12.3 (the latest release, July
+# 2024) pins tokio-rustls 0.24, i.e. rustls 0.21 and rustls-webpki 0.101, which
+# carries RUSTSEC-2026-0098, -0099 and -0104 with no fixed 0.101 release; its
+# `main` has moved on but is unpublished, and a git dependency is a decision
+# (CLAUDE.md). OpenSSL is maintained and patched by the base image's security
+# updates. It reaches only the `-mssql` image: the Postgres build does not
+# compile tiberius at all. `winauth` (NTLM) is off with the other defaults.
+tiberius = { version = "0.12", optional = true, default-features = false, features = [
+    "tds73",
+    "native-tls",
+    "chrono",
+] }
+# The pool for the above. `MIT`. bb8 rather than the bb8-tiberius or
+# deadpool-tiberius adapters: both enable tiberius' default features (`winauth`
+# among them) and neither lets a connection be marked broken after a failed
+# transaction, which `src/db/mssql.rs` needs. The adapter is short.
+bb8 = { version = "0.9", optional = true }
+# tiberius speaks futures-io; tokio's TcpStream speaks tokio-io. `MIT`.
+tokio-util = { version = "0.7", optional = true, features = ["compat"] }
 
 # Config. SPEC.md §4 mandates YAML with ${ENV_VAR} interpolation, so this does
 # NOT use the house config.json layering — see DECISIONS.md D-004.
@@ -75,7 +110,10 @@ chrono = { version = "0.4", features = ["serde"] }
 mail-parser = "0.11"
 
 # §5.3 — credentials are argon2id hashes, compared in constant time.
-argon2 = "0.5"
+# `std` for `hash-password`'s OsRng salt (rand_core's `getrandom`). It used to
+# arrive only through sqlx's feature unification, so the `mssql` build — which
+# has no sqlx — failed to compile without naming it here (D-084).
+argon2 = { version = "0.5", features = ["std"] }
 
 # AUTH PLAIN / LOGIN payloads (§5.3).
 base64 = "0.22"

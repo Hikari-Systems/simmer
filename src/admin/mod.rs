@@ -64,9 +64,10 @@ pub struct AdminState {
     /// `simmer_sessions_active` (D-075). `None` in tests that do not run a
     /// listener; the gauge is then not written.
     pub sessions: Option<std::sync::Arc<tokio::sync::Semaphore>>,
-    /// The Postgres pool, for `simmer_db_pool_*` (D-075). `engine.quota` is a
-    /// `dyn QuotaStore` and deliberately says nothing about connections.
-    pub db: Option<sqlx::PgPool>,
+    /// The storage pool, for `simmer_db_pool_*` (D-075). `engine.quota` is a
+    /// `dyn QuotaStore` and deliberately says nothing about connections; this is
+    /// whichever backend the build has (D-084), reduced to its occupancy.
+    pub db: Option<std::sync::Arc<dyn crate::db::PoolGauge>>,
 }
 
 impl AdminState {
@@ -164,6 +165,7 @@ async fn report(state: &AdminState, check_db: bool) -> (StatusCode, Json<serde_j
             "status": if db_ok { "ok" } else { "degraded" },
             "database": if db_ok { "up" } else { "down" },
             "fail_closed": state.config().database.fail_closed,
+            "backend": crate::db::BACKEND,
             "version": env!("CARGO_PKG_VERSION"),
         })),
     )
@@ -236,13 +238,8 @@ fn refresh_runtime_gauges(state: &AdminState) {
     crate::metrics::reservations_in_flight(state.engine.registry.len());
 
     if let Some(db) = &state.db {
-        let size = u64::from(db.size());
-        let idle = db.num_idle() as u64;
-        crate::metrics::db_pool(
-            size.saturating_sub(idle),
-            idle,
-            u64::from(db.options().get_max_connections()),
-        );
+        let s = db.stats();
+        crate::metrics::db_pool(s.in_use, s.idle, s.max);
     }
 
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {

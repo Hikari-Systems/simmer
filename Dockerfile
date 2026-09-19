@@ -2,6 +2,12 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /app
 
+# D-084: which storage backend to compile in. Empty is the default Postgres
+# build. The SQL Server image passes `--no-default-features --features mssql`
+# and is published as `hikarisystems/simmer:<version>-mssql`. The rust image
+# already carries libssl-dev, which the mssql build's native-tls links.
+ARG CARGO_FEATURES=""
+
 # Cache dependencies with a stub crate before copying real source, so subsequent
 # builds only recompile src/. No cargo-chef and no BuildKit cache mounts: for a
 # single crate the stub achieves the same thing with nothing extra to install.
@@ -11,7 +17,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src \
     && echo 'fn main() {}' > src/main.rs \
     && touch src/lib.rs
-RUN cargo build --release --locked
+RUN cargo build --release --locked $CARGO_FEATURES
 # Remove the stub artifacts, or the real build links the empty binary. The
 # leading wildcard matters: this crate produces both `server` (bin) and `simmer`
 # (lib), and cargo mangles the lib name into several files.
@@ -22,11 +28,13 @@ RUN rm -rf target/release/server \
 
 COPY src ./src
 COPY migrations ./migrations
+# include_str!'d by the mssql build's migration runner (D-084); unused otherwise.
+COPY migrations-mssql ./migrations-mssql
 COPY simmer.yaml simmer.acceptance.yaml ./
 # COPY preserves source mtimes, which can be older than the cached stub
 # artifacts; without this cargo decides nothing changed and ships the stub.
 RUN find src -name '*.rs' -exec touch {} + \
-    && cargo build --release --locked
+    && cargo build --release --locked $CARGO_FEATURES
 
 # --locked throughout. The original reason was that hs-utils was a git-tag
 # dependency, and a git tag is mutable — but D-060 removed it and the flag stays:
@@ -36,8 +44,14 @@ RUN find src -name '*.rs' -exec touch {} + \
 
 FROM debian:bookworm-slim AS runtime
 
+# Must match the builder's. The mssql build links OpenSSL through tiberius'
+# native-tls (D-084), so it names libssl3. `ca-certificates` already pulls it in
+# through `openssl`, but the mssql image should not depend on that staying true.
+# The Postgres build installs exactly what it did before.
+ARG CARGO_FEATURES=""
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        $(case "$CARGO_FEATURES" in *mssql*) echo libssl3 ;; esac) \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

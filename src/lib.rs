@@ -20,6 +20,7 @@ pub mod healthcheck;
 pub mod link_proxy;
 pub mod logging;
 pub mod metrics;
+#[cfg(feature = "postgres")]
 pub mod models;
 pub mod preflight;
 pub mod quota;

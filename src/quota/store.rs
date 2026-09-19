@@ -1,10 +1,11 @@
 //! §11 — the storage trait the quota model sits behind.
 //!
 //! "The storage layer sits behind a trait so the concrete backend can be
-//! substituted, but no alternative backend is implemented in v1." [`PgQuotaStore`]
-//! is that one implementation. The trait exists so the reservation protocol can
-//! be reasoned about — and tested — without a database in the way, not because a
-//! second backend is planned.
+//! substituted, but no alternative backend is implemented in v1." `PgQuotaStore`
+//! was that one implementation until D-084 added `MssqlQuotaStore` for the
+//! `-mssql` image; each build compiles exactly one. The trait also lets the
+//! reservation protocol be reasoned about — and tested — without a database in
+//! the way.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -121,6 +122,7 @@ pub enum QuotaError {
     Storage(String),
 }
 
+#[cfg(feature = "postgres")]
 impl From<sqlx::Error> for QuotaError {
     fn from(e: sqlx::Error) -> Self {
         QuotaError::Storage(e.to_string())

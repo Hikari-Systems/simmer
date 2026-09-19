@@ -162,6 +162,7 @@ pub fn validate(cfg: &Config) -> ViolationList {
     check_chains(cfg, &mut v);
     check_default_chain(cfg, &mut v);
     check_link_proxy(cfg, &mut v);
+    check_storage(cfg, &mut v);
 
     v
 }
@@ -903,6 +904,39 @@ fn check_route_uniqueness(cfg: &Config, v: &mut ViolationList) {
             v.push(
                 format!("routes[{i}].name"),
                 format!("'{}' duplicates routes[{prev}]", r.name),
+            );
+        }
+    }
+}
+
+/// D-084: what the build's storage backend needs of the configuration.
+///
+/// Only rules about the rest of the config live here. Whether `database.url`
+/// is for the right backend is checked where the pool is built
+/// (`db::postgres::build_pool`, `db::mssql::parse_url`), which still refuses to
+/// start and names the image to use instead.
+#[cfg(feature = "postgres")]
+fn check_storage(_cfg: &Config, _v: &mut ViolationList) {}
+
+#[cfg(feature = "mssql")]
+fn check_storage(cfg: &Config, v: &mut ViolationList) {
+    // The key columns are NVARCHAR(200): SQL Server caps a clustered key at 900
+    // bytes, and (route, domain_group, day_index) must fit. Postgres has no such
+    // limit, so the rule is this build's alone.
+    const MAX: usize = crate::db::mssql::MAX_NAME_CHARS;
+    for (i, r) in cfg.routes.iter().enumerate() {
+        if r.name.chars().count() > MAX {
+            v.push(
+                format!("routes[{i}].name"),
+                format!("is longer than {MAX} characters, the SQL Server build's limit"),
+            );
+        }
+    }
+    for (i, g) in cfg.domain_groups.iter().enumerate() {
+        if g.name.chars().count() > MAX {
+            v.push(
+                format!("domain_groups[{i}].name"),
+                format!("is longer than {MAX} characters, the SQL Server build's limit"),
             );
         }
     }

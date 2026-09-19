@@ -103,15 +103,14 @@ async fn run() -> anyhow::Result<()> {
         warn!(path = %w.path, "{}", w.message);
     }
 
-    let pool = db::build_pool(&config.database)?;
-
-    // §11: migrations are versioned and applied at startup.
-    db::migrate(&pool).await?;
-    info!("migrations applied");
+    // §11: migrations are versioned and applied at startup. Which database is a
+    // property of the build, not the config (D-084).
+    let backend = db::open(&config.database).await?;
+    info!(backend = db::BACKEND, "migrations applied");
 
     // §7.5: an unreachable database is not a startup failure — it means `451` on
     // every message while the listener stays up. Report it and carry on.
-    if db::is_reachable(&pool).await {
+    if backend.store.is_available().await {
         info!("database reachable");
     } else {
         warn!(
@@ -132,10 +131,10 @@ async fn run() -> anyhow::Result<()> {
         info!(roots, "platform root certificates loaded");
     }
 
-    // §11 — the storage layer behind its trait. `PgQuotaStore` is the one
-    // implementation; the trait exists so the §7.4 protocol can be reasoned
-    // about and tested without a database in the way.
-    let quota: Arc<dyn quota::QuotaStore> = Arc::new(quota::PgQuotaStore::new(pool.clone()));
+    // §11 — the storage layer behind its trait: `PgQuotaStore`, or
+    // `MssqlQuotaStore` in the `-mssql` build (D-084). The trait is also what
+    // lets the §7.4 protocol be reasoned about and tested without a database.
+    let quota: Arc<dyn quota::QuotaStore> = Arc::clone(&backend.store);
 
     // §6 — templates compiled once. Infallible here: `config::load` has already
     // run §4.2, which compiles every one of them to check §6.6's property, so a
@@ -238,7 +237,7 @@ async fn run() -> anyhow::Result<()> {
         engine: engine.clone(),
         metrics: metrics_handle.clone(),
         sessions: Some(Arc::clone(&sessions)),
-        db: Some(pool.clone()),
+        db: Some(Arc::clone(&backend.gauge)),
     };
     let admin_listener = tokio::net::TcpListener::bind(&config.admin.listen)
         .await

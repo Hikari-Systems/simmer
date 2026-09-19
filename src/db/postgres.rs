@@ -1,4 +1,5 @@
-//! Postgres connection management and migrations.
+//! Postgres connection management and migrations — the default `postgres`
+//! feature's half of [`crate::db`].
 //!
 //! Follows the hikari-systems data-service pattern for *organisation* — a
 //! concrete `AppState`-style pool handle, plain-SQL migrations in `migrations/`
@@ -16,11 +17,22 @@ use anyhow::Context;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
 use crate::config::Database;
+use crate::db::{PoolGauge, PoolStats};
 
 /// Build the pool. Does not connect eagerly — §7.5 says an unreachable database
 /// means `451` on every message, not a refusal to start, so the listener must
 /// come up regardless and report the condition through `/health`.
 pub fn build_pool(cfg: &Database) -> anyhow::Result<PgPool> {
+    // D-084: a SQL Server connection string means the wrong image. Say so
+    // rather than "not a valid Postgres connection URL".
+    let lower = cfg.url.trim_start().to_ascii_lowercase();
+    if lower.starts_with("jdbc:sqlserver:") || lower.starts_with("server=") {
+        anyhow::bail!(
+            "database.url is a SQL Server connection string, but this is the Postgres build \
+             of simmer. Use the `-mssql` image (`hikarisystems/simmer:<version>-mssql`) for \
+             SQL Server"
+        );
+    }
     let options = PgConnectOptions::from_str(&cfg.url)
         // Deliberately does not include the URL in the error: it carries the
         // password, and this error is going straight to a log.
@@ -51,4 +63,17 @@ pub async fn is_reachable(pool: &PgPool) -> bool {
         .fetch_one(pool)
         .await
         .is_ok()
+}
+
+/// `simmer_db_pool_*` (D-075) read straight off the pool.
+impl PoolGauge for PgPool {
+    fn stats(&self) -> PoolStats {
+        let size = u64::from(self.size());
+        let idle = self.num_idle() as u64;
+        PoolStats {
+            in_use: size.saturating_sub(idle),
+            idle,
+            max: u64::from(self.options().get_max_connections()),
+        }
+    }
 }

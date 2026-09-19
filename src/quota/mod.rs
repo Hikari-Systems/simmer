@@ -2,6 +2,9 @@
 //! §7.4 reserve/send/commit protocol.
 
 pub mod day;
+#[cfg(feature = "mssql")]
+pub mod mssql;
+#[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod registry;
 pub mod store;
@@ -12,6 +15,9 @@ use std::time::Duration;
 use crate::config::Route;
 use crate::quota::store::RouteState;
 
+#[cfg(feature = "mssql")]
+pub use mssql::MssqlQuotaStore;
+#[cfg(feature = "postgres")]
 pub use postgres::PgQuotaStore;
 pub use registry::ReservationRegistry;
 pub use store::{
