@@ -181,8 +181,10 @@ jobs:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
 
+      # A branch name is not always a valid image tag: `feat/mssql` has a slash.
+      # Anything outside the tag alphabet becomes `-`.
       - name: Make branch name
-        run: echo "BRANCH_NAME=$(echo ${{ github.ref }} | sed -e 's/^refs\/heads\///')" >> $GITHUB_ENV
+        run: echo "BRANCH_NAME=$(echo ${{ github.ref }} | sed -e 's/^refs\/heads\///' -e 's/[^A-Za-z0-9_.-]/-/g')" >> $GITHUB_ENV
 
       - name: Install skopeo
         run: |
@@ -210,4 +212,99 @@ jobs:
               --src-tls-verify=false \
               docker://localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }} \
               docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${TAG}
+          done
+
+  # ── D-084: the SQL Server build ─────────────────────────────────────────────
+  # The same gate as `check`, for `--no-default-features --features mssql`,
+  # against a real SQL Server. `tests/store_mssql.rs` runs the §11 conformance
+  # suite — the one `tests/store_postgres.rs` runs against Postgres in `check` —
+  # plus the migration runner's own tests. Everything above the storage trait is
+  # backend-neutral and runs here too; the Postgres-backed relay and admin tests
+  # are compiled out of this build.
+  check-mssql:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+    services:
+      # amd64 only — Microsoft publishes no arm64 SQL Server image, which is also
+      # why the `-mssql` image is amd64 only.
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: Simmer-ci-1!
+          MSSQL_PID: Developer
+        ports:
+          - 1434:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Simmer-ci-1!' -Q 'SELECT 1' -b"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+
+    env:
+      # The login the harness creates one database per test with. Port 1434 on
+      # the host, as in docker-compose.yml's `mssql` profile.
+      MSSQL_URL: server=tcp:127.0.0.1,1434;user id=sa;password=Simmer-ci-1!;TrustServerCertificate=true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Its own key: the feature sets resolve different dependency graphs.
+          key: mssql
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # `cargo fmt` is feature-independent and `check` already ran it.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked --no-default-features --features mssql -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --no-default-features --features mssql
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # The mssql graph is not the default graph: tiberius, bb8 and OpenSSL are
+      # only in this one, so the licence and advisory gate has to see it.
+      - name: Licences, advisories, sources
+        run: cargo deny --no-default-features --features mssql check
+
+  # amd64 only, and so a single-platform image: no manifest to merge, which is
+  # why this pushes to GHCR directly rather than through the S3 registry the
+  # multi-arch build uses as its staging area.
+  build-mssql:
+    needs: check-mssql
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 40
+    steps:
+      - name: Make repo name
+        run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
+
+      - name: Make branch name
+        run: echo "BRANCH_NAME=$(echo ${{ github.ref }} | sed -e 's/^refs\/heads\///' -e 's/[^A-Za-z0-9_.-]/-/g')" >> $GITHUB_ENV
+
+      - name: Checkout repository
+        uses: actions/checkout@v6.0.2
+
+      # `--target runtime` for the same reason as `build` (D-073).
+      - name: Build
+        run: |
+          docker build --platform linux/amd64 --target runtime \
+            --build-arg CARGO_FEATURES="--no-default-features --features mssql" \
+            -t ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${{ github.sha }}-mssql .
+
+      - name: Push to GHCR
+        run: |
+          echo "${{ secrets.GH_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          IMAGE=ghcr.io/hikari-systems/${{ env.REPO_NAME }}
+          docker push "$IMAGE:${{ github.sha }}-mssql"
+          for TAG in ${{ env.BRANCH_NAME }}-mssql latest-mssql; do
+            docker tag "$IMAGE:${{ github.sha }}-mssql" "$IMAGE:$TAG"
+            docker push "$IMAGE:$TAG"
           done

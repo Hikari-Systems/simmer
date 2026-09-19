@@ -8,7 +8,8 @@ name: release
 # exact bytes, re-tagged. Rebuilding would ship an image nothing had tested.
 #
 #   * Docker Hub: hikarisystems/simmer:<tag> + :latest   (releases only)
-#   * GHCR:       ghcr.io/hikari-systems/simmer:<tag>    (alongside build.yml's tags)
+#                 hikarisystems/simmer:<tag>-mssql + :latest-mssql   (D-084, amd64)
+#   * GHCR:       ghcr.io/hikari-systems/simmer:<tag> + :<tag>-mssql
 #   * GitHub:     a release whose notes are the tag annotation + generated changelog
 #
 # Can also be run manually against an existing tag from the Actions tab, e.g.
@@ -97,30 +98,41 @@ jobs:
             --password ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Pushing the release commit and its tag together is the normal flow, and
-      # then build.yml is still running. Wait for its image rather than failing;
-      # 60 minutes is well past build.yml's own 25 + 40 + 10 minute job timeouts.
-      - name: Wait for build.yml's image of the tagged commit
+      # then build.yml is still running. Wait for both of its images — the
+      # Postgres one and the `-mssql` one (D-084) — rather than failing; 60
+      # minutes is well past build.yml's own job timeouts. A release is both or
+      # neither: nothing is promoted until both exist.
+      - name: Wait for build.yml's images of the tagged commit
         run: |
           set -euo pipefail
-          src="docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${SHA}"
+          base="docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}"
           for i in $(seq 1 120); do
-            if skopeo inspect --raw "$src" >/dev/null 2>&1; then
-              echo "found $src"
+            missing=""
+            for suffix in "" "-mssql"; do
+              skopeo inspect --raw "$base:${SHA}${suffix}" >/dev/null 2>&1 || missing="$missing ${SHA}${suffix}"
+            done
+            if [ -z "$missing" ]; then
+              echo "found both images"
               exit 0
             fi
-            echo "waiting for $src ($i/120)"
+            echo "waiting for:$missing ($i/120)"
             sleep 30
           done
-          echo "::error::no image at $src after 60 minutes. Check build.yml's run for $SHA, then re-run this workflow."
+          echo "::error::still missing after 60 minutes:$missing. Check build.yml's run for $SHA, then re-run this workflow."
           exit 1
 
       - name: Promote to the release tags
         run: |
           set -euo pipefail
-          src="docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${SHA}"
-          skopeo copy --all "$src" "docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${TAG}"
-          for T in "${TAG}" latest; do
-            skopeo copy --all "$src" "docker://hikarisystems/${{ env.REPO_NAME }}:${T}"
+          ghcr="docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}"
+          hub="docker://hikarisystems/${{ env.REPO_NAME }}"
+          # Postgres: multi-arch. SQL Server: amd64 only (D-084).
+          for suffix in "" "-mssql"; do
+            src="$ghcr:${SHA}${suffix}"
+            skopeo copy --all "$src" "$ghcr:${TAG}${suffix}"
+            for T in "${TAG}${suffix}" "latest${suffix}"; do
+              skopeo copy --all "$src" "$hub:${T}"
+            done
           done
 
       # The annotated tag's message is the human-written release description,
@@ -138,7 +150,10 @@ jobs:
             echo "body<<__RELEASE_NOTES__"
             echo "$body"
             echo ""
-            echo "Image: \`hikarisystems/${{ env.REPO_NAME }}:${TAG}\` (also \`ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${TAG}\`), built from \`${SHA}\`."
+            echo "Images, built from \`${SHA}\`:"
+            echo ""
+            echo "- Postgres: \`hikarisystems/${{ env.REPO_NAME }}:${TAG}\` (linux/amd64, linux/arm64)"
+            echo "- SQL Server: \`hikarisystems/${{ env.REPO_NAME }}:${TAG}-mssql\` (linux/amd64)"
             echo "__RELEASE_NOTES__"
           } >> "$GITHUB_OUTPUT"
 
