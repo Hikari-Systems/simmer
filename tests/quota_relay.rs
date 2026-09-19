@@ -5,6 +5,11 @@
 //! §12.3's "a failed send leaves `committed` unchanged", and §3.2's fall-through
 //! to overflow at exhaustion.
 
+// Postgres-backed: the storage layer under test is `PgQuotaStore`. The SQL
+// Server build runs the backend-neutral suite instead (tests/store_mssql.rs,
+// D-084).
+#![cfg(feature = "postgres")]
+
 mod support;
 
 use std::sync::Arc;

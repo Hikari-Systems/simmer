@@ -34,6 +34,11 @@
 //! These use `#[sqlx::test]`'s pool-options form rather than its ready-made
 //! `PgPool`, which is the only way to get two pools onto one per-test database.
 
+// Postgres-backed: the storage layer under test is `PgQuotaStore`. The SQL
+// Server build runs the backend-neutral suite instead (tests/store_mssql.rs,
+// D-084).
+#![cfg(feature = "postgres")]
+
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};

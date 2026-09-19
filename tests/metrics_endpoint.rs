@@ -13,6 +13,11 @@
 //! file costs about a second and is the only thing that makes an equality
 //! assertion on a gauge mean anything.
 
+// Postgres-backed: the storage layer under test is `PgQuotaStore`. The SQL
+// Server build runs the backend-neutral suite instead (tests/store_mssql.rs,
+// D-084).
+#![cfg(feature = "postgres")]
+
 mod support;
 
 use std::sync::Arc;
@@ -549,7 +554,7 @@ async fn the_runtime_gauges_are_exported_on_every_scrape(pool: PgPool) {
     let sessions = Arc::new(tokio::sync::Semaphore::new(16));
     let _held = Arc::clone(&sessions).try_acquire_owned().expect("a permit");
     state.sessions = Some(sessions);
-    state.db = Some(pool.clone());
+    state.db = Some(Arc::new(pool.clone()));
 
     // One reservation the process is holding.
     state

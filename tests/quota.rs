@@ -6,6 +6,11 @@
 //! protocol is about what two transactions do to one row at the same time, and
 //! that is a property of Postgres, not of Rust.
 
+// Postgres-backed: the storage layer under test is `PgQuotaStore`. The SQL
+// Server build runs the backend-neutral suite instead (tests/store_mssql.rs,
+// D-084).
+#![cfg(feature = "postgres")]
+
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
