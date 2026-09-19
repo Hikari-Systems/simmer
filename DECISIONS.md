@@ -2829,6 +2829,110 @@ defaults are behaviour.
   beyond `main` binding one more optional listener and waiting on it at
   shutdown.
 
+### D-084 — A SQL Server build, as a second image of each release
+
+**Diverges from `SPEC.md` §11**, which says the storage layer "sits behind a
+trait so the concrete backend can be substituted, but no alternative backend is
+implemented in v1", and from §12 and §13, which assume Postgres throughout. Asked
+for on 2026-09-19 by the repository's owner: every release also ships an image
+that stores its state in SQL Server. The spec is **not** amended; see O-14.
+
+**Decision.** The backend is chosen at **compile time**, one per image, never
+at runtime:
+
+- Cargo features `postgres` (the default, unchanged) and `mssql`, mutually
+  exclusive. `src/db/mod.rs` refuses to compile with both or neither. The SQL
+  Server build is `--no-default-features --features mssql`, so it contains no
+  Postgres code and the Postgres build contains no SQL Server code.
+- Each release publishes `hikarisystems/simmer:vX.Y.Z` (Postgres, amd64 and
+  arm64) and `hikarisystems/simmer:vX.Y.Z-mssql` (SQL Server, **amd64 only**),
+  with `:latest` and `:latest-mssql`. The naming is the owner's. The release
+  gets both variants or neither.
+- `MssqlQuotaStore` implements the same `QuotaStore` trait operation for
+  operation. Nothing above the trait changed. `AdminState.db` became a
+  `PoolGauge` trait object so the `simmer_db_pool_*` gauges read either pool.
+- `database.url` for the `mssql` build is an ADO.NET or JDBC connection
+  string. Each build refuses the other's URL at startup, naming the image to use
+  instead.
+
+**Why compile time.** A binary with both backends would choose by URL, and then
+"which database is this instance using?" becomes a question about its
+configuration rather than about the image that was pulled. Nothing needs both at
+once. And the SQL Server dependencies — OpenSSL among them — stay out of the
+Postgres image entirely.
+
+**The driver.** sqlx dropped its SQL Server support in 0.7, so this is tiberius
+0.12.3 over a bb8 pool, with a small adapter. Two things were rejected:
+
+- **tiberius over rustls, which this crate uses everywhere else.** 0.12.3 is
+  still the latest release (July 2024). It pins tokio-rustls 0.24, and so
+  rustls-webpki 0.101, which carries RUSTSEC-2026-0098, -0099 and -0104 with no
+  fixed 0.101 release. `cargo deny` fails on it. Upstream `main` has moved to
+  rustls 0.23 but is unreleased, and a git dependency is a decision (`CLAUDE.md`,
+  D-060).
+- **Microsoft's `mssql-tds` 0.1.0**, published 2026-09-10. It is a protocol
+  layer, not a client, and it requires OpenSSL regardless of its features.
+
+So the build uses tiberius' `native-tls`, which is OpenSSL on Linux. It is
+maintained, the base image's security updates patch it, and it reaches only the
+`-mssql` image. Its runtime stage names `libssl3` explicitly, although
+`ca-certificates` already pulls it into both images. `winauth` is off along with
+the other defaults. `cargo deny` passes for both feature sets and CI runs it
+for both.
+
+**What the translation had to preserve.** `src/quota/mssql.rs` carries the
+details. Three of them are correctness rather than syntax:
+
+1. **The row lock (§7.4).** Postgres takes it with `INSERT … ON CONFLICT DO
+   UPDATE`. T-SQL has no `ON CONFLICT`, and a bare `MERGE` races. The
+   replacement is `UPDATE … WITH (UPDLOCK, SERIALIZABLE)` followed by `IF
+   @@ROWCOUNT = 0 INSERT`, in one transaction. The same shape is used for every
+   upsert: route state, the allowance override and the salt.
+2. **Collation.** SQL Server's default collation is case-insensitive, which
+   would let routes `Warming` and `warming` share a quota row. Every text key is
+   `Latin1_General_100_BIN2`, which compares bytes as Postgres does.
+3. **Poisoned connections.** A connection is marked broken for the whole of
+   every storage call and cleared only on success. One that errored, or whose
+   future was dropped mid-transaction, is discarded rather than reused. Every
+   session runs `SET XACT_ABORT ON`.
+
+Otherwise:
+
+- Migrations live in `migrations-mssql/` and are compiled in. They are
+  recorded in `simmer_migrations` with a SHA-256 checksum (an edited applied
+  migration refuses to start) and serialised across replicas by `sp_getapplock`.
+- Route and domain-group names are capped at 200 characters under this build,
+  because a clustered key is capped at 900 bytes. §4.2 enforces the cap.
+- `GREATEST` is written as `CASE`, so SQL Server 2017 and later works, not
+  only 2022. `OPENJSON` needs compatibility level 130 or higher.
+
+**Testing.**
+
+- `tests/store_conformance/` is one suite of 28 store-level tests.
+  `tests/store_postgres.rs` runs it against Postgres and `tests/store_mssql.rs`
+  against SQL Server, with a fresh database per test. Postgres passing it is what
+  makes a SQL Server pass mean something.
+- The race tests were **mutation-tested**. With the lock hints removed from each
+  upsert in turn, the reservation and admin-upsert races fail on a duplicate key
+  every run. The salt race is a single shot at one fixed key and caught it in 6
+  of 10 runs before being widened.
+- Their first version passed with the hints removed. The contenders were
+  logging in on fresh connections and never actually overlapped. They now warm
+  both pools and start behind a barrier. **Any future race test must do the
+  same.**
+- The relay, chain-walk and admin tests stay Postgres-backed and are compiled
+  out of the `mssql` build. Nothing above `QuotaStore` knows which backend it
+  has, so that is the only layer that needs running twice.
+- `build.yml` adds `check-mssql` (clippy, the whole `mssql` test build, and
+  `cargo deny` against a SQL Server 2022 service) and `build-mssql`.
+
+**Also fixed on the way.**
+
+- `argon2` needed its `std` feature named. `hash-password`'s `OsRng` had only
+  ever compiled because sqlx's feature unification switched it on.
+- `build.yml` used the raw branch name as an image tag, so any branch with a
+  `/` would have failed its GHCR copy. Nothing had pushed one.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -2849,6 +2953,7 @@ the phase that depends on each.
 | ~~O-11~~ | *Settled in phase 7 — see **D-053**. Named `admin.tokens` alongside `auth_token`, which is the token named `default`. The working assumption held: named tokens, not dropped wording.* | | |
 | ~~O-12~~ | *Settled in phase 3: DST transitions both directions, a start inside a DST gap, and a future start are all tested; the leap-second case is asserted to be a no-op rather than merely argued.* | | |
 | ~~O-13~~ | *Settled 2026-09-17 by the spec's author: amend the spec. §2.1, §2.2, §2.3, §4.1, §4.2, §5.7 (new), §9.1, §9.5, §10.4, §12.1 and §13 now carry the link proxy — see **D-083**.* | | |
+| O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment |
 
 
 ---

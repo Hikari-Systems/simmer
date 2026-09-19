@@ -87,10 +87,24 @@ Subcommands, as the first argument:
 | `healthcheck` | Exit 0 if the admin port answers `GET /healthcheck` |
 | `hash-password` | Read a password on stdin, print an argon2id PHC string |
 
+## Two images: Postgres and SQL Server
+
+Each release is published twice, in the same repository:
+
+| Tag | Database | Platforms |
+|---|---|---|
+| `:vX.Y.Z`, `:latest` | PostgreSQL | linux/amd64, linux/arm64 |
+| `:vX.Y.Z-mssql`, `:latest-mssql` | SQL Server 2017+ / Azure SQL | linux/amd64 |
+
+Same code, same configuration file, same control plane and metrics; only the
+storage layer differs, and each image contains exactly one. Give either image
+the other's `database.url` and it refuses to start, naming the image to use.
+
 ## Requirements
 
-- **PostgreSQL** (tested against 18). The configured role needs to be able to
-  create the schema on first start.
+- **PostgreSQL** (tested against 18) for the plain tags, or **SQL Server** (2017
+  or later, or Azure SQL; tested against 2022) for the `-mssql` tags. The login
+  needs to be able to create the schema on first start.
 - One or more downstream SMTP providers with credentials.
 - A configuration file — mount your own; the bundled `/app/simmer.yaml` is an
   example.
@@ -208,6 +222,24 @@ routing is the `senders` list.
         grants:
           send_as: ["oldbrand.com", "*.oldbrand.com", "newbrand.com"]
 ```
+
+### SQL Server (`-mssql` images)
+
+`database.url` is an ADO.NET or JDBC connection string instead of a Postgres URL:
+
+```yaml
+database:
+  url: "server=tcp:sql.internal,1433;database=simmer;user id=simmer;password=${SIMMER_DB_PASSWORD}"
+```
+
+- The connection is **encrypted by default**, queries included, whether or not
+  the string says `encrypt=true`. An explicit `encrypt=false` opts out, with a
+  startup warning. A self-signed server certificate needs
+  `TrustServerCertificate=true`, which also warns.
+- Route and domain-group names are limited to **200 characters**.
+- Names stay **case-sensitive**, as with Postgres: the tables use a binary
+  collation.
+- SQL Server authentication only; no Windows/Kerberos integrated login.
 
 ### Routes and the ramp
 
@@ -366,13 +398,17 @@ Your applications then send to `simmer:25` on the same network.
 
 ## Tags
 
-- `:latest` — the most recent release.
-- `:vX.Y.Z` — a specific release (e.g. `:v0.1.0`).
+- `:latest` — the most recent release, Postgres.
+- `:vX.Y.Z` — a specific release, Postgres (e.g. `:v0.2.0`).
+- `:latest-mssql` — the most recent release, SQL Server.
+- `:vX.Y.Z-mssql` — a specific release, SQL Server.
 
-Multi-arch: **linux/amd64** and **linux/arm64**.
+The Postgres images are multi-arch (**linux/amd64**, **linux/arm64**); the SQL
+Server images are **linux/amd64** only.
 
 ```sh
 docker pull hikarisystems/simmer:latest
+docker pull hikarisystems/simmer:latest-mssql
 ```
 
 ---

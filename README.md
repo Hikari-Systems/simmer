@@ -439,6 +439,41 @@ group, never an SMTP port, and point the target group's health check at the
 admin port's `/health`. The proxy reserves no path of its own. At cutover,
 repoint the public name at the upstream directly and remove the block.
 
+### Database: Postgres or SQL Server
+
+Every release ships two images of the same code, differing only in where quota
+state lives (`DECISIONS.md` D-084):
+
+| Image | Database | Platforms |
+|---|---|---|
+| `hikarisystems/simmer:vX.Y.Z` | PostgreSQL | amd64, arm64 |
+| `hikarisystems/simmer:vX.Y.Z-mssql` | SQL Server 2017 or later, or Azure SQL | amd64 |
+
+The choice is made when the image is built, not by configuration: each image
+contains one storage layer and refuses the other's `database.url` at startup,
+naming the image to use instead. Everything else — the config file, the control
+plane, the metrics, the behaviour — is identical.
+
+For the `-mssql` image, `database.url` is an ADO.NET or JDBC connection string:
+
+```yaml
+database:
+  url: "server=tcp:sql.internal,1433;database=simmer;user id=simmer;password=${SIMMER_DB_PASSWORD}"
+```
+
+- **The connection is encrypted by default**, queries included, whether or not
+  the string says `encrypt=true`. Only an explicit `encrypt=false` opts out, and
+  startup warns that queries then cross the network in cleartext. A server with a
+  self-signed certificate needs `TrustServerCertificate=true`, which also warns.
+- **The login needs to create tables** in its database on first start. Migrations
+  are applied at startup, as with Postgres, and serialised across replicas.
+- **Route and domain-group names are limited to 200 characters** in this build,
+  and startup refuses longer ones. SQL Server caps a clustered key at 900 bytes.
+- **Names stay case-sensitive.** The tables use a binary collation, so `Warming`
+  and `warming` are two routes, as they are in Postgres, even though SQL
+  Server's default collation would merge them.
+- SQL Server authentication only: no Windows or Kerberos integrated login.
+
 ## Control plane
 
 On `admin.listen`, port 8080 by default. `/health`, `/healthcheck` and `/metrics`
@@ -535,12 +570,14 @@ git push origin vX.Y.Z
 `release.yml` checks again (the hook can be skipped; CI cannot). The release does
 **not rebuild**: it promotes the image `build.yml` already built and tested for that
 commit on `main`, so the tagged commit must be on `main`, and the job waits for
-that build if it is still running. It tags the image `:vX.Y.Z` and `:latest` on
-Docker Hub (`hikarisystems/simmer`) and `:vX.Y.Z` on GHCR, then creates the GitHub
-release, with the tag annotation followed by the generated changelog as its notes.
+that build if it is still running. It tags both images on Docker Hub
+(`hikarisystems/simmer`): `:vX.Y.Z` and `:latest` for Postgres, and `:vX.Y.Z-mssql`
+and `:latest-mssql` for SQL Server. It tags both on GHCR too, then creates the
+GitHub release, with the tag annotation followed by the generated changelog as its
+notes. A release gets both images or neither.
 
 Docker Hub carries releases only. GHCR still gets `:<sha>`, `:<branch>` and
-`:latest` from every branch push, as before.
+`:latest` (and the same with `-mssql`) from every branch push.
 
 ## Development
 
@@ -561,6 +598,26 @@ was the one exception until phase 7 — it supplied a single stdlib-only functio
 which now lives in `src/healthcheck.rs` behaving identically (D-060). If you need
 something from the estate's shared crates, copy it and record why, rather than
 taking the dependency back.
+
+**The SQL Server build** is `--no-default-features --features mssql` on any cargo
+command (D-084). Its storage tests need a SQL Server; the compose file has one
+behind a profile:
+
+```sh
+docker compose --profile mssql up -d simmer-mssql-db
+export MSSQL_URL='server=tcp:127.0.0.1,1434;user id=sa;password=Simmer-dev-1!;TrustServerCertificate=true'
+
+cargo test --no-default-features --features mssql
+cargo clippy --all-targets --no-default-features --features mssql -- -D warnings
+cargo deny --no-default-features --features mssql check
+docker build --target runtime --build-arg CARGO_FEATURES="--no-default-features --features mssql" .
+```
+
+`tests/store_conformance/` is the storage contract both backends must meet,
+run by `tests/store_postgres.rs` and `tests/store_mssql.rs`. A change to either
+store belongs in that suite first. Race tests there warm their pools and start
+behind a barrier, because contenders that each open a fresh connection never
+actually overlap, and such a test passes with the lock removed (D-084).
 
 The §12.3 acceptance suite runs against its own stack and is not part of
 `cargo test` — it needs Docker and about two minutes of container restarts:
@@ -611,7 +668,7 @@ src/downstream/ §8 outbound: TLS, the SMTP client, the §10.1 reply mapping
   pool.rs         §8.3's per-route pool. max_connections is a bound, not a hint
 src/quota/      §7 day index, allowance, the reserve/commit protocol, sweeper
 src/frequency/  §7.3 normalisation, the keyed hash, the rolling window, eviction
-src/models/     runtime sqlx over &PgPool, house pattern
+src/models/     runtime sqlx over &PgPool, house pattern (Postgres build only)
 src/rewrite/    §6 the rewriting engine: templates, headers, encoding, stability
 src/preflight/  §6.7 the DNS preflight: three checks, a registry, an interval
 src/relay.rs    decide -> reserve -> rewrite -> relay -> commit/release
@@ -621,12 +678,17 @@ src/admin/      the §9 control plane: reads, writes, dry run, /metrics
   auth.rs         §9.3's bearer token, and O-11's answer to whose it was
   mutate.rs       the four mutations, the audit line, §14.1's warnings
   dryrun.rs       §9.4, over the real engine
-src/db.rs       pool construction and migrations
+src/db/         one storage backend per build (D-084)
+  postgres.rs     the default: sqlx pool and migrations
+  mssql.rs        the `mssql` feature: tiberius over bb8, its migration runner
+src/quota/mssql.rs  §7.4 over SQL Server: the same protocol, translated
 src/healthcheck.rs  the `healthcheck` subcommand the container's HEALTHCHECK runs
 src/hash_password.rs  `server hash-password`: argon2id from stdin, never argv
 src/bin/loadgen.rs  the acceptance suite's bulk sender; not in the shipped image
 migrations/     plain SQL, applied at startup
+migrations-mssql/  the same schema in T-SQL, for the `mssql` build
 tests/support/  a scripted fake downstream (§12.3)
+tests/store_conformance/  §11's storage contract, one suite for both backends
 tests/rewrite_stability.rs  §6.6 as a property test over generated messages
 tests/admin_api.rs   §9 against the real router and real Postgres
 tests/pool.rs        §8.3 from the downstream's side: connections, not intentions

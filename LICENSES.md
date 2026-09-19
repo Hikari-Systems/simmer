@@ -496,6 +496,36 @@ or body cap), `pingora-proxy` 0.9 (`Apache-2.0`; a whole server framework and
 runtime), `hyper-reverse-proxy` (last released 2022, hyper 0.14), and `sozu`
 (AGPL).
 
+## 9. D-084 — the SQL Server build (`--features mssql`)
+
+These crates are in the `mssql` graph only. The default Postgres build does not
+compile any of them, so its image is unchanged. Checked against crates.io
+2026-09-19; `cargo deny --no-default-features --features mssql check` passes,
+and CI runs it.
+
+| Crate | Version | Licence | Why |
+|---|---|---|---|
+| `tiberius` | 0.12.3 | MIT/Apache-2.0 | the TDS client; sqlx has had no SQL Server driver since 0.7 |
+| `bb8` | 0.9.1 | MIT | the connection pool |
+| `native-tls` / `async-native-tls` | 0.2.18 / 0.4.0 | MIT OR Apache-2.0 | tiberius' TLS on Linux |
+| `openssl` / `openssl-sys` | 0.10.81 / 0.9.117 | Apache-2.0 / MIT | beneath native-tls; links the base image's `libssl3` |
+| `encoding_rs` | 0.8.41 | (Apache-2.0 OR MIT) AND BSD-3-Clause | legacy code pages in TDS |
+| `connection-string` | 0.2.0 | MIT OR Apache-2.0 | ADO.NET / JDBC parsing |
+| `asynchronous-codec`, `pretty-hex` | 0.6.2, 0.3.0 | MIT | tiberius internals |
+| `enumflags2`, `multiversion`, `core_detect`, `simdutf8`, `foreign-types`, `openssl-macros`, `thiserror` 1.x | — | MIT OR Apache-2.0 | transitive |
+
+**Why OpenSSL, when the rest of this crate is rustls.** tiberius' `rustls`
+feature pins tokio-rustls 0.24, and so rustls-webpki 0.101. That version carries
+RUSTSEC-2026-0098, -0099 and -0104, and no fixed 0.101 release exists. The
+advisory gate fails on it, and it should. `native-tls` has no open advisories,
+and the base image's security updates patch the library it links. D-084 has the
+rest, including why neither a git dependency on tiberius' unreleased `main` nor
+Microsoft's new `mssql-tds` 0.1.0 was taken.
+
+**`argon2` gained its `std` feature** in the same change. It is not a new crate:
+`hash-password` had only ever compiled because sqlx's feature unification
+switched on `rand_core/getrandom`.
+
 ## How to re-check
 
 `cargo-deny` is the gate in CI:

@@ -129,6 +129,24 @@ cargo deny check
 docker compose up -d --build     # the real gate; do not skip
 ```
 
+**There are two builds, and CI checks both** (D-084). The default is Postgres.
+The SQL Server build is `--no-default-features --features mssql` on every cargo
+command, against a SQL Server named by `MSSQL_URL`:
+
+```sh
+docker compose --profile mssql up -d simmer-mssql-db
+export MSSQL_URL='server=tcp:127.0.0.1,1434;user id=sa;password=Simmer-dev-1!;TrustServerCertificate=true'
+cargo test --no-default-features --features mssql
+cargo clippy --all-targets --no-default-features --features mssql -- -D warnings
+cargo deny --no-default-features --features mssql check
+```
+
+A change behind `QuotaStore` goes into **both** stores, and into
+`tests/store_conformance/` first. A race test there must warm its pools and
+start behind a barrier: contenders that each open a fresh connection never
+overlap, and the test then passes with the lock removed. That happened once
+already (D-084).
+
 **Anything that builds the shipped image must pass `--target runtime`.** The
 Dockerfile's last stage is `acceptance` (it builds on `runtime`, so it has to come
 after it), and an unpinned `docker build` produces the *last* stage — which is the
@@ -195,7 +213,14 @@ src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve a
 src/metrics.rs           §9.1 counters, the recorder, and every `# HELP` line
 src/models/recipient_event.rs  §7.3's rows. A key is 16 bytes and never plaintext
 src/models/instance_config.rs  §7.3's salt: insert-if-absent, then read (D-050)
-src/db.rs                pool + migrations
+src/db/mod.rs            the backend switch: one per build, never both (D-084)
+src/db/postgres.rs       sqlx pool + migrations
+src/db/mssql.rs          tiberius over bb8. A connection is `broken` for the
+                         whole of every call and cleared only on success
+src/quota/mssql.rs       §7.4 over SQL Server. UPDATE WITH (UPDLOCK, SERIALIZABLE)
+                         + IF @@ROWCOUNT = 0 INSERT is the row lock; never MERGE
+migrations-mssql/        the same schema in T-SQL. BIN2 collation on every key
+tests/store_conformance/ §11's contract, run against both backends
 src/hash_password.rs     `server hash-password`. Reads stdin, never argv
 src/link_proxy/mod.rs    §5.7 (D-083) — the optional HTTP link forwarder. The
                          forwarding is axum-reverse-proxy's; the listener, the
