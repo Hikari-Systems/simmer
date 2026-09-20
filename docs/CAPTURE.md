@@ -18,7 +18,7 @@ it again to another Simmer.
 | | |
 |---|---|
 | **It is a mailbox on disk.** | Bodies and recipients in the clear. Password-reset links, one-time codes, session tokens — whatever your application sends. The directory is `0700` and the files `0600`, and that is the containment. Put it on a volume you are willing to treat as sensitive, and delete it afterwards. |
-| **It costs disk.** | A 25 MiB message is a ~34 MiB line. At 10 msg/s of 1 MiB bodies that is ~4.8 GiB an hour. `max_body_bytes` (default 1 MiB) caps the pathological case and `retention` (default 24h) bounds the rest. Alert on `simmer_capture_disk_bytes`. |
+| **It costs disk.** | A 25 MiB message is a ~34 MiB line. At 10 msg/s of 1 MiB bodies that is ~4.8 GiB an hour. `max_body_bytes` (default 1 MiB) caps the pathological case and `retention` (default 24h) bounds the rest. Measured on the soak's mixed traffic at 10 msg/s: ~1 GiB an hour per instance (`docs/SOAK.md` §11). Alert on `simmer_capture_disk_bytes`, which from 0.3.1 is live rather than swept-hourly (§6). |
 | **It costs a little CPU on the message path.** | base64 and SHA-256 over the body, on the session's own task. An instance with capture on is not the instance you were measuring a latency problem on. |
 | **Replay delivers mail twice.** | See §5. |
 
@@ -109,6 +109,27 @@ which is why the reader sorts.
 
 A restart inside the same ten minutes appends to the existing file. The name is a
 pure function of the bucket, so there are no sequence numbers and no pids.
+
+### When a record becomes visible
+
+The writer buffers, so a record is in the file a moment after the client was
+answered, not instantly. Two rules bound the gap, whichever comes first:
+
+| | |
+|---|---|
+| **10 buffered lines** | what fires under load, so the flush cost is amortised over ten records rather than paid per record |
+| **500 ms of quiet** | what fires when the stream trickles and ten lines would take a long time to accumulate. Measured from the last record, so it means *idle* |
+
+Behind both, the writer's one-second housekeeping tick flushes anything still
+buffered, which bounds the one case the idle rule cannot — a stream arriving just
+often enough to keep resetting the 500 ms deadline without ever reaching ten
+lines.
+
+So `tail -f` on the current bucket keeps up, and a `replay` of a range that ended
+a second ago will find it. What none of this gives you is durability against a
+machine that loses power: these are flushes, not `fsync`s. **`on_error: defer` is
+the only mode that puts a record on the platter before the client is told
+anything**, and it pays an `fsync` per message to do it.
 
 ---
 
@@ -319,7 +340,21 @@ would put in `/metrics` exactly what §7.3 keeps out of the database.
 | `simmer_capture_clock_regressions_total` | the wall clock stepped backwards; a replay of that range may need a wider `--pad-buckets` |
 | `simmer_capture_files_swept_total` | deleted past retention |
 | `simmer_capture_queue_depth`, `_queue_bytes` | the writer's backlog |
-| `simmer_capture_disk_bytes` | **what tells you a capture left on will fill the volume** |
+| `simmer_capture_disk_bytes` | **what tells you a capture left on will fill the volume.** Incremented as the writer flushes, recounted from the directory by each sweep — see below |
+
+> **How `simmer_capture_disk_bytes` is kept (F17).** The writer adds what each
+> flush pushes, so the gauge moves within the flush policy above rather than
+> waiting on the sweeper; each sweeper pass then *recounts* the directory and
+> sets it, which is what makes eviction show up and what corrects anything the
+> increments could not see — a bucket you deleted by hand, a file something else
+> rewrote, bytes against blocks. So it is live, and its error between passes is
+> bounded by one sweep.
+>
+> It was not always so: until 0.3.1 only the sweeper wrote it, on its one-hour
+> interval whose first pass runs at startup against an empty directory. Measured
+> over a 1-hour soak it read **0 for 59.9 of the 60 minutes** while 904 MB
+> accumulated (`docs/SOAK.md` §11). If you are on 0.3.0 or earlier, size a volume
+> from `simmer_capture_bytes_total` instead.
 
 There is **no admin API surface**, deliberately. `tests/admin_api.rs` asserts
 that no read endpoint emits so much as an `@`, and a capture browser on the

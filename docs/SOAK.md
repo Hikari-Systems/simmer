@@ -17,7 +17,12 @@ D-081. V4 and stress S9 are now its regression checks, and both pass on the
 stack (§8). In the planted-defect controls (§10), duplicate delivery and run B fail exactly
 as planted, but run A, a 64-byte-per-message leak, was **not** caught: the
 one-hour memory gate lacks the power its self-test claims. The burst/idle variants are
-outstanding.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
+outstanding. The tier then ran for the first time against something other than the
+Postgres build: the `mssql` build on SQL Server **Express**, with D-085's capture
+on, for an hour (§11) — 36,010 messages an instance with nothing deferred or
+refused, V4 and the ledger behaving exactly as on Postgres, an exact capture
+accounting, and one defect found and fixed (F17, the disk gauge) plus §10's memory
+limitation met again on a different backend.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
 step 5 summary". This document records what
 the soak tier is, what ten runs have established, and — at least as usefully —
 what they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
@@ -539,6 +544,15 @@ column.
 - ~~The `correlation_id` ↔ `X-Test-Id` link~~ — step 5c (§9): every soak route
   stamps `X-Simmer-Correlation` and the sink records it.
 - The 24-hour variant, and whether the CI runner permits a job that long.
+- ~~The tier against the `mssql` build, and against the capture~~ — both, §11.
+- **The capture under eviction**: `retention` shorter than a run, so the sweeper
+  actually deletes and the disk gauge's increments are tested across an eviction
+  (§11).
+- **T3 against the `mssql` build.** The soak is 10 msg/s; the stress tier has
+  never been pointed at SQL Server at all.
+- Gating the capture record count against messages accepted. The invariant held
+  exactly on all three §11 runs (7,250, 36,230 and 7,250 records, each equal to
+  the messages answered `250`); it is a check waiting to be written.
 
 ---
 
@@ -1133,3 +1147,200 @@ is a decision for the plan, not a change made here:
   gauge on `/metrics`, which is a server change;
 - a self-test whose noise the floors cannot remove, so that the calibration claim
   is tested against something like the real series.
+
+---
+
+## 11. The SQL Server build, against Express, with the capture on
+
+The first soak of anything but the Postgres build, and the first of D-085's
+capture. Both are stack-level changes rather than §1 variants: V2, V3 and V4 run
+unchanged under each, and what moves is what `app` was compiled from, what it
+connects to, and what it writes to disk. So they are stacks, not flags —
+`tests/compose/stack.rs` carries all four combinations, and two environment
+variables choose between them:
+
+| | |
+|---|---|
+| `SOAK_BACKEND=mssql` | D-084's `--no-default-features --features mssql` build, against **SQL Server 2022 Express** (`test/compose/mssql.yml`) |
+| `SOAK_CAPTURE=on` | D-085's capture, on **both** instances (`test/compose/capture.yml` and `test/config/simmer.soak.capture.yaml`) |
+
+```sh
+export SOAK_BACKEND=mssql SOAK_CAPTURE=on
+SIMMER_CONFIG=/config/simmer.soak.capture.yaml docker compose \
+  -f docker-compose.yml -f test/compose/acceptance.yml -f test/compose/stress.yml \
+  -f test/compose/mssql.yml -f test/compose/capture.yml \
+  --profile acceptance --profile stress --profile mssql --profile capture \
+  up -d --build --wait app app2 sink
+
+SOAK_DURATION=1h cargo test --test soak -- --ignored --test-threads=1 --nocapture soak_run
+cargo test --test soak -- --ignored --test-threads=1 --nocapture soak_analyze
+```
+
+**Both commands must carry both variables.** `soak_analyze` is a separate cargo
+invocation, and although it only reads files today, the banner it prints is the
+record of what was judged — and §6's rule about building every compose command
+the same way is what stops a stray invocation re-creating `app` as something else.
+
+### What each overlay changes, and what it deliberately does not
+
+**Express, not Developer.** The base file's `simmer-mssql-db` is Developer
+edition, which is right for the storage tests — they are about T-SQL correctness,
+and an edition ceiling would only slow them down. A soak is the opposite: Express
+is what a small deployment runs, and its ceilings (a 1410 MB buffer pool, four
+cores, 10 GB a database) are the kind of limit that appears over an hour and not
+over a test. `SERVERPROPERTY('Edition')` was read from the running container
+rather than inferred from `MSSQL_PID`: `Express Edition (64-bit)`, 16.0.4265.3.
+
+**A capture volume per instance.** A bucket file's name is a pure function of its
+ten-minute window, so one shared directory would have both processes appending to
+the same file under the same name, and the per-instance accounting — the A/B pair
+the whole tier rests on — would be one interleaved stream. The capture is on
+**both** instances for the same reason: V2's asymmetry is that `app` is scraped
+and `app2` is not, and capture on one only would cost the tier its one controlled
+comparison.
+
+**One config, plus a block.** `capture:` being absent is the only way to turn the
+capture off, and YAML has no conditional block, so the capture run needs a second
+config file. `test/config/simmer.soak.capture.yaml` is `simmer.soak.yaml`
+verbatim with the block appended, and
+`the_capture_soak_config_is_the_soak_config_plus_a_capture_block` asserts exactly
+that, so a timeout changed in one and not the other cannot silently give the two
+runs different shapes. The capture's values are the documented defaults
+deliberately: this is what an operator who read docs/CAPTURE.md §2 and changed
+nothing would get.
+
+**The harness learned a second dialect.** `Stack::sql` replaces `Stack::psql`
+where a tier does not care which backend it is on, and `Stack::sql_command`
+hands V4's ledger sampler a ready-made command so a slow query costs one sample
+rather than the run. Both dialects are asked for one `|` separated row —
+`psql -At` is that by definition, `sqlcmd` needs `-h -1 -W -s '|'` and a
+`SET NOCOUNT ON`. `reset_quota` gains the T-SQL form, since T-SQL has no
+multi-table `TRUNCATE`.
+
+### One change to the stack that is not plumbing: `tiberius=warn`
+
+`docker-compose.yml` and the stress overlay set `RUST_LOG: "info,sqlx=warn"`.
+That is the Postgres build's answer to a chatty driver, and the mssql build has no
+equivalent: tiberius logs `Begin transaction` and `Commit transaction` at INFO, so
+§7.4's reserve and commit put four lines per message on the session's own task —
+about 290,000 lines an hour at the soak's rate, written synchronously, into the
+same log step 5c's correlation ids are followed through. 28 of `app`'s 46 startup
+lines were tiberius's.
+
+`test/compose/mssql.yml` sets `RUST_LOG: "info,sqlx=warn,tiberius=warn"`, without
+which this stack would not be measuring the same thing the Postgres runs measured
+— it would be measuring its own logging. **It is also a gap in what is shipped:**
+the published guidance gives `info,sqlx=warn` for both images.
+
+### The hour — 2026-09-20, 14:27–15:28 UTC
+
+Images built from this working tree; `Express Edition (64-bit)` 16.0.4265.3 read
+back from the container; `"senders": 2` in both instances' startup lines (§6's
+trap) and `migrations applied backend=mssql` in both.
+
+| | `app` | `app2` |
+|---|---|---|
+| messages | 36,010 | 36,010 |
+| accepted | 36,010 | 36,010 |
+| deferred / refused / transport | 0 / 0 / 0 | 0 / 0 / 0 |
+| p50 / p90 / p99 | 23.1 / 54.5 / 75.6 ms | 22.9 / 50.0 / 72.5 ms |
+| max | 561.3 ms | 562.6 ms |
+| over 200 ms | 2 | 2 |
+
+**Not one message was deferred or refused in an hour on Express**, and the
+latency distribution is indistinguishable between the instances. Both slow
+messages are the same two on each instance — `soak-*-20313` at ~561 ms and
+`soak-*-20298` at ~294 ms, both `250 at dot`, both traced by correlation id. Two
+messages in 72,020 is not F16 returning.
+
+V4 (F2) behaved exactly as on Postgres: 275 messages in 11 sessions per instance,
+220 accepted, 11 cut by the session timeout, **none cut at the dot and none of
+the cut ones stored by the sink**, `reservations_in_flight` 0 after the drain
+against 11 cut, at most 2 reservation rows across 121 samples, and 440 committed
+on `warming-cancel` — 220 per instance, which is what was accepted. §7.4's
+reserve/commit protocol, the reservation registry and the sweeper all work on
+SQL Server exactly as the ledger says they should.
+
+At rest, both instances: threads 3 (3 before the first message), tasks 13 (13),
+`sessions_active` 0, `reservations_in_flight` 0, **0 unaccounted descriptors**.
+
+#### The capture, measured
+
+| | |
+|---|---|
+| records | **36,230 per instance** |
+| written | 913,960,956 bytes (0.85 GiB), **0.85 GiB/h** |
+| bodies omitted over `max_body_bytes` | 1,827 (5.0% — the 1m and 4m ends of the size distribution) |
+| late writes, clock regressions, files swept | 0, 0, 0 |
+| dropped, deferred | **0, 0** |
+| writer queue at rest | 0 deep |
+
+**The accounting is exact, and it is the invariant worth keeping.** 36,230 =
+36,010 V2/V3 messages + the 220 V4 messages that were accepted. The 11 cut by the
+session timeout and the 44 that ended with the connection are *not* captured, and
+should not be: D-081 answers `421` at the next command boundary, which is `RSET`,
+so those sessions never reached DATA and there was never a message to record.
+Capture records equal exactly the messages Simmer answered `250` to, on both
+instances, over 72,460 records. `soak_analyze` does not yet gate on this — the
+terms were first measured here — but it has now held on three runs: 7,250 records
+on the 12-minute validation run, 36,230 on the hour, and 7,250 again on the
+12-minute regression run against the fixed build.
+
+`retention` was never reached, and neither was the sweeper's hourly interval
+until the very end. See F17.
+
+#### F17 — found, and fixed
+
+`simmer_capture_disk_bytes` read **0 for 59.9 of the 60 minutes** while 904 MB
+accumulated, then jumped to 906,530,238 in the final sample when the sweeper's
+first post-startup tick fired. docs/CAPTURE.md §6 offered that gauge as "what
+tells you a capture left on will fill the volume" and §1 said to alert on it; it
+could do neither, because the only thing that wrote it ran hourly.
+
+The first version of this tier's check read the **final scrape** and therefore
+XPASSed this run — the tick lands about sixty minutes after startup, which on an
+hour-long run is a few seconds before the last sample. The check now judges the
+**series**, so its power does not depend on where the tick falls.
+
+Fixed rather than left open: the writer adds what each flush pushes
+(`metrics::capture_disk_grew`), and the sweeper's pass still *sets* the count
+from the directory. That division is the point — an increment-only gauge cannot
+see a bucket deleted by hand or bytes against blocks, and since the sweeper
+evicts whole buckets it would climb and never come down; D-056's rule keeps the
+directory authoritative and bounds the estimate's error to one interval. Verified
+live: 18,123 bytes on the gauge two seconds after three messages, equal to
+`du -b` on the file.
+
+#### The one gate that failed, and why it is not a leak
+
+`app` failed `anon` at **+4.28 MiB/h** with a quartile step of +2.64 MiB. Its
+twin, carrying an identical stream, read **-7.29 MiB/h**. The series is
+oscillation, not a climb — `app` runs 56, 49, 37, 36, 48, 24, 49, 43, 50, 43,
+20 MiB across the hour, `app2` 26, 57, 44, 34, 43, 33, 42, 62, 38, 50, 24 — and
+both finish near their lowest reading.
+
+§10 already established what this gate can resolve: the residual noise puts its
+standard error near 3 MiB/h, so a "no leak" verdict from a one-hour run means
+"no leak much above about 6 MiB/h". +4.28 against a twin at -7.29 is inside that
+band, and the run therefore establishes **no memory verdict either way** — not a
+leak, and not a clean bill. That is the same limitation §10 recorded, met again
+on a different backend with a new subsystem running; **the limit was not
+adjusted to make this run pass**, and the remedies remain §10's: a longer judged
+run, or a quieter series than cgroup anon.
+
+Everything else passed. F7 XFAILed as always: 1,495 new metric series over
+50 minutes, all `simmer_unmatched_sender_total{domain}`, client-controlled.
+
+#### What this hour did not establish
+
+- **Nothing about Express's ceilings.** The database stayed at ~1.43 GiB, its
+  edition buffer-pool limit, and never approached the 10 GB database cap: an hour
+  of quota rows and recipient-frequency events is megabytes. A run that pressed
+  either limit would be a different test.
+- **Nothing about the capture under eviction.** `retention` is 24h and the
+  sweeper's interval is an hour, so no bucket was ever deleted. What the capture
+  costs while the sweeper is actually evicting — and whether the gauge's
+  increments and its recount agree across an eviction — needs a run longer than
+  the interval, or a shorter retention and a run past it.
+- **Nothing about the mssql build under stress.** T3 has never been run against
+  it; this is 10 msg/s, not peak load.

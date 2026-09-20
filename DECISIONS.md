@@ -2901,6 +2901,17 @@ Otherwise:
 - Migrations live in `migrations-mssql/` and are compiled in. They are
   recorded in `simmer_migrations` with a SHA-256 checksum (an edited applied
   migration refuses to start) and serialised across replicas by `sp_getapplock`.
+
+  **Corrected in 0.3.1: the lock must be taken before `simmer_migrations` is
+  created, not after.** `IF OBJECT_ID(...) IS NULL CREATE TABLE` is not atomic, so
+  two replicas starting together both evaluated the guard as true, both ran the
+  DDL, and the loser failed startup with *There is already an object named
+  'simmer_migrations' in the database.* Creating the table before taking the lock
+  left the one piece of DDL the lock exists to serialise outside it.
+  `replicas_migrating_together_both_succeed` — which was written for exactly this
+  and whose comment says so — caught it only when the full suite ran the server
+  hard enough to widen the window, and passed when run alone. `sp_getapplock`
+  needs no table of its own, so there was never a reason for the old order.
 - Route and domain-group names are capped at 200 characters under this build,
   because a clustered key is capped at 900 bytes. §4.2 enforces the cap.
 - `GREATEST` is written as `CASE`, so SQL Server 2017 and later works, not
@@ -3141,6 +3152,168 @@ that succeeded**, because D-085's record carries no reply. That is the right
 answer rather than a gap: keeping the outcome out of the format is what keeps the
 format from becoming a spool's journal. Join `id` against the log stream to
 select a subset.
+
+### D-087 — The soak tier against the other build, and with the capture on
+
+Until now T4 ran one thing: the Postgres build with the capture off. D-084 shipped
+a second image and D-085 shipped a mode that writes every accepted message to
+disk, and neither had ever been run for an hour. This is what it took, and the
+three judgements inside it.
+
+**Stacks, not variants.** `docs/SOAK.md` §1's variants (V2, V3, V4) are *streams*
+— what the load does. The backend and the capture are neither: V2, V3 and V4 run
+unchanged under both, and what moves is what `app` was compiled from, what it
+connects to, and what it writes. So they are two compose overlays and four
+`Stack`s in `tests/compose/stack.rs`, chosen by `SOAK_BACKEND=mssql` and
+`SOAK_CAPTURE=on`, rather than conditionals inside one stack. The two overlays are
+orthogonal by construction and all four combinations are ordinary stacks, which is
+why a Postgres run with capture on needs nothing new.
+
+**Express, not Developer.** The storage tests use Developer edition, which is
+right for them — they are about T-SQL correctness and an edition ceiling would
+only slow them down. A soak is the opposite: Express is what a small deployment
+runs, and its ceilings (a 1410 MB buffer pool, four cores, 10 GB a database) are
+the kind of limit that appears over an hour rather than in a test. The edition is
+read back from `SERVERPROPERTY('Edition')` on the running container rather than
+inferred from `MSSQL_PID`.
+
+**A capture volume per instance, and the capture on both.** A bucket file's name
+is a pure function of its ten-minute window, so one shared directory means two
+processes appending to the same file under the same name: the per-instance
+accounting becomes unattributable and the A/B pair the tier rests on becomes one
+interleaved stream. And the capture goes on **both** instances, because V2's whole
+asymmetry is that `app` is scraped and `app2` is not — capture on one only would
+put a second difference between them and cost the tier its controlled comparison.
+
+**Two configs, and a test that they are one.** `capture:` being absent is the only
+way to turn the capture off and YAML has no conditional block, so
+`test/config/simmer.soak.capture.yaml` exists. It is `simmer.soak.yaml` verbatim
+plus that block, and `the_capture_soak_config_is_the_soak_config_plus_a_capture_block`
+asserts it, because two files drift and a `warming-cancel` timeout changed in one
+and not the other would give the two runs different shapes with nothing failing.
+`capture.directory` is `${SIMMER_CAPTURE_DIR}` rather than a literal so §4.2's
+writability probe can be satisfied by a temporary directory in ordinary
+`cargo test`.
+
+**`Stack` learned a second dialect.** `sql` replaces `psql` where a tier does not
+care which backend it is on, `psql` now asserts the backend it names, and
+`sql_command` hands V4's ledger sampler a command it runs itself, so a slow query
+costs one sample rather than the run. Both dialects are asked for one `|`
+separated row: `psql -At` is that by definition, `sqlcmd` needs
+`-h -1 -W -s '|'` and a `SET NOCOUNT ON`, and each field is trimmed because
+`sqlcmd` right-aligns an integer in its column width — without which the sampler
+returns nothing at all on the mssql stack and V4 is judged on an empty ledger.
+`reset_quota` gains the T-SQL form; T-SQL has no multi-table `TRUNCATE`.
+
+**The capture writer's open bucket is not a leaked descriptor — but the second one
+is.** `soak/rest/baseline` failed the first mssql+capture run on
+`/var/lib/simmer/capture/<bucket>.jsonl`: a descriptor open at rest that was not
+open before the first message and that no pool holds. It is the file the writer is
+filling, and the check was right to notice it and wrong to name it. So
+`leak::unaccounted_fds` takes the capture directory and accounts for **exactly
+one** open bucket. Not "ignore that directory": the writer re-opens on every
+ten-minute rotation, so a handle it failed to drop would accumulate one per
+bucket — a real leak, of precisely the kind only an hours-long run shows. Three
+self-tests pin all three halves: the current bucket is free, a second and third
+are named, and passing `None` does not lose the check.
+
+**`tiberius=warn`, and a gap in what is shipped.** `docker-compose.yml` and the
+stress overlay set `RUST_LOG: "info,sqlx=warn"`. That is the Postgres build's
+answer to a chatty driver and the mssql build has no equivalent: tiberius logs
+`Begin transaction` and `Commit transaction` at INFO, so §7.4's reserve and commit
+put four lines per message on the session's own task — about 290,000 lines an hour
+at the soak's rate, written synchronously, into the same log step 5c's correlation
+ids are followed through. 28 of `app`'s 46 startup lines were tiberius's.
+`test/compose/mssql.yml` sets `info,sqlx=warn,tiberius=warn`, without which this
+stack measures its own logging rather than the thing the Postgres runs measured.
+The published guidance still gives the Postgres answer for both images.
+
+### F17 — `simmer_capture_disk_bytes` could not do the job it is documented for
+
+`docs/CAPTURE.md` §1 says to alert on it and §6 calls it "what tells you a capture
+left on will fill the volume". It cannot be either. It is written in one place,
+`capture::sweeper::sweep_once`, which runs on a **one-hour** interval whose first
+pass happens at startup against an empty directory. So for the whole of the first
+hour it reads 0 however much has been written, and after that it reports the
+directory as of up to an hour ago — the wrong way round for a gauge whose purpose
+is to warn *before* a volume fills.
+
+Recomputing it from the directory rather than tracking it in the writer is not the
+mistake; that is D-056's reasoning and it holds — a number derived from what is
+actually on disk cannot drift from it. The mistake is that the recompute shares the
+*retention sweep's* timer, and the two have no reason to be the same number.
+
+Measured over the 1-hour soak: **0 for 59.9 of the 60 minutes** while 904 MB
+accumulated, then 906,530,238 in the final sample, when the first post-startup
+tick fired.
+
+**The check had to be fixed before the defect could be.** Its first version read
+the *final scrape*, and so XPASSed that hour — the tick lands about sixty minutes
+after startup, a few seconds before the last sample, and the one reading it looked
+at was the one correct reading in the run. `soak/capture/disk-gauge` now judges the
+series, and its power no longer depends on where the tick falls.
+
+**Fixed in 0.3.1.** `capture::writer` adds what each flush pushes
+(`metrics::capture_disk_grew`) and the sweeper's pass still *sets* the count from
+the directory. The division is the whole design:
+
+- increments make it live, to within the writer's flush policy;
+- the recount makes eviction visible and corrects what an increment cannot see —
+  a bucket deleted by hand, a file something else rewrote, bytes against blocks.
+  An increment-only gauge would climb and never come down, since the sweeper
+  deletes whole buckets;
+- the sweeper's *immediate first pass* is what initialises the gauge at startup,
+  where the directory may already hold a previous run's buckets. That pass existed
+  for retention; it is now load-bearing for the gauge too.
+
+D-056's rule — a number derived from the real directory cannot drift — is why the
+recount stays authoritative rather than being replaced. The estimate's error is
+bounded by one interval.
+
+The one way to get increments wrong is to count bytes twice: the idle deadline,
+the backstop tick and a rollover can all flush the same buffer. `flush_open`
+returns 0 when nothing is buffered, and two unit tests pin it — a repeat flush
+reports nothing and counting resumes from zero, and the total reported over
+25 records equals the file's own length. Verified live at 18,123 bytes two seconds
+after three messages, equal to `du -b`, and over a run with the gauge tracking the
+counter sample by sample.
+
+F17's entry is therefore deleted from `test/known-findings.json` in the same
+commit, as the rule requires: the list can never outlive the defects it names.
+
+### D-088 — When the capture reaches the file: ten lines, or half a second of quiet
+
+The capture writes through a 256 KiB `BufWriter`, and until 0.3.1 the only thing
+that emptied it on a live stream was a one-second housekeeping tick. That is the
+wrong bound for the thing this mode is for. At the 4 KiB end of a real message mix
+256 KiB is forty-odd records, so `tail -f` on the current bucket — the first thing
+anyone does with a debugging capture — showed nothing for long stretches, and a
+`replay` of a range that had just ended could miss its last records.
+
+Two rules now, whichever comes first:
+
+- **ten buffered lines**, which is what fires under load, so the flush cost is
+  amortised over ten records rather than paid per record;
+- **500 ms of quiet**, reset by each record, which is what fires when the stream
+  trickles and ten lines would take a long time to arrive.
+
+The one-second tick stays as the backstop, and it is not redundant: a stream
+arriving just often enough to keep resetting the 500 ms deadline without ever
+reaching ten lines is bounded by nothing else. So the worst case is no worse than
+it was, and the common cases are much better.
+
+**A flush, not an `fsync`.** The point is that the bytes leave this process, so
+anything reading the directory sees them. Durability against a machine losing
+power is `on_error: defer`'s business, which flushes *and* `sync_data`s before the
+client is told anything, and nothing here changes that.
+
+**The policy is a pure function** — `flush_decision(dirty, since_flush)` — and the
+loop acts on what it returns. A timing test of "did it flush within 500 ms" on a
+loaded machine is a flake; the rule is what is worth pinning, and it is pinned by
+four unit tests, including that the idle deadline is shorter than the backstop
+tick, which is the only thing that makes "backstop" true.
+
+It also gave F17's fix its hook: a flush knows exactly how many bytes it pushed.
 
 ## Still open — to settle at the start of the phase that needs them
 
