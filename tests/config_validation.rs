@@ -1050,3 +1050,180 @@ fn warns_about_a_plaintext_link_proxy_upstream() {
         .iter()
         .any(|w| w.path == "link_proxy.upstream"));
 }
+
+// -- D-085: capture -------------------------------------------------------
+
+fn with_capture(block: &str) -> String {
+    format!("{BASE}capture:\n{block}")
+}
+
+/// A `capture:` block naming a directory that really exists and is really
+/// writable, because `check_capture` probes it rather than reading mode bits.
+fn capture_in(dir: &std::path::Path, extra: &str) -> String {
+    with_capture(&format!("  directory: \"{}\"\n{extra}", dir.display()))
+}
+
+#[test]
+fn capture_is_optional_and_absent_by_default() {
+    assert!(load(BASE).unwrap().capture.is_none());
+}
+
+#[test]
+fn a_capture_block_needs_only_a_directory_and_defaults_the_rest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = load(&capture_in(dir.path(), "")).expect("should load");
+    let c = cfg.capture.expect("capture");
+    assert_eq!(c.max_body_bytes, 1024 * 1024);
+    assert_eq!(c.retention, std::time::Duration::from_secs(24 * 3600));
+    assert_eq!(c.on_error, config::CaptureOnError::Continue);
+    assert_eq!(c.queue_depth, 1024);
+    assert_eq!(c.max_queue_bytes, 64 * 1024 * 1024);
+}
+
+#[test]
+fn a_capture_directory_that_does_not_exist_yet_is_accepted_if_its_parent_is_writable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child = dir.path().join("not-created-yet");
+    assert!(load(&capture_in(&child, "")).is_ok());
+}
+
+#[test]
+fn rejects_a_relative_capture_directory() {
+    // It would resolve against the working directory — `/app` in the container,
+    // wherever the operator stood otherwise — so one config would capture to two
+    // different places.
+    rejected_for(&with_capture("  directory: \"capture\"\n"), "absolute");
+}
+
+#[test]
+fn rejects_an_empty_capture_directory() {
+    rejected_for(&with_capture("  directory: \"\"\n"), "capture.directory");
+}
+
+#[test]
+fn rejects_a_capture_directory_that_is_a_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, b"not a directory").expect("write");
+    rejected_for(&capture_in(&file, ""), "not a directory");
+}
+
+#[test]
+fn rejects_a_capture_directory_whose_parent_does_not_exist() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let deep = dir.path().join("missing").join("deeper");
+    rejected_for(&capture_in(&deep, ""), "neither does its parent");
+}
+
+#[test]
+fn rejects_a_zero_max_body_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    rejected_for(
+        &capture_in(dir.path(), "  max_body_bytes: 0\n"),
+        "capture.max_body_bytes",
+    );
+}
+
+#[test]
+fn rejects_a_retention_shorter_than_one_bucket() {
+    // A retention under ten minutes would have the sweeper delete the file the
+    // writer is appending to.
+    let dir = tempfile::tempdir().expect("tempdir");
+    rejected_for(
+        &capture_in(dir.path(), "  retention: 5m\n"),
+        "capture.retention",
+    );
+    assert!(load(&capture_in(dir.path(), "  retention: 10m\n")).is_ok());
+}
+
+#[test]
+fn rejects_a_zero_queue_depth_and_a_zero_queue_byte_budget() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    rejected_for(
+        &capture_in(dir.path(), "  queue_depth: 0\n"),
+        "capture.queue_depth",
+    );
+    rejected_for(
+        &capture_in(dir.path(), "  max_queue_bytes: 0\n"),
+        "capture.max_queue_bytes",
+    );
+}
+
+#[test]
+fn rejects_a_queue_byte_budget_that_could_never_hold_a_maximum_size_message() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    rejected_for(
+        &capture_in(dir.path(), "  max_queue_bytes: 1024\n"),
+        "max_message_bytes",
+    );
+}
+
+#[test]
+fn rejects_an_unparseable_capture_on_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(load(&capture_in(dir.path(), "  on_error: maybe\n")).is_err());
+    assert!(load(&capture_in(dir.path(), "  on_error: defer\n")).is_ok());
+}
+
+#[test]
+fn rejects_an_unknown_capture_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(load(&capture_in(dir.path(), "  fsync: true\n")).is_err());
+}
+
+#[test]
+fn rejects_a_bare_integer_capture_retention() {
+    // The house rule: a duration carries its unit (`config::duration`).
+    let dir = tempfile::tempdir().expect("tempdir");
+    assert!(load(&capture_in(dir.path(), "  retention: 3600\n")).is_err());
+}
+
+#[test]
+fn reports_every_capture_violation_at_once() {
+    let yaml = with_capture(
+        "  directory: \"relative/path\"\n  max_body_bytes: 0\n  retention: 1m\n  \
+         queue_depth: 0\n  max_queue_bytes: 0\n",
+    );
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            for needle in [
+                "capture.directory",
+                "capture.max_body_bytes",
+                "capture.retention",
+                "capture.queue_depth",
+                "capture.max_queue_bytes",
+            ] {
+                assert!(
+                    v.mentions(needle),
+                    "no violation mentioned '{needle}':\n{v}"
+                );
+            }
+        }
+        other => panic!("expected a validation failure, got: {other:?}"),
+    }
+}
+
+#[test]
+fn warns_whenever_capture_is_enabled_at_all() {
+    // Not conditional on anything: §7.3 hashes recipients precisely so the
+    // container does not accumulate a plaintext record of every address mailed,
+    // and this accumulates exactly that. An operator who left it on after an
+    // afternoon of debugging must see it on every start.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = load(&capture_in(dir.path(), "")).unwrap();
+    let warnings = config::validate::warnings(&cfg);
+    let w = warnings
+        .iter()
+        .find(|w| w.path == "capture")
+        .unwrap_or_else(|| panic!("no capture warning. Got: {warnings:?}"));
+    assert!(w.message.contains("7.3"), "{}", w.message);
+    assert!(w.message.contains(&dir.path().display().to_string()));
+}
+
+#[test]
+fn does_not_warn_about_capture_when_it_is_off() {
+    let cfg = load(BASE).unwrap();
+    assert!(!config::validate::warnings(&cfg)
+        .iter()
+        .any(|w| w.path.starts_with("capture")));
+}
