@@ -26,7 +26,7 @@ pub fn load(path: &str) -> Config {
         std::env::set_var("SIMMER_TLS_DIR", dir);
     }
     if std::env::var("SIMMER_CAPTURE_DIR").is_err() {
-        // D-085's capture directory, for `simmer.soak.capture.yaml`. §4.2 probes
+        // D-085's capture directory, for the generated capture twins. §4.2 probes
         // it for real rather than reading mode bits, so it has to exist and be
         // writable — a real temporary directory, not a plausible path. Kept for
         // the life of the process, like the certificate above.

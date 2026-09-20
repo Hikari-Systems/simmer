@@ -3165,9 +3165,16 @@ three judgements inside it.
 unchanged under both, and what moves is what `app` was compiled from, what it
 connects to, and what it writes. So they are two compose overlays and four
 `Stack`s in `tests/compose/stack.rs`, chosen by `SOAK_BACKEND=mssql` and
-`SOAK_CAPTURE=on`, rather than conditionals inside one stack. The two overlays are
-orthogonal by construction and all four combinations are ordinary stacks, which is
-why a Postgres run with capture on needs nothing new.
+`SIMMER_CAPTURE=on`, rather than conditionals inside one stack.
+
+The two are not symmetrical, and the difference is the point. The backend is a
+property of a **stack**: `SOAK_MSSQL` is a different stack from `SOAK`, with a
+different `app` image and a different database. The capture is a property of a
+**run**: it is the same server, the same database and the same streams, writing
+one extra file. So `SIMMER_CAPTURE=on` is applied by `Stack::compose` to whatever
+stack is running rather than doubling the stacks, there is no `SOAK_CAPTURE` and
+no capture twin of each `Stack`, and the stress tier or any other tier served from
+the config volume can be captured without a line of new plumbing.
 
 **Express, not Developer.** The storage tests use Developer edition, which is
 right for them — they are about T-SQL correctness and an edition ceiling would
@@ -3185,15 +3192,20 @@ interleaved stream. And the capture goes on **both** instances, because V2's who
 asymmetry is that `app` is scraped and `app2` is not — capture on one only would
 put a second difference between them and cost the tier its controlled comparison.
 
-**Two configs, and a test that they are one.** `capture:` being absent is the only
-way to turn the capture off and YAML has no conditional block, so
-`test/config/simmer.soak.capture.yaml` exists. It is `simmer.soak.yaml` verbatim
-plus that block, and `the_capture_soak_config_is_the_soak_config_plus_a_capture_block`
-asserts it, because two files drift and a `warming-cancel` timeout changed in one
-and not the other would give the two runs different shapes with nothing failing.
-`capture.directory` is `${SIMMER_CAPTURE_DIR}` rather than a literal so §4.2's
-writability probe can be satisfied by a temporary directory in ordinary
-`cargo test`.
+**One capture block, and the twins are generated.** `capture:` being absent is the
+only way to turn the capture off and YAML has no conditional block, so a captured
+run needs a second config file. Committing one per tier is how those files drift —
+a `warming-cancel` timeout changed in the soak config and not in its twin would
+give V4 a different shape under capture, and the comparison between the two runs
+would be worthless with nothing failing. So there is exactly one
+`test/config/capture.block.yaml`, and `test/config/Dockerfile` appends it to every
+tier config while building the volume image, producing `<name>.capture.yaml`. No
+twin is committed, so none can drift, and no test has to assert that none has.
+`the_capture_twin_of_every_tier_config_is_valid` builds each twin the same way on
+the host and runs the real `config::load` over it, so a block that broke the stress
+config fails in seconds rather than after an image build and a stack that will not
+come up. `capture.directory` is `${SIMMER_CAPTURE_DIR}` rather than a literal so
+§4.2's writability probe can be satisfied by a temporary directory there.
 
 **`Stack` learned a second dialect.** `sql` replaces `psql` where a tier does not
 care which backend it is on, `psql` now asserts the backend it names, and

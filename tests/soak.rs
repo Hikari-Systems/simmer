@@ -25,7 +25,7 @@
 //! | | |
 //! |---|---|
 //! | `SOAK_BACKEND=mssql` | D-084's SQL Server build, against SQL Server **Express** (`test/compose/mssql.yml`) |
-//! | `SOAK_CAPTURE=on` | D-085's capture, on **both** instances (`test/compose/capture.yml`, and the config that carries the `capture:` block) |
+//! | `SIMMER_CAPTURE=on` | D-085's capture, on **both** instances (`test/compose/capture.yml` and the generated config twin). **Not soak-specific** — the same variable captures any tier whose config comes from the config volume |
 //!
 //! Neither is a §1 variant: V2, V3 and V4 all run unchanged under both. They
 //! change what the stack *is*, which is why they are four stacks rather than a
@@ -33,7 +33,7 @@
 //! will:
 //!
 //! ```sh
-//! export SOAK_BACKEND=mssql SOAK_CAPTURE=on
+//! export SOAK_BACKEND=mssql SIMMER_CAPTURE=on
 //! SIMMER_CONFIG=/config/simmer.soak.capture.yaml docker compose \
 //!   -f docker-compose.yml -f test/compose/acceptance.yml -f test/compose/stress.yml \
 //!   -f test/compose/mssql.yml -f test/compose/capture.yml \
@@ -104,31 +104,26 @@ use std::time::{Duration, Instant};
 
 use compose::leak;
 use compose::reconcile::{self, Received, Sent};
-use compose::stack::{Stack, SOAK, SOAK_CAPTURE, SOAK_MSSQL, SOAK_MSSQL_CAPTURE};
+use compose::stack::{capture_on, Stack, SOAK, SOAK_MSSQL};
 
 const SOAK_CONFIG: &str = "test/config/simmer.soak.yaml";
 
-/// The same configuration with D-085's capture block (`SOAK_CAPTURE=on`).
-const SOAK_CAPTURE_CONFIG: &str = "test/config/simmer.soak.capture.yaml";
-
-/// Which stack this run drives, from the environment: `SOAK_BACKEND=mssql` for
-/// D-084's SQL Server build against Express, `SOAK_CAPTURE=on` for D-085's
-/// capture. Neither is a variant in the §1 sense — V2, V3 and V4 all run
-/// unchanged either way — they change what the stack *is*, which is why they are
-/// four stacks and not a flag inside one.
+/// Which stack this run drives: `SOAK_BACKEND=mssql` selects D-084's SQL Server
+/// build against Express. Not a variant in the §1 sense — V2, V3 and V4 all run
+/// unchanged either way — it changes what the stack *is*.
 ///
-/// **`soak_analyze` is a separate cargo invocation and reads this too**: it execs
+/// D-085's capture is **not** here, and deliberately. It belongs to no tier:
+/// `SIMMER_CAPTURE=on` layers it onto whatever stack is running, soak or
+/// otherwise, and `Stack::compose` does that for every tier at once.
+///
+/// **`soak_analyze` is a separate cargo invocation and reads these too**: it execs
 /// into the instances for their final state, and a command built from the wrong
 /// files would reconcile `app` into something else (stack.rs's preamble, D-042).
-/// Both commands must carry the same two variables.
+/// Both commands must carry the same environment.
 fn stack() -> &'static Stack {
-    let mssql = std::env::var("SOAK_BACKEND").is_ok_and(|v| v == "mssql");
-    let capture = std::env::var("SOAK_CAPTURE").is_ok_and(|v| v == "on");
-    match (mssql, capture) {
-        (false, false) => &SOAK,
-        (false, true) => &SOAK_CAPTURE,
-        (true, false) => &SOAK_MSSQL,
-        (true, true) => &SOAK_MSSQL_CAPTURE,
+    match std::env::var("SOAK_BACKEND").is_ok_and(|v| v == "mssql") {
+        false => &SOAK,
+        true => &SOAK_MSSQL,
     }
 }
 
@@ -138,7 +133,7 @@ fn stack_name() -> String {
         compose::stack::Backend::Postgres => "postgres",
         compose::stack::Backend::Mssql => "mssql (SQL Server Express)",
     };
-    let capture = if std::env::var("SOAK_CAPTURE").is_ok_and(|v| v == "on") {
+    let capture = if capture_on() {
         "capture on"
     } else {
         "capture off"
@@ -209,50 +204,10 @@ const SLOW_TRACED: usize = 200;
 
 #[test]
 fn the_soak_config_is_valid_and_cannot_run_out_of_allowance() {
-    // Both of them. A capture variant whose allowance or whose V4 wiring had
-    // drifted would be a run that looked like the soak and measured something
-    // else, which is exactly what this test exists to prevent.
-    for path in [SOAK_CONFIG, SOAK_CAPTURE_CONFIG] {
-        assert_soak_config_sound(path);
-    }
-}
-
-/// `test/config/simmer.soak.capture.yaml` is `simmer.soak.yaml` verbatim plus the
-/// `capture:` block, and this is what makes that true rather than aspirational.
-///
-/// The capture config cannot be a switch in the soak config: `capture:` being
-/// absent is the only way to turn the capture off (docs/CAPTURE.md §2), and YAML
-/// has no conditional block. So there are two files, and two files drift — a
-/// `warming-cancel` timeout changed in one and not the other would give V4 a
-/// different shape under capture and the comparison between the two runs would
-/// be worthless, with nothing failing.
-///
-/// The block is required to be last, because that makes the check a truncation
-/// rather than a parse.
-#[test]
-fn the_capture_soak_config_is_the_soak_config_plus_a_capture_block() {
-    let plain = fs::read_to_string(SOAK_CONFIG).expect("the soak config");
-    let captured = fs::read_to_string(SOAK_CAPTURE_CONFIG).expect("the capture soak config");
-
-    let body = |text: &str| -> Vec<String> {
-        text.lines()
-            .take_while(|l| *l != "capture:")
-            .map(str::trim_end)
-            .filter(|l| !l.is_empty() && !l.trim_start().starts_with('#'))
-            .map(str::to_string)
-            .collect()
-    };
-
-    assert!(
-        captured.lines().any(|l| l == "capture:"),
-        "{SOAK_CAPTURE_CONFIG} has no `capture:` block, so it captures nothing"
-    );
-    assert_eq!(
-        body(&plain),
-        body(&captured),
-        "{SOAK_CAPTURE_CONFIG} has drifted from {SOAK_CONFIG}: it must be that file \
-         verbatim, with the `capture:` block appended last"
-    );
+    // The capture twin is `test/config/Dockerfile`'s doing — this file verbatim
+    // plus `capture.block.yaml` — so there is no second config here to check and
+    // nothing that can drift from this one.
+    assert_soak_config_sound(SOAK_CONFIG);
 }
 
 fn assert_soak_config_sound(path: &str) {
@@ -806,7 +761,7 @@ fn soak_analyze() {
     );
 }
 
-/// D-085's capture, when the run had it on (`SOAK_CAPTURE=on`).
+/// D-085's capture, when the run had it on (`SIMMER_CAPTURE=on`).
 ///
 /// Two gates and a report, and the split is deliberate. What the capture *costs*
 /// — disk, and the message path's share of the base64 and the SHA-256 — is not a
@@ -1580,10 +1535,7 @@ fn unaccounted_fds(
 /// `SIMMER_CAPTURE_DIR`, so the harness and the container cannot disagree about
 /// the path. With the capture off there is nothing to account for.
 fn capture_dir() -> Option<&'static str> {
-    if !std::env::var("SOAK_CAPTURE").is_ok_and(|v| v == "on") {
-        return None;
-    }
-    Some("/var/lib/simmer/capture")
+    capture_on().then_some("/var/lib/simmer/capture")
 }
 
 /// Every connection the downstream and database pools report holding; each is

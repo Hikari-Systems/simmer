@@ -386,6 +386,57 @@ fn one_leaked_descriptor_is_named() {
     }
 }
 
+/// Every tier config, with D-085's capture block appended exactly as
+/// `test/config/Dockerfile` appends it, must still be a valid configuration.
+///
+/// The twins are generated into the config volume rather than committed, so
+/// without this nothing on the host would ever look at one: a block that broke
+/// the stress config would surface as a stack that will not come up, after an
+/// image build, rather than as a test failure in seconds. It covers every tier
+/// because the capture belongs to none of them.
+#[test]
+fn the_capture_twin_of_every_tier_config_is_valid() {
+    let block = std::fs::read_to_string("test/config/capture.block.yaml")
+        .expect("test/config/capture.block.yaml");
+    let dir = std::env::temp_dir().join("simmer-capture-twins");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    let mut checked = 0;
+    for entry in std::fs::read_dir("test/config").expect("test/config") {
+        let path = entry.expect("dir entry").path();
+        let name = path
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        if !name.starts_with("simmer.") || !name.ends_with(".yaml") {
+            continue;
+        }
+        let base = std::fs::read_to_string(&path).expect("a tier config");
+        let twin = dir.join(name.replace(".yaml", ".capture.yaml"));
+        std::fs::write(
+            &twin,
+            format!(
+                "{base}
+{block}"
+            ),
+        )
+        .expect("write the twin");
+
+        let cfg = compose::configs::load(twin.to_str().expect("utf-8"));
+        let capture = cfg
+            .capture
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name}'s twin carries no capture block"));
+        assert_eq!(capture.max_body_bytes, 1_048_576, "{name}");
+        checked += 1;
+    }
+    assert!(
+        checked >= 2,
+        "only {checked} tier configs found; the glob is wrong"
+    );
+}
+
 const CAPTURE_DIR: &str = "/var/lib/simmer/capture";
 
 #[test]

@@ -11,6 +11,18 @@ FROM debian:bookworm-slim
 
 COPY test/config/ /files/
 
+# Every tier config gets a `<name>.capture.yaml` twin: the original, verbatim,
+# plus capture.block.yaml. Generated here rather than committed because two files
+# drift — a timeout changed in one and not the other would silently give a
+# captured run a different shape from its uncaptured twin — and because the
+# capture belongs to no particular tier. `SIMMER_CAPTURE=on` points `app` at the
+# twin; see tests/compose/stack.rs.
+RUN set -e; \
+    for f in /files/simmer.*.yaml; do \
+        case "$f" in *.capture.yaml) continue ;; esac; \
+        { cat "$f"; echo; cat /files/capture.block.yaml; } > "${f%.yaml}.capture.yaml"; \
+    done
+
 # One-shot: replace the volume's contents with this build's files, readable by
 # the container user (UID 1000), then exit.
 ENTRYPOINT ["sh", "-ec", "rm -rf /config/* && cp -r /files/. /config/ && chown -R 1000:1000 /config && chmod -R a+rX /config && ls /config"]

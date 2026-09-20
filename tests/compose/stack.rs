@@ -24,6 +24,17 @@ pub enum Backend {
     Mssql,
 }
 
+/// D-085's capture overlay: the per-instance volumes and `SIMMER_CAPTURE_DIR`.
+/// Layered onto any stack when `SIMMER_CAPTURE=on`.
+const CAPTURE_OVERRIDE: &str = "test/compose/capture.yml";
+
+/// Is the capture on for this run? Deliberately not named for any tier: the same
+/// variable turns it on for the stress stack, the soak, or anything else that
+/// reads its config from the config volume.
+pub fn capture_on() -> bool {
+    std::env::var("SIMMER_CAPTURE").is_ok_and(|v| v == "on")
+}
+
 /// The SA login the `mssql` stacks use. Local development only — never a real
 /// credential; `docker-compose.yml`'s `simmer-mssql-db` carries the same literal.
 const MSSQL_SA_PASSWORD: &str = "Simmer-dev-1!";
@@ -82,18 +93,6 @@ pub static SOAK: Stack = Stack::new(
     "/config/simmer.soak.yaml",
 );
 
-/// The soak stack with D-085's capture on (`test/compose/capture.yml`), and so
-/// with the config that carries the `capture:` block — the two are inseparable.
-pub static SOAK_CAPTURE: Stack = Stack::new(
-    &["acceptance", "stress", "capture"],
-    &[
-        "test/compose/acceptance.yml",
-        "test/compose/stress.yml",
-        "test/compose/capture.yml",
-    ],
-    "/config/simmer.soak.capture.yaml",
-);
-
 /// The soak stack against the `mssql` build and SQL Server Express
 /// (`test/compose/mssql.yml`).
 pub static SOAK_MSSQL: Stack = Stack::with_backend(
@@ -104,22 +103,6 @@ pub static SOAK_MSSQL: Stack = Stack::with_backend(
         "test/compose/mssql.yml",
     ],
     "/config/simmer.soak.yaml",
-    Backend::Mssql,
-);
-
-/// Both at once: the `mssql` build against Express, with the capture on. The two
-/// overlays are orthogonal by construction — one changes what `app` is built from
-/// and what it connects to, the other what it writes to disk — so all four
-/// combinations are stacks and none of them is a special case.
-pub static SOAK_MSSQL_CAPTURE: Stack = Stack::with_backend(
-    &["acceptance", "stress", "mssql", "capture"],
-    &[
-        "test/compose/acceptance.yml",
-        "test/compose/stress.yml",
-        "test/compose/mssql.yml",
-        "test/compose/capture.yml",
-    ],
-    "/config/simmer.soak.capture.yaml",
     Backend::Mssql,
 );
 
@@ -160,7 +143,38 @@ impl Stack {
         self.backend
     }
 
+    /// `SIMMER_CONFIG` for this run: the tier's config, or its capture twin.
+    ///
+    /// The twins are generated into the config volume by `test/config/Dockerfile`
+    /// from one `capture.block.yaml`, so there is nothing here to keep in step.
+    /// A config served from the image rather than that volume has no twin, and
+    /// saying so is much better than running without the capture that was asked
+    /// for — D-085's rule that a capture configured and silently not writing is
+    /// the worst outcome available, applied to the harness.
+    fn config_path(&self) -> String {
+        if !capture_on() {
+            return self.config.to_string();
+        }
+        assert!(
+            self.config.starts_with("/config/"),
+            "SIMMER_CAPTURE=on, but this stack reads {} from the image rather than \
+             the config volume, so it has no generated capture twin. Only the tiers \
+             served by test/config/Dockerfile can be captured this way.",
+            self.config
+        );
+        self.config
+            .strip_suffix(".yaml")
+            .map(|base| format!("{base}.capture.yaml"))
+            .expect("a tier config ends in .yaml")
+    }
+
     /// `docker compose` with this stack's files, profiles and environment.
+    ///
+    /// D-085's capture is layered on here rather than being a stack of its own,
+    /// because it belongs to no tier: `SIMMER_CAPTURE=on` adds the overlay, its
+    /// profile and the config twin to **whatever** stack is running. That is why
+    /// there is no `SOAK_CAPTURE` and no capture variant of each `Stack` — the
+    /// capture is a property of a run, not a kind of stack.
     pub fn compose(&self) -> Command {
         let mut c = Command::new("docker");
         c.arg("compose");
@@ -169,11 +183,17 @@ impl Stack {
             for file in self.overrides {
                 c.args(["-f", file]);
             }
+            if capture_on() {
+                c.args(["-f", CAPTURE_OVERRIDE]);
+            }
         }
         for profile in self.profiles {
             c.args(["--profile", profile]);
         }
-        c.env("SIMMER_CONFIG", self.config);
+        if capture_on() {
+            c.args(["--profile", "capture"]);
+        }
+        c.env("SIMMER_CONFIG", self.config_path());
         let started = self.warmup_started.lock().expect("lock").clone();
         if !started.is_empty() {
             c.env("SIMMER_WARMUP_STARTED", started);

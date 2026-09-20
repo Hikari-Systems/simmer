@@ -1162,10 +1162,10 @@ variables choose between them:
 | | |
 |---|---|
 | `SOAK_BACKEND=mssql` | D-084's `--no-default-features --features mssql` build, against **SQL Server 2022 Express** (`test/compose/mssql.yml`) |
-| `SOAK_CAPTURE=on` | D-085's capture, on **both** instances (`test/compose/capture.yml` and `test/config/simmer.soak.capture.yaml`) |
+| `SIMMER_CAPTURE=on` | D-085's capture, on **both** instances (`test/compose/capture.yml` and the generated config twin). **Not the soak's** — the same variable captures any tier served from the config volume |
 
 ```sh
-export SOAK_BACKEND=mssql SOAK_CAPTURE=on
+export SOAK_BACKEND=mssql SIMMER_CAPTURE=on
 SIMMER_CONFIG=/config/simmer.soak.capture.yaml docker compose \
   -f docker-compose.yml -f test/compose/acceptance.yml -f test/compose/stress.yml \
   -f test/compose/mssql.yml -f test/compose/capture.yml \
@@ -1199,15 +1199,15 @@ the whole tier rests on — would be one interleaved stream. The capture is on
 and `app2` is not, and capture on one only would cost the tier its one controlled
 comparison.
 
-**One config, plus a block.** `capture:` being absent is the only way to turn the
-capture off, and YAML has no conditional block, so the capture run needs a second
-config file. `test/config/simmer.soak.capture.yaml` is `simmer.soak.yaml`
-verbatim with the block appended, and
-`the_capture_soak_config_is_the_soak_config_plus_a_capture_block` asserts exactly
-that, so a timeout changed in one and not the other cannot silently give the two
-runs different shapes. The capture's values are the documented defaults
-deliberately: this is what an operator who read docs/CAPTURE.md §2 and changed
-nothing would get.
+**One capture block, and it belongs to no tier.** `capture:` being absent is the
+only way to turn the capture off and YAML has no conditional block, so a captured
+run needs a second config file. Rather than commit one per tier,
+`test/config/Dockerfile` generates a `<name>.capture.yaml` twin for every tier
+config from a single `test/config/capture.block.yaml`. So the soak, the stress
+tier and anything else served from the config volume are captured the same way,
+by the same file, and no twin can drift from its original. The capture's values
+are the documented defaults deliberately: what an operator who read
+docs/CAPTURE.md §2 and changed nothing would get.
 
 **The harness learned a second dialect.** `Stack::sql` replaces `Stack::psql`
 where a tier does not care which backend it is on, and `Stack::sql_command`

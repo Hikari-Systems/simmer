@@ -1,0 +1,38 @@
+# D-085's capture, as a fragment appended to every tier config by
+# test/config/Dockerfile. `capture:` being absent is the only way to turn the
+# capture off (docs/CAPTURE.md §2) and YAML has no conditional block, so each
+# config gets a `<name>.capture.yaml` twin built from this one file.
+#
+# **It is not the soak's.** Any tier can run with the capture on — set
+# `SIMMER_CAPTURE=on`, which makes the harness mount the volumes
+# (test/compose/capture.yml) and point `app` at the twin. Nothing here knows
+# which tier it was appended to.
+#
+# One block in the repository, so the twins cannot drift from their originals and
+# no test has to assert that they have not.
+#
+# The values are the documented defaults, deliberately: what an operator who read
+# docs/CAPTURE.md §2 and changed nothing would get. Two worth knowing:
+#
+#   * `max_body_bytes` 1 MiB is §8.1's spill threshold, so a message above it is
+#     recorded as an envelope with `body_omitted: true` and counted on
+#     `simmer_capture_body_omitted_total`. On the soak's size distribution that is
+#     ~5% of the stream, and it is why the capture does not cost the mean message
+#     size times the run.
+#
+#   * `retention` 24h is never reached by a run of an hour, so nothing is swept
+#     and `simmer_capture_files_swept_total` stays 0. Shorten it below the run's
+#     length to exercise eviction.
+#
+# `on_error: continue` is the default and the right one for a measured run: a gap
+# in a debugging capture must not stop mail (§14.1 cuts both ways), and a gap is
+# visible on `simmer_capture_dropped_total{reason}` either way. Under `defer` a
+# slow disk turns into 451s and the run measures the capture's backpressure
+# instead of the server.
+capture:
+  directory: "${SIMMER_CAPTURE_DIR}"
+  max_body_bytes: 1048576
+  retention: 24h
+  on_error: continue
+  queue_depth: 1024
+  max_queue_bytes: 67108864
