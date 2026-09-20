@@ -1,9 +1,22 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-09-11, at the end of phase 11.** This is a session-handover
-document, not a maintained one: `README.md` describes the service, `DECISIONS.md`
-records why it is the way it is, and `docs/SPEC.md` is authoritative over both. If
-this file disagrees with any of them, they win.
+**Snapshot taken 2026-09-20, at release `v0.3.1`.** (The previous snapshot was
+2026-09-11, at the end of phase 11.) This is a session-handover document, not a
+maintained one: `README.md` describes the service, `DECISIONS.md` records why it is
+the way it is, and `docs/SPEC.md` is authoritative over both. If this file
+disagrees with any of them, they win.
+
+**What has landed since the phase 11 snapshot**, none of it a §13 phase — each was
+put to the spec's author and recorded rather than assumed:
+
+| | |
+|---|---|
+| **D-083** — the link proxy (§5.7) | An optional HTTP forwarder, after O-13 was answered; `SPEC.md` amended 2026-09-17 |
+| **D-084** — a second image | `--no-default-features --features mssql` over SQL Server, published as `:<tag>-mssql`. One backend per binary, `migrations-mssql/` in T-SQL, `tests/store_conformance/` run against both |
+| **D-085 / D-086** — the capture and `server replay` | An optional debugging capture of every accepted message, and a subcommand that replays a range. A recorded divergence, not a spec amendment (O-15) |
+| **D-087** — the soak tier generalised | T4 against the mssql build on SQL Server Express, and against the capture, on any tier |
+| **D-088** — the capture's flush policy | Ten buffered lines or 500 ms of quiet |
+| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below) |
 
 ---
 
@@ -122,15 +135,28 @@ re-encoded at all, so a body with no match is forwarded as the bytes it arrived 
 
 ## 2. Verification status
 
-Everything below was run on 2026-09-11 against the phase 11 tree.
+Re-run on 2026-09-20 against the `v0.3.1` tree. **Both feature sets, because CI
+gates both** (D-084):
 
 ```
-cargo test                                    830 passed, 0 failed
-cargo clippy --all-targets -- -D warnings     clean
-cargo fmt --all -- --check                    clean
-cargo deny check                              advisories ok, bans ok, licenses ok, sources ok
-docker compose up -d --build                  both containers healthy
+cargo test                                                  1068 passed, 0 failed
+cargo test --no-default-features --features mssql            937 passed, 0 failed
+cargo clippy --all-targets -- -D warnings                    clean
+cargo clippy --all-targets --no-default-features --features mssql   clean
+cargo fmt --all -- --check                                   clean
+docker compose up -d --build                                 both containers healthy
 ```
+
+The mssql suite needs a SQL Server and `MSSQL_URL` naming a login that may
+`CREATE DATABASE`; `cargo deny` is not installed in the current sandbox and was
+not re-run (CI runs it).
+
+For reference, the phase 11 snapshot read 830 passed on the default build alone.
+
+**T4, the soak tier, has now run against the SQL Server build** — an hour on
+Express with the capture on, 36,010 messages an instance with nothing deferred or
+refused. `docs/SOAK.md` §11 is the run, what it found, and what it did not
+establish.
 
 Plus the acceptance tier, which needs its own stack and is not in `cargo test`:
 
@@ -276,9 +302,25 @@ src/quota/           §7
   day.rs               §7.2 elapsed-duration day index
   store.rs             §11's storage trait
   postgres.rs          the §7.4 three-phase protocol
+  mssql.rs             the same over SQL Server: UPDLOCK/SERIALIZABLE, never MERGE (D-084)
   mod.rs               allowance resolution, reservation expiry
   registry.rs          §10.4 in-flight reservations
   sweeper.rs           §7.4 expiry release
+src/db/              the backend switch — exactly one per binary (D-084)
+  mod.rs               a compile_error! if both features or neither
+  postgres.rs          sqlx pool + migrations
+  mssql.rs             tiberius over bb8; the migration lock covers its own DDL
+src/capture/         D-085's optional debugging capture. WRITE-ONLY by design
+  mod.rs               the handle and the bounded queue; off unless configured
+  record.rs            the JSONL schema: no outcome, no derived state
+  writer.rs            one task, one file; D-088's flush policy; the disk gauge (F17)
+  bucket.rs            the ten-minute filename a record's `at` is always inside
+  sweeper.rs           retention; its pass is also the disk gauge's resync
+  replay.rs            `server replay` (D-086) — a duplicate-delivery machine
+  client.rs            the replay's SMTP client: no pool, no route, no misbehaviour
+src/link_proxy/      §5.7's optional HTTP forwarder (D-083)
+  mod.rs               the listener, no-store, query-free logging
+  rewrite.rs           Location / Set-Cookie back to the public name
 src/rewrite/         §6 the rewriting engine
   template.rs          §6.3's variable table as a parsed grammar
   encode.rs            sanitising, RFC 2047, phrase quoting, folding
@@ -292,7 +334,7 @@ src/rewrite/         §6 the rewriting engine
 src/preflight/       §6.7 the DNS preflight
   mod.rs               the three checks, the registry, the interval loop
   resolver.rs          the DNS leg behind a trait; TXT strings concatenated
-src/models/          runtime sqlx over &PgPool, house pattern
+src/models/          runtime sqlx over &PgPool, house pattern (Postgres build only)
   quota.rs             the §7.4 statements
   route_state.rs       §9.3 admin state
   instance_config.rs   §7.3's salt, get-or-insert (D-050)
@@ -316,12 +358,25 @@ tests/quota_multi_instance.rs  two independent pools against one database (D-061
 tests/preflight.rs   §6.7 through the walk, and 451 on the wire
 tests/metrics_endpoint.rs  §9.1 against a real recorder; its own binary
 tests/ingress_tls.rs §5.1/§5.3 against the real listener, verified handshakes
+tests/capture.rs     D-085 through a real session: off by default, no outcome
+                     field, `continue` cannot stop mail, exact recorded bytes
+tests/capture_replay.rs  capture and replay end to end
+tests/soak.rs        T4 — `soak_run` drives, `soak_analyze` judges the files
+tests/store_mssql.rs §11's contract against a real SQL Server, a fresh database
+                     per test
+tests/harness_selftest.rs  the tier machinery checked against planted defects
 migrations/          three: baseline (instance_config), quota (three tables),
                      recipient_event (D-048)
+migrations-mssql/    the same schema in T-SQL, BIN2 collation on every key (D-084)
+test/compose/        the tiers' compose overlays: acceptance, matrix, stress,
+                     mssql (Express), capture. Layered, never assembled by hand
+test/config/         the tiers' configs, plus capture.block.yaml — appended to
+                     each of them at image build time to make the capture twins
 simmer.acceptance.yaml   the acceptance stack's config (D-042)
 ```
 
-Roughly 27,000 lines including tests and comments.
+Roughly 27,000 lines including tests and comments at the phase 11 snapshot; more
+now, with `src/db/`, `src/capture/`, `src/link_proxy/` and the soak tier.
 
 ---
 
@@ -358,11 +413,50 @@ And two about `recipient_event`:
   per route, so a send via overflow does not count against the warming route's
   window (D-051).
 
+### Which index serves which query
+
+Identical definitions on both backends — verified from `pg_indexes` and
+`sys.index_columns`, same columns in the same order — and verified against the
+Postgres planner at 480k `recipient_event` rows rather than read off the DDL.
+
+| Query | Index | Plan |
+|---|---|---|
+| §7.4's read, reserve, release and commit on `quota_usage` | PK `(route, domain_group, day_index)` | exact key; `LockRows → Index Scan` for the `FOR UPDATE` read |
+| §7.3's window count — `recipient_hash = ? AND route = ? AND sent_at >= ?` | `recipient_event_lookup_idx (recipient_hash, route, sent_at)` | **`Index Only Scan`** — fully covering |
+| reservation insert, and its delete on commit or release | PK `id` | exact key |
+| the day-rollover reconcile's `SUM(count)` over reservations | `quota_reservation_route_idx (route, domain_group, day_index)` | `Index Scan`, all three columns as Index Cond |
+| §7.4's expiry sweep — `expires_at < now()` | `quota_reservation_expires_at_idx (expires_at)` | `Index Scan` |
+| §7.3's eviction — `sent_at < ?` | `recipient_event_sent_at_idx (sent_at)` | `Bitmap Index Scan` at realistic selectivity |
+
+**No query on any path is unindexed.** What is worth knowing instead:
+
+- **That last eviction flips to a `Seq Scan` when the predicate matches most of the
+  table** — correct planning, but it means a sweeper that has been off, or a
+  retention shortened suddenly, table-scans its first catch-up pass.
+- **On SQL Server `quota_reservation` is CLUSTERED on a random
+  `UNIQUEIDENTIFIER`**, one insert per message landing on a random page: page
+  splits and fragmentation, with no Postgres equivalent because its PK is a plain
+  btree over an append-only heap. Rows are short-lived, so this is churn rather
+  than growth. A nonclustered PK with the cluster on `expires_at` — also the
+  sweeper's own predicate, and roughly monotonic — is the fix if volume grows.
+- **On SQL Server `recipient_event` is a HEAP** (two nonclustered indexes, no
+  clustered index), and it is the table that actually grows: one row per commit,
+  ~864k a day at 10 msg/s. A clustered index on `sent_at` would make the eviction a
+  clustered range delete and keep the table ordered by the predicate that prunes it.
+- **On Postgres the answer at volume is partitioning, not another index.** The
+  table is a rolling window pruned hourly; declarative partitioning by `sent_at`
+  turns eviction into `DROP PARTITION` — O(1) rather than O(rows), no bloat and no
+  vacuum debt. SQL Server gets the same via partition switching.
+
+None of this has been measured under load: the §11 hour moved ~72k rows, which is
+megabytes. These bite in the tens of millions, and a schema change should follow a
+measurement rather than this table.
+
 ---
 
 ## 5. Decisions on record
 
-72 entries, `D-001` to `D-072`. The ones a new reader most needs:
+88 entries, `D-001` to `D-088`. The ones a new reader most needs:
 
 | | |
 |---|---|
@@ -373,6 +467,11 @@ And two about `recipient_event`:
 | **D-025** | The allowance override is a column on `quota_usage`, not a `route_state` field. |
 | **D-026** | `quota_usage.allowance` is authoritative once written — a config change applies from the next day boundary, not retroactively. |
 | **D-031** | Database tests use `#[sqlx::test]`, so `cargo test` needs a Postgres. |
+| **D-084** | Two builds and two images, one storage backend compiled into each. A change behind `QuotaStore` goes into both stores and into `tests/store_conformance/` first. |
+| **D-085** | The capture is not a spool, and structurally cannot become one: it is write-only, carries no outcome, and is written *before* the relay — which is what lets `on_error: defer` answer `451` honestly. |
+| **D-086** | `server replay` delivers mail twice on purpose and spends the target's quota. `--confirm` and `--host` have no defaults. |
+| **D-087** | The backend is a property of a *stack*; the capture is a property of a *run*. Hence `SOAK_BACKEND=mssql` selects a stack and `SIMMER_CAPTURE=on` is layered onto any of them. |
+| **D-088** | The capture flushes on ten lines or 500 ms of quiet, and each flush reports its bytes to the disk gauge. |
 | **D-034** | An unknown template variable is a fatal startup error — a §4.2 rule the spec does not list. |
 | **D-035** | The null sender is never rewritten, so a bounce stays a bounce. |
 | **D-036** | **`SPEC.md` §4.1's example configuration fails `SPEC.md` §4.2.** A finding for the spec's author; `simmer.yaml` was corrected instead. |
@@ -522,7 +621,45 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 
 ## 6a. Known defects
 
-**None outstanding.** The one this section carried since phase 8 — timing-based
+**Two fixed at `v0.3.1`, and both worth reading as patterns rather than incidents:**
+
+- **F17 — `simmer_capture_disk_bytes` could not do its documented job.** It was
+  written only by the retention sweeper, on a one-hour interval whose first pass
+  runs at startup against an empty directory, so the one gauge `docs/CAPTURE.md`
+  offered for "will this capture fill the volume" read 0 for the whole first hour.
+  Measured over a 1-hour soak: 0 for 59.9 of the 60 minutes while 904 MB
+  accumulated. The writer now adds what each flush pushes and the sweeper's pass
+  still sets the count from the directory. **The check had to be fixed before the
+  defect could be** — its first version read the final scrape, which on an
+  hour-long run is the one sample taken after the tick, so a broken gauge XPASSed.
+- **The mssql migration lock did not cover the table it creates.**
+  `IF OBJECT_ID(...) IS NULL CREATE TABLE` is not atomic and ran *before*
+  `sp_getapplock`, so two replicas starting together both ran the DDL and the loser
+  refused to start. Pre-existing in 0.3.0. `replicas_migrating_together_both_succeed`
+  was written for exactly this and only failed when the full suite ran the server
+  hard enough to widen the window.
+
+**Open, and not defects so much as measured limits:**
+
+- **The one-hour memory gate cannot resolve a small leak.** `docs/SOAK.md` §10's
+  planted-defect control: a 64-byte-per-message leak (~2.2 MiB/h) was **not**
+  caught, and the gate's standard error is near 3 MiB/h. So every "no leak" verdict
+  from a one-hour run means "no leak much above about 6 MiB/h". §11's hour met this
+  again from the other side — `app` failed the gate at +4.28 MiB/h while its twin
+  read -7.29 MiB/h on an identical stream. The limit has never been adjusted to make
+  a run pass.
+- **F7** — `simmer_unmatched_sender_total{domain}` is client-controlled and
+  unbounded; capping it diverges from §9.1 and needs the spec's author.
+- **F2's cost is understood and accepted**, fixed by D-081 and now V4's regression
+  check.
+
+`test/known-findings.json` is the machine-readable list, and the rule is that an
+entry cannot outlive its defect: a check that passes while listed is an XPASS and
+fails the tier, so the fixing commit must delete the entry.
+
+### Fixed earlier
+
+The one this section carried since phase 8 — timing-based
 username enumeration in `smtp/auth.rs`, where the decoy was minted at fixed argon2
 parameters while verification re-derives at whatever the *stored* hash says — was
 fixed in phase 10. The decoy now takes its parameters and salt from the costliest

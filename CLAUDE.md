@@ -125,7 +125,18 @@ which is also what lets `on_error: defer` answer `451` honestly, since nothing
 has been relayed yet. Move the capture after the relay and that `451` becomes a
 duplicate delivery on the client's retry (§10.2, D-068); that was the first
 draft, and D-085 records why it was wrong. `server replay` delivers mail twice on
-purpose; never point it at production. `docs/CAPTURE.md` is the long form.
+purpose; never point it at production. Two more things about it that are easy to get wrong. **The flush policy is a
+bound on records, not on bytes** (D-088): ten buffered lines or 500 ms of quiet,
+with the writer's one-second tick as the backstop for the trickle the idle rule
+cannot bound. Widen any of the three and `tail -f` on the current bucket — the
+first thing anyone does with this — stops keeping up. And
+**`simmer_capture_disk_bytes` has two writers on purpose** (F17): the writer adds
+what each flush pushed, so the gauge is live, and the retention sweeper *sets* it
+from the directory, so eviction shows and the increments' drift is bounded by one
+interval. Keep both. An increment-only gauge climbs and never comes down; a
+sweeper-only gauge reads 0 for the first hour, which is what F17 was.
+
+`docs/CAPTURE.md` is the long form.
 
 ## Build and run
 
@@ -165,6 +176,19 @@ loadgen, not the server. `docker-compose.yml`'s `app` service pins it; a
 deployment pipeline would have to as well.
 
 `SIMMER_CONFIG` overrides the config path (default `simmer.yaml`).
+
+**The test tiers can all run with the capture on**, and it is not the soak's:
+`SIMMER_CAPTURE=on` makes `tests/compose/stack.rs` layer `test/compose/capture.yml`
+onto whatever stack is running and point `app` at a generated config twin.
+`test/config/Dockerfile` builds those twins by appending the single
+`test/config/capture.block.yaml` to every tier config, so none of them is
+committed and none can drift. A stack reading its config from the image rather
+than the config volume — the acceptance tier — has no twin, and asking to capture
+it fails saying so rather than running uncaptured.
+
+The T4 soak also runs against the SQL Server build with `SOAK_BACKEND=mssql`
+(`test/compose/mssql.yml`, against Express). `docs/SOAK.md` §11 is what that
+found.
 
 The `server` binary has three subcommands, each a no-op unless it is `argv[1]`
 and each running before the config is read: `hash-password`, `healthcheck`, and
@@ -244,7 +268,8 @@ src/capture/record.rs    the JSONL schema. It carries NO outcome and no derived
                          state, and a test asserts the key set exactly
 src/capture/writer.rs    one task behind a bounded queue. `try_send`, never
                          `send().await` — awaiting it would make a slow disk into
-                         backpressure on the relay
+                         backpressure on the relay. D-088's flush policy and the
+                         bytes each flush reports to the disk gauge (F17)
 src/capture/bucket.rs    the 10-minute filename. A record's `at` is ALWAYS inside
                          the bucket its file names; that is what replay rests on
 src/capture/replay.rs    `server replay` (D-086). A DUPLICATE-DELIVERY machine by

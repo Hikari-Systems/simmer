@@ -141,6 +141,11 @@ logging:
 #   cut -c1-140 2026-09-20T14.10.jsonl
 #   jq -r '[.at, .rcpt_to[0], .mail_from, .subject] | @tsv' 2026-09-20T14.10.jsonl
 #
+# A record reaches the file within ten buffered lines or 500 ms of quiet (D-088),
+# whichever comes first, so `tail -f` on the current bucket keeps up. Those are
+# flushes and not fsyncs — only `on_error: defer` below is durable before the
+# client is answered.
+#
 # Replay a range with:
 #
 #   server replay --dir <directory> --from <ts> --to <ts> --host <target> --dry-run

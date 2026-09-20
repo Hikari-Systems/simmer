@@ -282,6 +282,14 @@ is trustworthy.
 - **Polling, not sleeping.** Assert by polling the trap API until the count is
   stable with a timeout, never by sleeping a fixed interval. This is the single
   most likely source of flakes.
+- **This is the one tier `SIMMER_CAPTURE=on` cannot capture.** The other tiers read
+  their config from the `stress-config` volume, where `test/config/Dockerfile`
+  generates a `<name>.capture.yaml` twin for each of them; the acceptance stack
+  reads `/app/simmer.acceptance.yaml` out of the image, which has no twin. Asking
+  to capture it fails with that sentence rather than running uncaptured — D-085's
+  rule that a capture configured and silently writing nothing is the worst outcome
+  available. Capturing it would mean generating the twin in the main `Dockerfile`,
+  which puts another test config into the shipped image.
 - **Message order is not guaranteed.** Assert on counts and per-message content,
   never on arrival order.
 - **Reset traps between simulated days**, or day 3's assertions see day 2's mail.

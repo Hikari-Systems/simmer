@@ -3,7 +3,7 @@
 An SMTP relay facade that applies a domain reputation warm-up ramp.
 
 <!-- current-version: source of truth for the release number. Keep in sync with the git tag, DOCKERHUB.md, and Cargo.toml; enforced by .githooks/pre-push and the release CI. -->
-**Current version: `v0.3.1`** — [all releases](https://github.com/Hikari-Systems/simmer/releases).
+**Current version: `v0.3.2`** — [all releases](https://github.com/Hikari-Systems/simmer/releases).
 
 Simmer sits between an application and one or more real SMTP providers. It
 accepts a message, selects an outbound route according to quota state, rewrites
@@ -496,6 +496,12 @@ $ cut -c1-140 2026-09-20T14.10.jsonl
 {"at":"2026-09-20T14:13:02.418Z","rcpt_to":["bob@gmail.com"],"mail_from":"news@oldbrand.com","subject":"Your September statement","v":1,
 ```
 
+A record is on disk within **ten buffered lines or 500 ms of quiet**, whichever
+comes first (D-088), so `tail -f` on the current bucket keeps up and a replay of a
+range that has just ended finds its last records. Those are flushes, not `fsync`s:
+`on_error: defer` is the only mode that puts a record on the platter before the
+client is told anything.
+
 `server replay` reads a range back out and sends it to another Simmer, as the
 original client did:
 
@@ -522,7 +528,11 @@ SIMMER_REPLAY_PASSWORD_CFAPP=... server replay \
   links, one-time codes, session tokens. Nothing can filter that.
 - **It costs disk.** A 25 MiB message is a ~34 MiB line. `max_body_bytes`
   (default 1 MiB) and `retention` bound it; alert on
-  `simmer_capture_disk_bytes`.
+  `simmer_capture_disk_bytes`, which is incremented as the writer flushes and
+  recounted from the directory by each retention sweep. Measured on mixed traffic
+  at 10 msg/s: about 1 GiB an hour per instance. **On 0.3.0 that gauge only moved
+  on the hourly sweep** and so read 0 for the first hour — if you are on 0.3.0,
+  size a volume from `simmer_capture_bytes_total` instead, or upgrade.
 - **Replay delivers mail twice, on purpose**, and spends the target's warm-up
   quota (§7.4) doing so. Point it at a test instance, never production.
   `--confirm` is required and has no default, and so is `--host`.

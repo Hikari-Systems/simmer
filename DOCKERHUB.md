@@ -12,7 +12,7 @@ It is **temporary infrastructure**: it exists for the length of a warm-up and is
 then taken out, in either order relative to reconfiguring the application.
 
 <!-- current-version: source of truth for the release number. Keep in sync with the git tag, README.md, and Cargo.toml; enforced by .githooks/pre-push and the release CI. -->
-**Current version: `v0.3.1`** — [all releases](https://github.com/Hikari-Systems/simmer/releases).
+**Current version: `v0.3.2`** — [all releases](https://github.com/Hikari-Systems/simmer/releases).
 
 📦 **Source, issues & full documentation:**
 [github.com/Hikari-Systems/simmer](https://github.com/Hikari-Systems/simmer)
@@ -344,12 +344,18 @@ Every mutation is audited at `INFO` with the acting token's name.
   standing pair is not.
 - **Leave `database.fail_closed: true`.** A quota enforcer that stops enforcing
   when its database is unreachable provides no guarantee at all.
+- **A captured record reaches the file within ten buffered lines or 500 ms of
+  quiet** (0.3.1 and later), so `tail -f` on the current bucket is useful. Those
+  are flushes, not `fsync`s; only `on_error: defer` is durable before the client
+  is answered.
 - **If you enable `capture:`, mount a writable volume for it and remember what
   is in it.** The image runs as UID 1000 with a read-only root filesystem, so the
   directory must be a volume that UID owns — a host bind mount usually is not.
   Simmer creates it `0700` and its files `0600`. It holds every recipient
   address and every message body in plaintext: treat the volume as you would a
-  mailbox, alert on `simmer_capture_disk_bytes`, and delete it when the
+  mailbox, alert on `simmer_capture_disk_bytes` (live from 0.3.1; on 0.3.0 it
+  only moved on the hourly retention sweep, so it read 0 for the first hour and
+  `simmer_capture_bytes_total` was the number to use), and delete it when the
   investigation is over. Capture is a debugging mode and is off unless
   configured; startup warns on every boot while it is on.
 - **Alert on `simmer_unmatched_sender_total`** (a sender typo sends unwarmed

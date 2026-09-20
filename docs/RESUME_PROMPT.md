@@ -1,5 +1,11 @@
 # Resume prompt — Simmer, after phase 8
 
+> **Historical.** This was the handover into phase 9 and is kept for the record
+> only: the build is long past it — all phases done, plus the link proxy (D-083),
+> the SQL Server build (D-084), the capture and `server replay` (D-085/D-086), and
+> releases up to `v0.3.1`. **`docs/STATE.md` is the current snapshot**; read that
+> instead. The path below is not this repository's path any more either.
+
 > Paste everything after the horizontal rule into a fresh Claude Code session
 > opened in `/home/rickk/git/hs/simmer`.
 
