@@ -254,20 +254,6 @@ pub async fn migrate(pool: &Pool) -> anyhow::Result<()> {
     conn.broken = true;
 
     let client = &mut conn.client;
-    client
-        .simple_query(
-            "IF OBJECT_ID(N'dbo.simmer_migrations', N'U') IS NULL \
-             CREATE TABLE dbo.simmer_migrations ( \
-                 version     BIGINT        NOT NULL PRIMARY KEY, \
-                 description NVARCHAR(200) NOT NULL, \
-                 checksum    VARBINARY(32) NOT NULL, \
-                 applied_at  DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME())",
-        )
-        .await?
-        .into_results()
-        .await
-        .context("creating simmer_migrations")?;
-
     let lock = client
         .simple_query(
             "DECLARE @r INT; \
@@ -283,6 +269,30 @@ pub async fn migrate(pool: &Pool) -> anyhow::Result<()> {
     if lock < 0 {
         anyhow::bail!("could not take the migration lock (sp_getapplock returned {lock})");
     }
+
+    // Inside the lock, and that is the point. `IF OBJECT_ID(...) IS NULL CREATE
+    // TABLE` is not atomic: two replicas starting together both evaluate the
+    // guard as true and both run the DDL, and the loser gets
+    //
+    //   There is already an object named 'simmer_migrations' in the database.
+    //
+    // which is a failed startup for a server that had nothing wrong with it.
+    // Creating the table before taking the lock left the one piece of DDL the
+    // lock exists to serialise outside it. `sp_getapplock` needs no table of its
+    // own, so there was never a reason for the old order.
+    client
+        .simple_query(
+            "IF OBJECT_ID(N'dbo.simmer_migrations', N'U') IS NULL \
+             CREATE TABLE dbo.simmer_migrations ( \
+                 version     BIGINT        NOT NULL PRIMARY KEY, \
+                 description NVARCHAR(200) NOT NULL, \
+                 checksum    VARBINARY(32) NOT NULL, \
+                 applied_at  DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME())",
+        )
+        .await?
+        .into_results()
+        .await
+        .context("creating simmer_migrations")?;
 
     for (version, description, sql) in MIGRATIONS {
         let checksum: Vec<u8> = Sha256::digest(sql.as_bytes()).to_vec();
