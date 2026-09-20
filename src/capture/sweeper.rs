@@ -119,9 +119,13 @@ pub async fn sweep_once(dir: &Path, retention: Duration) {
         }
     }
 
-    // A gauge recomputed here rather than tracked by the writer: this is the
-    // only place that has looked at the whole directory, and a number derived
-    // from what is actually on disk cannot drift from it (D-056's reasoning).
+    // The authoritative count. The writer adds what it flushes as it flushes
+    // (F17), which is what makes the gauge live between these passes; this is the
+    // only place that has looked at the whole directory, so it *sets* rather than
+    // adds, correcting whatever those increments could not see — a bucket deleted
+    // by hand, a file something else rewrote, blocks against bytes. A number
+    // derived from what is actually on disk cannot drift (D-056's reasoning), so
+    // the estimate's error is bounded by one interval.
     metrics::capture_disk_bytes(remaining);
 
     if deleted > 0 {

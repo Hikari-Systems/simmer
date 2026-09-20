@@ -335,8 +335,9 @@ fn describe() {
     describe_gauge!(
         "simmer_capture_disk_bytes",
         Unit::Bytes,
-        "D-085 bytes on disk in the capture directory, recomputed by the sweeper. \
-         This is what tells you a capture left on will fill the volume"
+        "D-085 bytes on disk in the capture directory: incremented as the writer \
+         flushes and recounted from the directory by each sweeper pass. This is \
+         what tells you a capture left on will fill the volume"
     );
 }
 
@@ -799,7 +800,31 @@ pub fn capture_queue(depth: usize, bytes: u64) {
     metrics::gauge!("simmer_capture_queue_bytes").set(bytes as f64);
 }
 
-/// Bytes on disk in the capture directory, as the sweeper last counted them.
+/// Bytes on disk in the capture directory, **counted** from the directory itself.
+///
+/// The sweeper's authority: it has just looked at every file, so this is the truth
+/// and it resets whatever [`capture_disk_grew`] has been adding since the last
+/// pass. It is also what initialises the gauge at startup, where the directory may
+/// already hold hours of a previous run's buckets — the sweeper's first pass runs
+/// immediately for exactly that reason.
 pub fn capture_disk_bytes(n: u64) {
     metrics::gauge!("simmer_capture_disk_bytes").set(n as f64);
+}
+
+/// Bytes the writer has just flushed to the current bucket.
+///
+/// Why the gauge is not left to the sweeper alone (F17): the sweeper runs hourly,
+/// so a gauge only it wrote read 0 for the whole first hour and was up to an hour
+/// stale after that — no use at all for the one thing docs/CAPTURE.md offers it
+/// for, noticing that a capture left on is filling a volume. Adding what was
+/// flushed, as it is flushed, makes it live to within the writer's flush policy.
+///
+/// It is an **estimate between sweeps**, deliberately. It cannot see a bucket an
+/// operator deleted by hand, a file something else gzipped, or the difference
+/// between bytes written and blocks occupied, and nothing here tries to: the
+/// sweeper's pass corrects all of it, so the drift is bounded by one interval.
+/// D-056's rule — that a number derived from the real directory cannot drift — is
+/// why that pass stays authoritative rather than being replaced by this.
+pub fn capture_disk_grew(n: u64) {
+    metrics::gauge!("simmer_capture_disk_bytes").increment(n as f64);
 }

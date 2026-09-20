@@ -54,15 +54,68 @@ use tokio::sync::{mpsc, oneshot};
 use super::bucket;
 use crate::metrics;
 
-/// How often the writer wakes with nothing to do: to flush a partial buffer so
-/// `tail -f` is useful during the debugging session this exists for, to publish
-/// the queue gauges, and to close a bucket whose window has passed.
+/// How often the writer wakes with nothing to do: to publish the queue gauges,
+/// to close a bucket whose window has passed, and as the backstop flush behind
+/// the policy below.
 const IDLE_TICK: Duration = Duration::from_secs(1);
+
+/// Flush once this many lines are buffered.
+///
+/// The buffer below is 256 KiB, which at the 4 KiB end of a real message mix is
+/// forty-odd records — so without this a quiet-ish stream can sit unwritten for
+/// as long as it takes to fill, and `tail -f` on the file this mode exists to
+/// produce shows nothing. Ten bounds it by records rather than by bytes.
+const FLUSH_LINES: u64 = 10;
+
+/// …or once the stream has been quiet this long with anything buffered.
+///
+/// The two rules are the two shapes traffic comes in. Under load the count is
+/// what fires, so the flush cost is amortised over ten records; when the stream
+/// trickles, the count may never be reached and this is what puts the record on
+/// disk. Reset by each record, so it means *idle* and not "at most this stale" —
+/// [`IDLE_TICK`] remains the backstop that bounds the trickling case, exactly as
+/// it did before.
+const IDLE_FLUSH: Duration = Duration::from_millis(500);
 
 /// The write buffer. `src/smtp/buffer.rs`'s spill buffer is 64 KiB for the same
 /// reason (D-080): one `write` syscall per line put a blocking-pool job on the
 /// latency path of every message.
 const WRITE_BUFFER: usize = 256 * 1024;
+
+/// When the buffered lines should reach the file.
+///
+/// A pure decision, separated from the loop that acts on it so the policy can be
+/// tested without a clock: a timing test of "did it flush within 500 ms" on a
+/// loaded machine is a flake, and the thing worth pinning is the rule, not the
+/// scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Flush {
+    /// [`FLUSH_LINES`] are buffered: write them through without waiting.
+    Now,
+    /// Something is buffered: write it through after this much quiet.
+    WhenIdle(Duration),
+    /// Nothing is buffered.
+    Nothing,
+}
+
+pub(super) fn flush_decision(dirty: bool, since_flush: u64) -> Flush {
+    match (dirty, since_flush) {
+        (false, _) => Flush::Nothing,
+        (true, n) if n >= FLUSH_LINES => Flush::Now,
+        (true, _) => Flush::WhenIdle(IDLE_FLUSH),
+    }
+}
+
+/// The idle-flush arm of the loop's `select!`.
+///
+/// `None` is "nothing is buffered", and must park forever rather than fire: a
+/// deadline that resolves immediately would spin the loop.
+async fn when(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
+    }
+}
 
 /// One record on its way to the file.
 pub(super) struct Job {
@@ -83,6 +136,11 @@ struct Open {
     file: tokio::io::BufWriter<tokio::fs::File>,
     /// Whether anything has been written since the last flush.
     dirty: bool,
+    /// Lines written since the last flush, for [`FLUSH_LINES`].
+    since_flush: u64,
+    /// Bytes written into the buffer and not yet pushed to the file. What a flush
+    /// adds to `simmer_capture_disk_bytes` (F17).
+    unflushed_bytes: u64,
     records: u64,
     bytes: u64,
 }
@@ -104,6 +162,9 @@ pub(super) async fn run(dir: PathBuf, mut rx: mpsc::Receiver<Job>, queued: super
 
     let mut ticker = tokio::time::interval(IDLE_TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // When the idle rule would next put a partial buffer on disk. `None` while
+    // nothing is buffered.
+    let mut flush_at: Option<tokio::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -117,13 +178,35 @@ pub(super) async fn run(dir: PathBuf, mut rx: mpsc::Receiver<Job>, queued: super
                         bytes += size;
                         metrics::capture_written(size);
                         // Under `defer` the line must be on the platter, not in
-                        // a buffer, before the client is told anything.
+                        // a buffer, before the client is told anything. That is
+                        // a flush and an fsync, so it satisfies the policy below
+                        // outright.
                         if let Some(ack) = job.ack {
                             let result = sync_open(&mut open).await;
                             if result.is_err() {
                                 dropped += 1;
                             }
                             let _ = ack.send(result);
+                            flush_at = None;
+                        } else {
+                            let (dirty, since) = open
+                                .as_ref()
+                                .map_or((false, 0), |o| (o.dirty, o.since_flush));
+                            match flush_decision(dirty, since) {
+                                Flush::Now => {
+                                    if let Err(e) = flush_and_account(&mut open).await {
+                                        metrics::capture_dropped("write_error");
+                                        tracing::error!(error = %e, "flushing the capture buffer failed");
+                                    }
+                                    flush_at = None;
+                                }
+                                Flush::WhenIdle(after) => {
+                                    // Reset on every record, so the deadline is
+                                    // measured from the last one.
+                                    flush_at = Some(tokio::time::Instant::now() + after);
+                                }
+                                Flush::Nothing => flush_at = None,
+                            }
                         }
                     }
                     Err(e) => {
@@ -147,23 +230,30 @@ pub(super) async fn run(dir: PathBuf, mut rx: mpsc::Receiver<Job>, queued: super
                     metrics::capture_dropped("write_error");
                     tracing::error!(error = %e, "flushing the capture buffer failed");
                 }
+                flush_at = None;
+            }
+            _ = when(flush_at) => {
+                if let Err(e) = flush_and_account(&mut open).await {
+                    metrics::capture_dropped("write_error");
+                    tracing::error!(error = %e, "flushing the capture buffer failed");
+                }
+                flush_at = None;
             }
         }
     }
 
     // The channel is closed, so nothing more can arrive. Everything buffered is
     // a message some client was told about.
-    if let Some(o) = open.as_mut() {
-        if let Err(e) = o.file.flush().await {
-            tracing::error!(path = %o.path.display(), error = %e, "final capture flush failed");
-            metrics::capture_dropped("shutdown");
-        }
+    if let Err(e) = flush_and_account(&mut open).await {
+        tracing::error!(error = %e, "final capture flush failed");
+        metrics::capture_dropped("shutdown");
     }
     close(&mut open).await;
     tracing::info!(written, dropped, bytes, "capture writer stopped");
 }
 
 /// A write that did not happen, and enough to say why in one log line.
+#[derive(Debug)]
 struct WriteError {
     reason: &'static str,
     path: PathBuf,
@@ -229,6 +319,8 @@ async fn write_one(
         error: e.to_string(),
     })?;
     o.dirty = true;
+    o.since_flush += 1;
+    o.unflushed_bytes += job.line.len() as u64;
     o.records += 1;
     o.bytes += job.line.len() as u64;
     Ok(())
@@ -261,9 +353,44 @@ async fn open_bucket(dir: &Path, start: DateTime<Utc>) -> Result<Open, WriteErro
         path,
         file: tokio::io::BufWriter::with_capacity(WRITE_BUFFER, file),
         dirty: false,
+        since_flush: 0,
+        unflushed_bytes: 0,
         records: 0,
         bytes: 0,
     })
+}
+
+/// Write the buffered lines through to the file, and reset the policy's counters.
+///
+/// A flush and not an fsync: the point is that the bytes leave this process, so a
+/// `tail -f`, a `replay`, or anything else reading the directory sees them.
+/// Durability against a machine that loses power is `on_error: defer`'s business
+/// (`sync_open`), and this is a debugging mode, not a spool.
+async fn flush_open(open: &mut Option<Open>) -> Result<u64, String> {
+    let Some(o) = open.as_mut() else {
+        return Ok(0);
+    };
+    if !o.dirty {
+        // Nothing buffered. Returning 0 rather than the last count is what stops
+        // the gauge double-counting a flush that had nothing to do — the idle
+        // deadline and the backstop tick can both land on the same clean buffer.
+        return Ok(0);
+    }
+    o.file.flush().await.map_err(|e| e.to_string())?;
+    let pushed = o.unflushed_bytes;
+    o.dirty = false;
+    o.since_flush = 0;
+    o.unflushed_bytes = 0;
+    Ok(pushed)
+}
+
+/// [`flush_open`], reporting what reached the file to the gauge (F17).
+async fn flush_and_account(open: &mut Option<Open>) -> Result<(), String> {
+    let pushed = flush_open(open).await?;
+    if pushed > 0 {
+        metrics::capture_disk_grew(pushed);
+    }
+    Ok(())
 }
 
 /// Flush and fsync whatever is open, for a `defer` acknowledgement.
@@ -280,20 +407,23 @@ async fn sync_open(open: &mut Option<Open>) -> Result<(), String> {
         .sync_data()
         .await
         .map_err(|e| e.to_string())?;
+    let pushed = o.unflushed_bytes;
     o.dirty = false;
+    o.since_flush = 0;
+    o.unflushed_bytes = 0;
+    if pushed > 0 {
+        metrics::capture_disk_grew(pushed);
+    }
     Ok(())
 }
 
-/// One idle pass: flush a partial buffer, and close a bucket whose window has
-/// passed so its fd is released and a reader sees a finished file.
+/// One idle pass: the backstop flush, and close a bucket whose window has passed
+/// so its fd is released and a reader sees a finished file.
 async fn idle(open: &mut Option<Open>) -> Result<(), String> {
-    let Some(o) = open.as_mut() else {
+    flush_and_account(open).await?;
+    let Some(o) = open.as_ref() else {
         return Ok(());
     };
-    if o.dirty {
-        o.file.flush().await.map_err(|e| e.to_string())?;
-        o.dirty = false;
-    }
     if o.start + chrono::Duration::seconds(bucket::BUCKET_SECS) <= Utc::now() {
         roll(open).await;
     }
@@ -318,9 +448,129 @@ async fn roll(open: &mut Option<Open>) {
 }
 
 async fn close(open: &mut Option<Open>) {
-    if let Some(mut o) = open.take() {
-        if let Err(e) = o.file.flush().await {
-            tracing::error!(path = %o.path.display(), error = %e, "closing a capture file");
+    // Through the accounting, so a rollover's last partial buffer reaches the
+    // gauge like any other flush.
+    let path = open.as_ref().map(|o| o.path.clone());
+    if let Err(e) = flush_and_account(open).await {
+        match path {
+            Some(p) => tracing::error!(path = %p.display(), error = %e, "closing a capture file"),
+            None => tracing::error!(error = %e, "closing a capture file"),
         }
+    }
+    open.take();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_clean_buffer_is_not_flushed() {
+        // Nothing buffered must park the idle arm forever rather than resolve:
+        // a deadline that fires immediately would spin the writer's loop.
+        assert_eq!(flush_decision(false, 0), Flush::Nothing);
+        // Counter without the dirty flag is not a reason to write: the two are
+        // reset together, so this pairing should not arise, and if it ever does
+        // the flag is the one that says whether there are bytes.
+        assert_eq!(flush_decision(false, FLUSH_LINES + 5), Flush::Nothing);
+    }
+
+    #[test]
+    fn ten_buffered_lines_flush_without_waiting() {
+        assert_eq!(flush_decision(true, FLUSH_LINES), Flush::Now);
+        assert_eq!(flush_decision(true, FLUSH_LINES + 1), Flush::Now);
+    }
+
+    #[test]
+    fn fewer_than_ten_wait_for_the_stream_to_go_quiet() {
+        // The trickle case: the count will not be reached, so the record reaches
+        // the file half a second after the last one and not when the 256 KiB
+        // buffer eventually fills.
+        for n in 1..FLUSH_LINES {
+            assert_eq!(
+                flush_decision(true, n),
+                Flush::WhenIdle(IDLE_FLUSH),
+                "{n} buffered"
+            );
+        }
+        assert_eq!(IDLE_FLUSH, Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn a_flush_reports_the_bytes_it_pushed_exactly_once() {
+        // F17's fix. The gauge is incremented by what each flush pushes, so the
+        // one way to get it wrong is to count the same bytes twice: the idle
+        // deadline and the backstop tick can both land on the same buffer, and a
+        // rollover flushes again on the way out.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut open = None;
+        let mut newest = None;
+        let job = |line: &str| Job {
+            line: line.as_bytes().to_vec(),
+            at: Utc::now(),
+            ack: None,
+        };
+
+        write_one(dir.path(), &mut open, &mut newest, &job("{\"a\":1}\n"))
+            .await
+            .expect("write");
+        assert_eq!(open.as_ref().expect("open").unflushed_bytes, 8);
+
+        assert_eq!(flush_open(&mut open).await.expect("flush"), 8);
+        assert_eq!(open.as_ref().expect("open").unflushed_bytes, 0);
+
+        // The second flush has nothing to push and must say so, or every idle
+        // tick would add the last flush's bytes again.
+        assert_eq!(flush_open(&mut open).await.expect("flush"), 0);
+        assert_eq!(flush_open(&mut open).await.expect("flush"), 0);
+
+        // And it resumes counting from zero, not from the running total.
+        write_one(dir.path(), &mut open, &mut newest, &job("{\"bb\":2}\n"))
+            .await
+            .expect("write");
+        assert_eq!(flush_open(&mut open).await.expect("flush"), 9);
+    }
+
+    #[tokio::test]
+    async fn the_bytes_flushed_are_the_bytes_on_disk() {
+        // The gauge's claim is "bytes on disk", so what a flush reports has to be
+        // what the file actually grew by — otherwise the increments and the
+        // sweeper's recount would disagree by construction and every sweep would
+        // show a jump.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut open = None;
+        let mut newest = None;
+        let mut reported = 0u64;
+        for n in 0..25 {
+            let line = format!("{{\"n\":{n}}}\n");
+            write_one(
+                dir.path(),
+                &mut open,
+                &mut newest,
+                &Job {
+                    line: line.into_bytes(),
+                    at: Utc::now(),
+                    ack: None,
+                },
+            )
+            .await
+            .expect("write");
+            reported += flush_open(&mut open).await.expect("flush");
+        }
+        let path = open.as_ref().expect("open").path.clone();
+        let on_disk = std::fs::metadata(&path).expect("stat").len();
+        assert_eq!(reported, on_disk, "reported {reported}, file is {on_disk}");
+    }
+
+    #[test]
+    fn the_idle_deadline_is_bounded_by_the_backstop_tick() {
+        // IDLE_FLUSH is what normally fires; IDLE_TICK is what bounds the case
+        // IDLE_FLUSH cannot, a stream arriving just often enough to keep
+        // resetting the deadline without ever reaching FLUSH_LINES. It is only a
+        // backstop if it is the longer of the two.
+        assert!(
+            IDLE_FLUSH < IDLE_TICK,
+            "the idle flush must fire before the backstop tick"
+        );
     }
 }
