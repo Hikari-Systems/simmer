@@ -1,0 +1,76 @@
+# D-085's capture, turned on for both soak instances (docs/CAPTURE.md; docs/SOAK.md
+# §11). An overlay of its own rather than part of test/compose/mssql.yml, because
+# the capture and the storage backend are orthogonal: a Postgres soak with capture
+# on, or a SQL Server soak with it off, is this file added or left out.
+#
+# It pairs with `test/config/simmer.soak.capture.yaml`. Both or neither: the mount
+# without the `capture:` block is a volume nothing writes, and the block without
+# the mount is a startup failure (which is the right way round — see below).
+#
+# **A volume per instance, and that is load-bearing.** A bucket file's name is a
+# pure function of its ten-minute window (src/capture/bucket.rs), so `app` and
+# `app2` sharing a directory would have both processes appending to the same file
+# under the same name. The accounting that follows — records against messages,
+# per instance — would then be unattributable, and the A/B pair the whole tier
+# rests on would have one shared, interleaved output.
+#
+# Capture is on **both** instances for the same reason. V2's asymmetry is that
+# `app` is scraped and `app2` is not, and a difference between their slopes is
+# therefore the exporter's doing (F8). Capture on one instance only would put a
+# second difference between them and cost the tier its only controlled comparison.
+
+services:
+  app: &captured
+    environment:
+      # `simmer.soak.capture.yaml` interpolates this into `capture.directory`,
+      # the way ${SIMMER_TLS_DIR} carries §5.1's certificate path. It is a
+      # variable rather than a literal so the same config can be validated on the
+      # host by ordinary `cargo test`, against a temporary directory, without
+      # /var/lib/simmer existing there.
+      SIMMER_CAPTURE_DIR: "/var/lib/simmer/capture"
+    volumes:
+      # Named, not a bind mount: `read_only: true` plus UID 1000 against a host
+      # directory is the combination docs/CAPTURE.md §2 warns about.
+      - capture-app:/var/lib/simmer/capture
+    depends_on:
+      capture-init:
+        condition: service_completed_successfully
+
+  app2:
+    <<: *captured
+    volumes:
+      - capture-app2:/var/lib/simmer/capture
+
+  # A fresh named volume is created root-owned, and the container runs as UID
+  # 1000, so without this the instances refuse to start with
+  #
+  #   capture.directory: '/var/lib/simmer/capture' is not writable: Permission denied
+  #
+  # which is the correct failure — the alternative is a capture that silently
+  # records nothing — but it is not one to hit by hand on every fresh stack.
+  # docs/CAPTURE.md §2 gives the equivalent one-off `docker run` for a stack
+  # brought up without this overlay.
+  #
+  # 0700 matches what src/capture creates the directory as when it is absent, so
+  # an existing volume and a fresh one end up in the same state.
+  capture-init:
+    profiles: ["capture"]
+    image: alpine:3.20
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        chown 1000:1000 /capture/app /capture/app2
+        chmod 0700 /capture/app /capture/app2
+    volumes:
+      - capture-app:/capture/app
+      - capture-app2:/capture/app2
+    healthcheck:
+      disable: true
+
+volumes:
+  # These hold plaintext mail — every recipient address and every body that passed
+  # through, which is precisely what §7.3 hashes recipients to avoid. Treat them as
+  # a mailbox and `docker volume rm simmer_capture-app simmer_capture-app2` when the
+  # investigation is over.
+  capture-app:
+  capture-app2:

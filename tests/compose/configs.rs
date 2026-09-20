@@ -25,6 +25,14 @@ pub fn load(path: &str) -> Config {
         std::fs::write(dir.join("key.pem"), key.serialize_pem()).expect("write key");
         std::env::set_var("SIMMER_TLS_DIR", dir);
     }
+    if std::env::var("SIMMER_CAPTURE_DIR").is_err() {
+        // D-085's capture directory, for `simmer.soak.capture.yaml`. §4.2 probes
+        // it for real rather than reading mode bits, so it has to exist and be
+        // writable — a real temporary directory, not a plausible path. Kept for
+        // the life of the process, like the certificate above.
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        std::env::set_var("SIMMER_CAPTURE_DIR", dir);
+    }
     for (k, v) in [
         ("SIMMER_WARMUP_STARTED", "2026-08-01T00:00:00Z"),
         // test/config/simmer.stress.yaml's session timeout, which S9 overrides.

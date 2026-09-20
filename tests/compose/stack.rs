@@ -12,6 +12,22 @@
 use std::process::{Command, Output};
 use std::sync::Mutex;
 
+/// Which storage backend the stack's `app` is built against (D-084).
+///
+/// It changes two things here and nothing else: which container holds the
+/// database, and which dialect a statement against it is written in. Everything
+/// a tier asks of a stack — the instances, the sink, the loadgen — is the same
+/// either way, which is the point of `QuotaStore`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Postgres,
+    Mssql,
+}
+
+/// The SA login the `mssql` stacks use. Local development only — never a real
+/// credential; `docker-compose.yml`'s `simmer-mssql-db` carries the same literal.
+const MSSQL_SA_PASSWORD: &str = "Simmer-dev-1!";
+
 pub struct Stack {
     /// `--profile` values.
     profiles: &'static [&'static str],
@@ -20,6 +36,8 @@ pub struct Stack {
     overrides: &'static [&'static str],
     /// `SIMMER_CONFIG` as `app` sees it.
     config: &'static str,
+    /// The database behind it, and so the dialect [`Stack::sql`] speaks.
+    backend: Backend,
     /// The `warmup.started` `app` is running with, once a test has chosen one.
     warmup_started: Mutex<String>,
 }
@@ -64,6 +82,47 @@ pub static SOAK: Stack = Stack::new(
     "/config/simmer.soak.yaml",
 );
 
+/// The soak stack with D-085's capture on (`test/compose/capture.yml`), and so
+/// with the config that carries the `capture:` block — the two are inseparable.
+pub static SOAK_CAPTURE: Stack = Stack::new(
+    &["acceptance", "stress", "capture"],
+    &[
+        "test/compose/acceptance.yml",
+        "test/compose/stress.yml",
+        "test/compose/capture.yml",
+    ],
+    "/config/simmer.soak.capture.yaml",
+);
+
+/// The soak stack against the `mssql` build and SQL Server Express
+/// (`test/compose/mssql.yml`).
+pub static SOAK_MSSQL: Stack = Stack::with_backend(
+    &["acceptance", "stress", "mssql"],
+    &[
+        "test/compose/acceptance.yml",
+        "test/compose/stress.yml",
+        "test/compose/mssql.yml",
+    ],
+    "/config/simmer.soak.yaml",
+    Backend::Mssql,
+);
+
+/// Both at once: the `mssql` build against Express, with the capture on. The two
+/// overlays are orthogonal by construction — one changes what `app` is built from
+/// and what it connects to, the other what it writes to disk — so all four
+/// combinations are stacks and none of them is a special case.
+pub static SOAK_MSSQL_CAPTURE: Stack = Stack::with_backend(
+    &["acceptance", "stress", "mssql", "capture"],
+    &[
+        "test/compose/acceptance.yml",
+        "test/compose/stress.yml",
+        "test/compose/mssql.yml",
+        "test/compose/capture.yml",
+    ],
+    "/config/simmer.soak.capture.yaml",
+    Backend::Mssql,
+);
+
 /// The same stack *without* its override, so without the test CA in any OS
 /// trust store — for negative controls only, and only with `run --no-deps`. A
 /// command that reconciled `app` through this stack would recreate it untrusted
@@ -77,12 +136,28 @@ impl Stack {
         overrides: &'static [&'static str],
         config: &'static str,
     ) -> Stack {
+        Stack::with_backend(profiles, overrides, config, Backend::Postgres)
+    }
+
+    /// As [`Stack::new`], naming the backend. Only the `mssql` stacks need it;
+    /// everything else is Postgres, which is what the default build is.
+    pub const fn with_backend(
+        profiles: &'static [&'static str],
+        overrides: &'static [&'static str],
+        config: &'static str,
+        backend: Backend,
+    ) -> Stack {
         Stack {
             profiles,
             overrides,
             config,
+            backend,
             warmup_started: Mutex::new(String::new()),
         }
+    }
+
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     /// `docker compose` with this stack's files, profiles and environment.
@@ -136,34 +211,118 @@ impl Stack {
         assert!(status.success(), "failed to restart app at day {day}");
     }
 
-    /// One SQL statement against the stack's Postgres, as unaligned tuples-only
-    /// text (`psql -At`) — a single value comes back as that value.
-    pub fn psql(&self, sql: &str) -> String {
-        let out = self.run(&[
-            "exec",
-            "-T",
-            "simmer-db",
-            "psql",
-            "-U",
-            "simmer",
-            "-d",
-            "simmer",
-            "-q",
-            "-At",
-            "-c",
-            sql,
-        ]);
+    /// One SQL statement against the stack's database, as a command ready to run
+    /// but **not** run.
+    ///
+    /// Separate from [`Stack::sql`] because a sampler that ran every thirty
+    /// seconds for an hour must not panic on one slow query: the soak's ledger
+    /// sampler takes the command, runs it itself, and treats a failure as a
+    /// sample it did not get rather than as the end of the run.
+    ///
+    /// Both dialects are asked for one unadorned row with `|` between the
+    /// columns, so a caller parses one shape whichever backend it is talking to:
+    /// `psql -At` is that by definition, and `sqlcmd` is talked into it with
+    /// `-h -1 -W -s '|'` and a `SET NOCOUNT ON` that suppresses the trailing
+    /// "(1 rows affected)".
+    pub fn sql_command(&self, sql: &str) -> Command {
+        let mut c = self.compose();
+        match self.backend {
+            Backend::Postgres => {
+                c.args([
+                    "exec",
+                    "-T",
+                    "simmer-db",
+                    "psql",
+                    "-U",
+                    "simmer",
+                    "-d",
+                    "simmer",
+                    "-q",
+                    "-At",
+                    "-c",
+                    sql,
+                ]);
+            }
+            Backend::Mssql => {
+                // `-C` trusts the container's self-signed certificate, as every
+                // other connection to it does; `-b` makes a T-SQL error a
+                // non-zero exit, which is what `run`'s assertion reads.
+                let batch = format!("SET NOCOUNT ON; {sql}");
+                c.args([
+                    "exec",
+                    "-T",
+                    "simmer-mssql-db",
+                    "/opt/mssql-tools18/bin/sqlcmd",
+                    "-C",
+                    "-S",
+                    "localhost",
+                    "-U",
+                    "sa",
+                    "-P",
+                    MSSQL_SA_PASSWORD,
+                    "-d",
+                    "simmer",
+                    "-b",
+                    "-h",
+                    "-1",
+                    "-W",
+                    "-s",
+                    "|",
+                    "-Q",
+                    &batch,
+                ]);
+            }
+        }
+        c
+    }
+
+    /// One SQL statement against the stack's database, as one line of `|`
+    /// separated values — a single value comes back as that value.
+    ///
+    /// Panics on a non-zero exit, like every other command here.
+    pub fn sql(&self, sql: &str) -> String {
+        let out = self.sql_command(sql).output().expect("docker compose exec");
+        assert!(
+            out.status.success(),
+            "sql failed:\n{sql}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// One SQL statement against the stack's Postgres. Postgres-only by name and
+    /// by dialect; the tiers that call it are all Postgres. [`Stack::sql`] is the
+    /// backend-agnostic one.
+    pub fn psql(&self, sql: &str) -> String {
+        assert!(
+            self.backend == Backend::Postgres,
+            "psql on a stack whose backend is not Postgres: use sql()"
+        );
+        self.sql(sql)
     }
 
     /// Truncate the quota tables.
     ///
-    /// Quota state lives in Postgres and outlives a container restart by design
-    /// (§7.4), so a test that re-uses a simulated day another test has already
-    /// spent finds the allowance gone and watches every message fall through to
-    /// overflow — which looks precisely like a routing bug.
+    /// Quota state lives in the database and outlives a container restart by
+    /// design (§7.4), so a test that re-uses a simulated day another test has
+    /// already spent finds the allowance gone and watches every message fall
+    /// through to overflow — which looks precisely like a routing bug.
+    ///
+    /// T-SQL has no multi-table `TRUNCATE`, and `TRUNCATE` there is per statement;
+    /// the tables carry no foreign keys either way, so the order is free.
     pub fn reset_quota(&self) {
-        self.psql("truncate quota_usage, quota_reservation, route_state;");
+        match self.backend {
+            Backend::Postgres => {
+                self.sql("truncate quota_usage, quota_reservation, route_state;");
+            }
+            Backend::Mssql => {
+                self.sql(
+                    "TRUNCATE TABLE dbo.quota_usage; \
+                     TRUNCATE TABLE dbo.quota_reservation; \
+                     TRUNCATE TABLE dbo.route_state;",
+                );
+            }
+        }
     }
 
     /// Every service's log, for a failure report.

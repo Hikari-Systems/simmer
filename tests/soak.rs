@@ -15,6 +15,32 @@
 //! SOAK_DURATION=10m cargo test --test soak -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
+//! ## Which stack (docs/SOAK.md §11)
+//!
+//! Two environment variables choose it, and **both `soak_run` and `soak_analyze`
+//! must carry the same pair** — the analyser execs into the instances for their
+//! final state, and a command built from the wrong files reconciles `app` into
+//! something else while appearing to work (D-042):
+//!
+//! | | |
+//! |---|---|
+//! | `SOAK_BACKEND=mssql` | D-084's SQL Server build, against SQL Server **Express** (`test/compose/mssql.yml`) |
+//! | `SOAK_CAPTURE=on` | D-085's capture, on **both** instances (`test/compose/capture.yml`, and the config that carries the `capture:` block) |
+//!
+//! Neither is a §1 variant: V2, V3 and V4 all run unchanged under both. They
+//! change what the stack *is*, which is why they are four stacks rather than a
+//! flag inside one — and why the bring-up must name the same files the harness
+//! will:
+//!
+//! ```sh
+//! export SOAK_BACKEND=mssql SOAK_CAPTURE=on
+//! SIMMER_CONFIG=/config/simmer.soak.capture.yaml docker compose \
+//!   -f docker-compose.yml -f test/compose/acceptance.yml -f test/compose/stress.yml \
+//!   -f test/compose/mssql.yml -f test/compose/capture.yml \
+//!   --profile acceptance --profile stress --profile mssql --profile capture \
+//!   up -d --build --wait app app2 sink
+//! ```
+//!
 //! ## Two tests, not one
 //!
 //! [`soak_run`] drives the load and writes every sample to `target/soak/*.csv` as
@@ -78,9 +104,47 @@ use std::time::{Duration, Instant};
 
 use compose::leak;
 use compose::reconcile::{self, Received, Sent};
-use compose::stack::SOAK;
+use compose::stack::{Stack, SOAK, SOAK_CAPTURE, SOAK_MSSQL, SOAK_MSSQL_CAPTURE};
 
 const SOAK_CONFIG: &str = "test/config/simmer.soak.yaml";
+
+/// The same configuration with D-085's capture block (`SOAK_CAPTURE=on`).
+const SOAK_CAPTURE_CONFIG: &str = "test/config/simmer.soak.capture.yaml";
+
+/// Which stack this run drives, from the environment: `SOAK_BACKEND=mssql` for
+/// D-084's SQL Server build against Express, `SOAK_CAPTURE=on` for D-085's
+/// capture. Neither is a variant in the §1 sense — V2, V3 and V4 all run
+/// unchanged either way — they change what the stack *is*, which is why they are
+/// four stacks and not a flag inside one.
+///
+/// **`soak_analyze` is a separate cargo invocation and reads this too**: it execs
+/// into the instances for their final state, and a command built from the wrong
+/// files would reconcile `app` into something else (stack.rs's preamble, D-042).
+/// Both commands must carry the same two variables.
+fn stack() -> &'static Stack {
+    let mssql = std::env::var("SOAK_BACKEND").is_ok_and(|v| v == "mssql");
+    let capture = std::env::var("SOAK_CAPTURE").is_ok_and(|v| v == "on");
+    match (mssql, capture) {
+        (false, false) => &SOAK,
+        (false, true) => &SOAK_CAPTURE,
+        (true, false) => &SOAK_MSSQL,
+        (true, true) => &SOAK_MSSQL_CAPTURE,
+    }
+}
+
+/// What the run is driving, for the log and for the analyser's header.
+fn stack_name() -> String {
+    let backend = match stack().backend() {
+        compose::stack::Backend::Postgres => "postgres",
+        compose::stack::Backend::Mssql => "mssql (SQL Server Express)",
+    };
+    let capture = if std::env::var("SOAK_CAPTURE").is_ok_and(|v| v == "on") {
+        "capture on"
+    } else {
+        "capture off"
+    };
+    format!("{backend}, {capture}")
+}
 
 /// Where samples land, on the host.
 const SAMPLE_DIR: &str = "target/soak";
@@ -145,7 +209,54 @@ const SLOW_TRACED: usize = 200;
 
 #[test]
 fn the_soak_config_is_valid_and_cannot_run_out_of_allowance() {
-    let cfg = compose::configs::load(SOAK_CONFIG);
+    // Both of them. A capture variant whose allowance or whose V4 wiring had
+    // drifted would be a run that looked like the soak and measured something
+    // else, which is exactly what this test exists to prevent.
+    for path in [SOAK_CONFIG, SOAK_CAPTURE_CONFIG] {
+        assert_soak_config_sound(path);
+    }
+}
+
+/// `test/config/simmer.soak.capture.yaml` is `simmer.soak.yaml` verbatim plus the
+/// `capture:` block, and this is what makes that true rather than aspirational.
+///
+/// The capture config cannot be a switch in the soak config: `capture:` being
+/// absent is the only way to turn the capture off (docs/CAPTURE.md §2), and YAML
+/// has no conditional block. So there are two files, and two files drift — a
+/// `warming-cancel` timeout changed in one and not the other would give V4 a
+/// different shape under capture and the comparison between the two runs would
+/// be worthless, with nothing failing.
+///
+/// The block is required to be last, because that makes the check a truncation
+/// rather than a parse.
+#[test]
+fn the_capture_soak_config_is_the_soak_config_plus_a_capture_block() {
+    let plain = fs::read_to_string(SOAK_CONFIG).expect("the soak config");
+    let captured = fs::read_to_string(SOAK_CAPTURE_CONFIG).expect("the capture soak config");
+
+    let body = |text: &str| -> Vec<String> {
+        text.lines()
+            .take_while(|l| *l != "capture:")
+            .map(str::trim_end)
+            .filter(|l| !l.is_empty() && !l.trim_start().starts_with('#'))
+            .map(str::to_string)
+            .collect()
+    };
+
+    assert!(
+        captured.lines().any(|l| l == "capture:"),
+        "{SOAK_CAPTURE_CONFIG} has no `capture:` block, so it captures nothing"
+    );
+    assert_eq!(
+        body(&plain),
+        body(&captured),
+        "{SOAK_CAPTURE_CONFIG} has drifted from {SOAK_CONFIG}: it must be that file \
+         verbatim, with the `capture:` block appended last"
+    );
+}
+
+fn assert_soak_config_sound(path: &str) {
+    let cfg = compose::configs::load(path);
 
     // The warming route has to survive the whole run: 24 h at 10 msg/s is ~864k
     // messages, and a route that quietly exhausted its allowance after an hour
@@ -265,6 +376,7 @@ fn soak_run() {
         duration.as_secs_f64() / 60.0,
         SAMPLE_EVERY.as_secs()
     );
+    eprintln!("soak: {}", stack_name());
 
     fs::create_dir_all(SAMPLE_DIR).expect("creating the sample directory");
     // Start from empty. The samplers append, and every run's clock restarts at
@@ -284,7 +396,7 @@ fn soak_run() {
         let _ = fs::remove_file(sample_path(file));
     }
     recreate_instances();
-    SOAK.reset_quota();
+    stack().reset_quota();
     fresh_sink();
 
     // Baseline before a single message: the return-to-baseline checks are all
@@ -496,6 +608,7 @@ fn soak_run() {
 #[test]
 #[ignore = "reads target/soak/*.csv from a previous soak_run"]
 fn soak_analyze() {
+    eprintln!("soak: judging a run of {}", stack_name());
     let mut judged = 0;
     // Every instance is analysed before anything fails. `app` and `app2` carry
     // identical streams and differ only in that `app` is scraped, so `app2`'s
@@ -676,6 +789,8 @@ fn soak_analyze() {
         _ => eprintln!("\nmetrics: too few post-warm-up scrapes for a series verdict"),
     }
 
+    analyze_capture(&mut failures);
+    analyze_capture_disk_gauge(&mut failures);
     analyze_v4(&mut failures);
     if baseline_judged {
         verdict(&mut failures, "soak/rest/baseline", joined(baseline));
@@ -689,6 +804,178 @@ fn soak_analyze() {
         failures.len(),
         failures.join("\n  ")
     );
+}
+
+/// D-085's capture, when the run had it on (`SOAK_CAPTURE=on`).
+///
+/// Two gates and a report, and the split is deliberate. What the capture *costs*
+/// — disk, and the message path's share of the base64 and the SHA-256 — is not a
+/// pass or a fail; it is the reason to run this at all, and it is judged by the
+/// tier's own memory, descriptor and latency gates with the capture on. What is a
+/// fail is the capture being other than what it says on the tin:
+///
+///   * **`deferred_total` must be 0.** Under `on_error: continue` it is
+///     unreachable by construction, so a non-zero reading means mail was stopped
+///     for a debugging feature — docs/CAPTURE.md §6's one "alert on this".
+///   * **`dropped_total` must be 0.** Under `continue` a drop is not a mail
+///     failure, which is exactly why it needs a gate: it is a silent gap in the
+///     capture, and a replay of a range with a gap in it is a replay of the wrong
+///     range. `queue_full`/`queue_bytes` would say the writer cannot keep up with
+///     the soak's rate; `write_error`/`open_error` say something about the volume.
+///
+/// Deliberately **not** gated here: the record count against the messages the sink
+/// received. The capture is written on acceptance and before the relay (D-085), so
+/// the two differ by every message V4 cancels and every 451 — a real invariant,
+/// but one whose terms this run is the first to measure. docs/SOAK.md §11 records
+/// the numbers; a gate can follow once they have held twice.
+fn analyze_capture(failures: &mut Vec<String>) {
+    let mut seen = false;
+    let mut problems: Vec<String> = Vec::new();
+    for instance in INSTANCES {
+        let Ok(body) = fs::read_to_string(final_path(instance)) else {
+            continue;
+        };
+        let Some(records) = metric(&body, "simmer_capture_records_total") else {
+            // The capture was off, which is the default and not a finding.
+            continue;
+        };
+        seen = true;
+        let bytes = metric(&body, "simmer_capture_bytes_total").unwrap_or(0.0);
+        let omitted = metric(&body, "simmer_capture_body_omitted_total").unwrap_or(0.0);
+        let disk = metric(&body, "simmer_capture_disk_bytes").unwrap_or(0.0);
+        let late = metric(&body, "simmer_capture_late_writes_total").unwrap_or(0.0);
+        let regressions = metric(&body, "simmer_capture_clock_regressions_total").unwrap_or(0.0);
+        let swept = metric(&body, "simmer_capture_files_swept_total").unwrap_or(0.0);
+        let depth = metric(&body, "simmer_capture_queue_depth").unwrap_or(0.0);
+        let deferred = metric(&body, "simmer_capture_deferred_total").unwrap_or(0.0);
+        let dropped: Vec<(&str, f64)> = series_matching(&body, "simmer_capture_dropped_total")
+            .filter(|(_, v)| *v > 0.0)
+            .collect();
+
+        eprintln!(
+            "\ncapture {instance}: {records:.0} records, {:.2} GiB written, {:.2} GiB on disk, \
+             {omitted:.0} bodies omitted, {late:.0} late, {regressions:.0} clock regressions, \
+             {swept:.0} files swept, queue {depth:.0} deep at rest",
+            bytes / 1_073_741_824.0,
+            disk / 1_073_741_824.0
+        );
+
+        if deferred > 0.0 {
+            problems.push(format!(
+                "{instance}: {deferred:.0} messages deferred for the capture, \
+                 with on_error: continue configured"
+            ));
+        }
+        for (name, value) in dropped {
+            problems.push(format!("{instance}: {value:.0} records dropped, {name}"));
+        }
+    }
+    if !seen {
+        return;
+    }
+    verdict(failures, "soak/capture/no-gap", joined(problems));
+
+    // What the capture actually cost, per hour, from the counter the writer
+    // increments — the number an operator sizes a volume from. Not from the disk
+    // gauge, for the reason the next check exists.
+    let scrapes = read_metrics();
+    if let (Some(first), Some(last)) = (
+        scrapes.iter().find(|s| s.capture_bytes.is_some()),
+        scrapes.iter().rev().find(|s| s.capture_bytes.is_some()),
+    ) {
+        let grew = last.capture_bytes.unwrap_or(0.0) - first.capture_bytes.unwrap_or(0.0);
+        let hours = (last.t - first.t) / 3600.0;
+        if hours > 0.0 {
+            eprintln!(
+                "capture app: +{:.2} GiB written over {:.1} minutes = {:.2} GiB/h",
+                grew / 1_073_741_824.0,
+                (last.t - first.t) / 60.0,
+                grew / 1_073_741_824.0 / hours
+            );
+        }
+    }
+}
+
+/// F17 — `simmer_capture_disk_bytes` against what was written, **over the run**.
+///
+/// docs/CAPTURE.md §6 gave that gauge as "what tells you a capture left on will
+/// fill the volume", and §1 said to alert on it. It can be neither. It is written
+/// in one place, `capture::sweeper::sweep_once`, which runs on a **one-hour**
+/// interval whose first pass happens at startup against an empty directory. So it
+/// reads 0 until the first tick after startup, and thereafter reports the
+/// directory as of up to an hour ago — the wrong way round for a gauge whose
+/// purpose is to warn *before* a volume fills.
+///
+/// **Judged on the series, not on the final scrape, and that distinction is the
+/// whole check.** The first version of this read the last scrape and XPASSed the
+/// 1-hour run: the sweeper's tick lands about sixty minutes after startup, which
+/// on an hour-long run is a few seconds *before* the final scrape. The gauge had
+/// read 0 for 59.9 of the 60 minutes and was accurate in the one sample the check
+/// looked at. Reading the series instead gives the gate power wherever the tick
+/// happens to fall.
+///
+/// A live gauge cannot read less than half of what has demonstrably been written
+/// while nothing has been swept. Every sample that does is counted, and the run
+/// fails if there is one.
+///
+/// Nothing is wrong with recomputing the number from the directory rather than
+/// tracking it in the writer — that is D-056's reasoning and it holds. What is
+/// wrong is that the recompute shares the *retention sweep's* timer, and the two
+/// have no reason to be the same number.
+fn analyze_capture_disk_gauge(failures: &mut Vec<String>) {
+    // Only `app` is scraped while the load runs (V2's asymmetry), so this is its
+    // series. The gauge is per process and the defect is in shared code.
+    let swept = fs::read_to_string(final_path("app"))
+        .ok()
+        .and_then(|b| metric(&b, "simmer_capture_files_swept_total"))
+        .unwrap_or(0.0);
+    let samples: Vec<(f64, f64, f64)> = read_metrics()
+        .iter()
+        .filter_map(|s| Some((s.t, s.capture_disk?, s.capture_bytes?)))
+        .filter(|(_, _, written)| *written > 0.0)
+        .collect();
+    if samples.is_empty() {
+        // The capture was off, which is the default and not a finding.
+        return;
+    }
+    if swept > 0.0 {
+        // Past one sweeper interval the two legitimately differ by whatever was
+        // evicted, and the comparison stops meaning anything.
+        eprintln!(
+            "capture: {swept:.0} files swept, so the disk gauge and the bytes \
+             counter are not comparable"
+        );
+        return;
+    }
+
+    let stale: Vec<&(f64, f64, f64)> = samples
+        .iter()
+        .filter(|(_, disk, written)| *disk < written / 2.0)
+        .collect();
+    let problems = if stale.is_empty() {
+        Vec::new()
+    } else {
+        let worst = stale
+            .iter()
+            .max_by(|a, b| (a.2 - a.1).total_cmp(&(b.2 - b.1)))
+            .expect("a stale sample");
+        vec![format!(
+            "the capture disk gauge reads under half of what was written in {} of {} \
+             samples, nothing having been swept; worst at t={:.0}s, {:.2} GiB on the \
+             gauge against {:.2} GiB written",
+            stale.len(),
+            samples.len(),
+            worst.0,
+            worst.1 / 1_073_741_824.0,
+            worst.2 / 1_073_741_824.0
+        )]
+    };
+    eprintln!(
+        "capture disk gauge: {} of {} samples under half of bytes written",
+        stale.len(),
+        samples.len()
+    );
+    verdict(failures, "soak/capture/disk-gauge", joined(problems));
 }
 
 /// W = clamp(0.15 x D, 10 min, 90 min), overridable with `SOAK_WARMUP` so a short
@@ -963,7 +1250,7 @@ const SAMPLE_CMD: &str = "grep -E '^(VmRSS|Threads)' /proc/1/status; \
      awk 'NR>1{print $4}' /proc/1/net/tcp";
 
 fn sample_instance(instance: &str) -> Option<Sample> {
-    let out = SOAK
+    let out = stack()
         .compose()
         .args(["exec", "-T", instance, "sh", "-c", SAMPLE_CMD])
         .output()
@@ -1014,6 +1301,16 @@ struct Scrape {
     unmatched: usize,
     /// `simmer_reservations_in_flight` (V4). `None` in a file from before V4.
     in_flight: Option<f64>,
+    /// `simmer_capture_disk_bytes` (D-085). `None` with the capture off, and in a
+    /// file from before it. Documented as the number that says a capture left on
+    /// will fill the volume — and **F17**: it is written only by the sweeper, on an
+    /// hourly interval whose first pass runs at startup against an empty
+    /// directory, so within the first hour it reads 0 no matter what was written.
+    capture_disk: Option<f64>,
+    /// `simmer_capture_bytes_total`. The counter the writer increments per record,
+    /// so unlike the gauge above it does track the run — which is what makes the
+    /// gauge's staleness measurable rather than merely arguable.
+    capture_bytes: Option<f64>,
 }
 
 /// Scrape `app`, from inside its container like the final scrapes.
@@ -1041,6 +1338,8 @@ fn scrape_app(t: f64) -> Option<Scrape> {
             .filter(|l| l.starts_with("simmer_unmatched_sender_total{"))
             .count(),
         in_flight: metric(&body, "simmer_reservations_in_flight"),
+        capture_disk: metric(&body, "simmer_capture_disk_bytes"),
+        capture_bytes: metric(&body, "simmer_capture_bytes_total"),
     })
 }
 
@@ -1063,10 +1362,19 @@ fn append_metrics(s: &Scrape) {
         return;
     };
     if fresh {
-        let _ = writeln!(f, "t,series,unmatched,reservations_in_flight");
+        let _ = writeln!(
+            f,
+            "t,series,unmatched,reservations_in_flight,capture_disk_bytes,capture_bytes_total"
+        );
     }
     let in_flight = s.in_flight.map(|v| v.to_string()).unwrap_or_default();
-    let _ = writeln!(f, "{:.1},{},{},{in_flight}", s.t, s.series, s.unmatched);
+    let disk = s.capture_disk.map(|v| v.to_string()).unwrap_or_default();
+    let written = s.capture_bytes.map(|v| v.to_string()).unwrap_or_default();
+    let _ = writeln!(
+        f,
+        "{:.1},{},{},{in_flight},{disk},{written}",
+        s.t, s.series, s.unmatched
+    );
 }
 
 /// `metrics.csv`, including one from before V4, which has no fourth column.
@@ -1083,6 +1391,8 @@ fn read_metrics() -> Vec<Scrape> {
                 series: f.next()?.trim().parse().ok()?,
                 unmatched: f.next()?.trim().parse().ok()?,
                 in_flight: f.next().and_then(|v| v.trim().parse().ok()),
+                capture_disk: f.next().and_then(|v| v.trim().parse().ok()),
+                capture_bytes: f.next().and_then(|v| v.trim().parse().ok()),
             })
         })
         .collect()
@@ -1197,7 +1507,7 @@ fn fds_path(instance: &str, when: &str) -> PathBuf {
 /// What each descriptor is, not only how many, so a return-to-baseline failure
 /// names what was left open.
 fn list_fds(instance: &str) -> Option<String> {
-    let out = SOAK
+    let out = stack()
         .compose()
         .args(["exec", "-T", instance, "ls", "-l", "/proc/1/fd"])
         .output()
@@ -1258,7 +1568,22 @@ fn unaccounted_fds(
         &rest,
         pooled(base_prom?),
         pooled(final_prom?),
+        capture_dir(),
     ))
+}
+
+/// D-085's capture directory as the instances see it, when this run has the
+/// capture on — the writer holds its current bucket file open at rest, and
+/// `leak::unaccounted_fds` needs to know which descriptor that is.
+///
+/// Read from the stack rather than guessed: `test/compose/capture.yml` sets
+/// `SIMMER_CAPTURE_DIR`, so the harness and the container cannot disagree about
+/// the path. With the capture off there is nothing to account for.
+fn capture_dir() -> Option<&'static str> {
+    if !std::env::var("SOAK_CAPTURE").is_ok_and(|v| v == "on") {
+        return None;
+    }
+    Some("/var/lib/simmer/capture")
 }
 
 /// Every connection the downstream and database pools report holding; each is
@@ -1479,31 +1804,21 @@ fn sample_v4_ledger() -> Option<Ledger> {
          (select coalesce(sum(reserved), 0) from quota_usage where route = '{V4_ROUTE}'), \
          (select coalesce(sum(committed), 0) from quota_usage where route = '{V4_ROUTE}')"
     );
-    // Not `Stack::psql`, which panics: a sampler that died on one slow query
-    // would leave the rest of the run unsampled.
-    let out = SOAK
-        .compose()
-        .args([
-            "exec",
-            "-T",
-            "simmer-db",
-            "psql",
-            "-U",
-            "simmer",
-            "-d",
-            "simmer",
-            "-q",
-            "-At",
-            "-c",
-            &sql,
-        ])
-        .output()
-        .ok()?;
+    // Not `Stack::sql`, which panics: a sampler that died on one slow query would
+    // leave the rest of the run unsampled. `sql_command` gives the same statement
+    // in whichever dialect the stack's backend speaks, and both answer with one
+    // `|` separated row.
+    let out = stack().sql_command(&sql).output().ok()?;
     if !out.status.success() {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut f = text.trim().split('|').map(|v| v.parse::<u64>().ok());
+    // Trimmed per field, not just at the ends: `sqlcmd` right-aligns an integer
+    // inside its column width, so a value arrives as `          0` (`-W` takes the
+    // trailing spaces and leaves the leading ones). Without this the whole sampler
+    // would silently return nothing on the mssql stack, and V4 would be judged on
+    // an empty ledger.
+    let mut f = text.trim().split('|').map(|v| v.trim().parse::<u64>().ok());
     Some(Ledger {
         rows: f.next()??,
         reserved: f.next()??,
@@ -1566,7 +1881,7 @@ fn drain_v4(started: Instant) -> bool {
 /// `/metrics` from inside the instance's own network namespace, so `app2` —
 /// whose admin port is not published — can be read too.
 fn scrape_in_container(instance: &str) -> Option<String> {
-    let out = SOAK
+    let out = stack()
         .compose()
         .args([
             "exec",
@@ -1600,7 +1915,8 @@ fn copy_v4_evidence() {
 }
 
 fn from_results(script: &str) -> String {
-    SOAK.compose()
+    stack()
+        .compose()
         .args([
             "run",
             "--rm",
@@ -1622,7 +1938,7 @@ fn from_results(script: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn recreate_instances() {
-    let out = SOAK
+    let out = stack()
         .compose()
         .args(["up", "-d", "--no-deps", "--force-recreate", "--wait"])
         .args(INSTANCES)
@@ -1636,7 +1952,7 @@ fn recreate_instances() {
 }
 
 fn fresh_sink() {
-    let _ = SOAK.run(&[
+    let _ = stack().run(&[
         "run",
         "--rm",
         "--no-deps",
@@ -1647,7 +1963,7 @@ fn fresh_sink() {
         "-c",
         "rm -f /results/soak-*.jsonl",
     ]);
-    let out = SOAK
+    let out = stack()
         .compose()
         .env("SINK_ARGS", "--idle-close-secs 45")
         .args([
@@ -1664,7 +1980,7 @@ fn fresh_sink() {
 }
 
 fn run_loadgen(instance: &str, args: &[String]) -> String {
-    let out = SOAK
+    let out = stack()
         .compose()
         .args(["run", "--rm", "--no-deps", "--no-TTY", "loadgen"])
         .args(args)

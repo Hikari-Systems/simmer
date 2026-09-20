@@ -1,0 +1,101 @@
+# The SQL Server build of Simmer, against SQL Server **Express**, for the T4 soak
+# (docs/SOAK.md §11). Layered on the stress stack, which is what the soak uses:
+#
+#   docker compose -f docker-compose.yml -f test/compose/acceptance.yml \
+#     -f test/compose/stress.yml -f test/compose/mssql.yml \
+#     --profile acceptance --profile stress --profile mssql up -d --wait app app2 sink
+#
+# `tests/compose/stack.rs`'s SOAK_MSSQL_CAPTURE stack builds every command with
+# exactly these files and profiles — never assemble one by hand for a run whose
+# result you intend to cite (D-042, and stack.rs's own preamble).
+#
+# D-084 gives the two builds: this overlay is the only place the *stack* runs the
+# `mssql` one. It differs from the default stack in three things and nothing else:
+# the feature flags `app` and `app2` are compiled with, the connection string they
+# are given, and a one-shot that creates the database — SQL Server, unlike the
+# Postgres image, creates nothing from its environment.
+#
+# **Express, not Developer.** The base file's `simmer-mssql-db` is Developer
+# edition, which is the right default for the storage tests: they are about T-SQL
+# correctness and an edition ceiling would only slow them down. A soak is the
+# opposite. Express is what a small deployment actually runs, and its ceilings —
+# a 1410 MB buffer pool, four cores, 10 GB a database — are exactly the kind of
+# limit that shows up over an hour and not over a test. If this stack ever reads
+# green where Developer read red, the edition is the first thing to check.
+
+services:
+  simmer-mssql-db:
+    environment:
+      # The one line this overlay exists for. Everything else about the service is
+      # the base file's.
+      MSSQL_PID: Express
+
+  # SQL Server creates no database from its environment the way the Postgres image
+  # does with POSTGRES_DB, so `database=simmer` in the connection string below
+  # would be a login failure on a fresh volume. Idempotent, so a re-run costs a
+  # connection and nothing else.
+  #
+  # It is a *dependency* of `app` and `app2` rather than a service the stack starts
+  # on its own: `docker compose up --wait` fails on any one-shot container that has
+  # exited, even successfully, unless something depends on it.
+  simmer-mssql-init:
+    profiles: ["mssql"]
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        /opt/mssql-tools18/bin/sqlcmd -C -S simmer-mssql-db -U sa \
+          -P "$$MSSQL_SA_PASSWORD" -b \
+          -Q "IF DB_ID('simmer') IS NULL CREATE DATABASE [simmer];"
+    environment:
+      # Local development only — never a real credential. The base file's
+      # `simmer-mssql-db` carries the same literal.
+      MSSQL_SA_PASSWORD: "Simmer-dev-1!"
+    depends_on:
+      simmer-mssql-db:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  app: &mssql_app
+    build:
+      context: .
+      target: runtime
+      args:
+        # D-084's flags, exactly as the published `-mssql` image is built.
+        CARGO_FEATURES: "--no-default-features --features mssql"
+    # Its own tag, so the default stack's `simmer-app` image is not overwritten by
+    # a build of the other backend. Switching stacks then costs a container
+    # re-creation and not a recompile.
+    image: simmer-app-mssql:latest
+    environment:
+      # §4.1's `database.url` for this build: an ADO.NET connection string, which
+      # `db::mssql::parse_url` refuses to confuse with a Postgres URL. The soak
+      # config interpolates ${DATABASE_URL} into it exactly as before — the config
+      # is backend-agnostic and only this value changes.
+      #
+      # TrustServerCertificate=true draws a startup WARN by design (D-084): the
+      # server's certificate is the container's self-signed one. Local only.
+      DATABASE_URL: "server=tcp:simmer-mssql-db,1433;database=simmer;user id=sa;password=Simmer-dev-1!;TrustServerCertificate=true"
+      # The mssql half of what `sqlx=warn` does for the default build, and it is
+      # not cosmetic. tiberius logs `Begin transaction` and `Commit transaction`
+      # at INFO, so §7.4's reserve and commit put four lines per message on the
+      # session's own task: ~290k lines an hour at the soak's rate, written
+      # synchronously, in the same log step 5c's correlation ids are followed
+      # through. Without this the mssql stack is not measuring the same thing the
+      # Postgres runs measured — it is measuring its own logging.
+      #
+      # The published guidance says `info,sqlx=warn`, which is the Postgres build's
+      # answer given for both (docs/SOAK.md §11).
+      RUST_LOG: "info,sqlx=warn,tiberius=warn"
+    depends_on:
+      simmer-mssql-init:
+        condition: service_completed_successfully
+      # The base file's `depends_on: simmer-db` cannot be removed by an override —
+      # compose merges the map — so Postgres still starts and still has to be
+      # healthy. It is idle: nothing in this stack holds a connection to it. Left
+      # alone deliberately, because the alternative is a second copy of the base
+      # `app` service maintained by hand.
+
+  app2: *mssql_app

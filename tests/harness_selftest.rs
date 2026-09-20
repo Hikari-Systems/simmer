@@ -362,7 +362,7 @@ fn pooled_sockets_account_for_the_growth_at_rest() {
     let base = compose::leak::fd_kinds(FDS_BASE);
     let mut rest = base.clone();
     rest.extend(["socket".to_string(), "socket".to_string()]);
-    assert!(compose::leak::unaccounted_fds(&base, &rest, 1.0, 3.0).is_empty());
+    assert!(compose::leak::unaccounted_fds(&base, &rest, 1.0, 3.0, None).is_empty());
 }
 
 #[test]
@@ -379,11 +379,63 @@ fn one_leaked_descriptor_is_named() {
         let mut rest = base.clone();
         rest.push(leaked.to_string());
         assert_eq!(
-            compose::leak::unaccounted_fds(&base, &rest, 1.0, 1.0),
+            compose::leak::unaccounted_fds(&base, &rest, 1.0, 1.0, None),
             [named],
             "{leaked}"
         );
     }
+}
+
+const CAPTURE_DIR: &str = "/var/lib/simmer/capture";
+
+#[test]
+fn the_capture_writers_current_bucket_is_not_a_leaked_descriptor() {
+    // D-085's writer holds the bucket it is filling open at rest, and that file
+    // did not exist before the first message. Without this every capture run
+    // reports a descriptor leak it does not have; with it, one open bucket is
+    // free and nothing else is.
+    let base = compose::leak::fd_kinds(FDS_BASE);
+    let mut rest = base.clone();
+    rest.push(format!("{CAPTURE_DIR}/2026-09-20T14.20.jsonl"));
+    assert!(
+        compose::leak::unaccounted_fds(&base, &rest, 1.0, 1.0, Some(CAPTURE_DIR)).is_empty(),
+        "the current bucket must be accounted for"
+    );
+}
+
+#[test]
+fn a_bucket_the_writer_never_closed_is_named() {
+    // The leak the allowance above must not hide: the writer re-opens on every
+    // ten-minute rotation, so a handle it failed to drop accumulates one per
+    // bucket. Only an hours-long run shows it, which is exactly why the gate has
+    // to keep its power here.
+    let base = compose::leak::fd_kinds(FDS_BASE);
+    let mut rest = base.clone();
+    for bucket in ["14.00", "14.10", "14.20"] {
+        rest.push(format!("{CAPTURE_DIR}/2026-09-20T{bucket}.jsonl"));
+    }
+    let extra = compose::leak::unaccounted_fds(&base, &rest, 1.0, 1.0, Some(CAPTURE_DIR));
+    assert_eq!(extra.len(), 2, "{extra:?}");
+    assert!(
+        extra
+            .iter()
+            .all(|e| e.contains("capture bucket file left open")),
+        "{extra:?}"
+    );
+}
+
+#[test]
+fn a_capture_path_is_only_excused_when_the_run_had_the_capture_on() {
+    // With the capture off there is no directory to excuse, so a file under that
+    // path is an ordinary leaked descriptor. Passing `None` must not be a way to
+    // lose the check.
+    let base = compose::leak::fd_kinds(FDS_BASE);
+    let mut rest = base.clone();
+    rest.push(format!("{CAPTURE_DIR}/2026-09-20T14.20.jsonl"));
+    assert_eq!(
+        compose::leak::unaccounted_fds(&base, &rest, 1.0, 1.0, None),
+        [format!("{CAPTURE_DIR}/2026-09-20T14.20.jsonl")]
+    );
 }
 
 // -- known findings --------------------------------------------------------

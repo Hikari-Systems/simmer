@@ -1,0 +1,231 @@
+# The T4 soak configuration **with D-085's capture on** (docs/CAPTURE.md;
+# docs/SOAK.md §11).
+#
+# Everything below the header is `simmer.soak.yaml`, verbatim, plus the `capture:`
+# block at the end — and `tests/soak.rs` asserts exactly that, so the two cannot
+# drift. Change the soak config and this file must be regenerated; that is what
+# the test is for. It pairs with `test/compose/capture.yml`, which mounts a
+# writable volume per instance and sets ${SIMMER_CAPTURE_DIR}.
+#
+# A separate file rather than a switch in `simmer.soak.yaml`, because `capture:`
+# being absent is the only way to turn the capture off (docs/CAPTURE.md §2) — a
+# YAML block cannot be made conditional — and because a soak with it on is a
+# different measurement, not the same one with a flag set: §1's three costs are
+# disk, a little CPU on the message path, and a mailbox on disk.
+# The T4 soak configuration (docs/TESTING.md; the test programme's step 5).
+#
+# Delivered into `app` and `app2` at /config by the same `stress-config` one-shot
+# that carries the stress config: test/config/Dockerfile copies the whole
+# directory, so this file is already there and the soak stack differs from the
+# stress stack only in SIMMER_CONFIG. The volume's name is a little narrow for
+# what it now carries; it is not renamed because that would strand the volume a
+# running stack is using.
+#
+# What the soak changes, and why each matters over hours rather than seconds:
+#
+#   * `idle_ttl` 60s with a downstream that closes idle connections sooner, so
+#     reuse, reaping and D-068's retry all happen thousands of times rather than
+#     once (V5's CLOSE_WAIT question).
+#   * Downstream timeouts 5/10/60s, which put §7.4's reservation expiry at 205s —
+#     long enough that a cancelled relay leaves a reservation visible for a while
+#     (F2), short enough that the sweeper's behaviour is observable in an hour.
+#   * A session timeout of 300s: long sessions are the realistic shape, and it is
+#     what V4 cancels a relay against — a sender of its own (`cancel.soak.test`)
+#     on a route of its own (`warming-cancel`). A literal, not the stress tier's
+#     ${SIMMER_SESSION_TIMEOUT}, so the two tiers cannot perturb each other.
+#   * `recipient_frequency` on the warming route, so §7.3 writes rows and evicts
+#     them continuously — the table that F12 says is never pruned.
+#   * An allowance no run can exhaust: 24 hours at 10 msg/s is ~864k messages, so
+#     steering here is recipient frequency's doing and never quota's. A soak that
+#     silently fell through to overflow after an hour would measure the wrong
+#     route for the other twenty-three.
+#   * `X-Simmer-Correlation: "{{correlation_id}}"` on every route, which the sink
+#     records: the id Simmer logs a message under, so a slow message can be
+#     followed into the server's log (step 5c). Not in `unstable_headers` —
+#     §6.6's probe pins volatile variables, so the header is stable, and
+#     declaring it would draw the stale-declaration WARN.
+
+server:
+  listeners:
+    - address: "0.0.0.0:25"
+      auth: required
+    - address: "0.0.0.0:587"     # starttls_required, auth required (port defaults)
+    - address: "0.0.0.0:465"     # implicit, auth required (port defaults)
+  tls:
+    certificate: "${SIMMER_TLS_DIR}/cert.pem"
+    private_key: "${SIMMER_TLS_DIR}/key.pem"
+  hostname: "simmer.acceptance"
+  max_message_bytes: 26214400
+  max_recipients: 1
+  max_concurrent_sessions: 64
+  allowed_cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+  timeouts:
+    command: 30s
+    data: 120s
+    session: 300s
+  auth:
+    allow_insecure_auth: true
+    mechanisms: [PLAIN, LOGIN]
+    users:
+      # Two users sharing one hash: `soakapp` is the soak's own identity, granted
+      # the soak's domains, while `cfapp` stays so anything pointed at this config
+      # by habit still authenticates.
+      - username: "soakapp"
+        password_hash: "${SIMMER_CFAPP_HASH}"
+        grants:
+          send_as: ["oldbrand.com", "newbrand.com", "*.soak.test"]
+      - username: "cfapp"
+        password_hash: "${SIMMER_CFAPP_HASH}"
+        grants:
+          send_as: ["oldbrand.com", "newbrand.com", "*.soak.test"]
+
+database:
+  url: "${DATABASE_URL}"
+  max_connections: 10
+  connect_timeout: 5s
+  fail_closed: true
+
+admin:
+  listen: "0.0.0.0:8080"
+  auth_token: "${SIMMER_ADMIN_TOKEN}"
+
+logging:
+  level: info
+  format: json
+
+domain_groups:
+  - name: catchall
+    domains: ["*"]
+
+senders:
+  - match: "oldbrand.com"
+    match_on: envelope
+    chain: [warming-newbrand, overflow-established]
+  # V4 (F2): one exact domain, onto a route of its own, so the relays the session
+  # timeout cancels hold their own pool and their own quota row and cannot
+  # perturb V2's warming route. Exact, not a wildcard: V3's `u<n>.soak.test`
+  # must still match nothing.
+  - match: "cancel.soak.test"
+    match_on: envelope
+    chain: [warming-cancel]
+  # There is deliberately **no** rule for `*.soak.test`. V3's senders have to be
+  # granted but unmatched, which is the only state that reaches §5.4's
+  # fall-through and labels `simmer_unmatched_sender_total{domain}` with a domain
+  # the client chose (F7). The grant in `server.auth.users` stays — without it the
+  # ACL refuses at MAIL FROM and no message is ever accepted, which would look
+  # exactly like F7 not reproducing.
+
+default_chain: [overflow-established]
+strict_senders: false
+
+routes:
+  - name: warming-newbrand
+    downstream:
+      host: "sink"
+      port: 2525
+      tls: off
+      pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+      timeouts:
+        connect: 5s
+        command: 10s
+        data: 60s
+    identity:
+      envelope_from: "bounce@newbrand.com"
+      set_headers:
+        X-Simmer-Route: "{{route.name}}"
+        X-Simmer-Correlation: "{{correlation_id}}"
+      body_rewrites:
+        - pattern: 'https://oldbrand\.com/'
+          replacement: "https://newbrand.com/"
+    preflight:
+      enabled: false
+    # §7.3 running continuously: rows written on every commit and evicted by the
+    # hourly sweeper, which is the churn F12 is about.
+    recipient_frequency:
+      mode: to_address
+      window: { unit: hourly, count: 1 }
+      threshold: 5
+    warmup:
+      started: "${SIMMER_WARMUP_STARTED}"
+      schedule:
+        default: [100000000]
+
+  # V4's route (F2). A warming route, because a reservation with a ledger behind
+  # it is what a cancelled relay strands; a pool of its own, because the sink
+  # holds every V4 message 15 s at the dot and would otherwise sit on V2's
+  # connections; and the same downstream timeouts as the warming route, so the
+  # reservation expiry is the same 205 s and the sweeper clears a stranded row
+  # before the next session's cancellation, 300 s later, can strand another.
+  - name: warming-cancel
+    downstream:
+      host: "sink"
+      port: 2525
+      tls: off
+      pool: { max_connections: 2, idle_ttl: 60s, max_messages_per_connection: 100 }
+      timeouts:
+        connect: 5s
+        command: 10s
+        data: 60s
+    identity:
+      envelope_from: "bounce@cancel.newbrand.com"
+      set_headers:
+        X-Simmer-Route: "{{route.name}}"
+        X-Simmer-Correlation: "{{correlation_id}}"
+    preflight:
+      enabled: false
+    warmup:
+      started: "${SIMMER_WARMUP_STARTED}"
+      schedule:
+        default: [100000000]
+
+  - name: overflow-established
+    overflow: true
+    downstream:
+      host: "sink"
+      port: 2526
+      tls: off
+      pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
+      timeouts:
+        connect: 5s
+        command: 10s
+        data: 60s
+    identity:
+      envelope_from: "bounce@mail.established.com"
+      set_headers:
+        X-Simmer-Route: "{{route.name}}"
+        X-Simmer-Correlation: "{{correlation_id}}"
+    preflight:
+      enabled: false
+
+# ---------------------------------------------------------------------------
+# D-085's capture. Absent means off, so this block is the whole switch.
+#
+# The values are the documented defaults, deliberately: this run is about what
+# the capture costs a server that is otherwise the soak's, as an operator who
+# read docs/CAPTURE.md §2 and changed nothing would get it. The two worth knowing
+# for the verdict:
+#
+#   * `max_body_bytes` 1 MiB is §8.1's spill threshold, so the 1m and 4m messages
+#     in the soak's size distribution are recorded as envelopes with
+#     `body_omitted: true` and counted on `simmer_capture_body_omitted_total`.
+#     That is ~5% of the stream, and it is why the capture does not cost the
+#     ~100 KB mean message size × the run.
+#
+#   * `retention` 24h is never reached by an hour — and neither is the sweeper's
+#     hourly interval, whose first pass runs at startup with nothing to delete.
+#     So `simmer_capture_files_swept_total` is expected to stay 0 and
+#     `simmer_capture_disk_bytes` to climb for the whole run. The slope is the
+#     measurement; a plateau would need a run longer than the interval.
+#
+# `on_error: continue` is the default and the right one here: a gap in a
+# debugging capture must not stop mail (§14.1 cuts both ways), and a gap is
+# visible on `simmer_capture_dropped_total{reason}` either way. Under `defer` a
+# slow disk would turn into 451s and the run would be measuring the capture's
+# backpressure instead of the server.
+capture:
+  directory: "${SIMMER_CAPTURE_DIR}"
+  max_body_bytes: 1048576
+  retention: 24h
+  on_error: continue
+  queue_depth: 1024
+  max_queue_bytes: 67108864

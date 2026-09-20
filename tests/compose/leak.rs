@@ -188,14 +188,45 @@ pub fn fd_kinds(listing: &str) -> Vec<String> {
 /// and go with the pools, so they are judged by count: the sockets no pool holds
 /// (the listeners, mostly) must not have grown. `pooled_base` and `pooled_rest`
 /// are what the downstream and database pools reported holding at each moment.
+///
+/// `capture_dir` is D-085's capture directory when the run had the capture on.
+/// Its writer legitimately holds the **current** bucket file open at rest, and
+/// that file did not exist before the first message, so without this every capture
+/// run reports a descriptor leak it does not have.
+///
+/// **One.** Not "ignore that directory": the writer re-opens on every ten-minute
+/// rotation, so a handle it failed to drop would accumulate one per bucket — a
+/// real leak, of exactly the kind this tier exists to find, and one that only an
+/// hours-long run shows. So the first is accounted for and every one after it is
+/// named.
 pub fn unaccounted_fds(
     base: &[String],
     rest: &[String],
     pooled_base: f64,
     pooled_rest: f64,
+    capture_dir: Option<&str>,
 ) -> Vec<String> {
+    let mut extra_capture = Vec::new();
+    let (base, rest) = match capture_dir {
+        None => (base.to_vec(), rest.to_vec()),
+        Some(dir) => {
+            let in_capture = |k: &String| k.starts_with(dir);
+            let mut held = rest.iter().filter(|k| in_capture(k));
+            // The one the writer is filling. Anything beyond it is a bucket whose
+            // handle was never dropped.
+            let _current = held.next();
+            for leaked in held {
+                extra_capture.push(format!("a capture bucket file left open: {leaked}"));
+            }
+            (
+                base.iter().filter(|k| !in_capture(k)).cloned().collect(),
+                rest.iter().filter(|k| !in_capture(k)).cloned().collect(),
+            )
+        }
+    };
+    let (base, rest) = (base.as_slice(), rest.as_slice());
+    let mut extra = extra_capture;
     let mut before: Vec<&String> = base.iter().filter(|k| *k != "socket").collect();
-    let mut extra = Vec::new();
     for kind in rest.iter().filter(|k| *k != "socket") {
         match before.iter().position(|b| *b == kind) {
             Some(i) => {
