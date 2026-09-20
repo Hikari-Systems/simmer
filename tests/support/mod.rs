@@ -415,6 +415,9 @@ pub struct Simmer {
     pub registry: ReservationRegistry,
     stop: smtp::Shutdown,
     hard: smtp::Shutdown,
+    /// D-085 — held so the writer's channel stays open for the life of the
+    /// fixture, and closes when it is dropped.
+    _capture: Option<simmer::capture::Capture>,
 }
 
 impl Drop for Simmer {
@@ -456,6 +459,17 @@ impl Simmer {
 
         let pools = Arc::new(simmer::downstream::Pool::build(&config));
         let registry = ReservationRegistry::new();
+
+        // D-085 — started from the config exactly as `main.rs` does, so a test
+        // that configures `capture:` gets the real writer rather than a stub. The
+        // handle is kept on `Simmer` below: dropping it closes the writer's
+        // channel, which is how the writer knows to stop.
+        let capture = config.capture.as_ref().map(|c| {
+            simmer::capture::Capture::start(c)
+                .unwrap_or_else(|e| panic!("starting the test capture: {e}"))
+                .0
+        });
+
         let engine = Engine {
             config: Arc::new(config),
             tls: Arc::new(tls),
@@ -465,6 +479,7 @@ impl Simmer {
             rewriters: Arc::new(rewriters),
             frequency: Arc::new(Frequency::new()),
             preflight,
+            capture: capture.clone(),
         };
 
         let listener = smtp::Listener::bind(engine).await.expect("bind simmer");
@@ -487,6 +502,7 @@ impl Simmer {
             registry,
             stop,
             hard,
+            _capture: capture,
         }
     }
 

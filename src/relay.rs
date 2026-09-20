@@ -61,6 +61,14 @@ pub struct Engine {
     /// Shared and read-mostly: the walk consults it per message and only a
     /// `strict` route can be eliminated by it.
     pub preflight: Arc<crate::preflight::Registry>,
+    /// D-085 — the optional debugging capture. `None` is the whole of "off":
+    /// no directory, no task, no metric, and an `Option<Capture>` one word wide,
+    /// so cloning the engine per session costs nothing when it is absent.
+    ///
+    /// **Write-only.** `Capture` exposes no read method, so nothing downstream
+    /// of this field can consult the capture to decide what to deliver. That
+    /// absence is what keeps §2.2 true — see `src/capture/mod.rs`.
+    pub capture: Option<crate::capture::Capture>,
 }
 
 /// Why no route could be selected. Each maps to a specific reply, and the

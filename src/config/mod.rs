@@ -41,6 +41,15 @@ pub struct Config {
     #[serde(default)]
     pub link_proxy: Option<LinkProxy>,
 
+    /// D-085 — the optional message capture sink. Absent means nothing is
+    /// written and no task is started.
+    ///
+    /// A **debugging mode**, not a spool: see `src/capture/mod.rs` for the four
+    /// properties that keep that true, and `DECISIONS.md` D-085 for what it
+    /// costs against §7.3.
+    #[serde(default)]
+    pub capture: Option<Capture>,
+
     pub domain_groups: Vec<DomainGroup>,
     pub senders: Vec<SenderRule>,
 
@@ -701,6 +710,108 @@ fn default_upstream_response() -> Duration {
 }
 fn default_idle() -> Duration {
     Duration::from_secs(60)
+}
+
+// ---------------------------------------------------------------------------
+// capture (D-085)
+// ---------------------------------------------------------------------------
+
+/// D-085. Where received messages are appended, one JSON object per line, in
+/// files of ten minutes each.
+///
+/// Presence is the opt-in, like `link_proxy` and §6.7's `preflight`. Every
+/// other key has a default, because the only one an operator must think about
+/// is where it goes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Capture {
+    /// Absolute path to the directory holding the bucket files. Created `0700`
+    /// if absent; the files inside are `0600`.
+    ///
+    /// The shipped container has a read-only root filesystem, so this must name
+    /// a writable mount owned by UID 1000 — see `docker-compose.yml`.
+    pub directory: String,
+
+    /// Above this, the envelope is recorded and the body is not
+    /// (`body_omitted: true`). Default 1 MiB, which is §8.1's spill threshold:
+    /// an inlined body then never exceeds what Simmer was already holding in
+    /// memory for that message anyway.
+    #[serde(default = "default_capture_max_body_bytes")]
+    pub max_body_bytes: u64,
+
+    /// Bucket files whose window ended longer ago than this are deleted by the
+    /// sweeper. Default 24h. It must exceed one bucket, or the sweeper would
+    /// delete the file being written.
+    #[serde(
+        default = "default_capture_retention",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub retention: Duration,
+
+    /// What a failed capture write does to the client's reply. Default
+    /// `continue` — §14.1's principle cuts both ways, and a full disk must not
+    /// stop mail for a facility that exists to help diagnose it.
+    ///
+    /// `defer` answers `451` instead, **before anything is relayed**. That is
+    /// only coherent because the capture happens before the downstream
+    /// conversation: a `451` raised afterwards would defer a message the
+    /// downstream had already accepted, and the client's retry would deliver it
+    /// twice (§10.2, D-068).
+    #[serde(default)]
+    pub on_error: CaptureOnError,
+
+    /// How many records may be queued for the writer before further ones are
+    /// dropped. The queue is never awaited on the message path — a slow disk
+    /// must not become backpressure on the relay — so a full queue drops and
+    /// counts rather than waiting.
+    #[serde(default = "default_capture_queue_depth")]
+    pub queue_depth: usize,
+
+    /// A second bound on the same queue, in bytes of serialised record.
+    ///
+    /// `queue_depth` alone is not a bound on memory: a 25 MiB message becomes a
+    /// ~34 MiB base64 line, and a thousand of those queued is 34 GiB. Default
+    /// 64 MiB.
+    #[serde(default = "default_capture_queue_bytes")]
+    pub max_queue_bytes: u64,
+}
+
+fn default_capture_max_body_bytes() -> u64 {
+    // crate::smtp::buffer::SPILL_THRESHOLD, not imported to keep `config` free
+    // of a dependency on `smtp`. The two are asserted equal in that module.
+    1024 * 1024
+}
+
+fn default_capture_retention() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
+}
+
+fn default_capture_queue_depth() -> usize {
+    1024
+}
+
+fn default_capture_queue_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+/// D-085 — what a failed capture write does to the client's reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureOnError {
+    /// Log, count, and leave the reply alone. The default.
+    #[default]
+    Continue,
+    /// Answer `451` and relay nothing. A deferral, never a `5xx` (§14.1).
+    Defer,
+}
+
+impl CaptureOnError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Defer => "defer",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

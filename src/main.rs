@@ -36,6 +36,13 @@ async fn main() -> ExitCode {
     // the config is what needs the credential.
     hash_password::check_subcommand();
 
+    // No-op unless argv[1] == "replay" (D-085). Before the config is read, like
+    // the two above and for the same kind of reason: a replay is told everything
+    // on the command line, so it must work from a machine that has a capture
+    // directory and no `simmer.yaml` at all. Unlike them it needs the runtime,
+    // which `main` already is.
+    simmer::capture::replay::check_subcommand().await;
+
     // No-op unless argv[1] == "healthcheck". Must run before anything else: it is
     // what `HEALTHCHECK CMD ["/app/server","healthcheck"]` invokes, and the
     // runtime image has no curl. Falls back to the §4.1 default admin port when
@@ -191,6 +198,20 @@ async fn run() -> anyhow::Result<()> {
     // is no reason to dial a downstream before a message needs one.
     let pools = Arc::new(simmer::downstream::Pool::build(&config));
 
+    // D-085 — the optional debugging capture. Started before the engine so the
+    // handle can be moved into it, and a failure here refuses to start: a
+    // capture that is configured but silently writing nothing is the worst
+    // outcome available, because the operator would find out only when they went
+    // looking for the records. `config::validate` has already checked the
+    // directory, so this is the second line of defence, not the first.
+    let (capture, capture_writer) = match &config.capture {
+        Some(cfg) => {
+            let (handle, task) = simmer::capture::Capture::start(cfg)?;
+            (Some(handle), Some(task))
+        }
+        None => (None, None),
+    };
+
     let engine = relay::Engine {
         config: Arc::clone(&config),
         tls: Arc::new(tls),
@@ -200,6 +221,7 @@ async fn run() -> anyhow::Result<()> {
         rewriters: Arc::new(rewriters),
         frequency,
         preflight: Arc::clone(&preflight),
+        capture: capture.clone(),
     };
 
     // §5.1 — bind before announcing readiness, so a port clash is a startup
@@ -286,6 +308,17 @@ async fn run() -> anyhow::Result<()> {
         tokio::spawn(simmer::frequency::sweeper::run(
             Arc::clone(&quota),
             retention,
+            stop_accepting.clone(),
+        ))
+    });
+
+    // D-085's retention. Not started when capture is off: nothing writes bucket
+    // files then, so there is nothing to evict — the frequency sweeper's
+    // precedent, for the same reason.
+    let capture_sweeper = config.capture.as_ref().map(|cfg| {
+        tokio::spawn(simmer::capture::sweeper::run(
+            std::path::PathBuf::from(&cfg.directory),
+            cfg.retention,
             stop_accepting.clone(),
         ))
     });
@@ -378,7 +411,31 @@ async fn run() -> anyhow::Result<()> {
     if let Some(task) = upkeep_task {
         let _ = task.await;
     }
+    if let Some(task) = capture_sweeper {
+        let _ = task.await;
+    }
     let _ = admin_task.await;
+
+    // D-085 — the capture writer outlives every session on purpose: a session
+    // finishing inside the §10.4 grace period still offers a record, and a
+    // capture with a hole in exactly the messages that were in flight at
+    // shutdown is worse than no capture.
+    //
+    // It listens to no shutdown token. Its channel closes when the last
+    // `Capture` handle is dropped, and "no handle exists" is precisely "no
+    // session can offer another record" — a condition the type system already
+    // tracks. So drop the two this process holds, in this order, and wait.
+    drop(engine);
+    drop(capture);
+    if let Some(task) = capture_writer {
+        match tokio::time::timeout(CAPTURE_FLUSH_GRACE, task).await {
+            Ok(_) => info!("capture writer flushed"),
+            Err(_) => warn!(
+                secs = CAPTURE_FLUSH_GRACE.as_secs(),
+                "the capture writer did not finish flushing; the last records may be missing"
+            ),
+        }
+    }
 
     info!("shutdown complete");
     Ok(())
@@ -387,6 +444,11 @@ async fn run() -> anyhow::Result<()> {
 /// §10.4 — "allow in-flight sessions to complete up to a grace period (default
 /// 30s)". Not in the §4.1 schema, so not configurable.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// D-085 — how long to wait for the capture writer to flush after every session
+/// has ended. A backstop against a task wedged on a hung filesystem, not a
+/// tuning knob; not in the §4.1 schema, like `SHUTDOWN_GRACE`.
+const CAPTURE_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// D-076 — how often the metrics exporter's buffered samples are drained. The
 /// exporter's own `install()` default.

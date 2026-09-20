@@ -407,6 +407,22 @@ pub fn no_eligible_route(permanent: bool) -> Reply {
     }
 }
 
+/// D-085 — the debugging capture could not be written and `capture.on_error` is
+/// `defer`.
+///
+/// `451`, and §14.1 decides it without much argument: the message is perfectly
+/// deliverable and the only thing wrong is a facility that exists to help
+/// diagnose Simmer. A `5xx` would put that recipient on suppression lists for
+/// years because a debug volume filled up.
+///
+/// It is emitted **before** the relay, which is the whole reason the capture
+/// happens there. Raised after the downstream conversation, this reply would
+/// defer a message the downstream had already accepted, and the client's retry
+/// would deliver it twice — §10.2's hazard, manufactured on purpose.
+pub fn capture_unavailable() -> Reply {
+    Reply::new(451, "4.3.0 message capture unavailable, try later")
+}
+
 /// D-018 — a UTF-8 address or `SMTPUTF8` parameter when `EHLO` did not advertise
 /// the extension.
 ///
@@ -539,6 +555,17 @@ mod tests {
     }
 
     // -- the §14.1 audit -------------------------------------------------
+
+    #[test]
+    fn a_capture_failure_defers_and_never_suppresses() {
+        // D-085. The recipient is deliverable; a debug volume filled up. Getting
+        // this wrong would suppress real recipients for years over a facility
+        // that is off by default.
+        let r = capture_unavailable();
+        assert_eq!(r.code, 451);
+        assert!(r.to_wire().starts_with("451 4.3.0"), "{}", r.to_wire());
+        assert!(!r.closes_connection());
+    }
 
     #[test]
     fn the_only_permanent_replies_are_the_ones_we_argued_for() {

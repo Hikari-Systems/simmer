@@ -124,6 +124,7 @@ fn state_from(pool: PgPool, cfg: Config) -> AdminState {
                 b"test salt".to_vec(),
             )),
             preflight: Arc::new(simmer::preflight::Registry::new()),
+            capture: None,
         },
         // No recorder: `metrics` allows exactly one per process and installing it
         // here would fail in whichever test ran second.

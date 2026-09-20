@@ -11,6 +11,7 @@
 //! spawning a process.
 
 pub mod admin;
+pub mod capture;
 pub mod config;
 pub mod db;
 pub mod downstream;

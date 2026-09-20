@@ -19,6 +19,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::Path;
+use std::time::Duration;
 
 use super::{Config, Identity, IngressAuth, Route};
 use crate::rewrite::{stability, RouteRewrite};
@@ -162,6 +164,7 @@ pub fn validate(cfg: &Config) -> ViolationList {
     check_chains(cfg, &mut v);
     check_default_chain(cfg, &mut v);
     check_link_proxy(cfg, &mut v);
+    check_capture(cfg, &mut v);
     check_storage(cfg, &mut v);
 
     v
@@ -235,6 +238,27 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
                     .to_string(),
             });
         }
+    }
+
+    // D-085 — the one warning in this file that is about what Simmer will write
+    // rather than about what it will do. §7.3 hashes recipients precisely so
+    // that the container does not accumulate a plaintext record of every address
+    // mailed; enabling capture is choosing to accumulate exactly that, plus the
+    // bodies. An operator who meant it will read this and move on. An operator
+    // who left it on after an afternoon of debugging needs to see it every time
+    // the process starts.
+    if let Some(c) = &cfg.capture {
+        out.push(Warning {
+            path: "capture".to_string(),
+            message: format!(
+                "is enabled: every accepted message's body and its recipient are written to \
+                 '{}' in the clear, retained for {}h. This is a debugging mode (D-085) — \
+                 §7.3 hashes recipients to avoid exactly this, so do not leave it on in \
+                 production",
+                c.directory,
+                c.retention.as_secs() / 3600
+            ),
+        });
     }
 
     // §9.3's write API can pause a route or set an allowance of zero, and either
@@ -619,6 +643,128 @@ fn check_link_proxy(cfg: &Config, v: &mut ViolationList) {
             );
         }
     }
+}
+
+/// D-085 — everything `capture::Capture::start` relies on.
+///
+/// The directory is checked here rather than on the first message because a
+/// capture that silently writes nothing is the worst outcome available: the
+/// operator enabled it for a reason, and would find out at the moment they went
+/// looking for the records. §4.2's posture — refuse to start, report everything
+/// — is what makes "it is on" and "it is working" the same statement.
+fn check_capture(cfg: &Config, v: &mut ViolationList) {
+    let Some(c) = &cfg.capture else {
+        return;
+    };
+
+    let dir = Path::new(&c.directory);
+    if c.directory.trim().is_empty() {
+        v.push("capture.directory", "is empty");
+    } else if !dir.is_absolute() {
+        // A relative path resolves against the working directory, which is
+        // `/app` in the container and wherever the operator stood in a test.
+        // The same config would then capture to two different places.
+        v.push(
+            "capture.directory",
+            format!("'{}' is not an absolute path", c.directory),
+        );
+    } else if dir.exists() {
+        if !dir.is_dir() {
+            v.push(
+                "capture.directory",
+                format!("'{}' exists and is not a directory", c.directory),
+            );
+        } else if let Err(e) = writable(dir) {
+            v.push(
+                "capture.directory",
+                format!("'{}' is not writable: {e}", c.directory),
+            );
+        }
+    } else {
+        // It will be created, so what matters is the parent. The container's
+        // root filesystem is read-only (docker-compose.yml), which is the
+        // failure this catches in practice.
+        match dir.parent() {
+            None => v.push(
+                "capture.directory",
+                format!("'{}' has no parent directory", c.directory),
+            ),
+            Some(parent) if !parent.is_dir() => v.push(
+                "capture.directory",
+                format!(
+                    "'{}' does not exist and neither does its parent '{}'",
+                    c.directory,
+                    parent.display()
+                ),
+            ),
+            Some(parent) => {
+                if let Err(e) = writable(parent) {
+                    v.push(
+                        "capture.directory",
+                        format!(
+                            "'{}' would have to be created in '{}', which is not writable: {e}",
+                            c.directory,
+                            parent.display()
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    if c.max_body_bytes == 0 {
+        v.push("capture.max_body_bytes", "must be greater than zero");
+    }
+
+    // A retention shorter than one bucket would make the sweeper delete the file
+    // the writer is appending to.
+    let bucket = Duration::from_secs(
+        u64::try_from(crate::capture::bucket::BUCKET_SECS).expect("BUCKET_SECS is positive"),
+    );
+    if c.retention < bucket {
+        v.push(
+            "capture.retention",
+            format!(
+                "must be at least {}s, one bucket; a shorter retention would sweep the file \
+                 being written",
+                bucket.as_secs()
+            ),
+        );
+    }
+
+    if c.queue_depth == 0 {
+        v.push("capture.queue_depth", "must be at least 1");
+    }
+    if c.max_queue_bytes == 0 {
+        v.push("capture.max_queue_bytes", "must be greater than zero");
+    } else if c.max_queue_bytes < cfg.server.max_message_bytes.saturating_mul(2) {
+        // One maximum-size message is a ~1.34x base64 line, and the writer needs
+        // room for the one it is writing plus the next. Below that, the largest
+        // messages — the ones a capture is usually chasing — are the only ones
+        // that never make it into the file.
+        v.push(
+            "capture.max_queue_bytes",
+            format!(
+                "is {}, below twice server.max_message_bytes ({}); the largest messages would \
+                 always be dropped by the capture queue",
+                c.max_queue_bytes,
+                cfg.server.max_message_bytes.saturating_mul(2)
+            ),
+        );
+    }
+}
+
+/// Whether `dir` can be written to, reported as the OS reports it.
+///
+/// `std::fs::Permissions` answers "what do the mode bits say", which is not the
+/// question — the container runs as UID 1000 against a mount whose ownership
+/// nobody checked, and a read-only filesystem has perfectly permissive modes.
+/// Creating and removing a file is the only answer that is not a guess.
+fn writable(dir: &Path) -> std::io::Result<()> {
+    let probe = dir.join(format!(".simmer-capture-probe-{}", std::process::id()));
+    std::fs::File::create(&probe)?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 /// Why `upstream` is not `scheme://host[:port][/prefix]`, or `None` if it is.

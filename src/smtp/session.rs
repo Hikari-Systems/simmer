@@ -43,7 +43,8 @@ use super::buffer::{self, MessageBuffer};
 use super::command::{self, Command, MailParams, ParseError};
 use super::reply::{self, Reply};
 use super::Policy;
-use crate::config::{Config, IngressAuth, IngressTls};
+use crate::capture;
+use crate::config::{CaptureOnError, Config, IngressAuth, IngressTls};
 use crate::downstream::stream::Stream;
 use crate::metrics;
 use crate::relay::{self, Engine};
@@ -726,13 +727,18 @@ impl Session {
 
         // §5.4 — the From: header, from the head of the buffer only. A spilled
         // 25 MiB message must not be read back whole to answer this.
-        let from_header = match body.header_block(MAX_HEADER_SCAN).await {
-            Ok(head) => first_from_address(&head),
+        //
+        // The block is kept rather than consumed: D-085's capture wants the
+        // `Subject:` out of the same bytes, and reading the head twice for two
+        // headers would be a second seek and a second parse per message.
+        let head = match body.header_block(MAX_HEADER_SCAN).await {
+            Ok(head) => head,
             Err(e) => {
                 tracing::error!(correlation_id = %self.correlation_id, error = %e, "reading buffered message");
                 return Reply::new(451, "4.3.0 internal buffering error");
             }
         };
+        let from_header = first_from_address(&head);
 
         // D-071 — the header half of the ACL. `From:` first exists here, which is
         // the same split §5.4 lives with. A message with no parseable `From:` has
@@ -772,6 +778,68 @@ impl Session {
             spilled = body.is_spilled(),
             "message buffered"
         );
+
+        // D-085 — the debugging capture, here and deliberately *before* the
+        // relay.
+        //
+        // Two things follow from the position, and both are the point. A record
+        // written here cannot carry an outcome, a route or a retry count,
+        // because none of them exists yet — so nothing can mistake a capture
+        // directory for a spool, and §2.2 stays true. And `on_error: defer` can
+        // answer `451` honestly, because nothing has been relayed: raised after
+        // the downstream conversation, that reply would defer a message the
+        // downstream had already accepted and the client's retry would deliver
+        // it twice (§10.2, D-068).
+        //
+        // What it does not see: a message the D-071 header ACL refused above,
+        // and a message refused before the final dot. Neither was ever accepted.
+        // The reply this message does get is joinable on `correlation_id`, which
+        // §9.5 puts on every log line.
+        if let Some(cap) = self.engine.capture.clone() {
+            let record = capture::Record::build(
+                capture::Ingress {
+                    correlation_id: &self.correlation_id,
+                    at: chrono::Utc::now(),
+                    peer: self.peer,
+                    helo: self.greeted.as_deref().unwrap_or_default(),
+                    tls: self.encrypted(),
+                    auth_user: self.user.as_deref(),
+                    mail_from: tx.mail_from.as_deref(),
+                    rcpt_to: &tx.recipients,
+                    // A label for whoever reads the file, from the header block
+                    // already in hand. Never read back: a replay sends the body.
+                    subject: capture::subject_from_headers(&head),
+                    params: capture::Params {
+                        size: tx.params.size,
+                        body_8bitmime: tx.params.body_8bitmime,
+                        smtputf8: tx.params.smtputf8,
+                        auth_identity: tx.params.auth_identity.clone(),
+                    },
+                    body: &bytes,
+                },
+                cap.max_body_bytes(),
+            );
+
+            match cap.on_error() {
+                CaptureOnError::Continue => {
+                    // Never awaited: a slow disk must not become backpressure on
+                    // the relay. A drop is a gap in a debugging artefact.
+                    let _ = cap.offer(record);
+                }
+                CaptureOnError::Defer => {
+                    if let Err(reason) = cap.offer_durable(record).await {
+                        tracing::error!(
+                            correlation_id = %self.correlation_id,
+                            reason = %reason,
+                            "the message was not captured and capture.on_error is defer; \
+                             deferring it. Nothing has been relayed"
+                        );
+                        metrics::capture_deferred();
+                        return reply::capture_unavailable();
+                    }
+                }
+            }
+        }
 
         // Everything from here is §7.4: reserve, relay, commit or release. The
         // reservation is taken inside, immediately before the conversation, and

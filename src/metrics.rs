@@ -274,6 +274,70 @@ fn describe() {
         "Live tokio tasks: one per session plus the accept loops, sweepers and admin \
          server. Growth at a flat session count is a task leak"
     );
+
+    // D-085 — the debugging capture. None of these carries a route, a sender, a
+    // recipient or a path: the capture runs before route selection and does not
+    // know a route, and a label naming anything about the message would put in
+    // /metrics exactly what §7.3 hashes to keep out of the database. `reason` is
+    // a closed set of &'static str, which is F7's lesson about label values the
+    // client can influence.
+    describe_counter!(
+        "simmer_capture_records_total",
+        "D-085 messages appended to the capture log"
+    );
+    describe_counter!(
+        "simmer_capture_bytes_total",
+        Unit::Bytes,
+        "D-085 bytes appended to the capture log, serialised lines including base64"
+    );
+    describe_counter!(
+        "simmer_capture_dropped_total",
+        "D-085 records that never reached the file: queue_full, queue_bytes, \
+         write_error, open_error or shutdown. Under the default on_error: continue \
+         these are gaps in the capture and nothing else — the mail was unaffected"
+    );
+    describe_counter!(
+        "simmer_capture_deferred_total",
+        "D-085 messages answered 451 because the capture could not be written and \
+         capture.on_error is defer. ALERT ON THIS: mail is being stopped for a \
+         debugging feature"
+    );
+    describe_counter!(
+        "simmer_capture_body_omitted_total",
+        "D-085 records written without their body, over capture.max_body_bytes"
+    );
+    describe_counter!(
+        "simmer_capture_late_writes_total",
+        "D-085 records appended to a bucket file that had already been closed, \
+         because they arrived at the writer out of order. Harmless — the record is \
+         still in the bucket its timestamp belongs to, which is the invariant a \
+         replay's file selection rests on"
+    );
+    describe_counter!(
+        "simmer_capture_clock_regressions_total",
+        "D-085 records whose timestamp was more than one bucket behind the newest \
+         seen. Nonzero means this instance's wall clock stepped backwards; a replay \
+         of that range may need a wider --pad-buckets"
+    );
+    describe_counter!(
+        "simmer_capture_files_swept_total",
+        "D-085 bucket files deleted past capture.retention"
+    );
+    describe_gauge!(
+        "simmer_capture_queue_depth",
+        "D-085 records queued for the capture writer"
+    );
+    describe_gauge!(
+        "simmer_capture_queue_bytes",
+        Unit::Bytes,
+        "D-085 bytes queued for the capture writer, bounded by capture.max_queue_bytes"
+    );
+    describe_gauge!(
+        "simmer_capture_disk_bytes",
+        Unit::Bytes,
+        "D-085 bytes on disk in the capture directory, recomputed by the sweeper. \
+         This is what tells you a capture left on will fill the volume"
+    );
 }
 
 /// §9.1 `simmer_messages_total{route,domain_group,result}`.
@@ -686,4 +750,56 @@ pub fn link_proxy_connection_refused(reason: &'static str) {
 /// D-083 — open link proxy client connections.
 pub fn link_proxy_connections(open: usize) {
     metrics::gauge!("simmer_link_proxy_connections").set(open as f64);
+}
+
+// ---------------------------------------------------------------------------
+// D-085 — the debugging capture
+// ---------------------------------------------------------------------------
+
+/// One record appended to the capture log, and the bytes it took.
+pub fn capture_written(bytes: u64) {
+    counter!("simmer_capture_records_total").increment(1);
+    counter!("simmer_capture_bytes_total").increment(bytes);
+}
+
+/// A record that never reached the file. `reason` is one of `queue_full`,
+/// `queue_bytes`, `write_error`, `open_error`, `shutdown`.
+pub fn capture_dropped(reason: &'static str) {
+    counter!("simmer_capture_dropped_total", "reason" => reason).increment(1);
+}
+
+/// A message answered `451` because `capture.on_error` is `defer`.
+pub fn capture_deferred() {
+    counter!("simmer_capture_deferred_total").increment(1);
+}
+
+/// A record written without its body, over `capture.max_body_bytes`.
+pub fn capture_body_omitted() {
+    counter!("simmer_capture_body_omitted_total").increment(1);
+}
+
+/// A record appended to a bucket file that had already been closed.
+pub fn capture_late_write() {
+    counter!("simmer_capture_late_writes_total").increment(1);
+}
+
+/// A record whose timestamp was more than one bucket behind the newest seen.
+pub fn capture_clock_regression() {
+    counter!("simmer_capture_clock_regressions_total").increment(1);
+}
+
+/// Bucket files deleted past their retention.
+pub fn capture_files_swept(n: u64) {
+    counter!("simmer_capture_files_swept_total").increment(n);
+}
+
+/// The writer's queue, as it stood at the last idle tick.
+pub fn capture_queue(depth: usize, bytes: u64) {
+    metrics::gauge!("simmer_capture_queue_depth").set(depth as f64);
+    metrics::gauge!("simmer_capture_queue_bytes").set(bytes as f64);
+}
+
+/// Bytes on disk in the capture directory, as the sweeper last counted them.
+pub fn capture_disk_bytes(n: u64) {
+    metrics::gauge!("simmer_capture_disk_bytes").set(n as f64);
 }
