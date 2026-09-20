@@ -116,6 +116,17 @@ passing. Alongside it, the `STARTTLS` injection check in `session::starttls` is 
 the session in step, and do not reset `auth_failures` in the handshake reset
 (D-070).
 
+And an eighth, from D-085, because it is exactly what a future reader will
+misjudge: **the capture is not a spool, and the way it is not is structural.**
+If you add an outcome field, a retry count, a "pending" state, or any read path
+from `capture::` into `relay::`, you have built the thing §2.2 forbids. The
+record is written *before* the relay precisely so it cannot know what happened —
+which is also what lets `on_error: defer` answer `451` honestly, since nothing
+has been relayed yet. Move the capture after the relay and that `451` becomes a
+duplicate delivery on the client's retry (§10.2, D-068); that was the first
+draft, and D-085 records why it was wrong. `server replay` delivers mail twice on
+purpose; never point it at production. `docs/CAPTURE.md` is the long form.
+
 ## Build and run
 
 ```sh
@@ -154,6 +165,10 @@ loadgen, not the server. `docker-compose.yml`'s `app` service pins it; a
 deployment pipeline would have to as well.
 
 `SIMMER_CONFIG` overrides the config path (default `simmer.yaml`).
+
+The `server` binary has three subcommands, each a no-op unless it is `argv[1]`
+and each running before the config is read: `hash-password`, `healthcheck`, and
+`replay` (D-086). `replay` is the only one that needs the runtime.
 
 The §12.3 acceptance suite runs against its own stack and is **not** in
 `cargo test` — it needs Docker and a couple of minutes of container restarts:
@@ -222,6 +237,23 @@ src/quota/mssql.rs       §7.4 over SQL Server. UPDATE WITH (UPDLOCK, SERIALIZAB
 migrations-mssql/        the same schema in T-SQL. BIN2 collation on every key
 tests/store_conformance/ §11's contract, run against both backends
 src/hash_password.rs     `server hash-password`. Reads stdin, never argv
+src/capture/mod.rs       D-085 — the optional debugging capture. WRITE-ONLY: it
+                         exposes no read method, so nothing in the delivery path
+                         can consult it. Off unless `capture:` is configured
+src/capture/record.rs    the JSONL schema. It carries NO outcome and no derived
+                         state, and a test asserts the key set exactly
+src/capture/writer.rs    one task behind a bounded queue. `try_send`, never
+                         `send().await` — awaiting it would make a slow disk into
+                         backpressure on the relay
+src/capture/bucket.rs    the 10-minute filename. A record's `at` is ALWAYS inside
+                         the bucket its file names; that is what replay rests on
+src/capture/replay.rs    `server replay` (D-086). A DUPLICATE-DELIVERY machine by
+                         design (§10.2) that spends the target's quota a second
+                         time (§7.4). `--confirm` is not optional
+src/capture/client.rs    the replay's SMTP client. NOT `downstream/client.rs` — no
+                         pool, no route, no D-068 retry — and NOT loadgen's: it
+                         cannot express a misbehaviour mode, which is why it may
+                         ship in the runtime image
 src/link_proxy/mod.rs    §5.7 (D-083) — the optional HTTP link forwarder. The
                          forwarding is axum-reverse-proxy's; the listener, the
                          no-store rule and the query-free logging are ours

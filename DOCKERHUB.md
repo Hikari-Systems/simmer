@@ -86,6 +86,7 @@ Subcommands, as the first argument:
 | *(none)* | Run the relay |
 | `healthcheck` | Exit 0 if the admin port answers `GET /healthcheck` |
 | `hash-password` | Read a password on stdin, print an argon2id PHC string |
+| `replay` | Re-send captured messages to another Simmer (D-086). **Delivers mail.** |
 
 ## Two images: Postgres and SQL Server
 
@@ -343,6 +344,14 @@ Every mutation is audited at `INFO` with the acting token's name.
   standing pair is not.
 - **Leave `database.fail_closed: true`.** A quota enforcer that stops enforcing
   when its database is unreachable provides no guarantee at all.
+- **If you enable `capture:`, mount a writable volume for it and remember what
+  is in it.** The image runs as UID 1000 with a read-only root filesystem, so the
+  directory must be a volume that UID owns — a host bind mount usually is not.
+  Simmer creates it `0700` and its files `0600`. It holds every recipient
+  address and every message body in plaintext: treat the volume as you would a
+  mailbox, alert on `simmer_capture_disk_bytes`, and delete it when the
+  investigation is over. Capture is a debugging mode and is off unless
+  configured; startup warns on every boot while it is on.
 - **Alert on `simmer_unmatched_sender_total`** (a sender typo sends unwarmed
   traffic at full volume via the default chain) and
   **`simmer_sender_not_permitted_total`** (a misconfigured app, or someone

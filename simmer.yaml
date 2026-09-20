@@ -122,6 +122,50 @@ logging:
 #     upstream_response: 30s         # to response headers; 504 after
 #     idle: 60s
 
+# D-085 — an optional debugging capture of every accepted message. Absent means
+# nothing is written and no task is started, which is how it should normally be.
+#
+# THIS IS A DEBUGGING MODE, NOT A SPOOL. Nothing in the delivery path reads it, a
+# record carries no outcome and no delivery state, and it recovers nothing after
+# a crash — §2.2 is untouched. What it does do is accumulate, in plaintext, every
+# recipient address and every message body that passes through. §7.3 hashes
+# recipients precisely to avoid that, so treat the directory as you would a
+# mailbox, and turn this off when the investigation is over. Startup warns about
+# it on every boot, deliberately.
+#
+# Records are JSON, one per line, in files of ten minutes each, named for the
+# bucket they cover (`2026-09-20T14.10.jsonl`, UTC). Each line opens with the
+# four fields that identify a message to a person — timestamp, recipient,
+# sender, subject — so a bucket is scannable without a parser:
+#
+#   cut -c1-140 2026-09-20T14.10.jsonl
+#   jq -r '[.at, .rcpt_to[0], .mail_from, .subject] | @tsv' 2026-09-20T14.10.jsonl
+#
+# Replay a range with:
+#
+#   server replay --dir <directory> --from <ts> --to <ts> --host <target> --dry-run
+#
+# The container's root filesystem is read-only, so `directory` must name a
+# writable volume owned by UID 1000 — see the commented mount in
+# docker-compose.yml.
+#
+# capture:
+#   directory: "/var/lib/simmer/capture"
+#   max_body_bytes: 1048576          # above this the envelope is kept, the body is not
+#   retention: 24h                   # whole buckets are deleted past this; min 10m
+#   on_error: continue               # or `defer`, below
+#   queue_depth: 1024                # records that may be waiting for the writer
+#   max_queue_bytes: 67108864        # and the memory they may occupy
+#
+# `on_error: continue` is the default and the right one: a failed capture write
+# is logged, counted on simmer_capture_dropped_total, and the message is relayed
+# anyway. A debugging aid must not be able to stop mail.
+#
+# `on_error: defer` answers 451 instead, *before* anything is relayed — which is
+# only coherent because the capture happens before the downstream conversation.
+# Use it when a gap would invalidate the run, and know that a full disk then
+# stops mail.
+
 # §3.1: the second axis of the quota key. Literal domains only — no MX-based or
 # heuristic grouping (§14.3), so Google Workspace custom domains land in the
 # catch-all rather than being tracked against Google.

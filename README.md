@@ -474,6 +474,67 @@ database:
   Server's default collation would merge them.
 - SQL Server authentication only: no Windows or Kerberos integrated login.
 
+## Capturing and replaying traffic
+
+Optional, off by default, and a **debugging mode rather than a spool** — see
+`docs/CAPTURE.md` for the long form and `DECISIONS.md` D-085/D-086 for why it is
+allowed to exist alongside "Simmer is not an MTA".
+
+With a `capture:` block configured, every accepted message is appended to a JSONL
+file rotated every ten minutes:
+
+```
+/var/lib/simmer/capture/2026-09-20T14.10.jsonl
+```
+
+Each line opens with the four fields that identify a message to a person —
+timestamp, recipient, sender, subject — so a bucket is scannable without a
+parser:
+
+```console
+$ cut -c1-140 2026-09-20T14.10.jsonl
+{"at":"2026-09-20T14:13:02.418Z","rcpt_to":["bob@gmail.com"],"mail_from":"news@oldbrand.com","subject":"Your September statement","v":1,
+```
+
+`server replay` reads a range back out and sends it to another Simmer, as the
+original client did:
+
+```sh
+# always count first — this connects to nothing
+server replay --dir /var/lib/simmer/capture \
+  --from 2026-09-20T14:00:00Z --to 2026-09-20T15:00:00Z \
+  --host app2 --dry-run
+
+# and then mean it
+SIMMER_REPLAY_PASSWORD_CFAPP=... server replay \
+  --dir /var/lib/simmer/capture \
+  --from 2026-09-20T14:00:00Z --to 2026-09-20T15:00:00Z \
+  --host app2 --confirm
+```
+
+### Before you enable this
+
+- **The directory is a mailbox.** Every recipient address and every body, in
+  plaintext. §7.3 hashes recipients precisely to avoid the container
+  accumulating that. It is `0700`, the files are `0600`, retention defaults to
+  24h, and startup warns on every boot. Delete it when the investigation ends.
+- **A captured body may hold anything** your application sends — password-reset
+  links, one-time codes, session tokens. Nothing can filter that.
+- **It costs disk.** A 25 MiB message is a ~34 MiB line. `max_body_bytes`
+  (default 1 MiB) and `retention` bound it; alert on
+  `simmer_capture_disk_bytes`.
+- **Replay delivers mail twice, on purpose**, and spends the target's warm-up
+  quota (§7.4) doing so. Point it at a test instance, never production.
+  `--confirm` is required and has no default, and so is `--host`.
+- **A capture write failure does not stop mail** under the default
+  `on_error: continue`. Set `on_error: defer` only when a gap would invalidate
+  the run, and know that a full disk then answers `451`.
+
+Nothing about the capture is reachable through the control plane, deliberately:
+a `/routes` or `/quota` response carrying a recipient would undo §7.3's whole
+reason for hashing, and a capture browser would turn a debugging mode into a
+permanent one.
+
 ## Control plane
 
 On `admin.listen`, port 8080 by default. `/health`, `/healthcheck` and `/metrics`
@@ -671,6 +732,9 @@ src/frequency/  §7.3 normalisation, the keyed hash, the rolling window, evictio
 src/models/     runtime sqlx over &PgPool, house pattern (Postgres build only)
 src/rewrite/    §6 the rewriting engine: templates, headers, encoding, stability
 src/preflight/  §6.7 the DNS preflight: three checks, a registry, an interval
+src/capture/    D-085's debugging capture and D-086's `server replay`.
+                Write-only from the delivery path's side; a record carries no
+                outcome, which is what keeps it from being a spool
 src/relay.rs    decide -> reserve -> rewrite -> relay -> commit/release
 src/metrics.rs  §9.1 counters and the Prometheus recorder
 src/admin/      the §9 control plane: reads, writes, dry run, /metrics

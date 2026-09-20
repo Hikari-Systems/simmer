@@ -27,6 +27,25 @@ services:
       # unused: `simmer.yaml` configures no TLS, and a mount that differed by
       # profile would make compose re-create `app` between the two.
       - acceptance-tls:/tls:ro
+      # D-085's capture directory. Commented out with the `capture:` block in
+      # simmer.yaml: mounting it unconditionally would make compose re-create
+      # `app` when the block is uncommented, and the two belong together.
+      #
+      # A named volume rather than a bind mount, and this is load-bearing twice
+      # over: `read_only: true` below means the container cannot write to its own
+      # filesystem, and the process runs as UID 1000, which a host directory is
+      # unlikely to be owned by.
+      #
+      # A *fresh* named volume is created root-owned, so the first start refuses
+      # with `capture.directory ... is not writable` — which is the right
+      # failure, since the alternative is a capture that silently records
+      # nothing. Give it to UID 1000 once:
+      #
+      #   docker run --rm -v simmer_capture:/d alpine chown 1000:1000 /d
+      #
+      # It holds plaintext mail — treat it as a mailbox, and
+      # `docker volume rm simmer_capture` when the investigation is over.
+      # - capture:/var/lib/simmer/capture
     read_only: true
     # The container runs as non-root (UID 1000), and §5.1 defaults the listener
     # to port 25 — a privileged port. Without this the SMTP bind fails with
@@ -278,6 +297,10 @@ services:
         condition: service_healthy
 
 volumes:
+  # D-085's capture directory, used only when the mount above and the `capture:`
+  # block in simmer.yaml are both uncommented. Declared unconditionally because a
+  # volume nothing mounts costs nothing.
+  capture:
   acceptance-tls:
   # tls-init's OS trust store: Debian's roots plus the per-run test CA. Mounted
   # only by the acceptance override (test/compose/acceptance.yml) — mounted here,

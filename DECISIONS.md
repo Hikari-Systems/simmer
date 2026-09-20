@@ -2936,6 +2936,212 @@ Otherwise:
   sanitised anyway, so that widening the trigger to `'**'` does not break the
   GHCR copy.
 
+### D-085 — A debugging capture of every accepted message
+
+**Diverges from `SPEC.md` §2.2**, which says Simmer "does not own messages —
+no spool, no queue, no retry scheduler"; from **§8.1**, which says the `DATA`
+buffer "is a transient buffer, not a spool. No durability guarantee attaches to
+it"; from **§9.5**, "message bodies are never logged; recipient addresses are
+logged only at `DEBUG`"; and from **§7.3**, which hashes recipient addresses
+because a plaintext record of every address mailed "is a data-protection
+liability with no operational benefit".
+
+Asked for on 2026-09-20 by the repository's owner, and framed by them in the same
+breath: *"this is intended not as a spool, but as a debugging mode used for
+testing only."* The spec is **not** amended; see O-15.
+
+`CLAUDE.md`'s first "thing that will bite you" says that if you find yourself
+designing message persistence, stop. This *is* message persistence, so the
+framing cannot be a sentence in a comment. Four properties make it structural,
+and each one has a test:
+
+1. **The delivery path has no read path into it.** `capture::Capture` exposes
+   `offer`, `offer_durable` and two accessors, and no `read`, `list`, `iter` or
+   `find`. Nothing downstream of `Engine::capture` can consult the capture to
+   decide what to deliver, because there is no API through which to do it. The
+   only reader in the crate is `capture::replay`, which is an SMTP client
+   reachable only from a subcommand.
+2. **A record cannot express delivery state.** It is built *before* the route
+   walk and before the downstream conversation, so at the moment it exists there
+   is no route, no domain group, no reply and no attempt count — and therefore no
+   field for any of them. A spool's minimum schema is "the message, and what we
+   still owe it"; this format has only the first half.
+   `record::tests::the_field_set_is_exactly_the_schema` asserts the emitted key
+   set exactly, so adding `reply`, `attempts` or `state` breaks a test rather
+   than passing review.
+3. **It recovers nothing.** No crash recovery, no retry, no `fsync` under the
+   default. A message missing from the log was still delivered or still refused
+   according to what its client was told.
+4. **It is off unless configured, and bounded when it is on.** Absent `capture:`
+   means no directory, no task and no metric. Present means a retention §4.2
+   refuses to set below one bucket, an hourly sweeper, and
+   `simmer_capture_disk_bytes` to alert on.
+
+**§7.3, answered by name.** §7.3's sentence is about what the container
+accumulates *as part of its operation*, and that is unchanged: `recipient_event`
+is still an HMAC under a persisted salt (D-048) and still swept. Capture is a
+deliberate, temporary, operator-enabled exception to it, bounded by five things:
+off unless configured; directory `0700` and files `0600`, set by the process
+rather than inherited from a umask; a nonzero retention with a sweeper; a startup
+`WARN` naming §7.3 and the directory, emitted on **every** boot and not
+conditional on anything; and **no admin API surface at all**. That last is
+deliberate rather than an omission — `tests/admin_api.rs`'s assertion that no
+read endpoint emits so much as an `@` stays untouched, and a capture browser on
+the control plane is exactly what would turn a debugging mode into a permanent
+one.
+
+**§9.5 is untouched**, because the capture is not a log. The writer owns its own
+file and never goes through the `tracing` subscriber, so nothing here can reach a
+log shipper that fans out to a SIEM. No capture log line carries a body, and none
+carries a recipient above `DEBUG`.
+
+**Where the capture happens, and why it is before the relay.** In
+`session::route_and_relay`, immediately after `body.read_all()` and before
+`relay::reserve_relay_commit`. The first draft of this feature put it *after* the
+relay so a record could carry the reply, and that was wrong for a reason worth
+recording: `on_error: defer` would then answer `451` for a message the downstream
+had **already accepted**, and the client's retry would deliver it twice. That is
+§10.2's hazard, which D-068 spends three load-bearing conditions avoiding by
+accident, manufactured here on purpose. Before the relay, `defer` defers a
+message nothing has accepted yet, and property 2 above falls out for free.
+
+The reply is not lost. `Record::id` is the session's `correlation_id`, which §9.5
+already puts on every log line including the one carrying the downstream reply
+code, so joining the two is one `jq`.
+
+**What is not captured**, and both are documented rather than discovered: a
+message the D-071 `From:`-header ACL refused, which never reached a route; and a
+message refused before the final dot — oversize, a `DATA` timeout, a dropped
+connection — where there is no complete message to record.
+
+**Field order is for the reader.** The first four serialised fields are `at`,
+`rcpt_to`, `mail_from`, `subject` — when, to whom, from whom, about what — so
+`cut -c1-160` over a bucket shows what identifies each message to a person
+before any of the machinery, with the base64 body pushed off the right. JSON
+object order means nothing to a parser, so nothing depends on it; it is
+declaration order in `Record`, asserted on the serialised bytes by
+`the_first_four_fields_are_when_to_from_and_about_what`.
+
+`subject` is the one field that is a projection of the body rather than something
+the transaction carried, which is a real exception to "nothing derived" and is
+made on purpose: it is what makes a bucket file scannable, and when
+`body_omitted` is true it is the only human handle the record has left. It is
+RFC 2047-decoded, unfolded and cut to 200 characters with a `…`, so it is **not**
+byte-faithful — and it is never read back, because a replay sends `body_b64`. A
+message with no `Subject:` records `""` rather than `null`, so the row of four
+stays a uniform four strings for `jq` and for a column-aligned dump. Extraction
+reuses the header block `session::route_and_relay` had already read for §5.4's
+`From:`, so it costs no extra seek and no extra parse.
+
+**The file format.** One JSON object per line in files of ten minutes,
+`2026-09-20T14.10.jsonl`, UTC, the minute zero-padded so lexical order is time
+order. The name round-trips through `bucket::parse`, and a file that does not is
+not ours — which is how the sweeper can be sure it never deletes an operator's
+notes, and why no index file exists: an index is state that can disagree with the
+data, and a filename cannot.
+
+The invariant the replay reader rests on is that **a record's timestamp is always
+inside the window of the bucket its file names**. Rollover is therefore driven by
+the record's own timestamp, never the writer's clock. A record arriving out of
+order re-opens its own bucket (`simmer_capture_late_writes_total`), and a wall
+clock stepping backwards does the same at scale
+(`simmer_capture_clock_regressions_total`, plus a WARN). The cost is that lines
+within one file are not guaranteed ordered, which is why the reader sorts. The
+alternative — clamping a timestamp forward to keep a file tidy — would put a lie
+in a file whose entire value is that its timestamps are true.
+
+**Not chosen: a shared `Mutex<BufWriter<File>>`.** It puts the write, the flush,
+the rollover and the file open inline on the message path under a lock held
+across `await`s, so every concurrent session serialises against one disk and a
+stalled disk stalls all of them at once. A single writer task behind a bounded
+`mpsc` costs one channel send. Relatedly, `offer` uses `try_send` and **never**
+`send().await`: awaiting a full capture queue is precisely how a slow disk
+becomes backpressure on the relay.
+
+**Not chosen: sidecar `.eml` files.** A pointer plus a file is two things that
+can disagree, and a bucket becomes a directory of thousands of entries. Inline
+base64 costs ~34% and keeps a line self-contained. Bodies over
+`max_body_bytes` (default 1 MiB, deliberately §8.1's spill threshold) are omitted
+with their `size` and `sha256` kept, so the record still names the message.
+
+**Known limits, accepted.** No `fsync` under `on_error: continue`, so a power cut
+loses at most the last second — which costs nothing for a debugging artefact and
+would otherwise put disk latency on the reply path. And the queue drops rather
+than blocking, so a sustained write stall shows up as
+`simmer_capture_dropped_total` and a gap, never as slower mail.
+
+### D-086 — `server replay`, and the client it speaks with
+
+The other half of D-085: a subcommand that reads a timestamp range out of a
+capture directory and sends those messages again, as the original client did.
+
+**A subcommand, not a `[[bin]]`.** `loadgen` and `sink` are not in the shipped
+image and should not be; this has to be, because the operator with a capture
+directory is the operator on the box. It follows `healthcheck`'s shape —
+`args_from` split from `check_subcommand` so the grammar is testable, since
+`check_subcommand` ends in `process::exit` and a test cannot survive that — and
+runs before the config is read, because a replay is told everything on the
+command line and must work from a machine that has no `simmer.yaml`.
+
+**It delivers mail twice, on purpose.** That is the function, not a side effect,
+and §10.2 and D-068 are the prior art for how carefully the codebase otherwise
+avoids it. So it is gated: `--confirm` is required and has no default; `--host`
+is required and has no default, so there is no "accidentally localhost";
+`--dry-run` connects to nothing; and without `--confirm` it prints what it would
+send, names the target, and exits 3 having sent nothing.
+
+**It spends the target's quota.** A replayed message takes a §7.4 reservation and
+commits exactly as a real one does, because a replay that bypassed quota would
+not be exercising the thing under test. Replaying a day's traffic into a
+production instance therefore corrupts that instance's ramp. The target is a test
+instance, and `--help`, the README and `CLAUDE.md` all say so.
+
+**It adds nothing to the message.** No marker header, no stamp. `loadgen --stamp`
+is opt-in for exactly this reason: an extra header breaks the §1.1 byte-equality
+property, which is the only property that makes a replay worth running.
+`tests/capture_replay.rs` asserts the equality across seven deliberately awkward
+message shapes, and a mutation that prepends one header to the replayed body
+fails it.
+
+**A new client, at `src/capture/client.rs`.** Neither existing one fits.
+`downstream::client` is the relay leg: it needs a `&Route` and a `&Pool`, its
+`Connection` methods are `pub(super)`, and D-068's single retry is the opposite
+of what a replay should do — D-068's third condition exists because a retry at
+the final dot is how one message becomes two, and replay is already sending a
+second copy deliberately. `loadgen`'s conversation is unreachable from the
+library and is welded to `Behaviour::{Silent, NoopIdle, DataTrickle, NoLf}`;
+lifting it would put a client that holds a connection open and dribbles one byte
+at a time into the runtime image, where §2.3's trusted-segment assumption is
+doing real work. The new surface **cannot express any of them** — no hold, no
+trickle, no partial-line write — and that is structural, not a comment.
+
+It adds no dependencies: `downstream::stream::Stream` for the three TLS modes,
+`smtp::buffer::stuff_into` for dot-stuffing (the same function the outbound leg
+uses, so a replay and a relay cannot disagree about what it means), and `base64`
+for AUTH.
+
+**Follow-up, not done here:** `loadgen`'s `Behaviour::Send` could be refactored
+onto this client so there is one conversation rather than two. It was left alone
+deliberately — `loadgen` is the acceptance suite's sender and the only tier that
+proves §1.1's byte-equality, so changing it is the riskiest edit available and
+does not belong in the same change as the feature it would serve.
+
+**Credentials are resolved before anything is sent.** Every distinct user in the
+selected range is resolved during planning; a missing password exits 4 having
+sent nothing. Discovering it after four thousand of ten thousand messages have
+been delivered is the failure to avoid, and it is not one that can be undone.
+The order is `--password-env`, then `SIMMER_REPLAY_PASSWORD_<USER>`, then
+`SIMMER_REPLAY_PASSWORD`. There is no `--password` flag: passing one is caught by
+name and refused with the reason, because a password on argv lands in shell
+history, `ps` output and the container's recorded command line — `hash-password`'s
+stdin rule, generalised.
+
+**A record whose delivery failed the first time is indistinguishable from one
+that succeeded**, because D-085's record carries no reply. That is the right
+answer rather than a gap: keeping the outcome out of the format is what keeps the
+format from becoming a spool's journal. Join `id` against the log stream to
+select a subset.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -2956,6 +3162,7 @@ the phase that depends on each.
 | ~~O-11~~ | *Settled in phase 7 — see **D-053**. Named `admin.tokens` alongside `auth_token`, which is the token named `default`. The working assumption held: named tokens, not dropped wording.* | | |
 | ~~O-12~~ | *Settled in phase 3: DST transitions both directions, a start inside a DST gap, and a future start are all tested; the leap-second case is asserted to be a no-op rather than merely argued.* | | |
 | ~~O-13~~ | *Settled 2026-09-17 by the spec's author: amend the spec. §2.1, §2.2, §2.3, §4.1, §4.2, §5.7 (new), §9.1, §9.5, §10.4, §12.1 and §13 now carry the link proxy — see **D-083**.* | | |
+| O-15 | Does the D-085 capture need a `SPEC.md` amendment, or does it stay a recorded divergence? It is off by default, never read by the delivery path, and carries no delivery state — but it *is* message persistence, and §2.2, §8.1, §7.3 and §9.5 each say something a reader of the spec alone would take to exclude it. If amended, the sections are §2.2 (a carve-out), §4.1/§4.2 (the block and its rules), §9.1 (eleven metrics), §9.5 (where bodies *do* go), §12.2 (the volume) and §13 (a phase 13). | A divergence, recorded in D-085 and D-086. `SPEC.md` is unchanged and no phase 13 is added — D-084's precedent, and it follows from the owner's own framing: §13's phases describe the product, and a debugging mode that ships off and plays no part in delivery is not one of them | Before the next spec amendment |
 | O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment |
 
 
