@@ -3,7 +3,7 @@
 An SMTP relay facade that applies a domain reputation warm-up ramp.
 
 <!-- current-version: source of truth for the release number. Keep in sync with the git tag, DOCKERHUB.md, and Cargo.toml; enforced by .githooks/pre-push and the release CI. -->
-**Current version: `v0.5.0`** — [all releases](https://github.com/Hikari-Systems/simmer/releases).
+**Current version: `v0.6.0`** — [all releases](https://github.com/Hikari-Systems/simmer/releases).
 
 Simmer sits between an application and one or more real SMTP providers. It
 accepts a message, selects an outbound route according to quota state, rewrites
