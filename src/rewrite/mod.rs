@@ -10,7 +10,7 @@
 //! 2. Parse into headers and MIME structure
 //! 4. Strip authentication artefacts (§6.5)
 //! 5. Apply remove_headers
-//! 5a. Apply header_rewrites (D-089 — not in SPEC.md; O-16)
+//! 5a. Apply header_rewrites (§6.2, D-089)
 //! 6. Apply set_headers, rendering templates
 //! 7. Apply body_rewrites to text/* parts (§6.4)
 //! 8. Prepend a Received: header naming Simmer

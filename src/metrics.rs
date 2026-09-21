@@ -462,8 +462,8 @@ pub fn body_rewrite_skipped(route: &str, reason: &'static str) {
     .increment(1);
 }
 
-/// `simmer_header_rewrite_skipped_total{route,header,reason}` — D-089, and so
-/// not in §9.1. `body_rewrite_skipped`'s argument for headers: a configured
+/// §9.1 `simmer_header_rewrite_skipped_total{route,header,reason}` (§6.2,
+/// D-089). `body_rewrite_skipped`'s argument for headers: a configured
 /// rewrite that silently stops applying is invisible everywhere else. `header`
 /// is bounded by configuration — it is always a name some route's
 /// `header_rewrites` spells — never by what a message carries.

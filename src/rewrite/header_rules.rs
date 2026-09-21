@@ -1,10 +1,9 @@
 //! `header_rewrites` (D-089) — a regex replacement over one named header's value.
 //!
-//! **Not in `SPEC.md`.** §6.2 gives headers two mechanisms, `set_headers` (an
-//! absolute template, §6.3) and `remove_headers`, and neither can move the host
-//! of a `List-Unsubscribe` URL while keeping the per-message token after it.
-//! This is the third, with `body_rewrites`' shape. O-16 in `DECISIONS.md` is
-//! the question it puts to the spec's author.
+//! `SPEC.md` §6.2, since the 2026-09-21 amendment (O-16). `set_headers` (an
+//! absolute template, §6.3) and `remove_headers` cannot move the host of a
+//! `List-Unsubscribe` URL while keeping the per-message token after it. This is
+//! the third mechanism, with `body_rewrites`' shape.
 //!
 //! ## Where it runs
 //!

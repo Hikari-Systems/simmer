@@ -839,8 +839,7 @@ pub struct Identity {
     #[serde(default)]
     pub body_rewrites: Vec<BodyRewrite>,
     /// D-089 — a regex replacement over one named header's value, applied
-    /// after `remove_headers` and before `set_headers`, in order. Not in
-    /// `SPEC.md`; O-16 is the open question.
+    /// after `remove_headers` and before `set_headers`, in order. §6.2.
     #[serde(default)]
     pub header_rewrites: Vec<HeaderRewrite>,
 }

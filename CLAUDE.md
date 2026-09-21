@@ -20,7 +20,9 @@ becomes a spec amendment only when its question has been put to the author and
 answered.** Everything else stays a `DECISIONS.md` entry. See "The spec
 settlements (after phase 10)" for what changed and what was deliberately left
 alone. The same rule produced the 2026-09-17 amendment for the link proxy
-(§5.7, and the sections D-083 lists), after O-13 was put to the author.
+(§5.7, and the sections D-083 lists), after O-13 was put to the author, and the
+2026-09-21 one for `header_rewrites` (§6.1 step 5a, §6.2, and the sections D-089
+lists), after O-16 was.
 
 ## The four things that will bite you
 
@@ -234,7 +236,7 @@ src/rewrite/encode.rs    RFC 2047/5322 conformance. EVERY function is idempotent
 src/rewrite/headers.rs   an untouched header keeps its ORIGINAL BYTES (D-039)
 src/rewrite/mime.rs      §6.4's structure, as byte RANGES into the body (D-043)
 src/rewrite/body.rs      §6.4 itself. No match means no re-encode — that is the point
-src/rewrite/header_rules.rs  D-089's header_rewrites — NOT in SPEC.md (O-16). Matched on
+src/rewrite/header_rules.rs  §6.2's header_rewrites (D-089). Matched on
                          the RFC 2047-DECODED value; a header no rule changes keeps its bytes
 src/rewrite/transfer.rs  quoted-printable and base64, each with a matching encoder
 src/rewrite/charset.rs   four charsets, by hand. Anything else is "unknown" (D-044)

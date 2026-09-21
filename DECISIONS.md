@@ -3331,10 +3331,14 @@ It also gave F17's fix its hook: a flush knows exactly how many bytes it pushed.
 
 ### D-089 — A per-route `header_rewrites` list: regex replacement over a header's value
 
-> **Open — O-16.** This diverges from `SPEC.md` as written, so it is recorded
-> here and `SPEC.md` is unchanged. §6.1, §6.2, §4.1, §4.2 and §9.1 say nothing
-> about it until the question below has been put to the spec's author and
-> answered. The proposed amendment text is at the end of this entry.
+> **Settled 2026-09-21 by the spec's author: amend the spec (O-16).** This was
+> built and released in v0.4.0 as a recorded divergence, and the question put
+> the same day; the answer was yes — "this is the change I wanted". `SPEC.md`
+> now carries it: §4.1's example, three §4.2 rules, §6.1 step 5a (numbered so no
+> existing step reference moves), §6.2's table row and a paragraph stating how
+> it satisfies §1.1, a `header_rewrites` class in §6.6, and the §9.1 counter.
+> The proposed text below is kept as the record of what was asked; the spec's
+> wording is what applies.
 
 **Spec:** §6.2 gives headers two mechanisms: `set_headers`, whose values are §6.3
 templates (variable substitution only), and `remove_headers`. §6.4's
@@ -3378,7 +3382,7 @@ severity for a stale expectation).
 
 **How each existing constraint is met.**
 
-- **§1.1 — see O-16; this is the part that needs the author.** Constraint 1
+- **§1.1 — O-16, now settled: this was the part that needed the author.** Constraint 1
   says rewrites are "absolute assignments, never relative transformations", and
   a regex replacement that keeps the token *is* a relative transformation of the
   value: its output is a function of what it overwrites. `body_rewrites` is
@@ -3475,7 +3479,8 @@ end to end, and `simmer.acceptance.yaml` has no `header_rewrites`. §9.4's dry r
 shows the rewritten header block, since it runs the real engine, but has no
 per-rule match report for headers as it does for `body_rewrites`.
 
-**Proposed amendment, if O-16 is answered yes:**
+**Proposed amendment, as put with O-16 (applied 2026-09-21, with §6.1's step
+numbered 5a rather than 6):**
 
 - §6.1: a step between 5 and 6 — "Apply `header_rewrites` to the named headers'
   decoded values."
@@ -3514,7 +3519,7 @@ the phase that depends on each.
 | ~~O-12~~ | *Settled in phase 3: DST transitions both directions, a start inside a DST gap, and a future start are all tested; the leap-second case is asserted to be a no-op rather than merely argued.* | | |
 | ~~O-13~~ | *Settled 2026-09-17 by the spec's author: amend the spec. §2.1, §2.2, §2.3, §4.1, §4.2, §5.7 (new), §9.1, §9.5, §10.4, §12.1 and §13 now carry the link proxy — see **D-083**.* | | |
 | O-15 | Does the D-085 capture need a `SPEC.md` amendment, or does it stay a recorded divergence? It is off by default, never read by the delivery path, and carries no delivery state — but it *is* message persistence, and §2.2, §8.1, §7.3 and §9.5 each say something a reader of the spec alone would take to exclude it. If amended, the sections are §2.2 (a carve-out), §4.1/§4.2 (the block and its rules), §9.1 (eleven metrics), §9.5 (where bodies *do* go), §12.2 (the volume) and §13 (a phase 13). | A divergence, recorded in D-085 and D-086. `SPEC.md` is unchanged and no phase 13 is added — D-084's precedent, and it follows from the owner's own framing: §13's phases describe the product, and a debugging mode that ships off and plays no part in delivery is not one of them | Before the next spec amendment |
-| O-16 | May a route rewrite a header's value by regex — **D-089**'s `header_rewrites`? §1.1 constraint 1 says rewrites are "absolute assignments, never relative transformations", and a pattern replacement that keeps a per-message token is a relative transformation of that value, as `body_rewrites` is of a body. Is "stable under repetition, and the target expressible as application-side config" the test §1.1 means for headers too? If yes, the amendment D-089 drafts (§4.1, §4.2, §6.1, §6.2, §6.6, §9.1). If no, how should a `List-Unsubscribe` carrying a per-message token be pointed at the §5.7 proxy? | Yes, with identity fields refused outright and instability fatal with no override. Built and shipped as a recorded divergence; `SPEC.md` unchanged | Before the next spec amendment — and before any route relies on it for identity-adjacent headers |
+| ~~O-16~~ | *Settled 2026-09-21 by the spec's author: amend the spec. §4.1, §4.2, §6.1 (step 5a), §6.2, §6.6 and §9.1 now carry `header_rewrites` — see **D-089**.* | | |
 | O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment |
 
 

@@ -320,6 +320,10 @@ routes:
       body_rewrites:
         - pattern: 'https://oldbrand\.com/'
           replacement: "https://newbrand.com/"
+      header_rewrites:                 # §6.2; between remove_headers and set_headers, so a
+        - header: List-Help            # header set_headers also names (List-Unsubscribe
+          pattern: '<https://oldbrand\.com/'   # above) is set, not rewritten
+          replacement: "<https://click.newbrand.com/"
     preflight:
       enabled: true
       spf_include: "spf.postal.internal"
@@ -384,6 +388,13 @@ not just the first.
 this inverts: plaintext AUTH is now refused unless allowed. The rest are new. See
 `DECISIONS.md` D-070, D-071.)*
 - A `body_rewrites.pattern` fails to compile.
+- A `header_rewrites` entry names an identity field (`From:`, `Sender:`, `Message-ID:`). Not
+  overridable. *(Added; see `DECISIONS.md` D-089.)*
+- A `header_rewrites` entry has a `header` that is not a field name, a `pattern` that fails to
+  compile, or a `replacement` that refers to a group the pattern does not define or that could
+  not produce an RFC 5322-conformant value. *(Added; D-089.)*
+- A route's `header_rewrites` fail the stability property (§6.6) — applied to their own output
+  they change it again. Not overridable by `unstable_headers`. *(Added; D-089.)*
 - Any route's **identity field** (`envelope_from`, `From:`, `Sender:`, `Message-ID:`) fails the
   stability property (§6.6) against a synthetic probe message. Not overridable.
 - Any other header fails the stability property and is not declared in the route's
@@ -628,11 +639,16 @@ a `POST`, and replaying it is the §10.2 hazard in another protocol.
 3. Resolve incoming identity; select route (§3.2).
 4. Strip authentication artefacts (§6.5).
 5. Apply `remove_headers`.
+
+   5a. Apply `header_rewrites` to the named headers' decoded values (§6.2).
 6. Apply `set_headers`, rendering templates.
 7. Apply `body_rewrites` to `text/*` parts (§6.4).
 8. Prepend a `Received:` header naming Simmer.
 9. Compute the outbound envelope sender.
 10. Serialise and transmit.
+
+*(Amended — step 5a is new; it is numbered so that no existing step reference changes. See
+`DECISIONS.md` D-089.)*
 
 ### 6.2 Rewritable fields
 
@@ -647,11 +663,38 @@ Each is independently configurable per route, and each is an absolute assignment
 | `Return-Path:` | `remove_headers` | Strip inbound; downstream sets it |
 | `Message-ID:` | `set_headers.Message-ID` | Domain part should match the outbound sending domain |
 | `List-Unsubscribe`, `List-Unsubscribe-Post` | `set_headers` | Weighted heavily by mailbox providers for bulk |
+| Part of any header's value | `header_rewrites` | Regex over the decoded value; below. Not for identity fields |
 | Any other header | `set_headers` / `remove_headers` | Escape hatch |
 | `text/*` body content | `body_rewrites` | Regex; §6.4 |
 
-`remove_headers` is applied before `set_headers`, so a header may be replaced by naming it in
-both. Setting a header that already exists replaces all instances.
+`remove_headers` is applied first, then `header_rewrites`, then `set_headers`. A header may be
+replaced by naming it in `remove_headers` and `set_headers`, and an explicit `set_headers` value
+wins over a `header_rewrites` entry for the same header. Setting a header that already exists
+replaces all instances.
+
+**`header_rewrites`** covers what a template cannot: changing part of a value while keeping the
+rest verbatim — the canonical case is a `List-Unsubscribe` URL whose host must move to the link
+proxy (§5.7) while its per-message token is kept. Each entry names a `header` and carries
+`body_rewrites`' `pattern` and `replacement`; entries apply in order, to every instance of the
+header, in place.
+
+- Matching is on the **decoded** value: unfolded, with each whitespace-delimited RFC 2047
+  encoded-word decoded. §6.4's reason for rejecting raw-byte matching applies to headers too.
+- A header no entry names, or one no pattern changes, keeps its original bytes. Only a changed
+  value is re-serialised, with non-ASCII runs RFC 2047-encoded.
+- Text captured from the message is escaped as it is substituted into the replacement.
+- A header that cannot be decoded (unknown charset, malformed encoded-word, raw 8-bit bytes) or
+  whose result cannot be written as a conformant field is left untouched, logged at `WARN`, and
+  counted in `simmer_header_rewrite_skipped_total`.
+- Templates are unaffected: `original.header[…]` is the value as it arrived.
+
+A pattern that keeps part of the value it replaces is not an absolute assignment in §1.1's
+literal sense — no more than a `body_rewrites` entry is. It satisfies §1.1 in the sense that
+matters: it must be stable (§6.6), and its target state is expressible as application-side
+configuration, so in arrangement B it matches nothing and the header passes through unchanged.
+Identity fields are the exception, and are never rewritable this way (§4.2).
+
+*(Amended — `header_rewrites` is new. See `DECISIONS.md` D-089.)*
 
 ### 6.3 Templating
 
@@ -771,6 +814,10 @@ of the component.
 
 **All other headers** — a stability violation is a startup error by default, downgradable to a
 `WARN` by naming the header in the route's `unstable_headers` list.
+
+**`header_rewrites` and `body_rewrites`** — a violation is a fatal startup error with no
+override: a pattern that matches what it just wrote has no migration-only reading, so there is
+nothing for `unstable_headers` to acknowledge. *(Added. See `DECISIONS.md` D-046 and D-089.)*
 
 #### `unstable_headers`
 
@@ -962,13 +1009,16 @@ Prometheus exposition on the admin listener. At minimum:
   continuity with the original list
 - `simmer_reservation_expired_total{route}`
 - `simmer_body_rewrite_skipped_total{route,reason}`
+- `simmer_header_rewrite_skipped_total{route,header,reason}` — reason: `malformed_encoding`,
+  `unsupported_charset`, `raw_8bit`, `unrepresentable`
 - `simmer_link_proxy_requests_total{status_class,origin}` — origin: `upstream`, or `proxy` for
   a response the proxy generated (§5.7)
 - `simmer_link_proxy_duration_seconds` — histogram, to response headers
 - `simmer_link_proxy_connections`
 - `simmer_link_proxy_connections_refused_total{reason}` — reason: `cidr`, `limit`
 
-*(The four `simmer_link_proxy_*` metrics are added. See `DECISIONS.md` D-083.)*
+*(The four `simmer_link_proxy_*` metrics are added. See `DECISIONS.md` D-083.
+`simmer_header_rewrite_skipped_total` is added; see D-089.)*
 
 ### 9.2 Read API
 
