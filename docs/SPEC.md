@@ -187,7 +187,8 @@ Given an accepted message with a resolved incoming identity:
    domain equals the literal domain of a chain route's `Message-ID:` template **pins** that
    route: it is walked first, and the rest of the chain follows in configured order. Only the
    matched chain's routes can be pinned. For the pinned route alone, step 3b is not applied
-   (its §7.3 event is still recorded on commit), and step 3c does not refuse: an ordinary
+   (its §7.3 event is still recorded on commit), step 3c′ is not applied, and step 3c does
+   not refuse: an ordinary
    reservation is attempted first, and only if it finds no headroom is the route reserved
    **past its cap** (§7.4). Steps 3a, §6.7's strict preflight and §7.2's future start still
    eliminate it, and the walk then continues with the next route.
@@ -195,6 +196,10 @@ Given an accepted message with a resolved incoming identity:
    a. If the route is paused (admin API, §9.3), skip.
    b. If the route has a `recipient_frequency` constraint and this recipient is at or over
       threshold within the window, skip. Evaluated **first** — it can eliminate routes outright.
+   c′. If the route's `warmup.schedule.share` for today is below 1 (§7.2) and this message
+      is not in it, skip. Membership is a keyed hash of the normalised recipient, the route
+      and the day index under the §7.3 salt — deterministic, so every instance and §9.4's dry
+      run give the same answer. *(Added. See `DECISIONS.md` D-091.)*
    c. If the route is warming and has no remaining headroom for this domain group today,
       skip.
    d. Otherwise, attempt reservation (§7.4). If reservation fails due to a concurrent
@@ -352,6 +357,7 @@ routes:
       started: "2026-08-01T09:00:00Z"   # RFC 3339 instant, must be explicit
       schedule:
         default: [50, 100, 200, 400, 800, 1500, 3000, 5000]
+        share:   [0.1, 0.25, 0.5]      # optional (§7.2, D-091); every message from day 3
         overrides:
           google:    [20, 50, 100, 250, 500, 1000, 2000, 4000]
           microsoft: [20, 50, 100, 250, 500, 1000, 2000, 4000]
@@ -392,6 +398,10 @@ not just the first.
 - A domain appears in more than one group.
 - A `warmup.schedule` array is empty, or contains a negative value.
 - An `overrides` key names a nonexistent domain group.
+- A `warmup.schedule.share` value is not above 0 and at most 1; or a route with a non-empty
+  `share` is the last route of any chain (sender rules and `default_chain`), where every
+  message it is not offered would be §10.3's reply by design.
+  *(Added. See `DECISIONS.md` D-091.)*
 - `${ENV_VAR}` interpolation cannot be resolved.
 - `server.listeners` is empty, or two listeners share an address.
 - A listener's `tls` is not `off` and `server.tls` is absent.
@@ -916,6 +926,16 @@ dates are rendered in logs and the admin API.
 **final value repeats indefinitely**. Routes do not auto-graduate to uncapped; a warm route is
 made uncapped by editing the configuration and restarting, or by removing Simmer entirely.
 
+**Partial ramp.** A schedule may carry `share`, a list indexed by `day_index` like the caps
+and applying to every domain group. On day `i`, only `share[i]` of the messages that reach
+the route in the walk are offered to it (§3.2 step 3c′); the rest go to the next link. The
+cap is then reached later in the day, and the route's volume is spread across it rather than
+spent in its first hours. **Past the end of `share` every message is offered** — the final
+value does *not* repeat, as a cap does, because a list ending below 1 would then throttle the
+route forever. A graduated route (§9.3) is offered every message too. The allowance itself
+is unchanged: a partial ramp decides which messages may *try* the route, never how many it may
+carry. *(Added. See `DECISIONS.md` D-091.)*
+
 An unused allowance does not carry over. A route that sent nothing yesterday still advances
 its `day_index`, because the index is a function of elapsed time only.
 
@@ -1041,7 +1061,8 @@ Prometheus exposition on the admin listener. At minimum:
 - `simmer_quota_committed{route,domain_group}` — used today
 - `simmer_quota_reserved{route,domain_group}`
 - `simmer_warmup_day{route}`
-- `simmer_route_skipped_total{route,reason}` — reason: `quota`, `frequency`, `paused`, `preflight`
+- `simmer_route_skipped_total{route,reason}` — reason: `quota`, `frequency`, `paused`, `preflight`,
+  `partial_ramp` *(added, D-091)*
 - `simmer_preflight_ok{route,check}`
 - `simmer_downstream_latency_seconds{route}` — histogram
 - `simmer_downstream_errors_total{route,class}`
@@ -1072,7 +1093,8 @@ added; see D-090.)*
 
 - `GET /health` — liveness; includes database reachability.
 - `GET /routes` — configuration summary plus live state: warm-up day, allowance and usage per
-  domain group, paused flag, preflight results, pool statistics.
+  domain group, paused flag, preflight results, pool statistics, and the `share` list with
+  today's share *(added, D-091)*.
 - `GET /routes/{name}` — as above for one route.
 - `GET /quota?route=&group=` — current window detail.
 - `GET /metrics` — Prometheus.
@@ -1102,6 +1124,10 @@ It also accepts optional `in_reply_to` and `references` values (or reads them fr
 full `message`), and reports what §3.2 step 2a made of them: the pinned route or `unmatched`,
 the walk in pinned order, and a pinned route that would be reserved past its cap as selected
 with reason `over_cap`. *(Added. See `DECISIONS.md` D-090.)*
+
+A route passed over by its partial ramp (§3.2 step 3c′) is reported with reason
+`partial_ramp`. The hash is the real walk's, so this is the real answer for that recipient,
+not an estimate. *(Added. See `DECISIONS.md` D-091.)*
 
 This is the primary tool for validating a configuration before it carries live traffic, and
 should be treated as a first-class feature rather than a debugging afterthought.

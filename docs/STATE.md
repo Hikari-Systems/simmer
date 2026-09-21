@@ -1,8 +1,8 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-09-21, at release `v0.5.0`.** (The previous snapshots were
+**Snapshot taken 2026-09-21, at release `v0.6.0`.** (The previous snapshots were
 2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
-numbers are still the `v0.3.1` run; what was verified for `v0.4.0` and `v0.5.0` is
+numbers are the `v0.6.0` run; what was verified for `v0.4.0` and `v0.5.0` is
 stated there separately. This is a session-handover document, not a
 maintained one: `README.md` describes the service, `DECISIONS.md` records why it is
 the way it is, and `docs/SPEC.md` is authoritative over both. If this file
@@ -20,7 +20,8 @@ put to the spec's author and recorded rather than assumed:
 | **D-088** — the capture's flush policy | Ten buffered lines or 500 ms of quiet |
 | **D-089** — `header_rewrites` | A regex over one named header's decoded value, between `remove_headers` and `set_headers` (§6.1 step 5a). After O-16; `SPEC.md` amended 2026-09-21 |
 | **D-090** — thread affinity | An outbound reply into a thread Simmer started leaves via the route that started it — past that route's day cap once the cap is met, counted, and past its §7.3 threshold. Keyed statelessly on the emitted `Message-ID:` domain. After O-17; `SPEC.md` amended 2026-09-21 (§3.2 step 2a, and §7.4's one exception to "overshoot is not acceptable") |
-| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity) |
+| **D-091** — the partial ramp | `warmup.schedule.share`, one value per day index: on day `i` only `share[i]` of a warming route's traffic is offered to it, the rest steering to the next link (reason `partial_ramp`), so the cap fills later in the day. A keyed hash picks which messages, so dry run and every instance agree. Past the list's end every message is offered. Asked for by the spec's author; `SPEC.md` amended 2026-09-21 (§3.2 step 3c′, §7.2) |
+| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp) |
 
 ---
 
@@ -171,7 +172,18 @@ not re-run (CI runs it).
 
 For reference, the phase 11 snapshot read 830 passed on the default build alone.
 
-**Since `v0.3.1`, the full suite has not been re-run in the development jail.**
+**For `v0.6.0` (D-091) the full suite was re-run in the development jail on both
+builds:** **1188 passed, 0 failed** on the default
+build against Postgres, and **1037 passed, 0 failed** on the mssql build against
+SQL Server 2022, with `cargo clippy --all-targets -D warnings` and `cargo deny
+check` clean on both and `cargo fmt --check` clean. New: `src/routing/partial.rs`'s
+5 unit tests, `tests/partial_ramp.rs` (6, through the real walk and dry run), and
+the `schedule.share` cases in `tests/config_validation.rs`. A live run of the
+fixed-share first draft on the acceptance stack (share 0.5) steered 38 of 67
+messages, and `/metrics` and `/routes` agreed with the logged walks. **Not run:**
+the acceptance tier (it cannot run from the jail), which has no partial-ramp case
+anyway.
+
 For `v0.5.0` (D-090), what *was* run, against Postgres on the default build:
 `src/routing/thread.rs`'s 24 unit tests, `tests/thread_affinity.rs` (14),
 `tests/admin_api.rs` (55), the new `tests/config_validation.rs` and

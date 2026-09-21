@@ -3620,6 +3620,84 @@ against the real walk, pinned, and §9.2's view past the cap).
 **Not tested here:** the §12.3 acceptance suite has no thread-affinity case yet,
 and cannot run from the development jail.
 
+### D-091 — A partial ramp: offer a warming route only a share of its traffic for its first days
+
+> **Settled 2026-09-21 by the spec's author, who asked for it, and the spec
+> amended in the same change:** §3.2 (step 3c′, and step 2a's exemption), §4.1,
+> §4.2, §7.2, §9.1, §9.2 and §9.4. Four calls were the author's: which messages
+> are offered is a **keyed hash**; the gate is keyed on the **day index**; the
+> share is **a list in the schedule**, one value per day; and this is a spec
+> amendment rather than a divergence.
+
+**The problem.** A warming route takes every eligible message until the day's
+cap is met, and then none. On a chain carrying more than the cap, that means the
+route is fully on from the day boundary until it fills, usually within its first
+hours, and then fully off. Early in a ramp, when the cap is smallest, the route's
+whole day is a burst. A mailbox provider sees that burst, not a steady low rate.
+
+**What it does.** `warmup.schedule.share: [0.1, 0.25, 0.5]`, indexed by
+`day_index` like `default`. On day `i`, a message reaching the route in the walk
+is offered to it only if it falls in `share[i]`. Otherwise it skips with reason
+`partial_ramp` and goes to the next link, as §7.3 steers. The cap is untouched:
+a partial ramp decides which messages may try the route, never how many it may
+carry. Past the end of the list, the walk is what it was.
+
+**Why a keyed hash.** HMAC under the §7.3 salt over the normalised recipient,
+the route and the day index, compared against `share`. It is deterministic, so
+two instances agree with no shared state, and §9.4's dry run reports the real
+answer for a recipient rather than a probability. §9 says the control plane must
+not lie, and a probability would be a small lie. The route is in the hash so two
+partial routes in one chain decide independently. The day index is in it so the
+same recipients are not the only ones warmed on every day of the ramp.
+*Alternatives, rejected:* a random draw per message (dry run could not say what
+would happen, and tests would be statistical); an exact 1-in-N counter on the
+quota row (a schema change in both stores for a precision nobody needs).
+
+**Why a list in the schedule.** The author's call, and the second shape tried.
+The first was one fixed `share` lifted at an `until_day`, which steps from, say,
+25% to 100% overnight. A list lets the share climb with the caps, reads beside
+them, and its length says when the gate ends, so `until_day` goes. Keying on the
+day index also means an admin allowance change (§9.3) does not silently switch
+the gate. *Alternatives, rejected:* a threshold on the day's effective allowance;
+per-group share lists (more to validate and to read, for a need nobody has yet);
+`{cap, share}` objects inline in `default` (mixed element types in a list every
+existing config uses).
+
+**Past the end is 1, not "the last value repeats".** §7.2 repeats a cap's last
+value so a route never auto-graduates to uncapped. The same rule for `share`
+would leave `[0.1, 0.25]` throttling a route for the rest of its life, which
+nobody writing that list means. The route's cap is what should hold a lasting
+limit.
+
+**Three consequences, each deliberate.**
+
+- **A pinned thread-affinity reply is exempt** (D-090). A reply that changed
+  identity because a hash said so is exactly what D-090 exists to prevent.
+- **A graduated route is offered everything.** §9.3's graduate jumps to the end
+  of the ramp, and the partial ramp is part of the ramp.
+- **A route with a non-empty `share` may not be last in a chain** (§4.2). Last, every message
+  it is not offered is §10.3's `451` while the route still has headroom. That is
+  an outage that looks like a ramp. The §5.4 early check (`any_eligible`) ignores
+  the gate for the same reason: a later link always exists, so counting the
+  route eligible can only err in the harmless direction.
+
+**§1.1 is untouched.** The gate selects a route; it rewrites nothing. After
+cutover there is one identity and no chain to split across.
+
+**Tested:** `routing/partial.rs` (determinism across instances, the offered
+fraction within 2% over 10,000 recipients, share 1, and that the day and the
+route each change the decision, normalisation); `tests/config_validation.rs`
+(indexing and past-the-end, each §4.2 rule, all reported together);
+`tests/partial_ramp.rs` (through the real walk on Postgres: a message outside
+the share steers without touching the warming row, one inside reserves, the
+day's entry is the one applied, the gate lifts past the end of the list and on
+graduation, a pinned reply is exempt, and dry run agrees with the walk for every
+recipient). A live run of the fixed-share first draft on the acceptance stack
+steered 38 of 67 messages at 0.5, with `/metrics` and `/routes` agreeing.
+
+**Not tested here:** the §12.3 acceptance suite has no partial-ramp case, and
+cannot run from the development jail.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

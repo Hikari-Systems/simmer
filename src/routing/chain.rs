@@ -5,6 +5,8 @@
 //!   a. If the route is paused (admin API, §9.3), skip.
 //!   b. If the route has a `recipient_frequency` constraint and this recipient is
 //!      at or over threshold within the window, skip. Evaluated **first**.
+//!   c′. If the route's `schedule.share` is below 1 today and this message is
+//!      not in it, skip (D-091).
 //!   c. If the route is warming and has no remaining headroom for this domain
 //!      group today, skip.
 //!   d. Otherwise, attempt reservation (§7.4).
@@ -25,6 +27,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
+use super::partial;
 use crate::config::{Config, Route};
 use crate::frequency::{self, Frequency};
 use crate::metrics;
@@ -51,6 +54,10 @@ pub enum SkipReason {
     Frequency,
     /// §6.7 with `preflight.strict: true` — phase 8.
     Preflight,
+    /// §3.2 3c′ (D-091) — `warmup.schedule.share` is below 1 today and this
+    /// message is not in it. Not `quota`: the route has headroom, and
+    /// is being given less traffic on purpose.
+    PartialRamp,
     /// The chain names a route that does not exist. §4.2 rejects this at
     /// startup, so it is unreachable; skipping rather than panicking keeps a
     /// configuration mistake from taking the process down.
@@ -65,6 +72,7 @@ impl SkipReason {
             SkipReason::Quota => "quota",
             SkipReason::Frequency => "frequency",
             SkipReason::Preflight => "preflight",
+            SkipReason::PartialRamp => "partial_ramp",
             SkipReason::Unknown => "unknown_route",
         }
     }
@@ -114,9 +122,11 @@ pub enum Walk<'a> {
 ///
 /// `chain` is walked in the order given, which for a thread-affinity reply is
 /// §3.2 step 2a's order with `pinned` first (`thread::order`). The pinned route
-/// is treated differently in exactly two ways (D-090): §7.3's threshold is not
-/// applied to it, though its events are still recorded on commit; and when it
-/// has no headroom it is reserved **past the cap** rather than skipped. Pause,
+/// is treated differently in exactly three ways (D-090): §7.3's threshold is not
+/// applied to it, though its events are still recorded on commit; D-091's
+/// partial ramp is not applied to it, since a reply that changed identity on
+/// the hash's say-so is what D-090 exists to prevent; and when it has no
+/// headroom it is reserved **past the cap** rather than skipped. Pause,
 /// strict preflight and a future `warmup.started` still eliminate it — those
 /// say the route cannot send, not that it has sent enough.
 ///
@@ -241,6 +251,25 @@ pub async fn walk_and_reserve<'a>(
             continue;
         }
 
+        // (c′) D-091's partial ramp. After the start check because it needs the
+        // day index, and before the reservation so that a message turned away
+        // here never touches the row lock. A pinned reply is exempt.
+        if let Some(share) = partial::share_today(route, day_index, state).filter(|_| !is_pinned) {
+            let keyer = frequency.keyer(store.as_ref()).await?;
+            let recipient = recipients.first().map(String::as_str).unwrap_or_default();
+            if !partial::offered(
+                keyer,
+                name,
+                recipient,
+                day_index,
+                share,
+                &cfg.dot_insensitive_domains,
+            ) {
+                record(evaluation, name, Err(SkipReason::PartialRamp));
+                continue;
+            }
+        }
+
         // (c) + (d) together, under one row lock.
         let request = ReserveRequest {
             route: name.clone(),
@@ -324,14 +353,15 @@ pub async fn walk_and_reserve<'a>(
 ///
 /// The order of the checks below is `walk_and_reserve`'s order, deliberately and
 /// fragilely: paused, then §6.7 preflight, then §7.3 frequency, then §7.2's start
-/// instant, then headroom. A dry run that evaluated them in a different order would report a
+/// instant, then D-091's partial ramp, then headroom. A dry run that evaluated them in a different order would report a
 /// different reason for the same route, and the reason is the entire product —
 /// "why did this message not go via the warming route" is the question the
 /// endpoint exists to answer. `tests/admin_api.rs` asserts the two agree rather
 /// than trusting this comment.
 ///
-/// `pinned` is `walk_and_reserve`'s, with its two exceptions reproduced: no
-/// §7.3 threshold, and no headroom means selected past the cap (D-090).
+/// `pinned` is `walk_and_reserve`'s, with its three exceptions reproduced: no
+/// §7.3 threshold, no partial ramp, and no headroom means selected past the cap
+/// (D-090, D-091).
 ///
 /// It stops at the first eligible route, as the real walk does, so the routes
 /// after the selected one are absent rather than reported — they would not have
@@ -400,6 +430,23 @@ pub async fn dry_walk(
             continue;
         }
 
+        // D-091, in `walk_and_reserve`'s position. The hash is the real walk's,
+        // so this is its answer and not an estimate of it.
+        if let Some(share) = partial::share_today(route, day_index, state).filter(|_| !is_pinned) {
+            let keyer = frequency.keyer(store.as_ref()).await?;
+            if !partial::offered(
+                keyer,
+                name,
+                recipient,
+                day_index,
+                share,
+                &cfg.dot_insensitive_domains,
+            ) {
+                evaluation.push(step(name, Err(SkipReason::PartialRamp)));
+                continue;
+            }
+        }
+
         let usage = store.usage(name, &group, day_index).await?;
         // An absent row reads as all-zero, so a fresh day is eligible against the
         // schedule's ceiling — which is what the reservation would write.
@@ -451,7 +498,9 @@ fn step(route: &str, outcome: Result<(), SkipReason>) -> Step {
 /// the last slot in between. That is harmless: the authoritative check is the
 /// reservation, and the message is refused at the final dot instead. It must
 /// never be wrong the other way, which is why it asks for headroom of 1 rather
-/// than for a guess at the eventual recipient count.
+/// than for a guess at the eventual recipient count — and why it ignores D-091's
+/// partial ramp: a route turned away by it always has a later link (§4.2), so
+/// counting it eligible can only err in the harmless direction.
 pub async fn any_eligible(
     cfg: &Config,
     store: &Arc<dyn QuotaStore>,
@@ -529,6 +578,7 @@ mod tests {
         assert_eq!(SkipReason::Frequency.as_str(), "frequency");
         assert_eq!(SkipReason::Preflight.as_str(), "preflight");
         assert_eq!(SkipReason::NotStarted.as_str(), "not_started");
+        assert_eq!(SkipReason::PartialRamp.as_str(), "partial_ramp");
     }
 
     #[test]

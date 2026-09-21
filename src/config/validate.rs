@@ -1217,6 +1217,25 @@ fn check_schedule(cfg: &Config, route: &Route, warmup: &super::Warmup, v: &mut V
         }
         check_series(series, &at(&format!("overrides.{group}")), v);
     }
+
+    check_share(&warmup.schedule.share, &at("share"), v);
+}
+
+/// §4.2 for D-091's `schedule.share`. Where a route carrying one may sit in a
+/// chain is [`check_chain`]'s business.
+fn check_share(share: &[f64], path: &str, v: &mut ViolationList) {
+    for (i, value) in share.iter().enumerate() {
+        // Written so that NaN fails it too.
+        if !(*value > 0.0 && *value <= 1.0) {
+            v.push(
+                format!("{path}[{i}]"),
+                format!(
+                    "is {value}; a share must be above 0 and at most 1. To offer the route \
+                     nothing, pause it (§9.3)"
+                ),
+            );
+        }
+    }
 }
 
 fn check_series(series: &[i64], path: &str, v: &mut ViolationList) {
@@ -1499,6 +1518,24 @@ fn check_chain(cfg: &Config, chain: &[String], path: &str, v: &mut ViolationList
         };
         if route.overflow {
             overflow_positions.push(i);
+        }
+
+        // D-091: a partially-ramped route turns messages away while it still
+        // has headroom. Last in a chain, each of those is §10.3's `451` by
+        // design, which is an outage dressed up as a ramp.
+        let partial = route
+            .warmup
+            .as_ref()
+            .is_some_and(|w| !w.schedule.share.is_empty());
+        if partial && i == chain.len() - 1 {
+            v.push(
+                path,
+                format!(
+                    "route '{name}' has a warmup.schedule.share and is last in the chain, so \
+                     the messages it is not offered would have nowhere to go. Put another \
+                     route after it (§4.2, D-091)"
+                ),
+            );
         }
     }
 

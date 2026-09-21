@@ -174,7 +174,9 @@ fn describe() {
     );
     describe_counter!(
         "simmer_route_skipped_total",
-        "Routes passed over during a chain walk, by reason (§3.2 step 3)"
+        "Routes passed over during a chain walk, by reason (§3.2 step 3). \
+         reason=\"partial_ramp\" is a route given less traffic on purpose (D-091), not a \
+         shortage"
     );
     describe_counter!(
         "simmer_reservation_expired_total",
@@ -733,8 +735,8 @@ pub fn route_paused(route: &str, paused: bool) {
 }
 
 /// §9.1 `simmer_route_skipped_total{route,reason}` — reason: `quota`,
-/// `frequency`, `paused`, `preflight`, and `not_started` (see
-/// `chain::SkipReason`).
+/// `frequency`, `paused`, `preflight`, `not_started`, and `partial_ramp` (D-091;
+/// see `chain::SkipReason`).
 pub fn route_skipped(route: &str, reason: &str) {
     counter!(
         "simmer_route_skipped_total",

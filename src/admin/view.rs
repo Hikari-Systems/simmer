@@ -93,7 +93,19 @@ pub struct FrequencyView {
     pub threshold: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// D-091's `warmup.schedule.share` as configuration, plus the share in force
+/// today. Carries nothing about which messages were or were not offered: that
+/// is per recipient, and a read endpoint emits no recipient (§7.3).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PartialRampView {
+    pub share: Vec<f64>,
+    /// `null` when every message is offered today: before `warmup.started`,
+    /// past the end of `share`, at a share of 1, or when the route is graduated
+    /// — the same rule the walk applies, by the same function.
+    pub today: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RouteView {
     pub name: String,
     pub overflow: bool,
@@ -110,6 +122,7 @@ pub struct RouteView {
     pub warmup_started: Option<DateTime<Utc>>,
     pub downstream: DownstreamView,
     pub recipient_frequency: Option<FrequencyView>,
+    pub partial_ramp: Option<PartialRampView>,
     pub groups: Vec<GroupWindow>,
     /// §9.2's preflight results (§6.7).
     ///
@@ -131,7 +144,7 @@ pub struct RouteView {
 }
 
 /// §9.2 `GET /routes`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RoutesView {
     pub generated_at: DateTime<Utc>,
     pub routes: Vec<RouteView>,
@@ -232,6 +245,14 @@ pub fn project_route(
             authenticated: route.downstream.auth.is_some(),
         },
         recipient_frequency: route.recipient_frequency.as_ref().map(frequency_view),
+        partial_ramp: route
+            .warmup
+            .as_ref()
+            .filter(|w| !w.schedule.share.is_empty())
+            .map(|w| PartialRampView {
+                share: w.schedule.share.clone(),
+                today: crate::routing::partial::share_today(route, day_index, state),
+            }),
         groups,
         preflight: preflight_view(route, preflight),
         pool: pools.stats(&route.name),

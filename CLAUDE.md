@@ -24,7 +24,8 @@ alone. The same rule produced the 2026-09-17 amendment for the link proxy
 2026-09-21 one for `header_rewrites` (§6.1 step 5a, §6.2, and the sections D-089
 lists), after O-16 was, and the same day's for thread affinity (§3.2 step 2a,
 §7.4's one exception to "overshoot is not acceptable", and the sections D-090
-lists), after O-17 was.
+lists), after O-17 was. And the same day's for the partial ramp (§3.2 step 3c′,
+§7.2, and the sections D-091 lists), which the author asked for directly.
 
 ## The four things that will bite you
 
@@ -258,6 +259,9 @@ src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve a
 src/routing/thread.rs    §3.2 step 2a (D-090) — thread affinity. A REORDERING plus two
                          exemptions for the pinned route only: no §7.3 threshold, and
                          an ordinary reservation first, then `over_cap` past the cap
+src/routing/partial.rs   §3.2 step 3c′ (D-091) — `schedule.share`. A KEYED HASH, not
+                         a dice roll, so dry run and every instance agree. Past the
+                         list's end the share is 1, NOT a cap's repeated last value
 src/metrics.rs           §9.1 counters, the recorder, and every `# HELP` line
 src/models/recipient_event.rs  §7.3's rows. A key is 16 bytes and never plaintext
 src/models/instance_config.rs  §7.3's salt: insert-if-absent, then read (D-050)
@@ -309,6 +313,7 @@ tests/pool.rs            §8.3 counted from the DOWNSTREAM's side — accepted
                          connections and command lines, never the pool's own view
 tests/ingress_tls.rs     §5.1/§5.3 end to end. Every handshake VERIFIES against a
                          per-test CA (support::TestPki); an unverified one proves little
+tests/partial_ramp.rs    D-091 through the real walk; dry run agrees per recipient
 tests/admin_api.rs       §9. Pins dry run against the REAL walk, step for step
 tests/metrics_endpoint.rs  §9.1. Its own binary — one global recorder per process
 tests/link_proxy.rs      D-083 on the wire: raw client, recording upstream

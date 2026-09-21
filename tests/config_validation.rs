@@ -1437,3 +1437,116 @@ fn without_thread_affinity_a_route_may_pass_the_message_id_through() {
     // The base fixture sets no Message-ID on either route.
     load(BASE).expect("valid");
 }
+
+// -- §4.2: warmup.schedule.share (D-091) ----------------------------------
+
+/// `BASE` with a `share` list on the warming route's schedule.
+fn with_share(share: &str) -> String {
+    BASE.replace(
+        "        default: [50, 100, 200]\n",
+        &format!("        default: [50, 100, 200]\n        share: {share}\n"),
+    )
+}
+
+#[test]
+fn accepts_a_share_list_followed_by_another_route() {
+    let cfg = load(&with_share("[0.1, 0.25, 0.5]")).expect("valid");
+    let schedule = &cfg
+        .route("warming")
+        .unwrap()
+        .warmup
+        .as_ref()
+        .unwrap()
+        .schedule;
+    assert_eq!(schedule.share, vec![0.1, 0.25, 0.5]);
+
+    // Indexed like the caps; past the end, and at 1, every message is offered.
+    assert_eq!(schedule.share_for(-1), None);
+    assert_eq!(schedule.share_for(0), Some(0.1));
+    assert_eq!(schedule.share_for(2), Some(0.5));
+    assert_eq!(
+        schedule.share_for(3),
+        None,
+        "not §7.2's 'final value repeats'"
+    );
+
+    let ones = load(&with_share("[1.0, 0.5]")).expect("a share of 1 is valid");
+    let schedule = &ones
+        .route("warming")
+        .unwrap()
+        .warmup
+        .as_ref()
+        .unwrap()
+        .schedule;
+    assert_eq!(schedule.share_for(0), None);
+    assert_eq!(schedule.share_for(1), Some(0.5));
+
+    // And absent, or empty, is no partial ramp at all.
+    assert!(load(BASE)
+        .unwrap()
+        .route("warming")
+        .unwrap()
+        .warmup
+        .as_ref()
+        .unwrap()
+        .schedule
+        .share
+        .is_empty());
+    load(&with_share("[]")).expect("an empty list is no partial ramp");
+}
+
+#[test]
+fn rejects_a_share_outside_zero_to_one() {
+    for bad in ["0", "0.0", "-0.5", "1.01", "2", ".nan", ".inf"] {
+        rejected_for(&with_share(&format!("[0.5, {bad}]")), "schedule.share[1]");
+    }
+}
+
+#[test]
+fn rejects_a_share_route_that_is_last_in_a_chain() {
+    let yaml = with_share("[0.5]").replace("chain: [warming, overflow]", "chain: [warming]");
+    rejected_for(
+        &yaml,
+        "has a warmup.schedule.share and is last in the chain",
+    );
+}
+
+#[test]
+fn rejects_a_share_route_that_is_last_in_the_default_chain() {
+    // strict_senders so that §4.2's own "default_chain must end in overflow"
+    // rule is not what refuses it.
+    let yaml = with_share("[0.5]")
+        .replace("default_chain: [overflow]", "default_chain: [warming]")
+        .replace("strict_senders: false", "strict_senders: true");
+    rejected_for(
+        &yaml,
+        "has a warmup.schedule.share and is last in the chain",
+    );
+}
+
+#[test]
+fn an_empty_share_list_may_be_last() {
+    // Nothing is turned away, so there is nothing that needs a next link.
+    let yaml = with_share("[]")
+        .replace("default_chain: [overflow]", "default_chain: [warming]")
+        .replace("strict_senders: false", "strict_senders: true");
+    load(&yaml).expect("valid");
+}
+
+#[test]
+fn share_violations_are_reported_together() {
+    let yaml = with_share("[0, 2]").replace("chain: [warming, overflow]", "chain: [warming]");
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            for needle in [
+                "schedule.share[0]",
+                "schedule.share[1]",
+                "is last in the chain",
+            ] {
+                assert!(v.mentions(needle), "missing '{needle}' in:\n{v}");
+            }
+        }
+        Ok(_) => panic!("accepted"),
+        Err(other) => panic!("expected a validation failure, got: {other}"),
+    }
+}

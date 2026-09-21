@@ -975,6 +975,20 @@ pub struct Schedule {
     /// Keyed by domain group name. §4.2 rejects a key naming a nonexistent group.
     #[serde(default)]
     pub overrides: BTreeMap<String, Vec<i64>>,
+    /// D-091's partial ramp: on day `i`, only `share[i]` of the messages that
+    /// reach this route in the walk are offered to it, and the rest skip to the
+    /// next link. The cap is then reached later in the day, and the route's
+    /// volume is spread across it rather than spent in its first hours.
+    ///
+    /// Indexed like `default`, for every domain group. Past its end the share is
+    /// **1** — not §7.2's "final value repeats", which would leave a list ending
+    /// below 1 throttling the route forever. Empty, the default, is no partial
+    /// ramp at all. Each value is in `(0, 1]`; §4.2 refuses anything else.
+    ///
+    /// Which messages are offered is a keyed hash, not a dice roll
+    /// (`routing::partial`), so every instance and §9.4's dry run agree.
+    #[serde(default)]
+    pub share: Vec<f64>,
 }
 
 impl Schedule {
@@ -992,6 +1006,13 @@ impl Schedule {
             .unwrap_or(usize::MAX)
             .min(series.len() - 1);
         series.get(idx).map(|v| u64::try_from(*v).unwrap_or(0))
+    }
+
+    /// D-091: the share of traffic offered on `day_index`, or `None` for all of
+    /// it — before the ramp starts, past the end of `share`, or at a share of 1.
+    pub fn share_for(&self, day_index: i64) -> Option<f64> {
+        let idx = usize::try_from(day_index).ok()?;
+        self.share.get(idx).copied().filter(|s| *s < 1.0)
     }
 }
 

@@ -308,6 +308,16 @@ routes:
         overrides:
           google:    [20, 50, 100, 250, 500, 1000, 2000, 4000]
           microsoft: [20, 50, 100, 250, 500, 1000, 2000, 4000]
+        # D-091 — offer this route only a share of its traffic for its first
+        # days, so the cap is reached later and its volume spreads across the
+        # day rather than being spent in a burst after each day boundary. One
+        # value per day index, for every group; past the end, every message is
+        # offered (the last value does NOT repeat, unlike a cap). A message not
+        # offered goes to overflow-established, as recipient_frequency steers.
+        # A keyed hash picks which, so dry run gives the real answer. Pinned
+        # thread-affinity replies are exempt.
+        #
+        # share: [0.1, 0.25, 0.5]
     # §7.3: a steering rule, not a suppression rule. Over threshold makes this
     # route ineligible so the message falls through; nothing is ever dropped.
     recipient_frequency:

@@ -335,6 +335,40 @@ index.
 Overflow routes are never capped, but they *are* counted — "how much is spilling
 to overflow" is the number that tells you whether the ramp is set too low.
 
+### Partial ramp
+
+Without it, a warming route takes **every** eligible message from the day
+boundary until its cap is met, and then none. Early in a ramp that is a burst in
+the first hours of each day. A `share` list in the schedule offers the route only
+part of its traffic for its first days, so the cap is reached later and the
+route's volume is spread across the day (§3.2 step 3c′, §7.2, D-091):
+
+```yaml
+    warmup:
+      started: "2026-08-01T09:00:00Z"
+      schedule:
+        default: [50, 100, 200, 400, 800]
+        share:   [0.1, 0.25, 0.5]   # day 0: a tenth of the messages try it; day 3 on: all
+```
+
+`share` is indexed by day like the caps and applies to every domain group. Past
+its end every message is offered: unlike a cap, the last value does **not**
+repeat.
+
+A message not offered skips with reason `partial_ramp` and goes to the next link,
+as `recipient_frequency` steers. Nothing is dropped, and the cap itself is
+unchanged. Which messages are offered is a keyed hash of the normalised
+recipient, the route and the day index under the §7.3 salt, not a dice roll.
+Every instance agrees, and `POST /dryrun` reports the real answer for a
+recipient. A pinned thread-affinity reply is exempt, and a graduated route is
+offered everything. §4.2 refuses a share outside `(0, 1]`, and a route with a
+`share` list that is last in any chain, where every message it turned away
+would be a `451`.
+
+Watch `simmer_route_skipped_total{reason="partial_ramp"}` against
+`reason="quota"`. `/routes` reports the list and `today`'s share (`null` when
+every message is offered).
+
 ### Thread affinity
 
 Off by default. With it on, a reply the application sends into a conversation
@@ -796,6 +830,7 @@ platform root store the §8.2 `required_verify` mode needs.
 src/config/     the §4.1 schema, ${ENV_VAR} interpolation, §4.2 validation
 src/routing/    sender matching (§5.4), domain groups (§3.2.2), the chain walk
   thread.rs       §3.2 step 2a's thread affinity: IDs in, a pinned route out (D-090)
+  partial.rs      §3.2 step 3c′'s partial ramp: a keyed hash picks the share (D-091)
 src/smtp/       §5 ingress: listeners, state machine, AUTH, DATA buffer, replies
   tls.rs          §5.1's certificate: loaded once, checked by §4.2 the same way
   acl.rs          §5.3's sender grants. Gates acceptance, never routing (D-071)
@@ -830,6 +865,7 @@ tests/store_conformance/  §11's storage contract, one suite for both backends
 tests/rewrite_stability.rs  §6.6 as a property test over generated messages
 tests/admin_api.rs   §9 against the real router and real Postgres
 tests/thread_affinity.rs  D-090 end to end, including replies past the cap
+tests/partial_ramp.rs     D-091 through the real walk, and dry run against it
 tests/pool.rs        §8.3 from the downstream's side: connections, not intentions
 tests/ingress_tls.rs §5.1 and §5.3 end to end: STARTTLS, implicit TLS, the ACL
 tests/metrics_endpoint.rs  §9.1 against a real recorder; its own binary
