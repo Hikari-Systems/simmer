@@ -27,6 +27,18 @@
 //! `Received:` is the one field genuinely excluded: pass 2 prepends a second one
 //! by design, and §6.1 step 8 says it should.
 //!
+//! ## `header_rewrites` (D-089)
+//!
+//! The probe carries every header a `header_rewrites` entry names, with a value
+//! built from the entries' own replacements (what an unstable rule re-matches)
+//! plus an RFC 2047 encoded-word, so both passes go through the decode and
+//! re-encode path the relay uses. Two things come back: the usual instability
+//! diff, and [`Report::skipped_headers`] — a rewrite the engine declined to
+//! emit because the result would not be a conformant field, which startup
+//! treats as a violation rather than waiting to meet it on a real message.
+//! `header_rules::Rules::fixed_point_violations` asks the stability question
+//! of the rules directly, as `body.rs` does for §6.4.
+//!
 //! ## The body is checked elsewhere
 //!
 //! This probe compares the header block and the envelope sender, not the body.
@@ -63,6 +75,10 @@ pub struct Report {
     /// it means either the declaration is stale or the intent was
     /// misunderstood."
     pub declared_but_stable: Vec<String>,
+    /// D-089: `header_rewrites` the engine declined to apply to the probe, in
+    /// either pass. A skip on the probe is a configuration that cannot produce
+    /// a conformant field, so `validate` refuses it.
+    pub skipped_headers: Vec<(String, super::header_rules::SkipReason)>,
 }
 
 impl Report {
@@ -108,7 +124,13 @@ pub fn probe(route: &RouteRewrite) -> Report {
     // Feeding it the original envelope would test a message that cannot occur.
     let second = pass(&first.raw, first.envelope_from.as_deref());
 
-    compare(route, &first, &second)
+    let mut report = compare(route, &first, &second);
+    for skip in first.skipped_headers.iter().chain(&second.skipped_headers) {
+        if !report.skipped_headers.contains(skip) {
+            report.skipped_headers.push(skip.clone());
+        }
+    }
+    report
 }
 
 fn compare(route: &RouteRewrite, first: &Rewritten, second: &Rewritten) -> Report {
@@ -168,6 +190,7 @@ fn canonical_name(route: &RouteRewrite, lowercase: &str) -> String {
         .set_headers
         .iter()
         .map(|(name, _)| name.as_str())
+        .chain(route.header_rewrites.headers())
         .chain(route.unstable_headers.iter().map(String::as_str))
         .find(|name| name.eq_ignore_ascii_case(lowercase))
         .map(str::to_string)
@@ -199,20 +222,43 @@ fn probe_message(route: &RouteRewrite) -> Vec<u8> {
         }
     }
 
-    let mut out = format!(
-        "From: Probe Display <probe-from@{PROBE_DOMAIN}>\r\n\
-         To: rcpt@{PROBE_DOMAIN}\r\n\
-         Subject: probe subject\r\n\
-         Message-ID: <probe-message-id@{PROBE_DOMAIN}>\r\n\
-         Date: Thu, 1 Jan 2026 00:00:00 +0000\r\n"
-    );
+    // D-089: a header a `header_rewrites` entry names carries a value the
+    // entries can match. One the probe already has keeps its value — a template
+    // may read it — with the probe text appended; the others are added.
+    let rewritten = route.header_rewrites.headers();
+    let probe_text = |name: &str, base: &str| -> String {
+        match rewritten.iter().find(|h| h.eq_ignore_ascii_case(name)) {
+            Some(h) => format!("{base} {}", route.header_rewrites.probe_value(h)),
+            None => base.to_string(),
+        }
+    };
+
+    let fixed = [
+        ("From", format!("Probe Display <probe-from@{PROBE_DOMAIN}>")),
+        ("To", format!("rcpt@{PROBE_DOMAIN}")),
+        ("Subject", "probe subject".to_string()),
+        ("Message-ID", format!("<probe-message-id@{PROBE_DOMAIN}>")),
+        ("Date", "Thu, 1 Jan 2026 00:00:00 +0000".to_string()),
+    ];
+    let mut out = String::new();
+    for (name, value) in &fixed {
+        out.push_str(&format!("{name}: {}\r\n", probe_text(name, value)));
+    }
+    let is_fixed = |name: &str| fixed.iter().any(|(f, _)| f.eq_ignore_ascii_case(name));
+
+    for name in &rewritten {
+        if !is_fixed(name) {
+            out.push_str(&format!(
+                "{name}: {}\r\n",
+                route.header_rewrites.probe_value(name)
+            ));
+        }
+    }
 
     for name in referenced {
         // Not for headers the probe already carries — overwriting `Subject:`
         // with a placeholder would weaken the check.
-        if ["from", "to", "subject", "message-id", "date"]
-            .contains(&name.to_ascii_lowercase().as_str())
-        {
+        if is_fixed(&name) || rewritten.iter().any(|h| h.eq_ignore_ascii_case(&name)) {
             continue;
         }
         out.push_str(&format!("{name}: probe-value-for-{name}\r\n"));
@@ -475,5 +521,86 @@ set_headers:
         ));
         assert_eq!(r.unstable.len(), 1, "{:?}", r.unstable);
         assert_eq!(r.unstable[0].field, "X-Copy");
+    }
+
+    // -- header_rewrites (D-089) ---------------------------------------------
+
+    #[test]
+    fn a_stable_header_rewrite_passes_the_probe() {
+        let r = probe(&route(
+            r#"
+envelope_from: "bounce@newbrand.com"
+header_rewrites:
+  - header: List-Unsubscribe
+    pattern: '<https://www\.meddoc\.net/'
+    replacement: '<https://link-pmps.healthcarematch.com/'
+"#,
+        ));
+        assert!(r.is_stable(), "{:?}", r.unstable);
+        assert!(r.skipped_headers.is_empty(), "{:?}", r.skipped_headers);
+    }
+
+    #[test]
+    fn an_unstable_header_rewrite_is_caught_by_the_probe() {
+        let r = probe(&route(
+            r#"
+envelope_from: "bounce@newbrand.com"
+header_rewrites:
+  - header: List-Unsubscribe
+    pattern: 'healthcarematch\.com'
+    replacement: 'healthcarematch.com.proxy'
+"#,
+        ));
+        assert_eq!(r.unstable.len(), 1, "{:?}", r.unstable);
+        assert_eq!(r.unstable[0].field, "List-Unsubscribe");
+    }
+
+    #[test]
+    fn the_probe_carries_a_rewritten_header_and_its_encoded_word() {
+        let r = route(
+            r#"
+envelope_from: "bounce@newbrand.com"
+header_rewrites:
+  - header: X-Tracking
+    pattern: 'a'
+    replacement: 'b'
+  - header: Subject
+    pattern: 'c'
+    replacement: 'd'
+"#,
+        );
+        let probe = String::from_utf8(probe_message(&r)).unwrap();
+        assert!(
+            probe.contains("X-Tracking: b b bb =?UTF-8?B?w6k=?=\r\n"),
+            "{probe}"
+        );
+        // A header the probe already has keeps its value and gains the text.
+        assert_eq!(probe.matches("Subject:").count(), 1, "{probe}");
+        assert!(probe.contains("Subject: probe subject d d dd"), "{probe}");
+    }
+
+    #[test]
+    fn a_rewrite_whose_result_cannot_be_a_header_is_reported() {
+        // Each literal run fits a line, so it compiles; the capture joins them
+        // into one that does not. The probe text carries the replacement as
+        // written, `${0}` included, whose `$` and `0` the pattern matches.
+        let half = "x".repeat(600);
+        let r = probe(&route(&format!(
+            r#"
+envelope_from: "bounce@newbrand.com"
+header_rewrites:
+  - header: X-A
+    pattern: '\$\{{0\}}'
+    replacement: '{half}${{0}}{half}'
+"#
+        )));
+        assert!(
+            r.skipped_headers.contains(&(
+                "X-A".to_string(),
+                crate::rewrite::header_rules::SkipReason::Unrepresentable
+            )),
+            "{:?}",
+            r.skipped_headers
+        );
     }
 }

@@ -234,6 +234,8 @@ src/rewrite/encode.rs    RFC 2047/5322 conformance. EVERY function is idempotent
 src/rewrite/headers.rs   an untouched header keeps its ORIGINAL BYTES (D-039)
 src/rewrite/mime.rs      §6.4's structure, as byte RANGES into the body (D-043)
 src/rewrite/body.rs      §6.4 itself. No match means no re-encode — that is the point
+src/rewrite/header_rules.rs  D-089's header_rewrites — NOT in SPEC.md (O-16). Matched on
+                         the RFC 2047-DECODED value; a header no rule changes keeps its bytes
 src/rewrite/transfer.rs  quoted-printable and base64, each with a matching encoder
 src/rewrite/charset.rs   four charsets, by hand. Anything else is "unknown" (D-044)
 src/rewrite/stability.rs §6.6's property; `validate.rs` runs it at startup. The

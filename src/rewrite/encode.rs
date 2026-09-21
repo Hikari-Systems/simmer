@@ -227,7 +227,7 @@ fn split_address_list(value: &str) -> Vec<String> {
 /// here than readable output. Adjacent encoded-words separated by whitespace are
 /// concatenated by the receiver with the whitespace dropped (RFC 2047 §6.2),
 /// so the split is invisible.
-fn encode_words(value: &str) -> String {
+pub(crate) fn encode_words(value: &str) -> String {
     let mut words = Vec::new();
     let mut chunk = String::new();
 

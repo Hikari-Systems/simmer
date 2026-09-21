@@ -141,6 +141,75 @@ async fn a_link_in_a_text_part_is_rewritten_on_the_way_through() {
     assert!(!got.contains("oldbrand.com/track"), "{got}");
 }
 
+// ---------------------------------------------------------------------------
+// D-089 through the relay
+// ---------------------------------------------------------------------------
+
+/// D-089's case: the body links and the unsubscribe header both move to the
+/// proxy host, and `set_headers` still wins over a rewrite of the same header.
+const WITH_HEADER_REWRITES: &str = concat!(
+    "      set_headers:\n",
+    "        X-Set: \"explicit\"\n",
+    "      body_rewrites:\n",
+    "        - pattern: 'https://www\\.meddoc\\.net/'\n",
+    "          replacement: \"https://link-pmps.healthcarematch.com/\"\n",
+    "      header_rewrites:\n",
+    "        - header: List-Unsubscribe\n",
+    "          pattern: '<https://www\\.meddoc\\.net/'\n",
+    "          replacement: '<https://link-pmps.healthcarematch.com/'\n",
+    "        - header: X-Set\n",
+    "          pattern: 'old'\n",
+    "          replacement: 'new'\n",
+);
+
+#[tokio::test]
+async fn the_unsubscribe_header_moves_host_with_the_body_links_and_keeps_its_token() {
+    let down = FakeDownstream::start(Script::default()).await;
+    let simmer = Simmer::start(&config_for(down.addr, WITH_HEADER_REWRITES)).await;
+    let mut c = simmer.connect().await;
+    c.hello().await;
+
+    let body = concat!(
+        "From: MedDoc <news@oldbrand.com>\r\n",
+        "subject:  Two  spaces\r\n",
+        "X-Folded: first\r\n\tsecond\r\n",
+        "X-Set: old\r\n",
+        "List-Unsubscribe: <mailto:u@meddoc.net>,\r\n",
+        " <https://www.meddoc.net/unsub.cfm?13323193_418550_3_9011119906_90535>\r\n",
+        "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n",
+        "Content-Type: text/plain; charset=utf-8\r\n",
+        "\r\n",
+        "Unsubscribe: https://www.meddoc.net/unsub.cfm?13323193_418550_3_9011119906_90535\r\n",
+    );
+    let r = c.deliver("news@oldbrand.com", "bob@gmail.com", body).await;
+    assert_eq!(r.code, 250, "{r:?}");
+
+    let got = support::without_received(&down.last().expect("received").body);
+    let expected = body
+        .replace(
+            "List-Unsubscribe: <mailto:u@meddoc.net>,\r\n <https://www.meddoc.net/",
+            "List-Unsubscribe: <mailto:u@meddoc.net>, <https://link-pmps.healthcarematch.com/",
+        )
+        .replace("X-Set: old", "X-Set: explicit")
+        .replace(
+            "Unsubscribe: https://www.meddoc.net/",
+            "Unsubscribe: https://link-pmps.healthcarematch.com/",
+        );
+    // Byte for byte: the rewritten header unfolded, the token untouched, and
+    // every header no rule changed exactly as it arrived.
+    assert_eq!(got, expected);
+
+    // And a message the application already sends to the proxy host — §1.1's
+    // arrangement B — passes through byte for byte.
+    let already = expected.clone();
+    let r = c
+        .deliver("news@oldbrand.com", "bob@gmail.com", &already)
+        .await;
+    assert_eq!(r.code, 250, "{r:?}");
+    let got = support::without_received(&down.last().expect("received").body);
+    assert_eq!(got, already);
+}
+
 #[tokio::test]
 async fn a_link_split_across_a_soft_line_break_is_rewritten_and_the_rest_is_left_alone() {
     // §6.4's stated reason for decoding first: a URL written across a

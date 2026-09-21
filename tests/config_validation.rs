@@ -1227,3 +1227,132 @@ fn does_not_warn_about_capture_when_it_is_off() {
         .iter()
         .any(|w| w.path.starts_with("capture")));
 }
+
+// -- D-089: header_rewrites ------------------------------------------------
+
+/// BASE's warming route with a `header_rewrites` block appended.
+fn with_header_rewrites(block: &str) -> String {
+    BASE.replace(
+        r#"      unstable_headers: ["Reply-To"]"#,
+        &format!("      unstable_headers: [\"Reply-To\"]\n      header_rewrites:\n{block}"),
+    )
+}
+
+const UNSUB_REWRITE: &str = "        - header: List-Unsubscribe
+          pattern: '<https://www\\.meddoc\\.net/'
+          replacement: '<https://link-pmps.healthcarematch.com/'\n";
+
+#[test]
+fn accepts_the_list_unsubscribe_host_rewrite() {
+    let cfg = load(&with_header_rewrites(UNSUB_REWRITE)).expect("should be accepted");
+    assert!(!config::validate::warnings(&cfg)
+        .iter()
+        .any(|w| w.path.contains("header_rewrites")));
+}
+
+#[test]
+fn rejects_a_header_rewrite_of_every_identity_field() {
+    // The treatment envelope_from gets: refused, and nothing overrides it.
+    for field in ["From", "Sender", "Message-ID", "from"] {
+        let yaml = with_header_rewrites(&format!(
+            "        - header: {field}\n          pattern: 'oldbrand'\n          replacement: 'newbrand'\n"
+        ));
+        rejected_for(&yaml, &format!("names identity field '{field}'"));
+    }
+}
+
+#[test]
+fn declaring_an_identity_field_unstable_does_not_admit_a_header_rewrite_of_it() {
+    // §6.6 refuses the declaration itself, so there is no route to admission —
+    // and the rewrite is refused in its own right, not only via the declaration.
+    let yaml = with_header_rewrites(
+        "        - header: Sender\n          pattern: 'old'\n          replacement: 'new'\n",
+    )
+    .replace(
+        r#"unstable_headers: ["Reply-To"]"#,
+        r#"unstable_headers: ["Reply-To", "Sender"]"#,
+    );
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            assert!(v.mentions("header_rewrites[0].header"), "{v}");
+            assert!(v.mentions("unstable_headers"), "{v}");
+        }
+        other => panic!("expected rejection, got {:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
+fn rejects_header_rewrites_that_are_not_a_fixed_point() {
+    let yaml = with_header_rewrites(
+        "        - header: List-Unsubscribe\n          pattern: 'meddoc\\.net'\n          replacement: 'meddoc.net.proxy.example'\n",
+    );
+    rejected_for(&yaml, "are not stable");
+}
+
+#[test]
+fn declaring_an_unstable_header_rewrite_does_not_rescue_it() {
+    // D-046's reasoning: no migration-only reading of a rule that re-matches
+    // its own output, so unstable_headers is not an escape hatch for it.
+    let yaml = with_header_rewrites(
+        "        - header: List-Unsubscribe\n          pattern: 'meddoc\\.net'\n          replacement: 'meddoc.net.proxy.example'\n",
+    )
+    .replace(
+        r#"unstable_headers: ["Reply-To"]"#,
+        r#"unstable_headers: ["Reply-To", "List-Unsubscribe"]"#,
+    );
+    rejected_for(&yaml, "Not overridable");
+}
+
+#[test]
+fn rejects_a_header_rewrite_whose_result_would_not_be_conformant() {
+    let yaml = with_header_rewrites(
+        "        - header: X-A\n          pattern: 'a'\n          replacement: \"b\\r\\nBcc: victim@example.com\"\n",
+    );
+    rejected_for(&yaml, "RFC 5322");
+}
+
+#[test]
+fn rejects_a_header_rewrite_with_an_unusable_header_name_or_pattern() {
+    let yaml = with_header_rewrites(
+        "        - header: 'Bad Name'\n          pattern: 'a'\n          replacement: 'b'\n        - header: X-B\n          pattern: '[unclosed'\n          replacement: 'b'\n",
+    );
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            assert!(v.mentions("header_rewrites[0].header"), "{v}");
+            assert!(v.mentions("header_rewrites[1].pattern"), "{v}");
+        }
+        other => panic!("expected rejection, got {:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
+fn a_capture_reference_followed_by_text_says_how_to_write_it() {
+    let yaml = with_header_rewrites(
+        "        - header: X-A\n          pattern: '(a)'\n          replacement: '$1b'\n",
+    );
+    rejected_for(&yaml, "write ${1}b");
+}
+
+#[test]
+fn warns_about_a_header_rewrite_that_can_never_take_effect() {
+    // Not a violation — §6.2's order makes each case well defined — but the
+    // operator wrote a rule expecting it to fire.
+    let yaml = with_header_rewrites(
+        "        - header: reply-to\n          pattern: 'a'\n          replacement: 'b'\n        - header: X-Mailer\n          pattern: 'a'\n          replacement: 'b'\n        - header: DKIM-Signature\n          pattern: 'a'\n          replacement: 'b'\n",
+    )
+    .replace(
+        r#"unstable_headers: ["Reply-To"]"#,
+        "unstable_headers: [\"Reply-To\"]\n      remove_headers: [\"X-Mailer\"]",
+    );
+    let cfg = load(&yaml).expect("dead rules warn, they do not refuse");
+    let warnings = config::validate::warnings(&cfg);
+    for (i, by) in [(0, "set_headers"), (1, "remove_headers"), (2, "§6.5")] {
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.path.ends_with(&format!("header_rewrites[{i}]"))
+                    && w.message.contains(by)),
+            "no warning for entry {i} naming {by}: {warnings:?}"
+        );
+    }
+}

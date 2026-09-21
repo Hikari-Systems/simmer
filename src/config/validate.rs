@@ -421,6 +421,43 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
         }
     }
 
+    // D-089 — a `header_rewrites` entry that can never take effect. Not a
+    // violation: §6.2's own idiom is naming a header in two lists, and the
+    // order makes each case well defined. But the operator wrote a rule
+    // expecting it to fire, and it will not.
+    for route in &cfg.routes {
+        let identity = &route.identity;
+        for (i, rule) in identity.header_rewrites.iter().enumerate() {
+            let path = format!("routes.{}.identity.header_rewrites[{i}]", route.name);
+            let header = &rule.header;
+            let shadowed_by = if identity.set_headers.contains_key(header) {
+                Some("set_headers, which runs after it and replaces the value")
+            } else if identity
+                .remove_headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(header))
+            {
+                Some("remove_headers, which runs before it")
+            } else if crate::rewrite::AUTH_ARTEFACTS
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(header))
+            {
+                Some("§6.5's unconditional strip, which runs before it")
+            } else {
+                None
+            };
+            if let Some(by) = shadowed_by {
+                out.push(Warning {
+                    path,
+                    message: format!(
+                        "rewrites '{header}', which is also handled by {by}: this rule never \
+                         takes effect (D-089)"
+                    ),
+                });
+            }
+        }
+    }
+
     // §14.2: an unmatched sender goes to the overflow route at full volume. If
     // that is not what the operator wants, strict_senders exists.
     if !cfg.strict_senders {
@@ -1249,6 +1286,29 @@ fn check_identity(identity: &Identity, route_name: &str, v: &mut ViolationList) 
             );
         }
     }
+    // D-089: an identity field is not rewritable by `header_rewrites`, with no
+    // override — the treatment `envelope_from` gets. §6.6 routes the override
+    // for every other header through `unstable_headers`, and naming an identity
+    // field there is refused just above, so there is no declaration that could
+    // admit one. A regex over `From:` is a relative transformation of the
+    // reputation-bearing field — the output is a function of the value it
+    // overwrites — which is §1.1 constraint 1 by name. `set_headers` is how an
+    // identity field is assigned.
+    for (i, rule) in identity.header_rewrites.iter().enumerate() {
+        if is_identity_header(&rule.header) {
+            v.push(
+                at(&format!("header_rewrites[{i}].header")),
+                format!(
+                    "names identity field '{}'. Identity fields determine which domain accrues \
+                     reputation and must be absolute assignments: set it with set_headers. This \
+                     is not overridable, and unstable_headers cannot name an identity field \
+                     (§1.1, §6.6, D-089)",
+                    rule.header
+                ),
+            );
+        }
+    }
+
     // A header the route never sets was a *violation* in phase 1, when there was
     // no way to tell a stale declaration from a live one. §6.6 says otherwise —
     // "Naming a header that is in fact stable is also a startup WARN" — and a
@@ -1318,9 +1378,56 @@ fn check_identity(identity: &Identity, route_name: &str, v: &mut ViolationList) 
                 );
             }
 
+            // D-089 — the same question of `header_rewrites`, one header at a
+            // time, and fatal for D-046's reason: nobody writes a regex meaning
+            // it to apply twice, so there is nothing for unstable_headers to
+            // acknowledge.
+            let mut unstable_rewrites: Vec<String> = Vec::new();
+            for (header, once, twice) in compiled.header_rewrites.fixed_point_violations() {
+                v.push(
+                    at("header_rewrites"),
+                    format!(
+                        "for '{header}' are not stable: applying them to their own output \
+                         changes it again ({once:?} then {twice:?}). A rule that matches what it \
+                         just wrote corrupts the header every time it passes through, and would \
+                         corrupt traffic from an application that has already been cut over. \
+                         Not overridable (§1.1, §6.6, D-089)"
+                    ),
+                );
+                unstable_rewrites.push(header.to_ascii_lowercase());
+            }
+
             let report = stability::probe(&compiled);
+
+            // D-089 — "a rewrite producing a non-RFC-5322-conformant value must
+            // fail validation, not emit a malformed header". The replacement's
+            // literal text is checked at compile; this is the engine declining
+            // to emit its result for the probe.
+            for (header, reason) in &report.skipped_headers {
+                v.push(
+                    at("header_rewrites"),
+                    format!(
+                        "for '{header}' cannot be applied to the startup probe: {} (D-089)",
+                        reason.describe()
+                    ),
+                );
+            }
+
             for u in report.unstable {
-                if u.identity {
+                let from_rewrite = compiled.header_rewrites.names(&u.field)
+                    && !identity.set_headers.contains_key(&u.field);
+                if from_rewrite {
+                    if !unstable_rewrites.contains(&u.field.to_ascii_lowercase()) {
+                        v.push(
+                            at("header_rewrites"),
+                            format!(
+                                "for '{}' are not stable: rewriting twice gives '{}' then '{}'. \
+                                 Not overridable (§1.1, §6.6, D-089)",
+                                u.field, u.first, u.second
+                            ),
+                        );
+                    }
+                } else if u.identity {
                     // "A stability violation here is a fatal startup error with
                     // no override."
                     v.push(

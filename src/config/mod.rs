@@ -838,11 +838,27 @@ pub struct Identity {
     /// §6.4. `text/*` parts only, applied in order.
     #[serde(default)]
     pub body_rewrites: Vec<BodyRewrite>,
+    /// D-089 — a regex replacement over one named header's value, applied
+    /// after `remove_headers` and before `set_headers`, in order. Not in
+    /// `SPEC.md`; O-16 is the open question.
+    #[serde(default)]
+    pub header_rewrites: Vec<HeaderRewrite>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BodyRewrite {
+    pub pattern: String,
+    pub replacement: String,
+}
+
+/// One `header_rewrites` entry (D-089): `body_rewrites`' shape plus the header
+/// it applies to. Every instance of the header is rewritten; a header no entry
+/// names keeps its original bytes (D-039).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderRewrite {
+    pub header: String,
     pub pattern: String,
     pub replacement: String,
 }

@@ -518,6 +518,84 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
+// header_rewrites (D-089)
+// ---------------------------------------------------------------------------
+
+/// The shipped identity plus D-089's case, and a Subject rewrite so the RFC 2047
+/// path is composed too.
+const WITH_HEADER_REWRITES: &str = r#"
+envelope_from: "bounce@newbrand.com"
+set_headers:
+  From: "{{original.from.display_name}} <sales@newbrand.com>"
+header_rewrites:
+  - header: List-Unsubscribe
+    pattern: '<https://www\.meddoc\.net/'
+    replacement: '<https://link-pmps.healthcarematch.com/'
+  - header: Subject
+    pattern: '(?i)oldbrand'
+    replacement: 'Newbrand'
+"#;
+
+/// The header D-089 rewrites, in the shapes it arrives in — and a Subject that
+/// needs decoding before it matches.
+fn rewritten_header() -> impl Strategy<Value = String> {
+    prop_oneof![
+        "[0-9_]{1,40}".prop_map(|token| format!(
+            "List-Unsubscribe: <https://www.meddoc.net/unsub.cfm?{token}>\r\n"
+        )),
+        "[0-9_]{1,40}".prop_map(|token| format!(
+            "List-Unsubscribe: <mailto:u@meddoc.net>,\r\n <https://www.meddoc.net/unsub.cfm?{token}>\r\n"
+        )),
+        Just("List-Unsubscribe: <https://link-pmps.healthcarematch.com/unsub.cfm?1>\r\n".to_string()),
+        Just("List-Unsubscribe: =?x-unknown?Q?a?=\r\n".to_string()),
+        Just("Subject: =?UTF-8?Q?Gr=C3=BC=C3=9Fe_from_OldBrand?=\r\n".to_string()),
+        Just("Subject: =?UTF-8?Q?Old?= =?UTF-8?Q?brand_news?=\r\n".to_string()),
+        Just("Subject: =?ISO-8859-1?Q?caf=E9?= oldbrand\r\n".to_string()),
+        Just("Subject: =?UTF-8?B?4pyTIG9sZGJyYW5k?=\r\n".to_string()),
+    ]
+}
+
+prop_compose! {
+    fn message_with_rewritten_headers()(
+        base in message(),
+        headers in prop::collection::vec(rewritten_header(), 1..4),
+    ) -> String {
+        format!("{}{base}", headers.concat())
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+
+    #[test]
+    fn header_rewrites_are_stable_over_generated_messages(m in message_with_rewritten_headers()) {
+        let route = compile(WITH_HEADER_REWRITES);
+        if let Err(why) = is_stable(&route, &m) {
+            return Err(TestCaseError::fail(format!("{why}\n--- input ---\n{m}")));
+        }
+    }
+
+    #[test]
+    fn header_rewrites_never_emit_a_malformed_field(m in message_with_rewritten_headers()) {
+        // Whatever arrived, a field this route wrote is printable ASCII and fits
+        // its line.
+        let route = compile(WITH_HEADER_REWRITES);
+        let out = pass(&route, m.as_bytes(), Some("sender@oldbrand.com"));
+        let text = String::from_utf8_lossy(&out.raw).to_string();
+        for line in text.split("\r\n\r\n").next().unwrap_or_default().split("\r\n") {
+            if line.starts_with("List-Unsubscribe:") || line.starts_with("Subject:") {
+                prop_assert!(line.len() <= 998, "{}", line);
+                prop_assert!(
+                    line.chars().all(|c| c == '\t' || (' '..='~').contains(&c)),
+                    "{}", line
+                );
+            }
+        }
+        prop_assert!(!text.contains("www.meddoc.net/"), "{}", text);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // the negative case — the property has to be able to fail
 // ---------------------------------------------------------------------------
 

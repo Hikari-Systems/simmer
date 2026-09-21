@@ -10,6 +10,7 @@
 //! 2. Parse into headers and MIME structure
 //! 4. Strip authentication artefacts (§6.5)
 //! 5. Apply remove_headers
+//! 5a. Apply header_rewrites (D-089 — not in SPEC.md; O-16)
 //! 6. Apply set_headers, rendering templates
 //! 7. Apply body_rewrites to text/* parts (§6.4)
 //! 8. Prepend a Received: header naming Simmer
@@ -30,6 +31,11 @@
 //!   depending on whether it was listed above or below `From:`.
 //! - **`remove_headers` before `set_headers`** is §6.2's own rule, and it is what
 //!   makes "replace this header" expressible as naming it in both.
+//! - **`header_rewrites` between the two** (D-089). After `remove_headers`, so a
+//!   removed header is not there to rewrite; before `set_headers`, so an
+//!   explicit value still wins. It edits the header block only — the template
+//!   context above was built before it ran, so `{{original.header["X"]}}` still
+//!   means the value as it arrived.
 //!
 //! ## What makes it stable (§6.6)
 //!
@@ -48,6 +54,7 @@
 pub mod body;
 pub mod charset;
 pub mod encode;
+pub mod header_rules;
 pub mod headers;
 pub mod mime;
 pub mod stability;
@@ -92,6 +99,8 @@ pub struct RouteRewrite {
     pub unstable_headers: Vec<String>,
     /// §6.4, compiled. Empty for a route that configures none.
     pub body_rewrites: body::Rules,
+    /// D-089, compiled. Empty for a route that configures none.
+    pub header_rewrites: header_rules::Rules,
 }
 
 /// Where an `identity` entry failed to compile, so §4.2 can name the YAML key.
@@ -110,6 +119,8 @@ pub enum CompileErrorKind {
     /// The regex crate's own diagnosis, reduced to the line that names the
     /// problem — see [`CompileErrorKind::pattern`].
     Pattern(String),
+    /// A `header_rewrites` entry's header name or replacement (D-089).
+    HeaderRewrite(String),
 }
 
 impl CompileErrorKind {
@@ -132,7 +143,9 @@ impl std::fmt::Display for CompileErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CompileErrorKind::Template(e) => e.fmt(f),
-            CompileErrorKind::Pattern(message) => f.write_str(message),
+            CompileErrorKind::Pattern(message) | CompileErrorKind::HeaderRewrite(message) => {
+                f.write_str(message)
+            }
         }
     }
 }
@@ -177,6 +190,19 @@ impl RouteRewrite {
             }
         };
 
+        let header_rewrites = match header_rules::Rules::compile(&identity.header_rewrites) {
+            Ok(rules) => Some(rules),
+            Err(failures) => {
+                for e in failures {
+                    errors.push(CompileError {
+                        field: format!("header_rewrites[{}].{}", e.index, e.field),
+                        error: CompileErrorKind::HeaderRewrite(e.message),
+                    });
+                }
+                None
+            }
+        };
+
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -187,6 +213,7 @@ impl RouteRewrite {
             remove_headers: identity.remove_headers.clone(),
             unstable_headers: identity.unstable_headers.clone(),
             body_rewrites: body_rewrites.expect("no errors means it compiled"),
+            header_rewrites: header_rewrites.expect("no errors means it compiled"),
         })
     }
 
@@ -276,6 +303,10 @@ pub struct Rewritten {
     /// applied to and was not. Carried out rather than counted here so the relay
     /// owns every metric call and the engine stays a pure function.
     pub skipped_parts: Vec<body::SkipReason>,
+    /// D-089 — one per header instance a `header_rewrites` entry named and
+    /// could not rewrite, as `(header, reason)`. Carried out for the same
+    /// reason as `skipped_parts`.
+    pub skipped_headers: Vec<(String, header_rules::SkipReason)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +382,30 @@ pub fn rewrite(route: &RouteRewrite, inbound: &Inbound<'_>) -> Rewritten {
         message.headers.remove(name);
     }
 
+    // -- step 5a: D-089 -----------------------------------------------
+    //
+    // Between remove and set, so `set_headers` still wins. A header no rule
+    // changes is offered and declined, and so keeps its original bytes.
+    let mut skipped_headers = Vec::new();
+    for name in route.header_rewrites.headers() {
+        message
+            .headers
+            .edit_each(name, |raw| match route.header_rewrites.apply(name, raw) {
+                header_rules::Edit::Unchanged => None,
+                header_rules::Edit::Rewritten(value) => Some(value),
+                header_rules::Edit::Skipped(reason) => {
+                    tracing::warn!(
+                        header = name,
+                        reason = reason.as_str(),
+                        "header_rewrites not applied: {}",
+                        reason.describe()
+                    );
+                    skipped_headers.push((name.to_string(), reason));
+                    None
+                }
+            });
+    }
+
     // -- step 6 --------------------------------------------------------
     for (name, tmpl) in &route.set_headers {
         message.headers.set(name, tmpl.render_header(name, &ctx));
@@ -394,6 +449,7 @@ pub fn rewrite(route: &RouteRewrite, inbound: &Inbound<'_>) -> Rewritten {
         raw,
         envelope_from,
         skipped_parts: rewritten_body.skipped,
+        skipped_headers,
     }
 }
 
@@ -881,5 +937,198 @@ set_headers:
         .unwrap();
         let errs = RouteRewrite::compile(&identity).unwrap_err();
         assert_eq!(errs.len(), 3);
+    }
+
+    // -- header_rewrites (D-089) --------------------------------------------
+
+    /// The message D-089 was written for: a per-message token after the host.
+    const UNSUB_MESSAGE: &[u8] = b"From: MedDoc <news@meddoc.net>\r\n\
+        To: bob@example.net\r\n\
+        subject:  Two  spaces, lowercase name\r\n\
+        X-Folded: first half\r\n\tsecond half\r\n\
+        List-Unsubscribe: <https://www.meddoc.net/unsub.cfm?13323193_418550_3_9011119906_90535>\r\n\
+        List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n\
+        \r\n\
+        Hello.\r\n";
+
+    const UNSUB_ROUTE: &str = r#"
+envelope_from: "bounce@healthcarematch.com"
+header_rewrites:
+  - header: List-Unsubscribe
+    pattern: '<https://www\.meddoc\.net/'
+    replacement: '<https://link-pmps.healthcarematch.com/'
+"#;
+
+    #[test]
+    fn header_rewrites_move_the_host_and_keep_the_token() {
+        let out = run(
+            &compile(UNSUB_ROUTE),
+            UNSUB_MESSAGE,
+            Some("news@meddoc.net"),
+        );
+        let text = text(&out);
+        assert!(
+            text.contains(
+                "List-Unsubscribe: <https://link-pmps.healthcarematch.com/unsub.cfm?\
+                 13323193_418550_3_9011119906_90535>\r\n"
+            ),
+            "{text}"
+        );
+        assert!(out.skipped_headers.is_empty());
+    }
+
+    #[test]
+    fn headers_no_rule_names_keep_their_original_bytes() {
+        // D-039. Everything but the rewritten field and the prepended Received:
+        // is byte-identical to what arrived — including the doubled spaces, the
+        // lowercase name and the tab-folded continuation.
+        let out = run(
+            &compile(UNSUB_ROUTE),
+            UNSUB_MESSAGE,
+            Some("news@meddoc.net"),
+        );
+        let text = text(&out);
+        let original = String::from_utf8(UNSUB_MESSAGE.to_vec()).unwrap();
+        let expected = original.replace(
+            "https://www.meddoc.net/",
+            "https://link-pmps.healthcarematch.com/",
+        );
+        let after_received = text.split_once("\r\n").unwrap().1;
+        assert_eq!(after_received, expected);
+    }
+
+    #[test]
+    fn a_named_header_no_pattern_matches_keeps_its_original_bytes() {
+        let route = compile(
+            r#"
+envelope_from: "b@new.com"
+header_rewrites:
+  - header: X-Folded
+    pattern: 'no such text'
+    replacement: 'x'
+"#,
+        );
+        let out = run(&route, UNSUB_MESSAGE, Some("news@meddoc.net"));
+        assert!(
+            text(&out).contains("X-Folded: first half\r\n\tsecond half\r\n"),
+            "{}",
+            text(&out)
+        );
+    }
+
+    #[test]
+    fn header_rewrites_run_after_remove_headers_and_before_set_headers() {
+        // Three headers, one rule each. `X-Removed` is removed before the rule
+        // can see it; `X-Set` is rewritten and then replaced outright;
+        // `X-Kept` is rewritten and survives.
+        let route = compile(
+            r#"
+envelope_from: "b@new.com"
+remove_headers: ["X-Removed"]
+set_headers:
+  X-Set: "explicit"
+  X-Copy: "{{original.header[\"X-Kept\"]}}"
+header_rewrites:
+  - header: X-Removed
+    pattern: 'old'
+    replacement: 'new'
+  - header: X-Set
+    pattern: 'old'
+    replacement: 'new'
+  - header: X-Kept
+    pattern: 'old'
+    replacement: 'new'
+"#,
+        );
+        let raw: &[u8] = b"From: a@old.com\r\n\
+            X-Removed: old\r\n\
+            X-Set: old\r\n\
+            X-Kept: old\r\n\
+            \r\n\
+            Hello.\r\n";
+        let text = text(&run(&route, raw, Some("a@old.com")));
+        assert!(!text.contains("X-Removed"), "{text}");
+        assert!(
+            text.contains("X-Set: explicit\r\n"),
+            "set_headers wins: {text}"
+        );
+        assert!(text.contains("X-Kept: new\r\n"), "{text}");
+        // Templates read the message as it arrived, not the rewrite's output.
+        assert!(text.contains("X-Copy: old\r\n"), "{text}");
+    }
+
+    #[test]
+    fn header_rewrites_are_idempotent_through_the_engine() {
+        let route = compile(UNSUB_ROUTE);
+        let once = run(&route, UNSUB_MESSAGE, Some("news@meddoc.net"));
+        let twice = run(&route, &once.raw, once.envelope_from.as_deref());
+        // Pass 2 prepends a second Received:; everything below it is pass 1.
+        let (_, rest) = text(&twice)
+            .split_once("\r\n")
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .unwrap();
+        assert_eq!(rest, text(&once));
+    }
+
+    #[test]
+    fn every_instance_of_a_rewritten_header_is_rewritten_in_place() {
+        let raw: &[u8] = b"From: a@old.com\r\n\
+            List-Unsubscribe: <https://www.meddoc.net/a>\r\n\
+            X-Between: here\r\n\
+            List-Unsubscribe: <mailto:u@x.example>\r\n\
+            list-unsubscribe: <https://www.meddoc.net/b>\r\n\
+            \r\n";
+        let text = text(&run(&compile(UNSUB_ROUTE), raw, Some("a@old.com")));
+        let after_received = text.split_once("\r\n").unwrap().1;
+        assert_eq!(
+            after_received,
+            "From: a@old.com\r\n\
+             List-Unsubscribe: <https://link-pmps.healthcarematch.com/a>\r\n\
+             X-Between: here\r\n\
+             List-Unsubscribe: <mailto:u@x.example>\r\n\
+             list-unsubscribe: <https://link-pmps.healthcarematch.com/b>\r\n\
+             \r\n"
+        );
+    }
+
+    #[test]
+    fn an_rfc_2047_value_is_matched_decoded_and_written_back_encoded() {
+        let route = compile(
+            r#"
+envelope_from: "b@new.com"
+header_rewrites:
+  - header: Subject
+    pattern: 'oldbrand'
+    replacement: 'newbrand'
+"#,
+        );
+        let raw: &[u8] = b"From: a@old.com\r\n\
+            Subject: =?UTF-8?Q?Gr=C3=BC=C3=9Fe_von?=\r\n =?UTF-8?Q?oldbrand?=\r\n\
+            \r\n";
+        let out = run(&route, raw, Some("a@old.com"));
+        let block = headers::split(&out.raw).headers;
+        let subject = block.get("Subject").unwrap();
+        assert!(subject.is_ascii(), "{subject}");
+        let parsed = mail_parser::MessageParser::default()
+            .parse_headers(out.raw.as_slice())
+            .unwrap();
+        assert_eq!(parsed.subject(), Some("Grüße vonnewbrand"));
+    }
+
+    #[test]
+    fn a_header_that_cannot_be_rewritten_is_left_alone_and_reported() {
+        let route = compile(UNSUB_ROUTE);
+        let raw: &[u8] = b"From: a@old.com\r\n\
+            List-Unsubscribe: =?x-unknown?Q?a?=\r\n\
+            \r\n";
+        let out = run(&route, raw, Some("a@old.com"));
+        assert!(text(&out).contains("List-Unsubscribe: =?x-unknown?Q?a?=\r\n"));
+        assert_eq!(
+            out.skipped_headers,
+            [(
+                "List-Unsubscribe".to_string(),
+                header_rules::SkipReason::UnsupportedCharset
+            )]
+        );
     }
 }

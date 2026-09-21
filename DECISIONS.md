@@ -3327,6 +3327,172 @@ tick, which is the only thing that makes "backstop" true.
 
 It also gave F17's fix its hook: a flush knows exactly how many bytes it pushed.
 
+## `header_rewrites` (2026-09-21)
+
+### D-089 — A per-route `header_rewrites` list: regex replacement over a header's value
+
+> **Open — O-16.** This diverges from `SPEC.md` as written, so it is recorded
+> here and `SPEC.md` is unchanged. §6.1, §6.2, §4.1, §4.2 and §9.1 say nothing
+> about it until the question below has been put to the spec's author and
+> answered. The proposed amendment text is at the end of this entry.
+
+**Spec:** §6.2 gives headers two mechanisms: `set_headers`, whose values are §6.3
+templates (variable substitution only), and `remove_headers`. §6.4's
+`body_rewrites` is regex, but scoped to `text/*` parts. Neither can do this:
+
+```
+List-Unsubscribe: <https://www.meddoc.net/unsub.cfm?13323193_418550_3_9011119906_90535>
+                            must become
+List-Unsubscribe: <https://link-pmps.healthcarematch.com/unsub.cfm?13323193_418550_3_9011119906_90535>
+```
+
+— the host changes and the per-message token is kept verbatim.
+`{{original.header["List-Unsubscribe"]}}` can copy the value but not transform
+it. So every body URL on the route was rewritten to the proxy host (§5.7) while
+the header still pointed at the origin: a mailbox provider's one-click
+unsubscribe (RFC 8058) bypassed the proxy, and disagreed with the visible links
+in the same message.
+
+**Decision:** a route's `identity` may carry
+
+```yaml
+header_rewrites:
+  - header: List-Unsubscribe
+    pattern: '<https://www\.meddoc\.net/'
+    replacement: '<https://link-pmps.healthcarematch.com/'
+```
+
+`body_rewrites`' `pattern`/`replacement` shape — same regex crate, same `$1`,
+`${name}`, `$$` syntax — plus the header it applies to. Entries apply in order;
+every instance of the named header is rewritten in place. `src/rewrite/header_rules.rs`.
+
+**Order: `remove_headers` → `header_rewrites` → `set_headers`**, as a step 5a
+between §6.1's 5 and 6. A removed header is not there to rewrite, and an explicit
+`set_headers` value still wins. Templates are unaffected: the §6.3 context is
+built from the message *as it arrived* before step 4, so
+`{{original.header["List-Unsubscribe"]}}` still means the inbound value, for the
+same reason `set_headers` entries cannot see each other's output. A rule the
+order makes dead — its header is also in `set_headers` or `remove_headers`, or is
+one of §6.5's stripped artefacts — is a startup `WARN`, not a violation (D-040's
+severity for a stale expectation).
+
+**How each existing constraint is met.**
+
+- **§1.1 — see O-16; this is the part that needs the author.** Constraint 1
+  says rewrites are "absolute assignments, never relative transformations", and
+  a regex replacement that keeps the token *is* a relative transformation of the
+  value: its output is a function of what it overwrites. `body_rewrites` is
+  exactly the same construction and §6.4 specifies it, so the spec already
+  treats "the result is expressible as application-side config, and stable under
+  repetition" as the operational test rather than the letter of constraint 1.
+  That test is met here — the application can be configured to emit
+  `link-pmps.healthcarematch.com` unsubscribe URLs itself, which is arrangement
+  B, and in arrangement B this rule matches nothing and the header passes through
+  with its bytes intact. But reading constraint 1 that way for headers is a call
+  about the spec's intent, not ours to make.
+- **Stable under repetition — fatal, no override.** At startup the rules for
+  each header must be a fixed point (`header_rules::Rules::fixed_point_violations`,
+  D-046's construction: a probe built from the rules' own replacements, as
+  written and with capture references dropped, alone and concatenated; compare
+  `apply(probe)` with `apply(apply(probe))`). The §6.6 engine probe also carries
+  each named header, with that text plus an RFC 2047 encoded-word, and an
+  instability there on a header `header_rewrites` names is reported as this
+  rule's. **`unstable_headers` does not downgrade either** — D-046's reasoning
+  exactly: nobody writes a regex meaning it to apply twice, so there is no
+  migration-only reading to acknowledge. Declaring such a header is a stale
+  declaration and gets §6.6's `WARN` like any other.
+- **Identity fields are refused, unconditionally.** The brief was "not
+  rewritable this way unless declared in `unstable_headers`, per §6.6". §6.6
+  and §4.2 already make naming an identity field in `unstable_headers` a fatal
+  error, so that condition can never be satisfied, and the rule collapses to
+  what `envelope_from` gets: refused at validation, no override. `From`,
+  `Sender` and `Message-ID` (`validate::IDENTITY_HEADERS`) in `header_rewrites`
+  are each a violation in their own right, not only via the declaration — a
+  regex over `From:` is §1.1 constraint 1 on the reputation-bearing field by
+  name, and `set_headers` is how an identity field is assigned.
+- **D-039 — an unmatched header keeps its original bytes.** A header no entry
+  names is never offered to the engine. A named header whose decoded value no
+  pattern changes is declined, and stays `Field::Original` — folding, name
+  spelling, encoded-words and all (`HeaderBlock::edit_each`). Only a value that
+  actually changed is re-serialised, which is D-043's rule for body parts.
+- **D-038 — escaping at the substitution boundary.** The replacement's literal
+  text is operator grammar and is validated at startup (below). Message text
+  enters the output through capture references, and each capture is neutralised
+  as it is placed — CR, LF and other controls become a space, `encode::sanitise`'s
+  treatment without its trim — never by scrubbing the finished value. This is why
+  the replacement is expanded by our own parser rather than `Captures::expand`,
+  which offers no hook; a test pins the two to the same output on every syntax
+  form.
+- **A non-conformant result fails validation.** At compile, a replacement is
+  refused if its literal text holds anything but printable ASCII and tab, if a
+  literal run with no whitespace to fold at could not fit RFC 5322's 998-octet
+  line, or if it refers to a group the pattern does not define (D-034's
+  reasoning: the regex crate expands an unknown group to nothing, and
+  `$1a` — the group *named* `1a` — is the classic way to write one). At probe
+  time, the engine declining to emit a rewritten value is itself a violation. At
+  runtime, a value that still could not be written conformantly — a capture
+  joining two literal runs into one unfoldable token — is not emitted: the header
+  goes out as it arrived, `WARN`, and `simmer_header_rewrite_skipped_total`,
+  §6.4's treatment of a part it cannot write back (D-045).
+- **RFC 2047 — decode before matching.** The §6.4 reasoning carries over
+  directly: one text has many header encodings. A value is unfolded (a fold is at
+  a point the sender chose), and each whitespace-delimited token that is exactly
+  an encoded-word is decoded by `mail-parser`, with the whitespace between two
+  adjacent encoded-words dropped (RFC 2047 §6.2) — so `newsletter` split into
+  `=?UTF-8?Q?news?= =?UTF-8?Q?letter?=` still matches, as does a `Grüße` that
+  arrived Q-encoded. Only whitespace-delimited tokens are decoded, which is RFC
+  2047 §5's own rule, so `=?…?=` inside a URL in angle brackets is text. A
+  changed value is written back with plain ASCII tokens as themselves and each run
+  of non-ASCII (or control, or encoded-word-lookalike) tokens as `encode.rs`'s
+  deterministic B-encoded words; `decode(encode(t)) == t`, which is what carries
+  the text-level fixed point over to the bytes.
+
+  Three inputs are **skipped, not guessed at** — left untouched, warned about and
+  counted: an encoded-word in a charset `mail-parser` does not know (it would
+  otherwise decode it as lossy UTF-8), one that does not decode, and raw 8-bit
+  header bytes (RFC 6532), because writing those back as RFC 2047 would change
+  the header's encoding, which D-045 already declines to do to a body part.
+
+**A counter the spec does not list:** `simmer_header_rewrite_skipped_total{route,
+header,reason}`, reasons `malformed_encoding`, `unsupported_charset`, `raw_8bit`,
+`unrepresentable`. `body_rewrite_skipped`'s argument: a configured rewrite that
+silently stops applying is invisible everywhere else in the mail flow. `header`
+is bounded by configuration, never by message content.
+
+**Tested:** `rewrite::header_rules` (the rule engine, RFC 2047, conformance,
+syntax parity with the regex crate), `rewrite::tests` (ordering against
+`remove_headers` and `set_headers`, templates still reading the original,
+original bytes for unmatched and unnamed headers, idempotence through the whole
+engine, every instance rewritten in place), `rewrite::stability` (the probe),
+`tests/config_validation.rs` (every §4.2 rule above, and the warnings), and
+`tests/rewrite_stability.rs` — the §6.6 property over generated messages
+carrying `List-Unsubscribe` and encoded `Subject:` variants, plus "never emits a
+malformed field".
+
+**Not done:** the §12.3 acceptance suite was not run (it cannot run from the
+development jail); it is the tier that proves §1.1's two arrangements byte-equal
+end to end, and `simmer.acceptance.yaml` has no `header_rewrites`. §9.4's dry run
+shows the rewritten header block, since it runs the real engine, but has no
+per-rule match report for headers as it does for `body_rewrites`.
+
+**Proposed amendment, if O-16 is answered yes:**
+
+- §6.1: a step between 5 and 6 — "Apply `header_rewrites` to the named headers'
+  decoded values."
+- §6.2: a table row — "`List-Unsubscribe` host, or any header's value by pattern
+  | `header_rewrites` | Regex over the RFC 2047-decoded value; not for identity
+  fields" — and the sentence "`remove_headers` is applied before
+  `header_rewrites`, and `header_rewrites` before `set_headers`, so an explicit
+  `set_headers` value wins."
+- §4.1: the example block above, on the warming route.
+- §4.2: "A `header_rewrites` entry names an identity field", "… has a pattern
+  that fails to compile, or a replacement that refers to an undefined group or
+  cannot produce a conformant header value", and "… is not stable (§6.6). Not
+  overridable."
+- §6.6: `header_rewrites` join the identity fields' severity, as D-046 put the
+  body there.
+- §9.1: `simmer_header_rewrite_skipped_total{route,header,reason}`.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -3348,6 +3514,7 @@ the phase that depends on each.
 | ~~O-12~~ | *Settled in phase 3: DST transitions both directions, a start inside a DST gap, and a future start are all tested; the leap-second case is asserted to be a no-op rather than merely argued.* | | |
 | ~~O-13~~ | *Settled 2026-09-17 by the spec's author: amend the spec. §2.1, §2.2, §2.3, §4.1, §4.2, §5.7 (new), §9.1, §9.5, §10.4, §12.1 and §13 now carry the link proxy — see **D-083**.* | | |
 | O-15 | Does the D-085 capture need a `SPEC.md` amendment, or does it stay a recorded divergence? It is off by default, never read by the delivery path, and carries no delivery state — but it *is* message persistence, and §2.2, §8.1, §7.3 and §9.5 each say something a reader of the spec alone would take to exclude it. If amended, the sections are §2.2 (a carve-out), §4.1/§4.2 (the block and its rules), §9.1 (eleven metrics), §9.5 (where bodies *do* go), §12.2 (the volume) and §13 (a phase 13). | A divergence, recorded in D-085 and D-086. `SPEC.md` is unchanged and no phase 13 is added — D-084's precedent, and it follows from the owner's own framing: §13's phases describe the product, and a debugging mode that ships off and plays no part in delivery is not one of them | Before the next spec amendment |
+| O-16 | May a route rewrite a header's value by regex — **D-089**'s `header_rewrites`? §1.1 constraint 1 says rewrites are "absolute assignments, never relative transformations", and a pattern replacement that keeps a per-message token is a relative transformation of that value, as `body_rewrites` is of a body. Is "stable under repetition, and the target expressible as application-side config" the test §1.1 means for headers too? If yes, the amendment D-089 drafts (§4.1, §4.2, §6.1, §6.2, §6.6, §9.1). If no, how should a `List-Unsubscribe` carrying a per-message token be pointed at the §5.7 proxy? | Yes, with identity fields refused outright and instability fatal with no override. Built and shipped as a recorded divergence; `SPEC.md` unchanged | Before the next spec amendment — and before any route relies on it for identity-adjacent headers |
 | O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment |
 
 

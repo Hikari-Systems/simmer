@@ -304,6 +304,10 @@ pub async fn reserve_relay_commit(
     for reason in &rewritten.skipped_parts {
         metrics::body_rewrite_skipped(&selected.route.name, reason.as_str());
     }
+    // D-089 — the same, for a header a `header_rewrites` entry named.
+    for (header, reason) in &rewritten.skipped_headers {
+        metrics::header_rewrite_skipped(&selected.route.name, header, reason.as_str());
+    }
 
     tracing::info!(
         correlation_id,

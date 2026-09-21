@@ -117,6 +117,10 @@ fn describe() {
         "simmer_body_rewrite_skipped_total",
         "text/* parts a route's body_rewrites was configured to change and did not (§6.4)"
     );
+    describe_counter!(
+        "simmer_header_rewrite_skipped_total",
+        "Header instances a route's header_rewrites was configured to change and did not (D-089)"
+    );
     describe_histogram!(
         "simmer_downstream_latency_seconds",
         Unit::Seconds,
@@ -453,6 +457,21 @@ pub fn body_rewrite_skipped(route: &str, reason: &'static str) {
     counter!(
         "simmer_body_rewrite_skipped_total",
         "route" => route.to_string(),
+        "reason" => reason,
+    )
+    .increment(1);
+}
+
+/// `simmer_header_rewrite_skipped_total{route,header,reason}` — D-089, and so
+/// not in §9.1. `body_rewrite_skipped`'s argument for headers: a configured
+/// rewrite that silently stops applying is invisible everywhere else. `header`
+/// is bounded by configuration — it is always a name some route's
+/// `header_rewrites` spells — never by what a message carries.
+pub fn header_rewrite_skipped(route: &str, header: &str, reason: &'static str) {
+    counter!(
+        "simmer_header_rewrite_skipped_total",
+        "route" => route.to_string(),
+        "header" => header.to_string(),
         "reason" => reason,
     )
     .increment(1);

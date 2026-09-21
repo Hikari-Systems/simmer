@@ -233,6 +233,32 @@ impl HeaderBlock {
         }
     }
 
+    /// `header_rewrites` (D-089): offer every instance of `name` to `edit`, as
+    /// its raw value — everything after the colon, folds and line ending
+    /// included — and replace **only** the instances it returns a value for.
+    ///
+    /// In place, so order is kept; and an instance `edit` declines keeps its
+    /// original bytes, which is D-039 holding for a header a rule names but
+    /// does not change. The field name keeps the spelling it arrived with.
+    pub fn edit_each(&mut self, name: &str, mut edit: impl FnMut(&[u8]) -> Option<String>) {
+        for field in self.fields.iter_mut().filter(|f| f.matches(name)) {
+            let value = match field {
+                Field::Original { raw, .. } => {
+                    let colon = raw
+                        .iter()
+                        .position(|b| *b == b':')
+                        .map_or(raw.len(), |i| i + 1);
+                    edit(&raw[colon..])
+                }
+                Field::Written { value, .. } => edit(value.as_bytes()),
+            };
+            if let Some(value) = value {
+                let name = field.name().to_string();
+                *field = Field::Written { name, value };
+            }
+        }
+    }
+
     /// §6.1 step 8. Trace headers go at the top, per RFC 5321 §4.4: the topmost
     /// `Received:` is the most recent hop.
     pub fn prepend(&mut self, name: &str, value: impl Into<String>) {
