@@ -12,7 +12,7 @@ It is **temporary infrastructure**: it exists for the length of a warm-up and is
 then taken out, in either order relative to reconfiguring the application.
 
 <!-- current-version: source of truth for the release number. Keep in sync with the git tag, README.md, and Cargo.toml; enforced by .githooks/pre-push and the release CI. -->
-**Current version: `v0.4.0`** — [all releases](https://github.com/Hikari-Systems/simmer/releases).
+**Current version: `v0.5.0`** — [all releases](https://github.com/Hikari-Systems/simmer/releases).
 
 📦 **Source, issues & full documentation:**
 [github.com/Hikari-Systems/simmer](https://github.com/Hikari-Systems/simmer)
