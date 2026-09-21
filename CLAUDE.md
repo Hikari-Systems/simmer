@@ -22,7 +22,9 @@ settlements (after phase 10)" for what changed and what was deliberately left
 alone. The same rule produced the 2026-09-17 amendment for the link proxy
 (§5.7, and the sections D-083 lists), after O-13 was put to the author, and the
 2026-09-21 one for `header_rewrites` (§6.1 step 5a, §6.2, and the sections D-089
-lists), after O-16 was.
+lists), after O-16 was, and the same day's for thread affinity (§3.2 step 2a,
+§7.4's one exception to "overshoot is not acceptable", and the sections D-090
+lists), after O-17 was.
 
 ## The four things that will bite you
 
@@ -253,6 +255,9 @@ src/quota/postgres.rs    the §7.4 protocol. The row lock is what makes it corre
                          `commit` also records §7.3's events, in ONE transaction
 src/quota/day.rs         §7.2 elapsed-duration day index; NEVER calendar arithmetic
 src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve are ONE op
+src/routing/thread.rs    §3.2 step 2a (D-090) — thread affinity. A REORDERING plus two
+                         exemptions for the pinned route only: no §7.3 threshold, and
+                         an ordinary reservation first, then `over_cap` past the cap
 src/metrics.rs           §9.1 counters, the recorder, and every `# HELP` line
 src/models/recipient_event.rs  §7.3's rows. A key is 16 bytes and never plaintext
 src/models/instance_config.rs  §7.3's salt: insert-if-absent, then read (D-050)

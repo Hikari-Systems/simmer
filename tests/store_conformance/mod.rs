@@ -35,6 +35,10 @@ macro_rules! conformance_suite {
         $harness!(a_multi_recipient_reservation_takes_its_whole_magnitude);
         $harness!(an_overflow_row_never_runs_out_but_counts);
         $harness!(the_first_allowance_written_is_authoritative);
+        $harness!(an_over_cap_reservation_is_taken_and_counted);
+        $harness!(an_over_cap_reservation_on_a_fresh_row_writes_the_allowance);
+        $harness!(releasing_an_over_cap_reservation_gives_nothing_extra_back);
+        $harness!(concurrent_over_cap_reservations_are_all_counted);
         $harness!(buckets_are_independent_by_group_and_day);
         $harness!(route_names_are_case_sensitive);
         $harness!(an_override_raises_the_ceiling_and_can_be_cleared);
@@ -77,6 +81,14 @@ fn at(route: &str, group: &str, day: i64, allowance: Option<i64>, count: i64) ->
         count,
         correlation_id: Uuid::new_v4().to_string(),
         expires_at: Utc::now() + Duration::minutes(10),
+        over_cap: false,
+    }
+}
+
+fn over_cap(req: ReserveRequest) -> ReserveRequest {
+    ReserveRequest {
+        over_cap: true,
+        ..req
     }
 }
 
@@ -172,6 +184,82 @@ pub async fn the_first_allowance_written_is_authoritative(stores: Stores<'_>) {
         s.usage("warming", "catchall", 0).await.unwrap().allowance,
         Some(1)
     );
+}
+
+/// D-090: a thread-affinity reply on its pinned route. Past the cap, but under
+/// the same row lock and counted — `committed` ends above `allowance` and the
+/// row says so, and the next ordinary reservation is still refused.
+pub async fn an_over_cap_reservation_is_taken_and_counted(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(&s, &request("warming", Some(1), 1)).await;
+    s.commit(&r, &[]).await.unwrap();
+    refused(&s, &request("warming", Some(1), 1)).await;
+
+    let r = taken(&s, &over_cap(request("warming", Some(1), 1))).await;
+    s.commit(&r, &[]).await.unwrap();
+
+    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    assert_eq!((u.committed, u.reserved), (2, 0), "counted past the cap");
+    assert_eq!(u.allowance, Some(1), "and the ceiling is untouched");
+    refused(&s, &request("warming", Some(1), 1)).await;
+}
+
+/// D-026 still holds when the day's first reservation is past the cap: the row
+/// is created with the schedule's ceiling, not an unlimited one, so the replies
+/// that follow a zero-allowance day do not uncap it.
+pub async fn an_over_cap_reservation_on_a_fresh_row_writes_the_allowance(stores: Stores<'_>) {
+    let s = stores();
+    taken(&s, &over_cap(request("warming", Some(0), 1))).await;
+    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    assert_eq!(u.allowance, Some(0));
+    assert_eq!(u.reserved, 1);
+    refused(&s, &request("warming", Some(0), 1)).await;
+}
+
+pub async fn releasing_an_over_cap_reservation_gives_nothing_extra_back(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(&s, &request("warming", Some(1), 1)).await;
+    s.commit(&r, &[]).await.unwrap();
+    let r = taken(&s, &over_cap(request("warming", Some(1), 1))).await;
+    s.release(&r).await.unwrap();
+    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    assert_eq!((u.committed, u.reserved), (1, 0));
+    refused(&s, &request("warming", Some(1), 1)).await;
+}
+
+/// D-090 under contention: past the cap nothing is refused, so the risk is a
+/// lost update rather than an overshoot — every over-cap send must land in
+/// `committed`. Two pools, warmed, released by a barrier.
+pub async fn concurrent_over_cap_reservations_are_all_counted(stores: Stores<'_>) {
+    const N: usize = 16;
+    let (a, b) = (stores(), stores());
+    let r = taken(&a, &request("warming", Some(1), 1)).await;
+    a.commit(&r, &[]).await.unwrap();
+    warm(&[Arc::clone(&a), Arc::clone(&b)], N).await;
+
+    let gate = Arc::new(tokio::sync::Barrier::new(N));
+    let mut handles = Vec::new();
+    for i in 0..N {
+        let s = if i % 2 == 0 {
+            Arc::clone(&a)
+        } else {
+            Arc::clone(&b)
+        };
+        let gate = Arc::clone(&gate);
+        handles.push(tokio::spawn(async move {
+            gate.wait().await;
+            let r = taken(&s, &over_cap(request("warming", Some(1), 1))).await;
+            s.commit(&r, &[]).await.expect("commit");
+        }));
+    }
+    for h in handles {
+        h.await.expect("task");
+    }
+
+    let u = b.usage("warming", "catchall", 0).await.unwrap();
+    assert_eq!((u.committed, u.reserved), (1 + N as i64, 0));
+    assert_eq!(u.allowance, Some(1));
+    refused(&a, &request("warming", Some(1), 1)).await;
 }
 
 pub async fn buckets_are_independent_by_group_and_day(stores: Stores<'_>) {

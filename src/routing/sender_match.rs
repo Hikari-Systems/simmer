@@ -166,10 +166,18 @@ pub fn match_sender<'a>(cfg: &'a Config, senders: &Senders) -> Match<'a> {
 /// decision cannot be made until the message body has been received... When all
 /// rules use `envelope`, Simmer should decide early and reject at `RCPT TO` to
 /// avoid a wasted body transfer."
+///
+/// Never with `thread_affinity` on (D-090). A pinned reply may take its route
+/// past the day's cap, and whether a message *is* a pinned reply is in its
+/// headers, which have not arrived at `RCPT TO`. Deciding early would refuse
+/// exactly the reply the pin exists to let through, whenever the chain's
+/// ordinary walk is spent.
 pub fn can_decide_at_rcpt(cfg: &Config) -> bool {
-    cfg.senders
-        .iter()
-        .all(|r| matches!(r.match_on, MatchOn::Envelope))
+    !cfg.thread_affinity
+        && cfg
+            .senders
+            .iter()
+            .all(|r| matches!(r.match_on, MatchOn::Envelope))
 }
 
 #[cfg(test)]

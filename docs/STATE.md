@@ -1,7 +1,9 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-09-20, at release `v0.3.1`.** (The previous snapshot was
-2026-09-11, at the end of phase 11.) This is a session-handover document, not a
+**Snapshot taken 2026-09-21, at release `v0.5.0`.** (The previous snapshots were
+2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
+numbers are still the `v0.3.1` run; what was verified for `v0.4.0` and `v0.5.0` is
+stated there separately. This is a session-handover document, not a
 maintained one: `README.md` describes the service, `DECISIONS.md` records why it is
 the way it is, and `docs/SPEC.md` is authoritative over both. If this file
 disagrees with any of them, they win.
@@ -16,7 +18,9 @@ put to the spec's author and recorded rather than assumed:
 | **D-085 / D-086** — the capture and `server replay` | An optional debugging capture of every accepted message, and a subcommand that replays a range. A recorded divergence, not a spec amendment (O-15) |
 | **D-087** — the soak tier generalised | T4 against the mssql build on SQL Server Express, and against the capture, on any tier |
 | **D-088** — the capture's flush policy | Ten buffered lines or 500 ms of quiet |
-| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below) |
+| **D-089** — `header_rewrites` | A regex over one named header's decoded value, between `remove_headers` and `set_headers` (§6.1 step 5a). After O-16; `SPEC.md` amended 2026-09-21 |
+| **D-090** — thread affinity | An outbound reply into a thread Simmer started leaves via the route that started it — past that route's day cap once the cap is met, counted, and past its §7.3 threshold. Keyed statelessly on the emitted `Message-ID:` domain. After O-17; `SPEC.md` amended 2026-09-21 (§3.2 step 2a, and §7.4's one exception to "overshoot is not acceptable") |
+| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity) |
 
 ---
 
@@ -48,13 +52,27 @@ optionally over `STARTTLS` or implicit TLS, authenticates it against argon2id
 hashes, checks the sender identities against the user's grants (D-071), refuses a
 second `RCPT TO` (D-047), buffers the body
 (memory to 1 MiB, then an unlinked tmpfs file), matches a sender rule, resolves the
-recipient's domain group, walks the chain — **skipping a route whose §6.7
+recipient's domain group, **moves a thread-affinity reply's pinned route to the
+front of the chain** (D-090, when `thread_affinity` is on), walks the chain — **skipping a route whose §6.7
 preflight is failing under `strict`, or whose recipient-frequency window is
 full** and then reserving quota under a row lock —
 **rewrites the message to the selected route's identity**, forwards to that route's
 downstream over TLS, and maps the downstream's verdict back on the same
 connection — committing the quota, and recording the frequency event, only on a
 `2xx` at the final dot.
+
+**Thread affinity (D-090, since `v0.5.0`).** Off by default. With
+`thread_affinity: true`, the message IDs in `In-Reply-To:` and `References:` —
+most recent first, at most 256 — are matched against each chain route's literal
+`Message-ID:` domain, and the first match pins that route: it is walked first,
+the rest follow in configured order. For the pinned route alone the §7.3
+threshold is not applied (the event is still recorded) and a spent cap does not
+refuse: an ordinary reservation is taken first, so a reply within the cap spends
+a slot like any message, and only when that is refused is the route reserved
+**past its cap** (`ReserveRequest.over_cap`) — same row lock, counted, the
+ceiling untouched. Pause, strict preflight and a future start still eliminate a
+pin; §3.3's no-failover is unchanged. §5.4's early `RCPT TO` decision is off
+while it is on. Nothing is stored: `src/routing/thread.rs`.
 
 §7.3 is complete: the recipient is normalised (lowercase, `+tag` stripped, dots
 folded at configured providers), keyed with an HMAC under a salt persisted in
@@ -153,6 +171,19 @@ not re-run (CI runs it).
 
 For reference, the phase 11 snapshot read 830 passed on the default build alone.
 
+**Since `v0.3.1`, the full suite has not been re-run in the development jail.**
+For `v0.5.0` (D-090), what *was* run, against Postgres on the default build:
+`src/routing/thread.rs`'s 24 unit tests, `tests/thread_affinity.rs` (14),
+`tests/admin_api.rs` (55), the new `tests/config_validation.rs` and
+`tests/shipped_config.rs` cases, and the Postgres run of `tests/store_conformance/`'s
+four new over-cap cases — all passing, with `cargo clippy --all-targets -D
+warnings` and `cargo fmt --check` clean and the mssql build compiling. Two
+mutations were checked by hand: disabling the pin fails the four tests that
+depend on it, and reserving past the cap before the cap is met fails the two
+ordering tests. **Not run locally:** the full default suite, the mssql suite
+(including the new conformance cases on SQL Server), and the acceptance tier. CI
+runs the first two.
+
 **T4, the soak tier, has now run against the SQL Server build** — an hour on
 Express with the capture on, 36,010 messages an instance with nothing deferred or
 refused. `docs/SOAK.md` §11 is the run, what it found, and what it did not
@@ -168,7 +199,8 @@ cargo test --test acceptance -- --ignored --test-threads=1     5 passed, 0 faile
 | Suite | Tests | What it covers |
 |---|---:|---|
 | `src/` unit tests | 509 | Everything logic-heavy, in place |
-| `tests/admin_api.rs` | 48 | §9 against the real router and real Postgres |
+| `tests/admin_api.rs` | 55 | §9 against the real router and real Postgres |
+| `tests/thread_affinity.rs` | 14 | D-090 end to end: pinning, past the cap only once it is met, counted, the race, pause, frequency, no failover (`v0.5.0`) |
 | `tests/smtp_ingress.rs` | 44 | §5 ingress end to end |
 | `tests/ingress_tls.rs` | 20 | §5.1 and §5.3: STARTTLS, implicit TLS, per-listener AUTH, the ACL. Every handshake verified |
 | `tests/config_validation.rs` | 65 | §4.2, one test per rule |
@@ -181,7 +213,7 @@ cargo test --test acceptance -- --ignored --test-threads=1     5 passed, 0 faile
 | `tests/rewrite_stability.rs` | 11 | §6.6 as a proptest over generated messages, bodies included |
 | `tests/metrics_endpoint.rs` | 11 | §9.1 against a real recorder — its own binary, deliberately |
 | `tests/quota_relay.rs` | 8 | §7.4 through the whole stack |
-| `tests/shipped_config.rs` | 5 | `simmer.yaml` round-trips |
+| `tests/shipped_config.rs` | 6 | `simmer.yaml` round-trips, and is ready for `thread_affinity` |
 | `tests/acceptance.rs` | 1 + 5 | Config drift guard; the rest behind `--ignored` |
 
 `tests/metrics_endpoint.rs` is a separate binary because `metrics` permits
@@ -340,6 +372,7 @@ src/models/          runtime sqlx over &PgPool, house pattern (Postgres build on
   instance_config.rs   §7.3's salt, get-or-insert (D-050)
   recipient_event.rs   §7.3's events: count, record, evict
 src/routing/         §5.4 sender match, §3.2.2 domain group, §3.2.3 chain walk
+  thread.rs            §3.2 step 2a's thread affinity: IDs in, a pinned route out (D-090)
 src/relay.rs         decide -> reserve -> rewrite -> relay -> commit/release
 src/healthcheck.rs   the `healthcheck` subcommand. Stdlib only (D-060)
 src/hash_password.rs `server hash-password`: argon2id from stdin
@@ -354,6 +387,7 @@ src/admin/           §9 control plane
 src/bin/loadgen.rs   the acceptance suite's bulk sender; not in the shipped image
 tests/support/       the scripted fake downstream (§12.3)
 tests/admin_api.rs   §9 against the real router and real Postgres
+tests/thread_affinity.rs  D-090 end to end, including replies past the cap
 tests/quota_multi_instance.rs  two independent pools against one database (D-061)
 tests/preflight.rs   §6.7 through the walk, and 451 on the wire
 tests/metrics_endpoint.rs  §9.1 against a real recorder; its own binary
@@ -456,7 +490,7 @@ measurement rather than this table.
 
 ## 5. Decisions on record
 
-88 entries, `D-001` to `D-088`. The ones a new reader most needs:
+90 entries, `D-001` to `D-090`. The ones a new reader most needs:
 
 | | |
 |---|---|
@@ -472,6 +506,8 @@ measurement rather than this table.
 | **D-086** | `server replay` delivers mail twice on purpose and spends the target's quota. `--confirm` and `--host` have no defaults. |
 | **D-087** | The backend is a property of a *stack*; the capture is a property of a *run*. Hence `SOAK_BACKEND=mssql` selects a stack and `SIMMER_CAPTURE=on` is layered onto any of them. |
 | **D-088** | The capture flushes on ten lines or 500 ms of quiet, and each flush reports its bytes to the disk gauge. |
+| **D-089** | `header_rewrites`: a regex over a named header's decoded value. Never on an identity field; stable or fatal. |
+| **D-090** | **Thread affinity.** A reply pins the route whose `Message-ID:` domain it refers to. The pinned route alone skips §7.3's threshold and, once its cap is met, is reserved **past** it — counted, the ceiling unchanged. The only exception to §7.4's "overshoot is not acceptable". |
 | **D-034** | An unknown template variable is a fatal startup error — a §4.2 rule the spec does not list. |
 | **D-035** | The null sender is never rewritten, so a bounce stays a bounce. |
 | **D-036** | **`SPEC.md` §4.1's example configuration fails `SPEC.md` §4.2.** A finding for the spec's author; `simmer.yaml` was corrected instead. |
@@ -531,6 +567,10 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
   listener — by design (D-071), and warned about at startup.
 - **Multi-recipient transactions are refused**, by policy rather than by
   omission — D-047, and `docs/RECIPIENTS.md`.
+- **Thread affinity recognises only Simmer's own emitted IDs** (D-090). An
+  application that threads from its own sent log, rather than carrying
+  `References:` forward from the inbound reply, is never pinned. The table of
+  original IDs that would cover it was considered and rejected.
 
 **Test coverage**
 
@@ -605,6 +645,12 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
   bound D-049 assumed was wrong in a way worth knowing — it is
   `threshold + (C - 1)` for peak concurrency `C` against one recipient key, not a
   flat one extra message. Two concurrent sends is the case that costs one.
+- **Thread affinity is absent from the acceptance tier.** Its relay-level
+  coverage is against real Postgres and a fake downstream; no test sends a reply
+  through a real mail server, and `simmer_thread_affinity_total` is asserted at a
+  scrape only by calling it directly, as with the body-rewrite counter above.
+- **The new over-cap conformance cases have not run on SQL Server** from the
+  development jail; CI runs them.
 - **No test drives the admin listener over a socket.** `tests/admin_api.rs` goes
   through `oneshot` against the router, so the bind, the graceful-shutdown wiring
   in `main` and the real TCP path are exercised only by `docker compose up`.
@@ -671,7 +717,9 @@ login runs. Four tests pin it. See `DECISIONS.md` D-066.
 ## 7. Outstanding non-code items
 
 **Phase 11 closed the one scheduled item below**, and `SPEC.md` is amended to match
-(D-070, D-071). Nothing is waiting on the spec's author.
+(D-070, D-071). O-16 and O-17 were answered on 2026-09-21 and the spec amended for
+each (D-089, D-090). Still open with the author: O-14 and O-15, both "amend, or
+stay a recorded divergence" questions with a working answer in place.
 
 A dependency note from the same day: `chacha20 0.10.1`, reached through
 `hickory-resolver`'s `rand`, was yanked upstream after 2026-08-11, so
@@ -740,8 +788,12 @@ Committed so far:
 | `Cargo.lock: bump chacha20 0.10.1 -> 0.10.2, which was yanked` | 772 tests + 4 acceptance |
 | `Phase 11: listeners on 25/465/587, inbound TLS, and the sender ACL` | 830 tests + 5 acceptance |
 
-**`main` is pushed through the spec-settlements commit.** The two phase 11 commits
-are local and not pushed.
+Since phase 11 the history is one commit per change, each a `Feature:`, `Fix:`,
+`Tests:`, `Docs:` or `Spec:` commit, with `release: X.Y.Z` commits between. The
+most recent: `Feature: header_rewrites …` (D-089), `release: 0.4.0`, `Spec: amend
+for header_rewrites …`, then thread affinity (D-090) and `release: 0.5.0`.
+Releases are tagged; the tag is pushed only after `build.yml` is green on the
+tagged commit.
 
 **Phase 10 is one commit**, for the same reason phase 8 was: it was built from a
 clean tree, so there is no interleaving to untangle. It carries D-066's auth fix

@@ -121,6 +121,14 @@ fn describe() {
         "simmer_header_rewrite_skipped_total",
         "Header instances a route's header_rewrites was configured to change and did not (D-089)"
     );
+    describe_counter!(
+        "simmer_thread_affinity_total",
+        "Messages that referred to a message ID (§3.2 step 2a, D-090), by the route that \
+         emitted it and outcome: hit — that route carried the reply within its cap; over_cap — \
+         it carried the reply past its day's cap; ineligible — it was paused, failing strict \
+         preflight or not yet started, and the ordinary walk decided; unmatched — no route in \
+         the chain emitted any ID referred to (route is \"-\")"
+    );
     describe_histogram!(
         "simmer_downstream_latency_seconds",
         Unit::Seconds,
@@ -473,6 +481,21 @@ pub fn header_rewrite_skipped(route: &str, header: &str, reason: &'static str) {
         "route" => route.to_string(),
         "header" => header.to_string(),
         "reason" => reason,
+    )
+    .increment(1);
+}
+
+/// §9.1 `simmer_thread_affinity_total{route,outcome}` (§3.2 step 2a, D-090).
+/// `over_cap` is the one to watch: each is a send the ramp did not schedule,
+/// which the spec's author chose over a conversation changing identity
+/// mid-thread. `ineligible` is a thread that did change identity. `route` is
+/// bounded by configuration — a pinned route is always a configured one — and
+/// is `-` for `unmatched`, which names no route.
+pub fn thread_affinity(route: &str, outcome: &'static str) {
+    counter!(
+        "simmer_thread_affinity_total",
+        "route" => route.to_string(),
+        "outcome" => outcome,
     )
     .increment(1);
 }

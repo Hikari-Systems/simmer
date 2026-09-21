@@ -4,7 +4,8 @@
 //!
 //! 1. **Decide** — resolve the incoming identity and match a sender rule (§3.2
 //!    steps 1–2).
-//! 2. **Reserve** — §7.4 phase 1, walking the chain (§3.2 step 3). This happens
+//! 2. **Reserve** — §7.4 phase 1, walking the chain (§3.2 step 3) in the order
+//!    §3.2 step 2a's thread affinity gives it (D-090). This happens
 //!    **immediately before** the downstream conversation, never before `DATA`, so
 //!    a reservation cannot outlive §7.4's expiry while a body transfers.
 //! 3. **Rewrite** — §6.1 steps 2 and 4–10, now that the route, and therefore the
@@ -33,6 +34,7 @@ use crate::quota::{self, QuotaStore, ReservationRegistry};
 use crate::rewrite::{self, Rewriters};
 use crate::routing::chain::{self, Walk};
 use crate::routing::sender_match::{self, Senders};
+use crate::routing::thread;
 use crate::smtp::reply::{self, Reply};
 
 /// Everything a session needs to relay, assembled once at startup.
@@ -225,6 +227,16 @@ pub async fn reserve_relay_commit(
         }
     };
 
+    // -- §3.2 step 2a (D-090) -----------------------------------------
+    //
+    // A reply into a thread Simmer started walks the route that started it
+    // first, past its §7.3 threshold and, when it has none left, past its
+    // day's cap — counted, under the row lock, but not refused. Pause, strict
+    // preflight and a future start still apply: they say the route cannot
+    // send, not that it has sent enough.
+    let pin = thread::pin_for_message(cfg, chain, message.body);
+    let walk_order = thread::order(chain, &pin);
+
     // -- §7.4 phase 1 -------------------------------------------------
     let mut evaluation = Vec::new();
     let selected = match chain::walk_and_reserve(
@@ -232,21 +244,27 @@ pub async fn reserve_relay_commit(
         &engine.quota,
         &engine.frequency,
         &engine.preflight,
-        chain,
+        &walk_order,
+        pin.route(),
         message.recipients,
         correlation_id,
         &mut evaluation,
     )
     .await
     {
-        Ok(Walk::Selected(s)) => s,
+        Ok(Walk::Selected(s)) => {
+            thread::observe(&pin, Some(&s.route.name), s.over_cap);
+            s
+        }
         Ok(Walk::Exhausted) => {
+            thread::observe(&pin, None, false);
             // §10.3, and the whole of §14.1: `451` by default, because a `550`
             // here would permanently suppress a deliverable recipient in systems
             // that outlive Simmer by years.
             tracing::info!(
                 correlation_id,
                 chain = %chain::render(&evaluation),
+                thread_pin = pin.as_log(),
                 "no eligible route in chain"
             );
             return SelectError::ChainExhausted.to_reply(cfg);
@@ -316,6 +334,7 @@ pub async fn reserve_relay_commit(
         day_index = selected.day_index,
         reservation = %selected.reservation.id,
         chain = %chain::render(&evaluation),
+        thread_pin = pin.as_log(),
         // §9.5 forbids logging bodies; the two envelope senders are the whole
         // point of the component and are exactly what an operator needs when
         // asking "which identity did this leave under".

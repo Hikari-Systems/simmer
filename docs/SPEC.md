@@ -70,6 +70,8 @@ applies to the domain, not to whether Simmer altered the message.
 - DNS preflight validation of SPF/DKIM/DMARC for warming routes.
 - An optional HTTP/1.x link proxy that forwards the tracking and unsubscribe links in rewritten
   messages to one upstream (§5.7). *(Added. See `DECISIONS.md` D-083.)*
+- Optional thread affinity: an outbound reply into a conversation Simmer started leaves via the
+  route that started it (§3.2 step 2a). *(Added. See `DECISIONS.md` D-090.)*
 
 ### 2.2 Explicitly out of scope
 
@@ -79,7 +81,11 @@ Simmer is **not an MTA**. It does not own messages.
   of the downstream conversation. A message is either delivered during that conversation or
   the client is told it was not.
 - **No DSN or bounce generation.** Simmer never composes mail.
-- **No inbound mail handling, no bounce processing, no reply routing.**
+- **No inbound mail handling, no bounce processing, no reply routing.** "Reply routing" means
+  the recipient's replies, which go wherever the route's `Reply-To:` or `From:` sends them and
+  never pass through Simmer. The application's *outbound* replies are ordinary submissions, and
+  §3.2 step 2a may route them by the message IDs they refer to. *(Clarified. See `DECISIONS.md`
+  D-090.)*
 - **No DKIM signing and no key material.** Downstreams sign. See §6.5.
 - **No ACME and no certificate reload.** Inbound TLS uses one PEM certificate and key read at
   startup (§5.1); rotation is a restart, like any other configuration change. *(Amended — was
@@ -175,6 +181,16 @@ Given an accepted message with a resolved incoming identity:
    `550 5.7.1 sender domain not configured`.
 2. **Resolve the recipient's domain group.** Exact, case-insensitive match of the recipient
    domain against each group's domain list; fall back to the catch-all group.
+
+   2a. **Thread affinity**, when `thread_affinity: true`. Read the message IDs in
+   `In-Reply-To:` and then `References:`, most recent first (at most 256). The first whose
+   domain equals the literal domain of a chain route's `Message-ID:` template **pins** that
+   route: it is walked first, and the rest of the chain follows in configured order. Only the
+   matched chain's routes can be pinned. For the pinned route alone, step 3b is not applied
+   (its §7.3 event is still recorded on commit), and step 3c does not refuse: an ordinary
+   reservation is attempted first, and only if it finds no headroom is the route reserved
+   **past its cap** (§7.4). Steps 3a, §6.7's strict preflight and §7.2's future start still
+   eliminate it, and the walk then continues with the next route.
 3. **Walk the chain in order.** For each route:
    a. If the route is paused (admin API, §9.3), skip.
    b. If the route has a `recipient_frequency` constraint and this recipient is at or over
@@ -287,6 +303,9 @@ senders:
 
 default_chain: [overflow-established]  # used for unmatched senders unless strict_senders
 strict_senders: false
+thread_affinity: false                 # true: replies stay on the route that started the
+                                       # thread (§3.2 step 2a); every route then needs a
+                                       # Message-ID with its own literal domain (§4.2)
 
 routes:
   - name: warming-newbrand
@@ -404,6 +423,11 @@ this inverts: plaintext AUTH is now refused unless allowed. The rest are new. Se
   overflow route.
 - Any route's `identity.envelope_from` has a **domain that is not a literal** — that is, the
   part after the final `@` contains a template variable. *(Added; see the note below.)*
+- `thread_affinity: true` and any route in any chain (sender rules and `default_chain`) does not
+  set `Message-ID:` with a literal domain, or two different routes in one chain set the same
+  `Message-ID:` domain. A route whose IDs name no route can never be pinned, and a shared domain
+  would pin every reply to whichever of the two is listed first. *(Added; see `DECISIONS.md`
+  D-090.)*
 - `link_proxy` is present and any of the following hold *(added, see `DECISIONS.md` D-083)*:
   - `upstream` is not an absolute `http` or `https` URI with a host, or it carries
     credentials, a query or a fragment.
@@ -535,7 +559,10 @@ Full-address rules should therefore be placed above domain rules where both coul
 **Consequence:** when any applicable rule uses `from_header` or `either`, the routing decision
 cannot be made until the message body has been received, so rejections land on the final dot
 rather than at `RCPT TO`. This is legal and accepted. When all rules use `envelope`, Simmer
-should decide early and reject at `RCPT TO` to avoid a wasted body transfer.
+should decide early and reject at `RCPT TO` to avoid a wasted body transfer — unless
+`thread_affinity` is on, since a pinned reply can take a route past its cap and whether a
+message is one is in headers that have not yet arrived. *(Amended — the exception is new. See
+`DECISIONS.md` D-090.)*
 
 If the envelope and header senders disagree, log at `WARN` with both values and increment
 `simmer_sender_mismatch_total`.
@@ -914,6 +941,11 @@ generated once and persisted. This bounds row size and avoids the container accu
 plaintext record of every address mailed, which is a data-protection liability with no
 operational benefit.
 
+A thread-affinity reply is not subject to the threshold on its pinned route (§3.2 step 2a): a
+message the recipient prompted by replying is not the over-mailing this rule steers away from.
+Its event is recorded as usual, so the window stays true for the next message that is not a
+reply. *(Added. See `DECISIONS.md` D-090.)*
+
 Window is `count × unit` (`hourly`, `daily`, `weekly`) evaluated as a **rolling** window, so
 per-event timestamps are stored rather than a counter. A sweeper evicts rows older than the
 longest configured window plus a margin, on an interval.
@@ -938,6 +970,17 @@ counted, since a nonzero rate indicates crashes or a mistuned timeout.
 
 Overshoot is not acceptable on a warm-up quota — avoiding overshoot is the entire purpose of
 the component — so the reservation cost is justified.
+
+**The one exception is a thread-affinity reply on its pinned route** (§3.2 step 2a), chosen over
+a conversation changing identity mid-thread. It takes an ordinary reservation while there is
+headroom, so it spends the cap like any message and the ramp's own traffic spills over sooner.
+Only when the ordinary reservation is refused is it reserved past the cap: under the same row
+lock, incrementing `reserved`, and committed or released exactly as any other. So it is
+**counted** — `committed` may end above `allowance`, and the row, the §9.2 read API and
+`simmer_thread_affinity_total{outcome="over_cap"}` all say so — but the ceiling itself is never
+raised, and every message that is not a pinned reply is still refused at it. A reservation past
+the cap that creates the day's row writes the schedule's allowance, as any first reservation
+does. *(Added. See `DECISIONS.md` D-090.)*
 
 ### 7.5 Database unavailability
 
@@ -1016,9 +1059,14 @@ Prometheus exposition on the admin listener. At minimum:
 - `simmer_link_proxy_duration_seconds` — histogram, to response headers
 - `simmer_link_proxy_connections`
 - `simmer_link_proxy_connections_refused_total{reason}` — reason: `cidr`, `limit`
+- `simmer_thread_affinity_total{route,outcome}` — outcome: `hit` (the pinned route carried it
+  within its cap), `over_cap` (past its cap), `ineligible` (the pinned route was eliminated and
+  the ordinary walk decided), `unmatched` (the message refers to IDs no chain route emitted;
+  `route` is `-`). A message that refers to no ID counts nothing
 
 *(The four `simmer_link_proxy_*` metrics are added. See `DECISIONS.md` D-083.
-`simmer_header_rewrite_skipped_total` is added; see D-089.)*
+`simmer_header_rewrite_skipped_total` is added; see D-089. `simmer_thread_affinity_total` is
+added; see D-090.)*
 
 ### 9.2 Read API
 
@@ -1050,6 +1098,11 @@ skip reason, selected route, resolved outbound envelope and headers after templa
 and body rewrite matches against a supplied sample body. It sends nothing and takes no
 reservation.
 
+It also accepts optional `in_reply_to` and `references` values (or reads them from a supplied
+full `message`), and reports what §3.2 step 2a made of them: the pinned route or `unmatched`,
+the walk in pinned order, and a pinned route that would be reserved past its cap as selected
+with reason `over_cap`. *(Added. See `DECISIONS.md` D-090.)*
+
 This is the primary tool for validating a configuration before it carries live traffic, and
 should be treated as a first-class feature rather than a debugging afterthought.
 
@@ -1057,8 +1110,9 @@ should be treated as a first-class feature rather than a debugging afterthought.
 
 Structured JSON. Every message carries a `correlation_id` propagated through every log line
 and emitted as `X-Simmer-Correlation-Id` when configured. Log the incoming identity, matched
-rule, chain evaluation with skip reasons, selected route, downstream reply code and text, and
-total latency. Message bodies are never logged; recipient addresses are logged only at `DEBUG`.
+rule, chain evaluation with skip reasons, the thread-affinity pin (§3.2 step 2a) and whether
+the selected route was reserved past its cap, selected route, downstream reply code and text,
+and total latency. Message bodies are never logged; recipient addresses are logged only at `DEBUG`.
 
 A link proxy request (§5.7) is logged with its method, path, status and latency only. The query
 string, cookies and body are never logged, because a tracking token identifies a recipient.

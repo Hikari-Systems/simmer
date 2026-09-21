@@ -56,7 +56,7 @@ impl QuotaStore for PgQuotaStore {
         )
         .await?;
 
-        if !usage.has_headroom_for(req.count) {
+        if !req.over_cap && !usage.has_headroom_for(req.count) {
             // Roll back rather than commit: the only thing the transaction did
             // was touch `updated_at`, and rolling back also releases the lock
             // immediately for the next contender.

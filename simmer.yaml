@@ -212,6 +212,12 @@ senders:
 default_chain: [overflow-established]
 strict_senders: false
 
+# §3.2 step 2a (D-090): a reply the application sends into a thread Simmer
+# started leaves via the route that started it — past that route's day cap if
+# the cap is already met, and counted. Needs every route's Message-ID to carry a
+# literal domain of its own, which the routes below do.
+thread_affinity: false
+
 # §10.3. 451 by default: Simmer must not emit a reply that causes a client to
 # record permanent state about a recipient, because Simmer is temporary and that
 # state is not (§14.1).

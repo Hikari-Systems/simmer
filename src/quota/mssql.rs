@@ -154,7 +154,7 @@ impl QuotaStore for MssqlQuotaStore {
             .ok_or_else(|| missing("locking the quota row"))?;
         let current = usage(&row)?;
 
-        if !current.has_headroom_for(req.count) {
+        if !req.over_cap && !current.has_headroom_for(req.count) {
             client
                 .simple_query("ROLLBACK TRANSACTION")
                 .await?

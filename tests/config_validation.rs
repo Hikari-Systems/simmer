@@ -1356,3 +1356,84 @@ fn warns_about_a_header_rewrite_that_can_never_take_effect() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// §3.2 step 2a — thread affinity (D-090)
+// ---------------------------------------------------------------------------
+
+/// BASE with `thread_affinity` on and each route given a `Message-ID:`.
+fn with_affinity(warming_id: &str, overflow_id: &str) -> String {
+    let mut yaml = BASE
+        .replace(
+            "        From: \"Sales <sales@newbrand.com>\"\n",
+            &format!("        From: \"Sales <sales@newbrand.com>\"\n        Message-ID: \"{warming_id}\"\n"),
+        )
+        .replace(
+            "        From: \"News <news@mail.established.com>\"\n",
+            &format!("        From: \"News <news@mail.established.com>\"\n        Message-ID: \"{overflow_id}\"\n"),
+        );
+    yaml.push_str("thread_affinity: true\n");
+    yaml
+}
+
+#[test]
+fn thread_affinity_accepts_routes_with_distinct_literal_message_id_domains() {
+    load(&with_affinity(
+        "<{{uuid}}@newbrand.com>",
+        "<{{uuid}}@mail.established.com>",
+    ))
+    .expect("valid");
+}
+
+#[test]
+fn thread_affinity_requires_every_route_to_set_a_message_id() {
+    let mut yaml = BASE.to_string();
+    yaml.push_str("thread_affinity: true\n");
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            // §4.2: all of them, not the first.
+            assert!(
+                v.mentions("routes.warming.identity.set_headers.Message-ID"),
+                "{v}"
+            );
+            assert!(
+                v.mentions("routes.overflow.identity.set_headers.Message-ID"),
+                "{v}"
+            );
+            let overflow =
+                v.0.iter()
+                    .filter(|x| x.path == "routes.overflow.identity.set_headers.Message-ID")
+                    .count();
+            assert_eq!(
+                overflow, 1,
+                "reported once, though two chains contain it: {v}"
+            );
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn thread_affinity_refuses_a_templated_message_id_domain() {
+    rejected_for(
+        &with_affinity(
+            "<{{uuid}}@{{original.from.domain}}>",
+            "<{{uuid}}@mail.established.com>",
+        ),
+        "routes.warming.identity.set_headers.Message-ID",
+    );
+}
+
+#[test]
+fn thread_affinity_refuses_two_routes_in_a_chain_sharing_a_domain() {
+    rejected_for(
+        &with_affinity("<{{uuid}}@newbrand.com>", "<{{uuid}}@NewBrand.com>"),
+        "both emit Message-IDs at 'newbrand.com'",
+    );
+}
+
+#[test]
+fn without_thread_affinity_a_route_may_pass_the_message_id_through() {
+    // The base fixture sets no Message-ID on either route.
+    load(BASE).expect("valid");
+}

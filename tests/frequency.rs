@@ -348,6 +348,7 @@ async fn walk(
         &Frequency::new(),
         &simmer::preflight::Registry::new(),
         &chain,
+        None,
         &[recipient.to_string()],
         "test-correlation",
         &mut evaluation,

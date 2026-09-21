@@ -95,6 +95,7 @@ fn request(route: &str, allowance: Option<i64>, count: i64) -> ReserveRequest {
         count,
         correlation_id: Uuid::new_v4().to_string(),
         expires_at: Utc::now() + Duration::minutes(10),
+        over_cap: false,
     }
 }
 
@@ -696,6 +697,7 @@ async fn walk(
         &frequency(),
         &simmer::preflight::Registry::new(),
         &chain,
+        None,
         &[recipient.to_string()],
         "test-correlation",
         &mut evaluation,
@@ -822,6 +824,7 @@ async fn an_exhausted_chain_with_no_overflow_selects_nothing(pool: PgPool) {
             &frequency(),
             &simmer::preflight::Registry::new(),
             &chain,
+            None,
             &["bob@example.com".to_string()],
             "c",
             &mut Vec::new(),
@@ -840,6 +843,7 @@ async fn an_exhausted_chain_with_no_overflow_selects_nothing(pool: PgPool) {
         &frequency(),
         &simmer::preflight::Registry::new(),
         &chain,
+        None,
         &["bob@example.com".to_string()],
         "c",
         &mut evaluation,
@@ -905,6 +909,7 @@ async fn the_early_check_sees_an_exhausted_chain_without_reserving(pool: PgPool)
             &frequency(),
             &simmer::preflight::Registry::new(),
             &chain,
+            None,
             &["bob@example.com".to_string()],
             "c",
             &mut ev,
@@ -937,6 +942,7 @@ async fn the_early_check_always_passes_a_chain_ending_in_overflow(pool: PgPool) 
             &frequency(),
             &simmer::preflight::Registry::new(),
             &chain,
+            None,
             &["bob@example.com".to_string()],
             "c",
             &mut ev,

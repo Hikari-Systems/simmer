@@ -107,6 +107,7 @@ fn request(route: &str, allowance: Option<i64>, count: i64) -> ReserveRequest {
         count,
         correlation_id: Uuid::new_v4().to_string(),
         expires_at: Utc::now() + Duration::minutes(10),
+        over_cap: false,
     }
 }
 
@@ -359,6 +360,7 @@ async fn send_through(
         &instance.frequency,
         &simmer::preflight::Registry::new(),
         &chain,
+        None,
         &[recipient.to_string()],
         "multi-instance-test",
         &mut evaluation,

@@ -76,6 +76,14 @@ pub struct DryRunRequest {
     pub body: Option<String>,
     #[serde(default)]
     pub subject: Option<String>,
+    /// §3.2 step 2a (D-090) — `In-Reply-To:` and `References:` values for the
+    /// synthesised message, so an operator can ask "where would a reply to this
+    /// go". Ignored when `message` is supplied: its own headers are what the
+    /// relay would read.
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub references: Option<String>,
     /// Return the rewritten message in full. Off by default: the useful answer
     /// is almost always the headers and which patterns fired.
     #[serde(default)]
@@ -98,7 +106,21 @@ pub struct DryRunResponse {
     /// evaluate them against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refused: Option<Refused>,
+    /// §3.2 step 2a (D-090). Absent when `thread_affinity` is off or the
+    /// message refers to no message ID — the ordinary first message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ThreadView>,
     pub recipients: Vec<RecipientOutcome>,
+}
+
+/// What §3.2 step 2a made of the message's threading headers.
+#[derive(Debug, Serialize)]
+pub struct ThreadView {
+    /// `pinned` or `unmatched`.
+    pub outcome: &'static str,
+    /// The route walked first. `null` when unmatched.
+    pub pinned: Option<String>,
+    pub explanation: &'static str,
 }
 
 /// §3.2 step 1 said no. Not an HTTP error: the request was well formed and this
@@ -125,7 +147,8 @@ pub struct MatchedRule {
 pub struct RecipientOutcome {
     pub recipient: String,
     pub domain_group: String,
-    /// One entry per route consulted, in chain order. The walk stops at the
+    /// One entry per route consulted, in walk order — chain order, with a
+    /// thread-affinity pin moved to the front (D-090). The walk stops at the
     /// first eligible route, so the links after it are absent — they would not
     /// have been consulted either.
     pub evaluation: Vec<StepView>,
@@ -213,6 +236,7 @@ pub async fn dryrun(
                 chain_source: "none".to_string(),
                 chain: Vec::new(),
                 note: None,
+                thread: None,
                 refused: Some(Refused {
                     reason: refusal_reason(&e),
                     explanation: refusal_explanation(&e),
@@ -236,9 +260,19 @@ pub async fn dryrun(
         sender_match::Match::Unmatched => (None, "default_chain".to_string()),
     };
 
+    // §3.2 step 2a, from the bytes the relay would see — the same function over
+    // the same message, so a dry run cannot read threading headers differently.
+    // The pin depends on the headers and the chain, never on the recipient.
+    let pin = crate::routing::thread::pin_for_message(
+        cfg,
+        chain,
+        &synthesise(&request, &request.recipients[0]),
+    );
+    let thread = thread_view(&pin);
+
     let mut recipients = Vec::with_capacity(request.recipients.len());
     for recipient in &request.recipients {
-        recipients.push(evaluate_one(&state, chain, recipient, &request, now).await?);
+        recipients.push(evaluate_one(&state, chain, &pin, recipient, &request, now).await?);
     }
 
     Ok(Json(DryRunResponse {
@@ -252,8 +286,30 @@ pub async fn dryrun(
                 .to_string()
         }),
         refused: None,
+        thread,
         recipients,
     }))
+}
+
+fn thread_view(pin: &crate::routing::thread::Pin) -> Option<ThreadView> {
+    use crate::routing::thread::Pin;
+    match pin {
+        Pin::None => None,
+        Pin::Unmatched => Some(ThreadView {
+            outcome: "unmatched",
+            pinned: None,
+            explanation: "the message refers to message IDs, and no route in this chain emitted \
+                          any of them, so the chain is walked in its configured order (D-090)",
+        }),
+        Pin::Route(route) => Some(ThreadView {
+            outcome: "pinned",
+            pinned: Some(route.clone()),
+            explanation: "a reply into a thread this route started: it is walked first, without \
+                          its recipient_frequency threshold, and past its day's cap if it has no \
+                          headroom. Pause, strict preflight and a future warmup.started still \
+                          skip it (§3.2 step 2a, D-090)",
+        }),
+    }
 }
 
 /// A slug for the two §3.2 step 1 refusals a dry run can produce.
@@ -289,6 +345,7 @@ fn refusal_explanation(e: &relay::SelectError) -> &'static str {
 async fn evaluate_one(
     state: &AdminState,
     chain: &[String],
+    pin: &crate::routing::thread::Pin,
     recipient: &str,
     request: &DryRunRequest,
     now: chrono::DateTime<Utc>,
@@ -305,7 +362,8 @@ async fn evaluate_one(
         state.store(),
         &state.engine.frequency,
         &state.engine.preflight,
-        chain,
+        &crate::routing::thread::order(chain, pin),
+        pin.route(),
         recipient,
         now,
     )
@@ -442,6 +500,12 @@ fn synthesise(request: &DryRunRequest, recipient: &str) -> Vec<u8> {
         "Subject: {}\r\n",
         request.subject.as_deref().unwrap_or("simmer dry run")
     ));
+    if let Some(v) = &request.in_reply_to {
+        out.push_str(&format!("In-Reply-To: {v}\r\n"));
+    }
+    if let Some(v) = &request.references {
+        out.push_str(&format!("References: {v}\r\n"));
+    }
     out.push_str("MIME-Version: 1.0\r\n");
     out.push_str("Content-Type: text/plain; charset=utf-8\r\n");
     out.push_str("\r\n");
@@ -483,6 +547,16 @@ fn split_message(raw: &[u8]) -> (Vec<Header>, Vec<u8>) {
 
 fn step_view(step: &chain::Step) -> StepView {
     match step.outcome {
+        Ok(()) if step.over_cap => StepView {
+            route: step.route.clone(),
+            outcome: "selected",
+            reason: Some("over_cap"),
+            explanation: Some(
+                "a thread-affinity reply on its pinned route, which has no headroom left for \
+                 this domain group today: it would be reserved and counted past the cap \
+                 (§3.2 step 2a, D-090)",
+            ),
+        },
         Ok(()) => StepView {
             route: step.route.clone(),
             outcome: "selected",
@@ -542,8 +616,28 @@ mod tests {
             message: message.map(str::to_string),
             body: body.map(str::to_string),
             subject: None,
+            in_reply_to: None,
+            references: None,
             include_message: false,
         }
+    }
+
+    #[test]
+    fn threading_headers_are_synthesised_only_when_asked_for() {
+        let raw = String::from_utf8(synthesise(&request(Some("hi"), None), "a@b.com")).unwrap();
+        assert!(!raw.contains("In-Reply-To") && !raw.contains("References"));
+
+        let mut r = request(Some("hi"), None);
+        r.in_reply_to = Some("<r@gmail.com>".into());
+        r.references = Some("<1@newbrand.com> <r@gmail.com>".into());
+        let raw = String::from_utf8(synthesise(&r, "a@b.com")).unwrap();
+        assert!(raw.contains("In-Reply-To: <r@gmail.com>\r\n"), "{raw}");
+        assert!(
+            raw.contains("References: <1@newbrand.com> <r@gmail.com>\r\n"),
+            "{raw}"
+        );
+        let (head, _) = raw.split_once("\r\n\r\n").unwrap();
+        assert!(head.contains("References:"), "a header, not the body");
     }
 
     #[test]
@@ -615,6 +709,7 @@ mod tests {
         let selected = step_view(&chain::Step {
             route: "overflow".into(),
             outcome: Ok(()),
+            over_cap: false,
         });
         assert_eq!(selected.outcome, "selected");
         assert_eq!(selected.reason, None);
@@ -622,9 +717,19 @@ mod tests {
         let skipped = step_view(&chain::Step {
             route: "warming".into(),
             outcome: Err(SkipReason::Quota),
+            over_cap: false,
         });
         assert_eq!(skipped.outcome, "skipped");
         assert_eq!(skipped.reason, Some("quota"));
         assert!(skipped.explanation.is_some());
+
+        let over = step_view(&chain::Step {
+            route: "warming".into(),
+            outcome: Ok(()),
+            over_cap: true,
+        });
+        assert_eq!(over.outcome, "selected", "past the cap is still selected");
+        assert_eq!(over.reason, Some("over_cap"));
+        assert!(over.explanation.is_some());
     }
 }

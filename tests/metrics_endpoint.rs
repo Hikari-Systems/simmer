@@ -245,6 +245,7 @@ async fn a_reservation_moves_the_gauges_without_a_relay(pool: PgPool) {
             count: 1,
             correlation_id: "metrics".into(),
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            over_cap: false,
         })
         .await
         .expect("reserve");
@@ -518,6 +519,20 @@ async fn the_metrics_carry_help_text(pool: PgPool) {
     );
     // §14.2's caveat, in the exposition itself.
     assert!(body.contains("ALERT ON THIS"), "{body}");
+
+    // D-090's counter, with outcome and route as its only labels.
+    simmer::metrics::thread_affinity("warming", "over_cap");
+    let (_, body) = scrape(&state).await;
+    assert!(
+        body.contains("# HELP simmer_thread_affinity_total"),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"simmer_thread_affinity_total{route="warming",outcome="over_cap"} 1"#)
+            || body
+                .contains(r#"simmer_thread_affinity_total{outcome="over_cap",route="warming"} 1"#),
+        "{body}"
+    );
 }
 
 #[sqlx::test]

@@ -75,6 +75,10 @@ impl SkipReason {
 pub struct Step {
     pub route: String,
     pub outcome: Result<(), SkipReason>,
+    /// §3.2 step 2a (D-090): selected as a thread-affinity reply's pinned route
+    /// with no headroom left, so the reservation was taken past the cap. Only
+    /// ever true on an `Ok` step.
+    pub over_cap: bool,
 }
 
 /// A route selected and its quota reserved.
@@ -93,6 +97,9 @@ pub struct Selected<'a> {
     /// mode-specific, so they belong to the route that produced them, and a
     /// route with no constraint records nothing at all.
     pub recipient_keys: Vec<frequency::Key>,
+    /// §3.2 step 2a (D-090): the reservation was taken past the day's cap,
+    /// because this is a thread-affinity reply on its pinned route.
+    pub over_cap: bool,
 }
 
 /// The result of walking a chain.
@@ -104,6 +111,14 @@ pub enum Walk<'a> {
 }
 
 /// §3.2 step 3, for real: walk and reserve.
+///
+/// `chain` is walked in the order given, which for a thread-affinity reply is
+/// §3.2 step 2a's order with `pinned` first (`thread::order`). The pinned route
+/// is treated differently in exactly two ways (D-090): §7.3's threshold is not
+/// applied to it, though its events are still recorded on commit; and when it
+/// has no headroom it is reserved **past the cap** rather than skipped. Pause,
+/// strict preflight and a future `warmup.started` still eliminate it — those
+/// say the route cannot send, not that it has sent enough.
 ///
 /// `smtp::mod::handle`'s precedent on the argument count. The four collaborators
 /// — store, frequency, preflight, and the evaluation buffer — are passed
@@ -118,6 +133,7 @@ pub async fn walk_and_reserve<'a>(
     frequency: &Frequency,
     preflight: &crate::preflight::Registry,
     chain: &[String],
+    pinned: Option<&str>,
     recipients: &[String],
     correlation_id: &str,
     evaluation: &mut Vec<Step>,
@@ -147,6 +163,7 @@ pub async fn walk_and_reserve<'a>(
             continue;
         };
         let state = states.get(name).copied().unwrap_or_default();
+        let is_pinned = pinned == Some(name.as_str());
 
         // (a) paused.
         if state.paused {
@@ -183,9 +200,13 @@ pub async fn walk_and_reserve<'a>(
                     .map(|r| keyer.key_for(r, constraint.mode, &cfg.dot_insensitive_domains))
                     .collect();
 
+                // D-090: a reply the recipient prompted by replying is not the
+                // over-mailing §7.3 steers away from, so a pinned route skips
+                // the threshold — and still records the event, so the window
+                // stays true for the next message that is not a reply.
                 let since = frequency::window_start(constraint, now);
                 let mut over = false;
-                for key in &keys {
+                for key in keys.iter().filter(|_| !is_pinned) {
                     let seen = store.recipient_event_count(name, key, since).await?;
                     if seen >= i64::from(constraint.threshold) {
                         // No recipient in the log line, and no recipient label on
@@ -231,11 +252,41 @@ pub async fn walk_and_reserve<'a>(
             expires_at: now
                 + chrono::Duration::from_std(quota::reservation_expiry(route, recipients.len()))
                     .unwrap_or_else(|_| chrono::Duration::seconds(600)),
+            over_cap: false,
         };
 
-        match store.reserve(&request).await? {
+        // D-090: the ordinary reservation first, even for a pinned route, so
+        // that "past the cap" is known rather than assumed — it is what
+        // `simmer_thread_affinity_total{outcome="over_cap"}` counts. Only a
+        // refusal is retried, and the retry cannot be refused.
+        let mut over_cap = false;
+        let mut reserved = store.reserve(&request).await?;
+        if is_pinned && matches!(reserved, Reserved::NoHeadroom { .. }) {
+            over_cap = true;
+            reserved = store
+                .reserve(&ReserveRequest {
+                    over_cap: true,
+                    ..request
+                })
+                .await?;
+        }
+
+        match reserved {
             Reserved::Taken(reservation) => {
-                record(evaluation, name, Ok(()));
+                if over_cap {
+                    tracing::info!(
+                        route = %name,
+                        domain_group = %group,
+                        day_index,
+                        correlation_id,
+                        "thread-affinity reply reserved past the day's cap (D-090)"
+                    );
+                }
+                evaluation.push(Step {
+                    route: name.to_string(),
+                    outcome: Ok(()),
+                    over_cap,
+                });
                 metrics::warmup_day(name, day_index);
                 if let Allowance::Limited(a) = allowance {
                     metrics::quota_allowance(name, &group, a as f64);
@@ -248,6 +299,7 @@ pub async fn walk_and_reserve<'a>(
                     day_index,
                     reservation,
                     recipient_keys,
+                    over_cap,
                 })));
             }
             Reserved::NoHeadroom { usage } => {
@@ -278,6 +330,9 @@ pub async fn walk_and_reserve<'a>(
 /// endpoint exists to answer. `tests/admin_api.rs` asserts the two agree rather
 /// than trusting this comment.
 ///
+/// `pinned` is `walk_and_reserve`'s, with its two exceptions reproduced: no
+/// §7.3 threshold, and no headroom means selected past the cap (D-090).
+///
 /// It stops at the first eligible route, as the real walk does, so the routes
 /// after the selected one are absent rather than reported — they would not have
 /// been consulted either.
@@ -287,12 +342,15 @@ pub async fn walk_and_reserve<'a>(
 /// transaction. So it can say "eligible" for a route that another session
 /// empties a millisecond later. That is the same direction of error the §5.4
 /// early check makes, and harmless for the same reason — nothing acts on it.
+/// `walk_and_reserve`'s argument list, for the same reason (D-090 added `pinned`).
+#[allow(clippy::too_many_arguments)]
 pub async fn dry_walk(
     cfg: &Config,
     store: &Arc<dyn QuotaStore>,
     frequency: &Frequency,
     preflight: &crate::preflight::Registry,
     chain: &[String],
+    pinned: Option<&str>,
     recipient: &str,
     now: chrono::DateTime<Utc>,
 ) -> Result<Vec<Step>, QuotaError> {
@@ -310,6 +368,7 @@ pub async fn dry_walk(
             continue;
         };
         let state = states.get(name).copied().unwrap_or_default();
+        let is_pinned = pinned == Some(name.as_str());
 
         if state.paused {
             evaluation.push(step(name, Err(SkipReason::Paused)));
@@ -322,7 +381,7 @@ pub async fn dry_walk(
             continue;
         }
 
-        if let Some(constraint) = &route.recipient_frequency {
+        if let Some(constraint) = route.recipient_frequency.as_ref().filter(|_| !is_pinned) {
             let keyer = frequency.keyer(store.as_ref()).await?;
             let key = keyer.key_for(recipient, constraint.mode, &cfg.dot_insensitive_domains);
             let since = frequency::window_start(constraint, now);
@@ -352,6 +411,13 @@ pub async fn dry_walk(
             evaluation.push(step(name, Ok(())));
             return Ok(evaluation);
         }
+        if is_pinned {
+            evaluation.push(Step {
+                over_cap: true,
+                ..step(name, Ok(()))
+            });
+            return Ok(evaluation);
+        }
 
         evaluation.push(step(name, Err(SkipReason::Quota)));
     }
@@ -369,6 +435,7 @@ fn step(route: &str, outcome: Result<(), SkipReason>) -> Step {
     Step {
         route: route.to_string(),
         outcome,
+        over_cap: false,
     }
 }
 
@@ -432,6 +499,7 @@ fn record(evaluation: &mut Vec<Step>, route: &str, outcome: Result<(), SkipReaso
     evaluation.push(Step {
         route: route.to_string(),
         outcome,
+        over_cap: false,
     });
 }
 
@@ -440,6 +508,7 @@ pub fn render(evaluation: &[Step]) -> String {
     evaluation
         .iter()
         .map(|s| match s.outcome {
+            Ok(()) if s.over_cap => format!("{}=selected_over_cap", s.route),
             Ok(()) => format!("{}=selected", s.route),
             Err(r) => format!("{}={}", s.route, r.as_str()),
         })
@@ -468,10 +537,12 @@ mod tests {
             Step {
                 route: "warming".into(),
                 outcome: Err(SkipReason::Quota),
+                over_cap: false,
             },
             Step {
                 route: "overflow".into(),
                 outcome: Ok(()),
+                over_cap: false,
             },
         ];
         assert_eq!(render(&steps), "warming=quota,overflow=selected");
@@ -483,10 +554,12 @@ mod tests {
             Step {
                 route: "a".into(),
                 outcome: Err(SkipReason::Paused),
+                over_cap: false,
             },
             Step {
                 route: "b".into(),
                 outcome: Err(SkipReason::NotStarted),
+                over_cap: false,
             },
         ];
         assert_eq!(render(&steps), "a=paused,b=not_started");

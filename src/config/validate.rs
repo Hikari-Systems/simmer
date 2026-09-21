@@ -163,6 +163,7 @@ pub fn validate(cfg: &Config) -> ViolationList {
     check_routes(cfg, &mut v);
     check_chains(cfg, &mut v);
     check_default_chain(cfg, &mut v);
+    check_thread_affinity(cfg, &mut v);
     check_link_proxy(cfg, &mut v);
     check_capture(cfg, &mut v);
     check_storage(cfg, &mut v);
@@ -1526,6 +1527,74 @@ fn check_chain(cfg: &Config, chain: &[String], path: &str, v: &mut ViolationList
                     chain[*first], first
                 ),
             );
+        }
+    }
+}
+
+/// §4.2 for §3.2 step 2a (D-090): with `thread_affinity` on, an emitted
+/// `Message-ID:` has to name the route that emitted it, in every chain a
+/// message can walk.
+///
+/// Both failures are refusals rather than warnings because both are silent
+/// otherwise. A route whose ID names no route is never pinned, and a reply to
+/// its mail takes the ordinary walk with nothing to say it did; two routes in
+/// one chain sharing a domain make the pin pick whichever is listed first,
+/// which is right for one of them. Memory of which it was is exactly the state
+/// D-090 chose not to keep.
+fn check_thread_affinity(cfg: &Config, v: &mut ViolationList) {
+    if !cfg.thread_affinity {
+        return;
+    }
+
+    let mut chains: Vec<(String, &[String])> = cfg
+        .senders
+        .iter()
+        .enumerate()
+        .map(|(i, rule)| {
+            (
+                format!("senders[{i}] (match '{}')", rule.pattern),
+                rule.chain.as_slice(),
+            )
+        })
+        .collect();
+    if let Some(chain) = &cfg.default_chain {
+        chains.push(("default_chain".to_string(), chain.as_slice()));
+    }
+
+    let mut reported = std::collections::BTreeSet::new();
+    for (path, chain) in chains {
+        let mut seen: Vec<(String, &str)> = Vec::new();
+        for name in chain {
+            // A dangling name is check_chain's to report.
+            let Some(route) = cfg.route(name) else {
+                continue;
+            };
+            match crate::routing::thread::route_domain(&route.identity) {
+                None => {
+                    if reported.insert(name.as_str()) {
+                        v.push(
+                            format!("routes.{name}.identity.set_headers.Message-ID"),
+                            "must be set, with a literal domain, when thread_affinity is on: \
+                             a reply is recognised by the domain of the Message-ID this route \
+                             emitted, and a route whose IDs carry no domain of its own can \
+                             never be pinned (§4.2, D-090)",
+                        );
+                    }
+                }
+                Some(domain) => match seen.iter().find(|(d, _)| *d == domain) {
+                    Some((_, other)) if *other != name.as_str() => v.push(
+                        &path,
+                        format!(
+                            "routes '{other}' and '{name}' both emit Message-IDs at '{domain}', \
+                             so with thread_affinity on a reply to either would be pinned to \
+                             '{other}'. Give each route in a chain its own Message-ID domain \
+                             (§4.2, D-090)"
+                        ),
+                    ),
+                    Some(_) => {}
+                    None => seen.push((domain, name.as_str())),
+                },
+            }
         }
     }
 }

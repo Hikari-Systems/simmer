@@ -402,6 +402,7 @@ async fn a_reservation_shows_up_as_reserved_and_reduces_headroom(pool: PgPool) {
             count: 1,
             correlation_id: "test".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
+            over_cap: false,
         })
         .await
         .expect("reserved");
@@ -433,6 +434,7 @@ async fn the_read_api_reports_the_row_when_the_schedule_has_moved_under_it(pool:
             count: 1,
             correlation_id: "test".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
+            over_cap: false,
         })
         .await
         .expect("reserved");
@@ -561,6 +563,7 @@ async fn a_paused_route_is_skipped_by_the_real_chain_walk(pool: PgPool) {
         &state.engine.frequency,
         &state.engine.preflight,
         &["warming".to_string(), "overflow".to_string()],
+        None,
         &["someone@gmail.com".to_string()],
         "test",
         &mut evaluation,
@@ -700,6 +703,7 @@ async fn an_override_takes_effect_on_the_next_reservation(pool: PgPool) {
                 count: 1,
                 correlation_id: format!("test-{i}"),
                 expires_at: Utc::now() + chrono::Duration::minutes(10),
+                over_cap: false,
             })
             .await
             .expect("store");
@@ -859,6 +863,7 @@ async fn a_reset_zeroes_committed_and_keeps_live_reservations(pool: PgPool) {
             count: 1,
             correlation_id: "committed".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
+            over_cap: false,
         })
         .await
         .expect("reserve");
@@ -877,6 +882,7 @@ async fn a_reset_zeroes_committed_and_keeps_live_reservations(pool: PgPool) {
             count: 1,
             correlation_id: "in-flight".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
+            over_cap: false,
         })
         .await
         .expect("reserve");
@@ -1172,8 +1178,23 @@ async fn a_dry_run_needs_at_least_one_recipient(pool: PgPool) {
 
 /// Walk the real chain and the dry-run chain over the same state, and compare.
 async fn compare_walks(state: &AdminState, recipient: &str) -> (String, String) {
+    compare_pinned_walks(state, recipient, None).await
+}
+
+/// [`compare_walks`] for a thread-affinity reply pinned to `pinned` (D-090):
+/// both walks get §3.2 step 2a's order and the same pin.
+async fn compare_pinned_walks(
+    state: &AdminState,
+    recipient: &str,
+    pinned: Option<&str>,
+) -> (String, String) {
     let cfg = &state.engine.config;
-    let chain = vec!["warming".to_string(), "overflow".to_string()];
+    let pin = match pinned {
+        Some(r) => simmer::routing::thread::Pin::Route(r.to_string()),
+        None => simmer::routing::thread::Pin::None,
+    };
+    let chain =
+        simmer::routing::thread::order(&["warming".to_string(), "overflow".to_string()], &pin);
 
     let dry = simmer::routing::chain::dry_walk(
         cfg,
@@ -1181,6 +1202,7 @@ async fn compare_walks(state: &AdminState, recipient: &str) -> (String, String) 
         &state.engine.frequency,
         &state.engine.preflight,
         &chain,
+        pinned,
         recipient,
         Utc::now(),
     )
@@ -1194,6 +1216,7 @@ async fn compare_walks(state: &AdminState, recipient: &str) -> (String, String) 
         &state.engine.frequency,
         &state.engine.preflight,
         &chain,
+        pinned,
         &[recipient.to_string()],
         "compare",
         &mut evaluation,
@@ -1240,6 +1263,7 @@ async fn dry_run_agrees_with_the_real_walk_on_an_exhausted_quota(pool: PgPool) {
             count: 1,
             correlation_id: "filler".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
+            over_cap: false,
         })
         .await
         .expect("reserve");
@@ -1309,6 +1333,7 @@ async fn dry_run_agrees_with_the_real_walk_on_a_frequency_skip(pool: PgPool) {
             count: 1,
             correlation_id: "filler".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
+            over_cap: false,
         })
         .await
         .expect("reserve");
@@ -1362,6 +1387,7 @@ async fn no_endpoint_exposes_a_recipient(pool: PgPool) {
             count: 1,
             correlation_id: "real".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
+            over_cap: false,
         })
         .await
         .expect("reserve");
@@ -1414,6 +1440,7 @@ async fn a_dry_run_echoes_only_what_the_caller_supplied(pool: PgPool) {
             count: 1,
             correlation_id: "other".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
+            over_cap: false,
         })
         .await
         .expect("reserve");
@@ -1468,4 +1495,211 @@ async fn a_body_free_post_is_accepted_without_an_empty_object(pool: PgPool) {
     )
     .await;
     assert_eq!(response.status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// §3.2 step 2a — thread affinity in the dry run (D-090)
+// ---------------------------------------------------------------------------
+
+/// CFG with `thread_affinity` on: each route gets its own `Message-ID:` domain,
+/// and warming a one-per-day recipient_frequency constraint.
+fn affinity_state(pool: PgPool) -> AdminState {
+    let yaml = CFG
+        .replace(
+            "        From: \"New Brand <hello@newbrand.com>\"\n",
+            "        From: \"New Brand <hello@newbrand.com>\"\n        Message-ID: \"<{{uuid}}@newbrand.com>\"\n",
+        )
+        .replace(
+            "    warmup:\n      started: \"2020-01-01T00:00:00Z\"\n",
+            "    recipient_frequency:\n      mode: to_address\n      window: { unit: daily, count: 1 }\n      threshold: 1\n    warmup:\n      started: \"2020-01-01T00:00:00Z\"\n",
+        )
+        .replace(
+            "    identity: { envelope_from: \"bounce@established.com\" }\n",
+            "    identity:\n      envelope_from: \"bounce@established.com\"\n      set_headers: { Message-ID: \"<{{uuid}}@established.com>\" }\n",
+        )
+        + "thread_affinity: true\n";
+    let cfg = simmer::config::from_str(&yaml, "test").expect("fixture is valid");
+    assert!(cfg.thread_affinity);
+    assert!(cfg.route("warming").unwrap().recipient_frequency.is_some());
+    state_from(pool, cfg)
+}
+
+/// Fill google's one warming slot for today.
+async fn spend_google(state: &AdminState) {
+    let day = today(&state.engine.config, "warming");
+    let simmer::quota::Reserved::Taken(r) = store(state)
+        .reserve(&ReserveRequest {
+            route: "warming".into(),
+            domain_group: "google".into(),
+            day_index: day,
+            allowance: Some(1),
+            count: 1,
+            correlation_id: "filler".into(),
+            expires_at: Utc::now() + chrono::Duration::minutes(10),
+            over_cap: false,
+        })
+        .await
+        .expect("reserve")
+    else {
+        panic!("expected a reservation");
+    };
+    store(state).commit(&r, &[]).await.expect("commit");
+}
+
+#[sqlx::test]
+async fn dry_run_agrees_with_the_real_walk_on_a_pinned_route_past_its_cap(pool: PgPool) {
+    let state = affinity_state(pool);
+    spend_google(&state).await;
+
+    let (dry, real) = compare_walks(&state, "a@gmail.com").await;
+    assert_eq!(dry, real);
+    assert_eq!(
+        dry, "warming=quota,overflow=selected",
+        "unpinned, the ramp holds"
+    );
+
+    let (dry, real) = compare_pinned_walks(&state, "b@gmail.com", Some("warming")).await;
+    assert_eq!(dry, real);
+    assert_eq!(dry, "warming=selected_over_cap");
+}
+
+#[sqlx::test]
+async fn dry_run_agrees_with_the_real_walk_on_a_pinned_route_over_its_frequency(pool: PgPool) {
+    let state = affinity_state(pool);
+
+    // One delivered message to bob puts him at warming's threshold of 1.
+    let mut ev = Vec::new();
+    let simmer::routing::chain::Walk::Selected(s) = simmer::routing::chain::walk_and_reserve(
+        &state.engine.config,
+        &store(&state),
+        &state.engine.frequency,
+        &state.engine.preflight,
+        &["warming".to_string()],
+        None,
+        &["bob@example.com".to_string()],
+        "first",
+        &mut ev,
+    )
+    .await
+    .expect("walk") else {
+        panic!("expected warming");
+    };
+    store(&state)
+        .commit(&s.reservation, &s.recipient_keys)
+        .await
+        .expect("commit");
+
+    let (dry, real) = compare_walks(&state, "bob@example.com").await;
+    assert_eq!(dry, real);
+    assert_eq!(dry, "warming=frequency,overflow=selected");
+
+    let (dry, real) = compare_pinned_walks(&state, "bob@example.com", Some("warming")).await;
+    assert_eq!(dry, real);
+    assert_eq!(dry, "warming=selected", "a reply is not over-mailing");
+}
+
+#[sqlx::test]
+async fn dry_run_agrees_with_the_real_walk_on_a_paused_pinned_route(pool: PgPool) {
+    let state = affinity_state(pool);
+    post(&state, "/routes/warming/pause", Some(TOKEN), "").await;
+    let (dry, real) = compare_pinned_walks(&state, "a@gmail.com", Some("warming")).await;
+    assert_eq!(dry, real);
+    assert_eq!(dry, "warming=paused,overflow=selected");
+}
+
+#[sqlx::test]
+async fn dry_run_reports_the_pin_from_the_threading_headers(pool: PgPool) {
+    let state = affinity_state(pool);
+    spend_google(&state).await;
+
+    let doc = post(
+        &state,
+        "/dryrun",
+        Some(TOKEN),
+        r#"{"envelope_from":"a@oldbrand.com","recipients":["x@gmail.com"],
+            "in_reply_to":"<CAx9@mail.gmail.com>",
+            "references":"<3f2a@newbrand.com> <CAx9@mail.gmail.com>"}"#,
+    )
+    .await
+    .json();
+
+    assert_eq!(doc["thread"]["outcome"], "pinned", "{doc}");
+    assert_eq!(doc["thread"]["pinned"], "warming", "{doc}");
+    let r = &doc["recipients"][0];
+    assert_eq!(r["selected"], "warming", "{doc}");
+    assert_eq!(r["evaluation"][0]["reason"], "over_cap", "{doc}");
+    assert_eq!(
+        doc["chain"],
+        serde_json::json!(["warming", "overflow"]),
+        "configured order"
+    );
+}
+
+#[sqlx::test]
+async fn dry_run_reads_the_pin_from_a_supplied_message_and_reports_unmatched(pool: PgPool) {
+    let state = affinity_state(pool);
+
+    let doc = post(
+        &state,
+        "/dryrun",
+        Some(TOKEN),
+        r#"{"envelope_from":"a@oldbrand.com","recipients":["x@example.com"],
+            "message":"From: a@oldbrand.com\nReferences: <1@established.com>\n\nhi\n"}"#,
+    )
+    .await
+    .json();
+    assert_eq!(doc["thread"]["pinned"], "overflow", "{doc}");
+    assert_eq!(
+        doc["recipients"][0]["evaluation"][0]["route"], "overflow",
+        "{doc}"
+    );
+
+    let doc = post(
+        &state,
+        "/dryrun",
+        Some(TOKEN),
+        r#"{"envelope_from":"a@oldbrand.com","recipients":["x@example.com"],
+            "references":"<CAx9@mail.gmail.com>"}"#,
+    )
+    .await
+    .json();
+    assert_eq!(doc["thread"]["outcome"], "unmatched", "{doc}");
+    assert_eq!(doc["recipients"][0]["selected"], "warming", "{doc}");
+
+    let doc = post(
+        &state,
+        "/dryrun",
+        Some(TOKEN),
+        r#"{"envelope_from":"a@oldbrand.com","recipients":["x@example.com"]}"#,
+    )
+    .await
+    .json();
+    assert!(
+        doc.get("thread").is_none(),
+        "a first message has no thread: {doc}"
+    );
+}
+
+#[sqlx::test]
+async fn the_quota_view_reports_replies_past_the_cap_truthfully(pool: PgPool) {
+    // The control plane must not lie (D-026's rule): past the cap is shown as
+    // committed above the allowance, with no headroom — never as a raised
+    // allowance, and never as negative headroom.
+    let state = affinity_state(pool);
+    spend_google(&state).await;
+    for _ in 0..2 {
+        let (_, real) = compare_pinned_walks(&state, "b@gmail.com", Some("warming")).await;
+        assert_eq!(real, "warming=selected_over_cap");
+    }
+    // compare_pinned_walks leaves the real walk's reservation outstanding, so
+    // the two replies show as reserved: in flight, past the cap.
+    let day = today(&state.engine.config, "warming");
+    let u = store(&state).usage("warming", "google", day).await.unwrap();
+    assert_eq!((u.committed, u.reserved), (1, 2));
+
+    let warming = route_of(&get(&state, "/routes", Some(TOKEN)).await.json(), "warming");
+    let group = group_of(&warming, "google");
+    assert_eq!(group["allowance"], 1, "{group}");
+    assert_eq!(group["reserved"], 2, "{group}");
+    assert_eq!(group["headroom"], 0, "{group}");
 }

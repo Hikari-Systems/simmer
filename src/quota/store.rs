@@ -100,6 +100,13 @@ pub struct ReserveRequest {
     pub count: i64,
     pub correlation_id: String,
     pub expires_at: DateTime<Utc>,
+    /// §3.2 step 2a (D-090): take the reservation **without** the headroom
+    /// check. Everything else is unchanged — the row lock is taken, `reserved`
+    /// is incremented, and commit or release resolves it — so the send is
+    /// counted and contenders are still serialised; `committed` may simply end
+    /// above `allowance`. Set only for a thread-affinity reply on its pinned
+    /// route, and only once an ordinary reservation has been refused.
+    pub over_cap: bool,
 }
 
 /// The outcome of §7.4 phase 1.

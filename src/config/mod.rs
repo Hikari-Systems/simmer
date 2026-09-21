@@ -59,6 +59,13 @@ pub struct Config {
     #[serde(default)]
     pub strict_senders: bool,
 
+    /// §3.2 step 2a (D-090) — walk the route that emitted a message ID this
+    /// message refers to first. Off by default. When on, §4.2 requires every
+    /// route in every chain to set a `Message-ID:` with a literal domain, and
+    /// those domains to differ within each chain.
+    #[serde(default)]
+    pub thread_affinity: bool,
+
     /// §10.3. Not shown in the §4.1 example; placed at the top level because it
     /// is a policy about the whole engine rather than about one route.
     #[serde(default)]

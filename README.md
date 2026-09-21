@@ -151,7 +151,8 @@ falls outside them is refused `550 5.7.1`. Details under
 
 What works today: **an end-to-end relay that applies the ramp, rewrites both the
 identity and the body, paces how often one recipient hears from a warming route,
-pools its downstream connections, accepts submissions over verified TLS from
+keeps a conversation on the route that started it, pools its downstream
+connections, accepts submissions over verified TLS from
 applications limited to their own sender identities, and can be inspected and
 steered without a restart.** What does not:
 
@@ -333,6 +334,65 @@ index.
 
 Overflow routes are never capped, but they *are* counted — "how much is spilling
 to overflow" is the number that tells you whether the ramp is set too low.
+
+### Thread affinity
+
+Off by default. With it on, a reply the application sends into a conversation
+Simmer started leaves via **the route that started it** — the same outbound
+identity the recipient has already seen — instead of whichever route the ramp
+would pick today (§3.2 step 2a, D-090).
+
+```yaml
+thread_affinity: true      # top level, beside strict_senders
+```
+
+**How a reply is recognised.** Nothing is stored. Each route's `Message-ID:`
+carries its own domain (`<{{uuid}}@newbrand.com>`), so an ID Simmer emitted names
+the route that emitted it. When the recipient replies, their mail client puts
+that ID in `In-Reply-To:`/`References:`; when the application answers, its
+`References:` carries it forward, and Simmer reads it. With `thread_affinity`
+on, startup refuses any route in any chain that does not set a `Message-ID:`
+with a literal domain, and any two routes in one chain that share one.
+
+**What the application must send.** A correctly threaded reply (RFC 5322
+§3.6.4), built from the recipient's inbound message:
+
+| New outbound header | Built from the inbound | Rule |
+|---|---|---|
+| `In-Reply-To:` | its `Message-ID:` | Exactly that one ID, in angle brackets |
+| `References:` | its `References:` + its `Message-ID:` | If it has no `References:`, its `In-Reply-To:` (when it holds one ID) + its `Message-ID:`; if neither, just its `Message-ID:` |
+| `Subject:` | its `Subject:` | Prefix `Re: ` unless already present; otherwise unchanged |
+| `To:` | its `Reply-To:` if present, else its `From:` | The recipient's address |
+
+`From:` is the application's usual sending address, so the same sender rule —
+and so the same chain — matches. Carry `References:` forward on every turn:
+drop it once and the link back to Simmer's first ID is gone for the rest of the
+thread; if you must trim a long one, keep the first ID and the most recent. Copy
+IDs byte for byte. Check that your inbound parser or webhook actually hands you
+`References:` and `Message-ID:`; some drop them unless asked for raw headers. A
+new message that is not a reply carries no `References:`, and is routed
+ordinarily.
+
+**What a pinned reply is exempt from, and what it is not.**
+
+- **The day's cap — only once it has been met.** A pinned reply first takes an
+  ordinary slot, so replies within the cap spend it like any message and new
+  conversations spill to overflow sooner. When the cap is already met, the reply
+  still goes out on its route, **past the cap, and counted**: `committed` reads
+  above `allowance` in `/routes` and `/quota`, the allowance itself never
+  changes, and every message that is not a pinned reply is still refused at it.
+  `simmer_thread_affinity_total{outcome="over_cap"}` counts them — watch it,
+  because each is a send the ramp did not schedule.
+- **`recipient_frequency`** on the pinned route: a conversation is not
+  over-mailing. The event is still recorded.
+- **Not exempt:** a pause, a strict preflight failure, or a `warmup.started` in
+  the future. Those mean the route cannot send; the reply then takes the
+  ordinary walk (`outcome="ineligible"`) and the thread changes identity. A
+  downstream failure is still a failure — no failover (§3.3).
+
+Only the matched chain's routes can be pinned, and with thread affinity on,
+envelope-only configurations no longer reject at `RCPT TO` (§5.4): whether a
+message is a reply is in its headers.
 
 ### SMTPUTF8
 
@@ -602,7 +662,10 @@ It runs the real sender match, the real chain walk and the real rewrite engine, 
 what it shows is what would go out; the tests assert its chain evaluation is
 identical to the relay's across every skip reason. It reports each
 `body_rewrites` pattern's match count **including the ones that matched nothing**,
-which is usually the answer to "why is my rewrite not firing".
+which is usually the answer to "why is my rewrite not firing". Give it
+`in_reply_to` and `references` (or a full `message`) to see where a reply would
+go: the response's `thread` names the pinned route, and a pinned route that
+would go past its cap shows as selected with reason `over_cap`.
 
 **Every mutation is audited** at `INFO` with the acting token's name, the target,
 and the value it replaced. Name your tokens (`admin.tokens`) and that line names
@@ -732,6 +795,7 @@ platform root store the §8.2 `required_verify` mode needs.
 ```
 src/config/     the §4.1 schema, ${ENV_VAR} interpolation, §4.2 validation
 src/routing/    sender matching (§5.4), domain groups (§3.2.2), the chain walk
+  thread.rs       §3.2 step 2a's thread affinity: IDs in, a pinned route out (D-090)
 src/smtp/       §5 ingress: listeners, state machine, AUTH, DATA buffer, replies
   tls.rs          §5.1's certificate: loaded once, checked by §4.2 the same way
   acl.rs          §5.3's sender grants. Gates acceptance, never routing (D-071)
@@ -765,6 +829,7 @@ tests/support/  a scripted fake downstream (§12.3)
 tests/store_conformance/  §11's storage contract, one suite for both backends
 tests/rewrite_stability.rs  §6.6 as a property test over generated messages
 tests/admin_api.rs   §9 against the real router and real Postgres
+tests/thread_affinity.rs  D-090 end to end, including replies past the cap
 tests/pool.rs        §8.3 from the downstream's side: connections, not intentions
 tests/ingress_tls.rs §5.1 and §5.3 end to end: STARTTLS, implicit TLS, the ACL
 tests/metrics_endpoint.rs  §9.1 against a real recorder; its own binary

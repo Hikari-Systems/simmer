@@ -209,3 +209,20 @@ fn a_missing_secret_is_a_fatal_startup_error() {
     // Restore, so a later test in this binary is not affected.
     set_all_vars();
 }
+
+#[test]
+fn the_shipped_config_is_ready_for_thread_affinity() {
+    // D-090's §4.2 rules against the shipped routes: switching it on must be a
+    // one-line change, not a surprise at the next restart.
+    let _env = env_guard();
+    set_all_vars();
+    let text = std::fs::read_to_string("simmer.yaml").expect("read");
+    assert!(
+        text.contains("\nthread_affinity: false\n"),
+        "documented and off"
+    );
+    let on = text.replace("\nthread_affinity: false\n", "\nthread_affinity: true\n");
+    let cfg = config::from_str(&on, "simmer.yaml")
+        .unwrap_or_else(|e| panic!("simmer.yaml is not valid with thread_affinity on:\n{e}"));
+    assert!(cfg.thread_affinity);
+}

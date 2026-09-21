@@ -146,6 +146,7 @@ async fn walk(
         &Frequency::new(),
         registry,
         &chain,
+        None,
         &["someone@example.com".to_string()],
         "preflight-test",
         &mut evaluation,

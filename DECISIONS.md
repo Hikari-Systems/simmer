@@ -3498,6 +3498,128 @@ numbered 5a rather than 6):**
   body there.
 - §9.1: `simmer_header_rewrite_skipped_total{route,header,reason}`.
 
+## Thread affinity (2026-09-21)
+
+### D-090 — Replies stay on the route that started the thread, past its cap if need be
+
+> **Settled 2026-09-21 by the spec's author (O-17), and the spec amended in the
+> same release (v0.5.0):** §2.1, §2.2 (a clarification), §3.2 step 2a, §4.1,
+> §4.2, §5.4, §7.3, §7.4, §9.1, §9.4 and §9.5. Three calls were the author's:
+> the switch is **global** rather than per sender rule; a pinned reply may go
+> **past the ramp's cap**, counted; and it **bypasses §7.3's threshold** on its
+> pinned route. Each is recorded below with the alternative it replaced.
+
+**The problem.** §3.2 decides every message afresh. A recipient who replied to
+mail from `sales@newbrand.com` in the morning gets the application's answer from
+`news@mail.established.com` in the afternoon, once the warming route has spent
+its day or the recipient has tripped its `recipient_frequency` threshold — and a
+back-and-forth conversation trips a threshold like 3/day by its nature. The
+thread changes identity, which is both confusing and exactly the inconsistency
+a warm-up exists to avoid.
+
+**What Simmer can and cannot see.** The recipient's reply never passes through
+Simmer (§2.2): it goes to `Reply-To:` or `From:`. What Simmer does see is the
+application's *next* outbound message, and if the application writes it as a
+reply (RFC 5322 §3.6.4) its `References:` carries the `Message-ID:` Simmer
+emitted on the first message — because the recipient's client put that ID in its
+own `In-Reply-To:`/`References:`, and the application carries the chain forward.
+The README's "Thread affinity" section is the list of headers the application
+must build.
+
+**Decision: stateless, keyed on the `Message-ID:` domain.** Every route already
+sets a `Message-ID:` whose domain is its own (§6.2 says it should match the
+sending domain), so an emitted ID names the route that emitted it. §3.2 step 2a
+reads `In-Reply-To:` then `References:`, most recent first, at most 256 IDs, and
+the first whose domain equals a chain route's literal `Message-ID:` domain pins
+that route. `src/routing/thread.rs`.
+
+- **Rejected: a table of emitted IDs.** It would match the application's
+  *original* IDs too, which is its one advantage — but it is a third kind of
+  persistence beside quota and §7.3 events, needing a hash, a salt, a TTL and a
+  sweeper, in both stores, for a fact the ID already carries. It remains the
+  answer if a deployment ever needs two routes in one chain to share a
+  `Message-ID:` domain; §4.2 refuses that today instead.
+- **Rejected: an `X-Simmer-Original-Message-ID:` header** set by the
+  application. It duplicates `References:`, would have to be stripped before
+  relay, and ties the application to Simmer: after cutover it means nothing but
+  stays in the application's code. §1.1 is about exactly that residue.
+- **Most recent wins**, so a thread that did change identity (its route paused
+  mid-thread) follows the identity the recipient saw last.
+- **Only the matched chain's routes.** The sender rule decides which identities
+  a message may leave under; an ID naming a route outside the chain pins
+  nothing. A pin can order the chain, never widen it.
+
+**The pin is a reordering plus two exemptions.** The pinned route is walked
+first, then the rest of the chain in configured order, through the unchanged
+walk (`thread::order`, then `chain::walk_and_reserve` with `pinned`). For the
+pinned route alone:
+
+1. **§7.3's threshold is not applied** (author's call). A reply the recipient
+   prompted by replying is not the over-mailing §7.3 steers away from. The event
+   is still recorded on commit, so the window stays true for the next message
+   that is *not* a reply. *Alternative, rejected: frequency still applies, so a
+   chatty thread is steered off its route even with quota to spare.*
+2. **No headroom does not refuse it** (author's call, over the soft pin first
+   proposed). The walk takes an **ordinary** reservation first — so a reply
+   within the cap spends a slot like any message, and the ramp's own new
+   conversations spill over sooner — and only if that is refused does it
+   reserve with `ReserveRequest.over_cap`, which skips the headroom comparison
+   and nothing else: same row lock, `reserved` incremented, commit or release as
+   always. "Past the cap" is therefore known rather than assumed, and reported:
+   `Selected.over_cap`, `warming=selected_over_cap` in the §9.5 chain line, and
+   `simmer_thread_affinity_total{outcome="over_cap"}`. *Alternatives, rejected:
+   the soft pin (fall through at the cap — the thread changes identity, which
+   is the problem), and a bounded overdraft (a second ceiling to configure and
+   explain, for a volume that is replies to our own mail).*
+
+**What still eliminates a pinned route:** a pause, a strict §6.7 failure, and a
+`warmup.started` in the future. Those say the route *cannot* send, not that it
+has sent enough; an operator's pause has to keep meaning "stop". The walk then
+continues with the next route, ordinarily — only the pinned route is ever
+reserved past its cap. §3.3 is unchanged: a pinned route that fails downstream
+releases and reports, and does not fail over.
+
+**§7.4's "overshoot is not acceptable" now has one exception**, and the spec says
+so. What keeps it bounded is that the ceiling is never raised: `allowance` is
+untouched (D-026 holds — a past-the-cap reservation that creates the day's row
+writes the schedule's value), every message that is not a pinned reply is still
+refused at it, and §9.2 shows `committed` above `allowance` with headroom floored
+at zero rather than lying about either.
+
+**§5.4's early `RCPT TO` decision is off when `thread_affinity` is on.** A pinned
+reply may take a spent route, and whether a message is one is in headers that
+have not arrived at `RCPT TO`; deciding early would refuse exactly the reply the
+feature exists for (`sender_match::can_decide_at_rcpt`). The cost is a wasted
+body transfer for mail that is refused anyway, only on envelope-only
+configurations with no overflow route.
+
+**Global, not per rule** (author's call). One `thread_affinity:` key at the top
+level beside `strict_senders`. With it on, §4.2 requires every route in every
+chain — sender rules and `default_chain` — to set `Message-ID:` with a literal
+domain, and different routes in one chain to have different domains. Both are
+refusals, not warnings: a route whose IDs name no route is silently never pinned,
+and a shared domain silently pins every reply to whichever route is listed first.
+*Alternative, rejected: per sender rule, so a rule whose routes cannot satisfy
+the checks does not block the rest.*
+
+**§1.1 is untouched.** The pin selects; it does not rewrite. After cutover there
+is one identity, so there is nothing to pin, and nothing the application must
+keep doing except write replies properly — which it should anyway.
+
+**Tested:** `thread.rs` (parsing, precedence, the order, outcome labels);
+`tests/config_validation.rs` (the §4.2 rules); `tests/thread_affinity.rs`
+(end to end: a reply stays on overflow though warming has room; within the cap
+it takes an ordinary slot and counts; past the cap only once the cap is met,
+each one counted; a race of twelve splits exactly at the remaining slots; a
+failed reply past the cap counts nothing; only the pinned route goes past its
+cap; pause, frequency, no-failover, the early check, and the threading headers'
+bytes); `tests/store_conformance/` (past the cap on both backends, including a
+barrier race over two pools); `tests/admin_api.rs` (dry run step for step
+against the real walk, pinned, and §9.2's view past the cap).
+
+**Not tested here:** the §12.3 acceptance suite has no thread-affinity case yet,
+and cannot run from the development jail.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -3520,6 +3642,7 @@ the phase that depends on each.
 | ~~O-13~~ | *Settled 2026-09-17 by the spec's author: amend the spec. §2.1, §2.2, §2.3, §4.1, §4.2, §5.7 (new), §9.1, §9.5, §10.4, §12.1 and §13 now carry the link proxy — see **D-083**.* | | |
 | O-15 | Does the D-085 capture need a `SPEC.md` amendment, or does it stay a recorded divergence? It is off by default, never read by the delivery path, and carries no delivery state — but it *is* message persistence, and §2.2, §8.1, §7.3 and §9.5 each say something a reader of the spec alone would take to exclude it. If amended, the sections are §2.2 (a carve-out), §4.1/§4.2 (the block and its rules), §9.1 (eleven metrics), §9.5 (where bodies *do* go), §12.2 (the volume) and §13 (a phase 13). | A divergence, recorded in D-085 and D-086. `SPEC.md` is unchanged and no phase 13 is added — D-084's precedent, and it follows from the owner's own framing: §13's phases describe the product, and a debugging mode that ships off and plays no part in delivery is not one of them | Before the next spec amendment |
 | ~~O-16~~ | *Settled 2026-09-21 by the spec's author: amend the spec. §4.1, §4.2, §6.1 (step 5a), §6.2, §6.6 and §9.1 now carry `header_rewrites` — see **D-089**.* | | |
+| ~~O-17~~ | *Settled 2026-09-21 by the spec's author: amend the spec. Thread affinity is global, may take a pinned route past its cap (counted), and bypasses §7.3 on it. §2.1, §2.2, §3.2 (step 2a), §4.1, §4.2, §5.4, §7.3, §7.4, §9.1, §9.4 and §9.5 now carry it — see **D-090**.* | | |
 | O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment |
 
 
