@@ -22,7 +22,11 @@ Postgres build: the `mssql` build on SQL Server **Express**, with D-085's captur
 on, for an hour (§11) — 36,010 messages an instance with nothing deferred or
 refused, V4 and the ledger behaving exactly as on Postgres, an exact capture
 accounting, and one defect found and fixed (F17, the disk gauge) plus §10's memory
-limitation met again on a different backend.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
+limitation met again on a different backend. An hour with D-091's partial ramp
+on (§12) sent 49.45% and 50.34% of the warming route's traffic to it at a share of
+0.5, delivered all 36,230 messages an instance, and met the same limitation a
+third time: `app2` failed `anon` at +2.84 MiB/h on a flat series, against a twin
+at −3.40.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
 step 5 summary". This document records what
 the soak tier is, what ten runs have established, and — at least as usefully —
 what they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
@@ -1344,3 +1348,142 @@ Everything else passed. F7 XFAILed as always: 1,495 new metric series over
   the interval, or a shorter retention and a run past it.
 - **Nothing about the mssql build under stress.** T3 has never been run against
   it; this is 10 msg/s, not peak load.
+
+---
+
+## 12. The partial ramp (D-091), on — `share: [0.5]` for an hour
+
+The first soak with `warmup.schedule.share` set. `v0.6.0` shipped the partial
+ramp after the ordinary release hour (2026-09-21, 21:43–22:40 UTC: every gate
+passed, F7 XFAILed). But the standard soak config sets no `share`, so that hour
+only showed the walk *carrying* step 3c′. This one runs it.
+
+### What was changed, and how to repeat it
+
+One line in `test/config/simmer.soak.yaml`, **reverted after the run** so the
+standard soak stays comparable with every hour above:
+
+```yaml
+  - name: warming-newbrand
+    warmup:
+      schedule:
+        default: [100000000]
+        share: [0.5]
+```
+
+And `SIMMER_WARMUP_STARTED` set to an hour before the run. The stack's default,
+2026-08-01, puts the route on day ~52, **past the end of a one-entry list, where
+every message is offered**. The line would then have done nothing, and the hour
+would have looked exactly like a pass. The run script checks for this before it
+starts. It reads the line back from the config volume (§6's stale-reseed trap
+applies, so the `stress-config` image was rebuilt first), and it reads `/routes`
+on both instances. Both reported `day_index 0` and
+`partial_ramp: {share: [0.5], today: 0.5}` before the first message. The script
+is `target/soak-runs/2026-09-22-share-hour/run.sh`.
+
+`soak_analyze` does not look at which route carried a message. So the script
+also scrapes both instances' `simmer_messages_total` and
+`simmer_route_skipped_total` after the load, which is where the split below
+comes from.
+
+### An attempt voided by a suspended host
+
+The first attempt (06:35 UTC) was frozen partway through when the host was
+suspended. On resume, its script, `soak_run` and all four loadgens were still
+alive, with the hour's clock broken. They were killed, and the loadgens were
+removed by name (§6: stopping `soak_run` does not stop them). The stack went down
+**with `-v`**, so the retry started from empty quota rows and an empty sink.
+Nothing from that attempt is used here; its directory is kept as
+`2026-09-22-share-hour-aborted/`. **A soak on a laptop has to keep the laptop
+awake.**
+
+### The hour — 2026-09-22, 08:12–09:12 UTC
+
+On the `v0.6.0` images (built from `1fd176b`: `app` `52cf395a…`, `app2`
+`c0c2628f…`, the same images as the release hour). `"senders": 2` in the startup
+lines.
+
+| | `app` | `app2` |
+|---|---|---|
+| walk decisions at `warming-newbrand` | 34,209 | 34,209 |
+| offered, and delivered on it | 16,917 | 17,222 |
+| turned away (`reason="partial_ramp"`) | 17,292 | 16,987 |
+| **share offered** | **49.45%** | **50.34%** |
+| delivered on `overflow-established` | 19,093 | 18,788 |
+| of which unmatched senders (V3) | 1,801 | 1,801 |
+| delivered on `warming-cancel` (V4) | 220 | 220 |
+| **delivered, all routes** | **36,230** | **36,230** |
+| messages over 200 ms | 0 | 0 |
+
+**Every message was delivered.** `simmer_messages_total` has no `deferred` or
+`rejected` series on either instance. 36,230 is the usual 36,010 plus V4's 220
+accepted, the same total as every Postgres hour above. Overflow is exactly the
+partial-ramp skips plus V3's unmatched senders (17,292 + 1,801 = 19,093 on
+`app`, 16,987 + 1,801 = 18,788 on `app2`). **Every message the share turned away
+reached the next link.** None was dropped, and none reached §10.3's `451`.
+
+**The share is what was configured.** Over 34,209 decisions, a fair 50% has a
+standard deviation of 0.27 points. `app` is 2.0 of those low and `app2` 1.3
+high, which is ordinary for an HMAC over distinct recipients.
+
+**One thing this run cannot show: that two instances agree.** Each loadgen tags
+its recipients with its own instance (`soak-app-N@…` against `soak-app2-N@…`,
+`tests/soak.rs`), so no recipient is ever seen by both. The two splits are
+independent samples, and they differ, as they should. At the 10-minute mark the
+two instances happened to show identical counts, and that was briefly misread as
+agreement. It was a coincidence, gone by 18 minutes. Cross-instance agreement
+rests on `routing::partial`'s `the_same_message_gets_the_same_answer` and
+`tests/partial_ramp.rs`'s dry-run check, not on the soak.
+
+**The gate costs nothing a soak can see.** 0 messages over 200 ms on either
+instance, the same as the release hour without it. The salt is read once per
+process and held (`Frequency`'s `OnceCell`), so a turned-away message costs an
+HMAC and no database round trip.
+
+V4 (F2), unchanged: 275 messages in 11 sessions per instance, 220 accepted, 11
+cut by the session timeout, **none at the dot and none of those stored**.
+`reservations_in_flight` was 0 after the drain, there were at most 2 reservation
+rows across 121 samples, and 440 were committed on `warming-cancel`.
+
+At rest, both instances: threads 3 (3 before the first message), tasks 11 (11),
+**0 unaccounted descriptors**. Descriptors and threads were flat on both.
+
+F7 XFAILed as always: 1,645 new metric series over 55 minutes, all
+`simmer_unmatched_sender_total{domain}`.
+
+#### The one gate that failed: `app2`'s `anon`, again not a leak and not a clean bill
+
+`app2` failed `anon` at **+2.84 MiB/h** with a quartile step of +1.42 MiB,
+against a limit of 2 MiB/h. Its twin read **−3.40 MiB/h**. The 5-minute floors
+the gate works from, after the warm-up:
+
+| minute | 5 | 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 | 50 | 55 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `app` | 14 | 15 | 17 | 12 | 16 | 13 | 13 | 13 | 14 | 13 | 11 |
+| `app2` | 11 | 11 | 10 | 13 | 14 | 16 | 13 | 14 | 15 | 12 | 13 |
+
+(MiB, the minimum `anon` in each 5-minute window, from the saved `app*.csv`.)
+`app2` steps up by about 3 MiB between minutes 15 and 30 and then holds. That is a plateau, not a climb, and a
+least-squares slope over an hour cannot tell the two apart. §10 measured what
+this gate can resolve: a standard error near 3 MiB/h, so a one-hour "no leak"
+means "no leak much above about 6 MiB/h". +2.84 is well inside that band. **The
+run therefore gives no memory verdict either way**, the same result §11 recorded
+at +4.28. The limit was **not** adjusted to make it pass.
+
+Nothing D-091 added keeps anything per message. The share is read from
+configuration, the keyer is built once, and the hash's input and output are
+dropped at the end of the check. So there is no mechanism here for a leak to
+come from. That is an argument, not a measurement, and the measurement is
+§10's: a longer judged run, or a quieter series than cgroup anon.
+
+#### What this hour did not establish
+
+- **Anything about a share that changes during a run.** One entry, one day. A
+  day boundary moving the route from `share[0]` to `share[1]`, or off the end of
+  the list, happened in the unit and walk tests, never on the stack under load.
+- **Cross-instance agreement,** for the reason above.
+- **The partial ramp against a real cap.** The soak's allowance is 10⁸, so no
+  message was ever refused for quota, and "the cap fills later in the day",
+  which is what the feature is for, was not observed. It needs a cap small
+  enough to be met within the run.
+- **The mssql build.** Postgres only.

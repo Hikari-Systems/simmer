@@ -3693,10 +3693,15 @@ the share steers without touching the warming row, one inside reserves, the
 day's entry is the one applied, the gate lifts past the end of the list and on
 graduation, a pinned reply is exempt, and dry run agrees with the walk for every
 recipient). A live run of the fixed-share first draft on the acceptance stack
-steered 38 of 67 messages at 0.5, with `/metrics` and `/routes` agreeing.
+steered 38 of 67 messages at 0.5, with `/metrics` and `/routes` agreeing. An
+hour's soak with `share: [0.5]` (`docs/SOAK.md` §12) offered 49.45% and 50.34%
+of the warming route's traffic on the two instances, delivered every message, and
+added no latency visible at 200 ms. It gave no memory verdict either way, for
+§10's reason.
 
 **Not tested here:** the §12.3 acceptance suite has no partial-ramp case, and
-cannot run from the development jail.
+cannot run from the development jail. No soak has run the share against a cap
+small enough to be met.
 
 ## Still open — to settle at the start of the phase that needs them
 
