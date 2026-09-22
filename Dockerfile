@@ -1,3 +1,22 @@
+# The dependency manifests with simmer's OWN version pinned to 0.0.0, so that a
+# release bump does not invalidate the dependency layer below. Docker keys a
+# `COPY` on the copied files' contents; the builder copies these normalised
+# files rather than the real ones, so its cache key changes only when a
+# dependency does. A sed after copying the real files would not do: the COPY
+# layer itself would already have changed. This is what cargo-chef's recipe
+# does, by hand. The same image as the builder, so there is nothing extra to pull.
+FROM rust:1-bookworm AS manifest
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+# The first `version =` line is [package]'s; in Cargo.lock, simmer's is the line
+# after `name = "simmer"`. Each is checked, so a reshuffled manifest fails the
+# build here instead of silently caching nothing.
+RUN sed -i '0,/^version = ".*"$/s//version = "0.0.0"/' Cargo.toml \
+    && sed -i '/^name = "simmer"$/{n;s/^version = ".*"$/version = "0.0.0"/}' Cargo.lock \
+    && grep -q '^version = "0.0.0"$' Cargo.toml \
+    && grep -A1 '^name = "simmer"$' Cargo.lock | grep -q '^version = "0.0.0"$'
+
 FROM rust:1-bookworm AS builder
 
 WORKDIR /app
@@ -13,7 +32,7 @@ ARG CARGO_FEATURES=""
 # single crate the stub achieves the same thing with nothing extra to install.
 #
 # Not alpine/musl — proc-macro crates need the dynamic linker at build time.
-COPY Cargo.toml Cargo.lock ./
+COPY --from=manifest /app/Cargo.toml /app/Cargo.lock ./
 RUN mkdir src \
     && echo 'fn main() {}' > src/main.rs \
     && touch src/lib.rs
@@ -26,6 +45,10 @@ RUN rm -rf target/release/server \
            target/release/deps/*simmer* \
            target/release/.fingerprint/simmer-*
 
+# The real manifests, for simmer's real version (CARGO_PKG_VERSION, the startup
+# line). Only the root package's version differs from the stub build's, so no
+# dependency recompiles.
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 # include_str!'d by the mssql build's migration runner (D-084); unused otherwise.
