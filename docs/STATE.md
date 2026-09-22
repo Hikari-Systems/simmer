@@ -1,7 +1,7 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-09-21, at release `v0.6.0`.** (The previous snapshots were
-2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
+**Snapshot taken 2026-09-22, at release `v0.7.0`.** (The previous snapshots were
+2026-09-21 at `v0.6.0`, 2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
 numbers are the `v0.6.0` run; what was verified for `v0.4.0` and `v0.5.0` is
 stated there separately. This is a session-handover document, not a
 maintained one: `README.md` describes the service, `DECISIONS.md` records why it is
@@ -21,7 +21,10 @@ put to the spec's author and recorded rather than assumed:
 | **D-089** — `header_rewrites` | A regex over one named header's decoded value, between `remove_headers` and `set_headers` (§6.1 step 5a). After O-16; `SPEC.md` amended 2026-09-21 |
 | **D-090** — thread affinity | An outbound reply into a thread Simmer started leaves via the route that started it — past that route's day cap once the cap is met, counted, and past its §7.3 threshold. Keyed statelessly on the emitted `Message-ID:` domain. After O-17; `SPEC.md` amended 2026-09-21 (§3.2 step 2a, and §7.4's one exception to "overshoot is not acceptable") |
 | **D-091** — the partial ramp | `warmup.schedule.share`, one value per day index: on day `i` only `share[i]` of a warming route's traffic is offered to it, the rest steering to the next link (reason `partial_ramp`), so the cap fills later in the day. A keyed hash picks which messages, so dry run and every instance agree. Past the list's end every message is offered. Asked for by the spec's author; `SPEC.md` amended 2026-09-21 (§3.2 step 3c′, §7.2) |
-| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp) |
+| **D-092** — allocator counters for the soak | An `alloc-stats` feature (jemalloc `stats` + `tikv-jemalloc-ctl`) writes six jemalloc counters to a file the soak samples. No published image enables it. `docs/SOAK.md` §13: simmer's live heap is 1.5–2.0 MiB while `anon` swings 5–70 MiB, so the anon gate judges the allocator |
+| **D-093** — `/metrics` opt-in | `admin.metrics` (`true`, `false`, or `{ enabled, idle_timeout }`), **off by default — breaking for monitoring**; unset logs a startup warning. Idle counters expire (default 24h), which bounds F7 (~204 bytes per unmatched sender domain, held forever before) by time. `SPEC.md` amended (§4.1, §4.2, §9.1, §9.2) |
+| **D-094** — no `unsafe` | `[lints.rust] unsafe_code = "forbid"` over the library, binaries and tests |
+| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp), `v0.7.0` (`/metrics` opt-in; allocator counters; no `unsafe`) |
 
 ---
 
@@ -171,6 +174,16 @@ The mssql suite needs a SQL Server and `MSSQL_URL` naming a login that may
 not re-run (CI runs it).
 
 For reference, the phase 11 snapshot read 830 passed on the default build alone.
+
+**For `v0.7.0` (D-092, D-093, D-094):** **1198 passed, 0 failed** on the default
+build against Postgres and **1046 passed, 0 failed** on the mssql build against
+SQL Server 2022; `cargo clippy --all-targets -D warnings` clean on the default,
+`alloc-stats` and mssql builds; `cargo deny check` clean on the default and mssql
+builds (`--features alloc-stats` reports `paste` as unmaintained, accepted in
+D-092); `cargo fmt --check` clean; the `unsafe_code` lint shown to refuse a
+planted `unsafe` block. An hour's soak with the counters on (SOAK.md §13) ran
+before the release; a 30-minute metrics-off soak was running when it was tagged,
+and is recorded in SOAK.md when complete. **Not run:** the acceptance tier.
 
 **For `v0.6.0` (D-091) the full suite was re-run in the development jail on both
 builds:** **1188 passed, 0 failed** on the default
