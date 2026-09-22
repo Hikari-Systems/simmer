@@ -29,7 +29,9 @@ third time: `app2` failed `anon` at +2.84 MiB/h on a flat series, against a twin
 at −3.40. The same hour with jemalloc's own counters sampled (§13) settled it:
 simmer's live heap is 1.5–2.0 MiB while `anon` swings across 60, so the anon gate
 has been judging the allocator. Its one real growth is F7, measured at about 204
-bytes per unmatched-sender series, which D-093 now expires.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
+bytes per unmatched-sender series, which D-093 now expires. With `/metrics` off
+(§14), simmer's live heap was flat over 30 minutes and F7 passed for the first
+time.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
 step 5 summary". This document records what
 the soak tier is, what ten runs have established, and — at least as usefully —
 what they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
@@ -1617,3 +1619,82 @@ the time.
   series for a leak gate: flat and quiet where `anon` swings by 60 MiB. Moving the
   gate needs the feature in every soak image, and a limit. That is a decision for
   after the metrics-off run.
+
+---
+
+## 14. Metrics off — does simmer still grow? (D-093)
+
+§13 attributed simmer's only live-heap growth to F7's unmatched-sender series,
+at about 204 bytes each. D-093 made `/metrics` opt-in: off, no recorder is
+installed and nothing is held. This run checks the attribution: with no recorder
+there is no F7, so `je_allocated` should not grow.
+
+### What was run
+
+§13's setup exactly (`share: [0.5]`, jemalloc's counters on, the stack reset with
+`-v`), but with `admin.metrics: false` and images built from `d44b68f` (the
+v0.7.0 code, plus `alloc-stats`; `app` `c2e25e25…`, `app2` `465b6933…`). **30
+minutes**, not an hour. The run script refused to start unless the config volume
+said `metrics: false` and both instances answered `/metrics` with `404`; both did,
+and both logged `admin.metrics is off: no recorder, and /metrics is not served`.
+2026-09-22, 11:12–11:42 UTC.
+`target/soak-runs/2026-09-22-metrics-off-30m/run.sh`.
+
+### The answer: flat
+
+| `je_allocated` median, MiB | 0–5 | 5–10 | 10–15 | 15–20 | 20–25 | 25–30 | Theil–Sen |
+|---|---|---|---|---|---|---|---:|
+| `app`, metrics **off** | 1.478 | 1.464 | 1.472 | 1.499 | 1.510 | 1.501 | **−0.05 MiB/h** |
+| `app2`, metrics **off** | 1.396 | 1.402 | 1.419 | 1.417 | 1.419 | 1.384 | **−0.01 MiB/h** |
+| `app`, metrics on (§13) | 1.582 | 1.611 | 1.653 | 1.683 | 1.714 | 1.754 | +0.39 MiB/h |
+
+**With no recorder, simmer's live heap does not grow.** Over the same 30 minutes
+with metrics on, the median rose 0.17 MiB; with metrics off it moved within 0.05
+MiB and ended where it began. The baseline is also lower, by about 0.1 MiB on
+`app` and 0.2 MiB on `app2`: with no recorder, the registry, the histograms and
+every route's series are not held at all. §13's attribution holds: **F7 was the
+whole of the growth.**
+
+The soak's F7 check **XPASSed** for the first time: 0 series from 302 s to 1,781 s,
+against 1,645 new series an hour in every run before.
+
+**The writer fix worked.** Threads at rest were 3 against 3 before the first
+message on both instances, where §13's hour read 4 → 5 with the `tokio::fs`
+writer.
+
+Everything else behaved as before: V4 cut 5 sessions per instance in 30 minutes,
+none at the dot, 0 reservations in flight after the drain; every message
+delivered.
+
+### What failed, and why: the harness reads `/metrics`
+
+- **`soak/rest/baseline`** reported the final scrape missing
+  `simmer_sessions_active`, `simmer_db_pool_connections`, the quota series and
+  the pool series. There was no final scrape: `/metrics` answered `404`, as
+  configured.
+- **"3 descriptors" (`app`) and "2" (`app2`) at rest "that no pool holds",** where
+  earlier runs had 0. The harness counts pooled sockets from the pool gauges in
+  the final scrape, so with no scrape it counts none and reports the pools' idle
+  database and downstream connections as unaccounted. The same harness
+  dependency, not a leak.
+- **The trend gates were inconclusive** by design: 30 minutes past a 5-minute
+  warm-up is five 5-minute floors, and the gates need eight. The `je_resident`
+  and `je_retained` slopes over five points (+22, +34, +127 MiB/h) are
+  meaningless for the same reason.
+
+**The harness cannot fully judge a metrics-off run.** A soak of the default
+configuration would need the at-rest checks to get pool counts some other way.
+Until then, a metrics-off run is judged on `je_allocated`, as this one was.
+
+**Latency:** 9 messages over 200 ms on `app` and 7 on `app2`. The slowest two are
+the same messages on both instances (`soak-*-15600` at ~2.0 s and `soak-*-15610`
+at ~1.0–1.1 s), about 26 minutes in, so the cause is shared, as in §13. It was
+not traced.
+
+### What this run did not establish
+
+- **An hour's verdict on the trend gates.** Thirty minutes was the question
+  asked, and `je_allocated` answers it. The anon, descriptor and thread gates
+  need an hour.
+- **The published binary.** As in §13, the counters need `alloc-stats`, which no
+  published image has.
