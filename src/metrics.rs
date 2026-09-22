@@ -34,8 +34,13 @@ static STARTED: OnceLock<f64> = OnceLock::new();
 ///
 /// Fails only if a recorder is already installed, which in a process with one
 /// `main` means it has been called twice.
-pub fn install() -> Result<PrometheusHandle, BuildError> {
+pub fn install(idle_timeout: std::time::Duration) -> Result<PrometheusHandle, BuildError> {
     let handle = PrometheusBuilder::new()
+        // D-093: a counter idle this long is dropped, which is what returns
+        // F7's memory — one series per unmatched sender domain, held for the
+        // life of the process until now. Counters only: gauges are recomputed
+        // at every scrape (D-056), and histograms are few and fixed.
+        .idle_timeout(metrics_util::MetricKindMask::COUNTER, Some(idle_timeout))
         // §9.1 says histogram. The exporter's default rendering for a histogram
         // is a summary with quantiles computed in-process, which cannot be
         // aggregated across instances — declaring buckets is what makes it an

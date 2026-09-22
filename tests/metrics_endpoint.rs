@@ -47,7 +47,7 @@ server:
   timeouts: { command: 5s, data: 5s, session: 60s }
   auth: { allow_insecure_auth: true }
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
-admin: { listen: "127.0.0.1:0", auth_token: "0123456789abcdef-default" }
+admin: { listen: "127.0.0.1:0", auth_token: "0123456789abcdef-default", metrics: true }
 logging: { level: warn, format: text }
 domain_groups:
   - { name: google, domains: ["gmail.com"] }
@@ -94,7 +94,10 @@ fn handle() -> metrics_exporter_prometheus::PrometheusHandle {
     use std::sync::OnceLock;
     static HANDLE: OnceLock<metrics_exporter_prometheus::PrometheusHandle> = OnceLock::new();
     HANDLE
-        .get_or_init(|| simmer::metrics::install().expect("no recorder installed yet"))
+        .get_or_init(|| {
+            simmer::metrics::install(simmer::config::Metrics::DEFAULT_IDLE_TIMEOUT)
+                .expect("no recorder installed yet")
+        })
         .clone()
 }
 

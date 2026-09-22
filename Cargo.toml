@@ -20,6 +20,14 @@ path = "src/lib.rs"
 name = "server"
 path = "src/main.rs"
 
+# No `unsafe` in this crate: the library, `server`, `loadgen`, `sink` and every
+# integration test. `forbid`, not `deny`, so no `#[allow]` inside the source can
+# lift it. The `unsafe` Simmer runs is in its dependencies — jemalloc's crates
+# above all (D-078, D-092) — which a package's lints do not reach, by design.
+# `#[global_allocator]` needs none of ours.
+[lints.rust]
+unsafe_code = "forbid"
+
 # D-084: the storage backend is chosen at compile time, one per image. The
 # default build is Postgres, exactly as before; the SQL Server image is built
 # with `--no-default-features --features mssql` and published as
@@ -30,6 +38,10 @@ path = "src/main.rs"
 default = ["postgres"]
 postgres = ["dep:sqlx"]
 mssql = ["dep:tiberius", "dep:bb8", "dep:tokio-util"]
+# D-092 — jemalloc's own counters, written to a file for the soak tier to sample.
+# NOT in any published image: jemalloc's `stats` changes the allocator, and the
+# shipped binary stays as D-078 measured it. Only the soak run turns it on.
+alloc-stats = ["tikv-jemallocator/stats", "dep:tikv-jemalloc-ctl"]
 
 [dependencies]
 # Runtime. `rt-multi-thread` + `net` + `signal` because main owns a set of peer
@@ -202,6 +214,9 @@ hmac = "0.12"
 # `PrometheusHandle::render()`, which is exactly what `GET /metrics` needs.
 # `MIT`, every published version — see LICENSES.md §5.
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
+# D-093: `MetricKindMask`, for the exporter's idle timeout. Already in the tree
+# as the exporter's own dependency, at the same version; no features needed.
+metrics-util = { version = "0.20", default-features = false }
 
 # §9.3's bearer token, compared in constant time. Already in the graph via
 # argon2/password-hash, so this takes a direct dependency on a crate that is
@@ -249,6 +264,9 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
 # features, which include `background_threads_runtime_support`: the purge thread
 # can be turned on through `_RJEM_MALLOC_CONF` without a rebuild.
 tikv-jemallocator = "0.7"
+# D-092, behind `alloc-stats` only. The same family and version line as the
+# allocator above, and a safe API: `epoch::advance` and the `stats` reads.
+tikv-jemalloc-ctl = { version = "0.7", optional = true, features = ["stats"] }
 
 # --- the link proxy (D-083) -----------------------------------------------
 

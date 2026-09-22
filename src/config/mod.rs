@@ -372,6 +372,85 @@ pub struct Admin {
     /// mechanism. See `DECISIONS.md` D-053.
     #[serde(default)]
     pub tokens: Vec<AdminToken>,
+    /// D-093 — whether `/metrics` is served at all. Off by default: every
+    /// series the exporter holds is kept only to answer a scrape, so a
+    /// deployment that never scrapes should not pay for them — and with it off
+    /// no recorder is installed and every `metrics::` call is a no-op.
+    ///
+    /// An `Option` so that "not set" is distinguishable from `false`: a
+    /// configuration from before v0.7.0 says nothing here and has just lost
+    /// `/metrics`, which is worth a startup warning; one that says `false`
+    /// meant it. Read it through [`Admin::metrics`].
+    #[serde(default)]
+    pub metrics: Option<Metrics>,
+}
+
+/// D-093's `admin.metrics`: `true`, `false`, or
+/// `{ enabled: true, idle_timeout: 6h }`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Metrics {
+    pub enabled: bool,
+    /// A counter nothing has incremented for this long is dropped from the
+    /// exporter, and comes back from zero if it is incremented again — which
+    /// Prometheus's `rate()` and `increase()` read as an ordinary counter reset.
+    /// This is what returns F7's memory: a series per unmatched sender domain
+    /// used to be held for the life of the process. Counters only; gauges are
+    /// recomputed at every scrape (D-056) and histograms are few and fixed.
+    ///
+    /// The exporter prunes while rendering, so an enabled endpoint that nothing
+    /// scrapes prunes nothing. Enabling it is the promise that something does.
+    pub idle_timeout: Duration,
+}
+
+impl Metrics {
+    pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_timeout: Self::DEFAULT_IDLE_TIMEOUT,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Metrics {
+    /// A bare boolean, or a map. By hand rather than `#[serde(untagged)]`,
+    /// whose only error is "did not match any variant" — §4.2 is worth a
+    /// message that says which key was wrong.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            enabled: bool,
+            #[serde(default, deserialize_with = "duration::deserialize_opt")]
+            idle_timeout: Option<Duration>,
+        }
+
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Metrics;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("true, false, or a map with `enabled` and optionally `idle_timeout`")
+            }
+            fn visit_bool<E: serde::de::Error>(self, enabled: bool) -> Result<Metrics, E> {
+                Ok(Metrics {
+                    enabled,
+                    ..Metrics::default()
+                })
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Metrics, A::Error> {
+                let t = Table::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(Metrics {
+                    enabled: t.enabled,
+                    idle_timeout: t.idle_timeout.unwrap_or(Metrics::DEFAULT_IDLE_TIMEOUT),
+                })
+            }
+        }
+
+        d.deserialize_any(V)
+    }
 }
 
 /// One named §9.3 credential.
@@ -393,6 +472,11 @@ impl fmt::Debug for AdminToken {
 }
 
 impl Admin {
+    /// `admin.metrics` as configured, or the default — off — when it is not set.
+    pub fn metrics(&self) -> Metrics {
+        self.metrics.unwrap_or_default()
+    }
+
     /// The name `auth_token` is logged under. Chosen rather than `admin` so that
     /// an audit trail makes the difference between "the shared token" and a
     /// named one visible at a glance.
@@ -423,6 +507,7 @@ impl fmt::Debug for Admin {
             .field("listen", &self.listen)
             .field("auth_token", &"<redacted>")
             .field("tokens", &self.tokens)
+            .field("metrics", &self.metrics)
             .finish()
     }
 }

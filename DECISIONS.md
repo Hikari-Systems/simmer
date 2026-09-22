@@ -3703,6 +3703,129 @@ added no latency visible at 200 ms. It gave no memory verdict either way, for
 cannot run from the development jail. No soak has run the share against a cap
 small enough to be met.
 
+### D-092 — jemalloc's own counters, for the soak tier only
+
+**The problem.** The soak's memory gate judges cgroup `anon`, which cannot tell
+bytes the program holds from pages the allocator kept after they were freed.
+`docs/SOAK.md` §12's hour failed that gate on `app2` with a series that stepped
+up once after a spike and then held. That is the allocator's shape, not a
+leak's, but nothing in the samples could say which.
+
+**What it does.** A cargo feature, `alloc-stats`, builds jemalloc with its
+`stats` option and links `tikv-jemalloc-ctl`. With the feature compiled in and
+`SIMMER_ALLOC_STATS_FILE` naming a path, a task writes six of jemalloc's
+counters (`allocated`, `active`, `resident`, `retained`, `mapped`, `metadata`)
+to that file every 5 s, through a temporary file and a rename. The soak's
+sampler reads the file in the same `docker exec` as everything else and adds
+six CSV columns. `soak_analyze` reports a trend for four of them, **reported,
+never judged**: which to gate on, and at what limit, is a decision the data
+exists to inform.
+
+**Why the soak build only.** The author's call. jemalloc's `stats` changes the
+allocator, and the published image stays exactly as D-078 measured it. The
+cost is that a soak with the counters on measures a slightly different binary
+from the one that ships. `test/compose/stress.yml` takes the feature from
+`SIMMER_CARGO_FEATURES` at build time and the path from
+`SIMMER_ALLOC_STATS_FILE` at run time; both default to empty.
+
+**Why a file, not `/metrics`.** The soak scrapes `app` and never `app2`, so the
+exporter's own cost shows as a difference between them (V2). A file each
+instance writes on the same interval keeps the two paying the same cost.
+
+**`cargo deny --features alloc-stats` fails on RUSTSEC-2024-0436**: `paste` is
+unmaintained, and arrives through `tikv-jemalloc-ctl`. Accepted without a
+`deny.toml` ignore, because an ignore is global and would also hide `paste` if
+it ever reached the shipped graph. `paste` is a compile-time macro crate, the
+advisory is "unmaintained" rather than a vulnerability, and CI's two deny runs
+(default and `mssql`) never include the feature.
+
+**What it found** (`docs/SOAK.md` §13, one hour, `share: [0.5]`): simmer's
+live heap is small and nearly flat, **1.5–2.0 MiB**, while `anon` and
+`je_resident` swing between about 8 and 70 MiB. The noise the anon gate judges is
+jemalloc holding pages after simmer freed them, so §12's failure was the
+allocator. This hour's `anon` gate passed on both instances. The one real growth
+is `je_allocated` at **+0.39 and +0.38 MiB/h**, which tracks F7's
+unmatched-sender series at r = 0.979, about **204 bytes a series**. That growth
+is D-093's subject.
+
+**The instrument perturbed what it measured, once.** The first version wrote
+with `tokio::fs`, whose calls run on the blocking pool; a write every 5 s kept a
+pool thread alive and sometimes a second. That hour failed its threads-at-rest
+check (4 before, 5 after) on the writer, not on Simmer. It now writes with
+`std::fs` on the task: about 150 bytes to a tmpfs, microseconds, and no thread.
+
+### D-093 — `/metrics` is off unless `admin.metrics` enables it, and idle counters expire
+
+> **Settled 2026-09-22 by the spec's author, who asked for it; the spec is
+> amended (§4.1, §4.2, §9.1, §9.2).** Three calls were the author's: the switch
+> lives at `admin.metrics`; it defaults to **off**, a breaking change, shipped
+> as v0.7.0; and the idle timeout is **configurable, default 24h**.
+
+**The problem (F7).** `simmer_unmatched_sender_total{domain}` takes its label
+from a domain the client chose, and the exporter held every series for the life
+of the process. Measured by D-092's counters, the soak's ~1,645 fresh domains
+an hour cost simmer's live heap **+0.39 MiB/h**, about **204 bytes per series**
+(r = 0.979 against the series count; `docs/SOAK.md` §13). A million domains
+would be about 195 MiB. A long-running daemon
+fed new sender domains grows without bound, and nothing recovers it short of a
+restart. Those series are read by exactly one thing, `GET /metrics`.
+
+**What it does.** `admin.metrics` is `true`, `false`, or
+`{ enabled, idle_timeout }`.
+
+- **Off, the default:** no recorder is installed, so every `metrics::` call is
+  the crate's no-op and nothing is held. `/metrics` is not routed, and answers
+  `404`: switched-off configuration, not a fault, so a scraper pointed at it
+  reads 404 rather than an alarming `503`.
+- **On:** the exporter drops a **counter** not incremented for `idle_timeout`
+  (default 24h, at least 1m), and it reappears from zero on its next
+  increment, which Prometheus's `rate()` and `increase()` read as an ordinary
+  counter reset. Gauges are left alone because they are recomputed at every
+  scrape (D-056); histograms because they are few and fixed.
+
+**What the expiry does not do.** It bounds F7 by time, not by count: a burst of
+a million distinct domains inside one timeout is still a million series until
+it passes. `tests/metrics_endpoint.rs`'s `f7_unmatched_sender_series_are_bounded`
+therefore still XFAILs, correctly. Capping the label is the fix for that, and
+remains open. The exporter's expiry applies by metric kind, not by name, so
+every counter expires on the same rule: a route silent for a day loses its
+`simmer_messages_total` series until its next message. And the exporter prunes
+while rendering, so an enabled endpoint nothing scrapes prunes nothing.
+
+**Why off by default, and the warning.** The author's call: a deployment that
+never scrapes should not pay for series kept only for a scrape. That makes
+v0.7.0 breaking for monitoring: a configuration from before it says nothing
+about `admin.metrics`, still loads cleanly, and has silently lost `/metrics`,
+and with it every alert §14.2 and §7.4 ask for. So the key is an `Option`, and
+**leaving it unset logs a startup warning** saying `/metrics` is off, why, and
+that `true` serves it or `false` silences the warning. An explicit `false` is a
+decision and is not second-guessed. *Alternative, rejected: default `true`,
+which breaks nothing and holds series for deployments nobody scrapes.* Every configuration in this
+repository that is scraped sets `metrics: true`: `simmer.yaml`,
+`simmer.acceptance.yaml`, and the stress, soak and matrix configs.
+
+**Tested:** `tests/config_validation.rs` (off by default, both forms, parse
+failures, the one-minute floor checked even when off, the warning when unset
+and silence when explicit); `tests/admin_api.rs`
+(404 with and without a token when off; open when on);
+`tests/metrics_idle.rs` (200 domains dropped after the timeout, one touched in
+time kept, a dropped one back from zero).
+
+### D-094 — No `unsafe` in simmer's own code, enforced
+
+`[lints.rust] unsafe_code = "forbid"` in `Cargo.toml`, at the author's request.
+It covers the library, `server`, `loadgen`, `sink` and every integration test.
+`forbid` rather than `deny`, so no `#[allow]` in the source can lift it. There
+was no `unsafe` to remove; this makes the absence a guarantee. A package's
+lints do not reach its dependencies, so the `unsafe` simmer runs is theirs: at
+the time of writing 157 of the 239 crates in the Linux build contain some,
+jemalloc's among them, which is normal for a network service on tokio, rustls
+and libc. The least necessary is `unsafe-libyaml`, the YAML parser behind
+`serde_yaml_ng`: a machine translation of libyaml's C, nearly all of it
+`unsafe`, which parses only the trusted configuration file, once. slater, which
+claims "zero `unsafe`", means the same thing: its own workspace, by the same
+lint, over dependencies that use it about as often.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

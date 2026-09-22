@@ -158,6 +158,7 @@ pub fn validate(cfg: &Config) -> ViolationList {
     check_cidrs(cfg, &mut v);
     check_auth(cfg, &mut v);
     check_admin_tokens(cfg, &mut v);
+    check_admin_metrics(cfg, &mut v);
     check_domain_groups(cfg, &mut v);
     check_route_uniqueness(cfg, &mut v);
     check_routes(cfg, &mut v);
@@ -174,6 +175,20 @@ pub fn validate(cfg: &Config) -> ViolationList {
 /// Non-fatal conditions, logged at `WARN` at startup.
 pub fn warnings(cfg: &Config) -> Vec<Warning> {
     let mut out = Vec::new();
+
+    // D-093: `/metrics` became opt-in in v0.7.0. A configuration that does not
+    // mention it is most likely one from before, whose scrapes and alerts have
+    // just stopped — and a clean startup would say nothing about it. `false`
+    // is a choice, and silences this.
+    if cfg.admin.metrics.is_none() {
+        out.push(Warning {
+            path: "admin.metrics".to_string(),
+            message: "is not set, so /metrics is off and answers 404 — the default since \
+                      v0.7.0 (D-093). Set `admin.metrics: true` to serve it, or `false` to \
+                      silence this warning"
+                .to_string(),
+        });
+    }
 
     // §5.5's ceiling can no longer be reached: D-047 refuses the second RCPT TO
     // whatever this says, so any value above 1 describes a limit that will never
@@ -948,6 +963,21 @@ fn grant_pattern_problem(pattern: &str) -> Option<&'static str> {
 /// scalar cannot be inconsistent with itself. Named tokens can be, and every way
 /// they can be wrong here ends with the write API either unusable or logging an
 /// identifier that does not identify anything.
+/// §4.2 for D-093's `admin.metrics`. Checked whether or not it is enabled, so
+/// switching it on later surfaces nothing new.
+fn check_admin_metrics(cfg: &Config, v: &mut ViolationList) {
+    let idle = cfg.admin.metrics().idle_timeout;
+    if idle < std::time::Duration::from_secs(60) {
+        v.push(
+            "admin.metrics.idle_timeout",
+            format!(
+                "is {idle:?}; it must be at least 1m. Shorter than a scrape interval, a \
+                 counter on a quiet route would vanish and reappear from zero between scrapes"
+            ),
+        );
+    }
+}
+
 fn check_admin_tokens(cfg: &Config, v: &mut ViolationList) {
     let credentials = cfg.admin.credentials();
 

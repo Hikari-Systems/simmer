@@ -1550,3 +1550,100 @@ fn share_violations_are_reported_together() {
         Err(other) => panic!("expected a validation failure, got: {other}"),
     }
 }
+
+// -- §4.2: admin.metrics (D-093) --------------------------------------------
+
+fn with_metrics(value: &str) -> String {
+    BASE.replace(
+        "  auth_token: \"tok\"\n",
+        &format!("  auth_token: \"tok\"\n  metrics: {value}\n"),
+    )
+}
+
+#[test]
+fn metrics_is_off_by_default() {
+    let m = load(BASE).expect("valid").admin.metrics();
+    assert!(!m.enabled);
+    assert_eq!(m.idle_timeout, config::Metrics::DEFAULT_IDLE_TIMEOUT);
+}
+
+#[test]
+fn metrics_takes_a_boolean_or_a_map() {
+    assert!(
+        load(&with_metrics("true"))
+            .expect("valid")
+            .admin
+            .metrics()
+            .enabled
+    );
+    assert!(
+        !load(&with_metrics("false"))
+            .expect("valid")
+            .admin
+            .metrics()
+            .enabled
+    );
+
+    let m = load(&with_metrics("{ enabled: true, idle_timeout: 6h }"))
+        .expect("valid")
+        .admin
+        .metrics();
+    assert!(m.enabled);
+    assert_eq!(m.idle_timeout, std::time::Duration::from_secs(6 * 3600));
+
+    let m = load(&with_metrics("{ enabled: true }"))
+        .expect("valid")
+        .admin
+        .metrics();
+    assert_eq!(m.idle_timeout, config::Metrics::DEFAULT_IDLE_TIMEOUT);
+}
+
+#[test]
+fn a_malformed_metrics_value_is_a_parse_failure() {
+    for bad in [
+        "{ idle_timeout: 6h }",        // `enabled` is required in the map form
+        "{ enabled: true, idle: 6h }", // unknown key
+        "\"yes\"",                     // not a boolean
+        "{ enabled: true, idle_timeout: soon }",
+    ] {
+        assert!(
+            matches!(load(&with_metrics(bad)), Err(LoadError::Parse { .. })),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn rejects_an_idle_timeout_under_a_minute() {
+    rejected_for(
+        &with_metrics("{ enabled: true, idle_timeout: 30s }"),
+        "admin.metrics.idle_timeout",
+    );
+    // Checked when off too, so switching it on later surfaces nothing new.
+    rejected_for(
+        &with_metrics("{ enabled: false, idle_timeout: 30s }"),
+        "admin.metrics.idle_timeout",
+    );
+    load(&with_metrics("{ enabled: true, idle_timeout: 1m }")).expect("1m is the floor");
+}
+
+#[test]
+fn an_unset_metrics_key_warns_and_an_explicit_one_does_not() {
+    // D-093: the likely reader is an operator upgrading past v0.7.0 whose
+    // scrapes just stopped, so the warning says what happened and how to undo
+    // it. `false` is a decision, and is not second-guessed.
+    let unset = config::validate::warnings(&load(BASE).expect("valid"));
+    let w = unset
+        .iter()
+        .find(|w| w.path == "admin.metrics")
+        .unwrap_or_else(|| panic!("expected an admin.metrics warning, got: {unset:?}"));
+    assert!(w.message.contains("404") && w.message.contains("admin.metrics: true"));
+
+    for value in ["true", "false", "{ enabled: false }"] {
+        let explicit = config::validate::warnings(&load(&with_metrics(value)).expect("valid"));
+        assert!(
+            !explicit.iter().any(|w| w.path == "admin.metrics"),
+            "{value}: {explicit:?}"
+        );
+    }
+}

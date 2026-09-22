@@ -105,6 +105,7 @@ use std::time::{Duration, Instant};
 use compose::leak;
 use compose::reconcile::{self, Received, Sent};
 use compose::stack::{capture_on, Stack, SOAK, SOAK_MSSQL};
+use simmer::alloc_stats::Snapshot;
 
 const SOAK_CONFIG: &str = "test/config/simmer.soak.yaml";
 
@@ -661,6 +662,54 @@ fn soak_analyze() {
             }
         }
 
+        // D-092: jemalloc's own view, when the run recorded it. Reported, never
+        // judged — which of these to gate on, and at what limit, is a decision
+        // this data exists to inform, not one to take by default. `allocated`
+        // is what the program holds, so a leak climbs there; retention by the
+        // allocator shows in `resident` and `retained` while `allocated` holds.
+        let with_je: Vec<(f64, Snapshot)> = samples
+            .iter()
+            .filter_map(|s| s.je.map(|j| (s.t, j)))
+            .collect();
+        if with_je.len() * 2 < samples.len() {
+            eprintln!(
+                "  jemalloc: {} of {} samples carry counters; not reported (D-092)",
+                with_je.len(),
+                samples.len()
+            );
+        } else {
+            type Pick = fn(&Snapshot) -> u64;
+            let picks: [(&str, Pick); 4] = [
+                ("allocated", |j| j.allocated),
+                ("resident", |j| j.resident),
+                ("retained", |j| j.retained),
+                ("metadata", |j| j.metadata),
+            ];
+            for (name, pick) in picks {
+                let series: Vec<(f64, f64)> =
+                    with_je.iter().map(|(t, j)| (*t, pick(j) as f64)).collect();
+                let v = leak::verdict(
+                    &series,
+                    warmup,
+                    FLOOR_WINDOW,
+                    leak::Limits {
+                        slope_per_hour: 2.0 * 1_048_576.0,
+                    },
+                );
+                let mib = |x: f64| x / 1_048_576.0;
+                let (lo, hi) = series.iter().fold((f64::MAX, 0.0f64), |(lo, hi), (_, x)| {
+                    (lo.min(*x), hi.max(*x))
+                });
+                eprintln!(
+                    "  je_{name:<9} slope {:+.2} MiB/h, quartile step {:+.2} MiB, range {:.1}–{:.1} MiB  (reported, not judged; D-092)",
+                    mib(v.slope_per_hour),
+                    mib(v.quartile_step),
+                    mib(lo),
+                    mib(hi)
+                );
+            }
+        }
+
         // Hard bounds, at every sample rather than on the trend: these are not
         // allowed to drift even briefly.
         let peak_established = samples.iter().map(|s| s.established).max().unwrap_or(0);
@@ -1195,6 +1244,20 @@ struct Sample {
     tmp_used_kb: u64,
     established: u64,
     close_wait: u64,
+    /// D-092: jemalloc's counters, when the image was built with `alloc-stats`
+    /// and the run set `SIMMER_ALLOC_STATS_FILE`. `None` otherwise, and in every
+    /// file from before it.
+    je: Option<Snapshot>,
+}
+
+/// Where the D-092 writer puts its counters: `SIMMER_ALLOC_STATS_FILE`, which
+/// the run exports to both the stack and this harness. The default is what the
+/// run script sets, so a harness started without it still finds the file.
+fn alloc_stats_path() -> String {
+    std::env::var(simmer::alloc_stats::ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/tmp/simmer-alloc-stats".to_string())
 }
 
 const SAMPLE_CMD: &str = "grep -E '^(VmRSS|Threads)' /proc/1/status; \
@@ -1207,7 +1270,19 @@ const SAMPLE_CMD: &str = "grep -E '^(VmRSS|Threads)' /proc/1/status; \
 fn sample_instance(instance: &str) -> Option<Sample> {
     let out = stack()
         .compose()
-        .args(["exec", "-T", instance, "sh", "-c", SAMPLE_CMD])
+        .args([
+            "exec",
+            "-T",
+            instance,
+            "sh",
+            "-c",
+            // D-092's file last, and allowed to be missing: `cat`'s status is not
+            // the command's, and a run without the writer prints nothing here.
+            &format!(
+                "{SAMPLE_CMD}; cat {} 2>/dev/null || true",
+                alloc_stats_path()
+            ),
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -1215,8 +1290,14 @@ fn sample_instance(instance: &str) -> Option<Sample> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut s = Sample::default();
+    let mut je = Snapshot::default();
+    let mut je_lines = 0;
     let mut seen_fd_count = false;
     for line in text.lines() {
+        if je.absorb(line) {
+            je_lines += 1;
+            continue;
+        }
         let f: Vec<&str> = line.split_whitespace().collect();
         match f.as_slice() {
             ["VmRSS:", v, ..] => s.vmrss_kb = v.parse().unwrap_or(0),
@@ -1242,6 +1323,11 @@ fn sample_instance(instance: &str) -> Option<Sample> {
             }
             _ => {}
         }
+    }
+    // All six or nothing: a file caught mid-rename cannot happen (the writer
+    // renames into place), but a partial read would be a lie in the CSV.
+    if je_lines == 6 {
+        s.je = Some(je);
     }
     Some(s)
 }
@@ -1384,12 +1470,24 @@ fn append_sample_to(path: &Path, t: f64, s: &Sample) {
     if fresh {
         let _ = writeln!(
             f,
-            "t,vmrss_kb,threads,fds,anon,shmem,file,cpu_usec,tmp_used_kb,established,close_wait"
+            "t,vmrss_kb,threads,fds,anon,shmem,file,cpu_usec,tmp_used_kb,established,close_wait,\
+             je_allocated,je_active,je_resident,je_retained,je_mapped,je_metadata"
         );
     }
+    // D-092's six columns are empty when there is no reading, so a file from a
+    // run without the writer still has one shape.
+    let je = s.je.map_or_else(
+        || ",,,,,".to_string(),
+        |j| {
+            format!(
+                "{},{},{},{},{},{}",
+                j.allocated, j.active, j.resident, j.retained, j.mapped, j.metadata
+            )
+        },
+    );
     let _ = writeln!(
         f,
-        "{t:.1},{},{},{},{},{},{},{},{},{},{}",
+        "{t:.1},{},{},{},{},{},{},{},{},{},{},{je}",
         s.vmrss_kb,
         s.threads,
         s.fds,
@@ -1431,6 +1529,16 @@ fn read_samples_from(path: &Path) -> Vec<Sample> {
                 tmp_used_kb: n(8),
                 established: n(9),
                 close_wait: n(10),
+                // Absent in a file from before D-092, empty in one from a run
+                // without the writer.
+                je: (f.len() >= 17 && !f[11].is_empty()).then(|| Snapshot {
+                    allocated: n(11),
+                    active: n(12),
+                    resident: n(13),
+                    retained: n(14),
+                    mapped: n(15),
+                    metadata: n(16),
+                }),
             })
         })
         .collect()

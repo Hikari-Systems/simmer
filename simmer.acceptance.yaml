@@ -70,6 +70,7 @@ database:
 admin:
   listen: "0.0.0.0:8080"
   auth_token: "${SIMMER_ADMIN_TOKEN}"
+  metrics: true                    # D-093: off by default; this tier scrapes it
 
 logging:
   level: info

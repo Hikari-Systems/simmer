@@ -76,7 +76,7 @@ database:
   # guarantee at all. Leave this true.
   fail_closed: true
 
-# §9 control plane. /health, /healthcheck and /metrics are open; every other
+# §9 control plane. /health, /healthcheck and /metrics (when enabled below) are open; every other
 # endpoint — including §9.2's reads and §9.4's dry run — needs a bearer token
 # (D-055).
 admin:
@@ -84,6 +84,15 @@ admin:
   # The shared token of §4.1. §9.3 logs every mutation with "the acting token's
   # identifier", and this one is logged as `default`.
   auth_token: "${SIMMER_ADMIN_TOKEN}"
+  # D-093 — serve /metrics. Off by default: every series the exporter holds is
+  # kept only to answer a scrape, so with it off no recorder is installed and
+  # nothing is held. On here because the local stack is where you look at it.
+  # A counter nothing increments for `idle_timeout` is dropped, and comes back
+  # from zero on its next increment (F7: one series per unmatched sender domain
+  # used to be held forever). The long form, with the default:
+  #
+  #   metrics: { enabled: true, idle_timeout: 24h }
+  metrics: true
   # Named tokens, so that identifier names somebody (O-11, D-053). Issue one per
   # human or per system and the audit line stops saying `default`. Optional, and
   # additive: `auth_token` above keeps working either way. Names and secrets must

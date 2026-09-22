@@ -120,6 +120,7 @@ mod tests {
         Admin {
             listen: "127.0.0.1:8080".to_string(),
             auth_token: auth_token.map(str::to_string),
+            metrics: None,
             tokens: tokens
                 .iter()
                 .map(|(name, token)| AdminToken {

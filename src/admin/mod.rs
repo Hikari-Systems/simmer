@@ -81,7 +81,11 @@ impl AdminState {
 }
 
 pub fn router(state: AdminState) -> Router {
-    Router::new()
+    // D-093: `/metrics` exists only when `admin.metrics` enables it. Absent
+    // rather than a 503, because a switched-off endpoint is configuration, not
+    // a fault — a scraper pointed at it should read 404 and stop.
+    let metrics_enabled = state.engine.config.admin.metrics().enabled;
+    let router = Router::new()
         // -- open ------------------------------------------------------
         .route("/health", get(health))
         // The house probe path. [`crate::healthcheck::check_subcommand`] — what
@@ -91,7 +95,6 @@ pub fn router(state: AdminState) -> Router {
         // this one is liveness-only by default, so a database outage does not
         // make Docker restart-loop a container that a restart cannot fix.
         .route("/healthcheck", get(healthcheck))
-        .route("/metrics", get(metrics_endpoint))
         // -- §9.2 read -------------------------------------------------
         .route("/routes", get(routes))
         .route("/routes/{name}", get(route_by_name))
@@ -103,8 +106,13 @@ pub fn router(state: AdminState) -> Router {
         .route("/routes/{name}/allowance", post(mutate::allowance))
         .route("/quota/reset", post(mutate::reset))
         // -- §9.4 ------------------------------------------------------
-        .route("/dryrun", post(dryrun::dryrun))
-        .with_state(state)
+        .route("/dryrun", post(dryrun::dryrun));
+    let router = if metrics_enabled {
+        router.route("/metrics", get(metrics_endpoint))
+    } else {
+        router
+    };
+    router.with_state(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +221,9 @@ async fn metrics_endpoint(State(state): State<AdminState>) -> Response {
             )
                 .into_response()
         }
-        // Reachable only in a test that built the state without a recorder.
+        // Enabled, but no recorder: a test that built the state without one, or
+        // a second install in one process. A switched-off endpoint never gets
+        // here — the route does not exist (D-093).
         None => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "no_recorder",

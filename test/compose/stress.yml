@@ -28,10 +28,19 @@ services:
       nofile:
         soft: "${STRESS_APP_NOFILE:-65536}"
         hard: "${STRESS_APP_NOFILE:-65536}"
+    # D-092: the soak run that wants jemalloc's counters sets
+    # SIMMER_CARGO_FEATURES="--features alloc-stats" at build time, and
+    # SIMMER_ALLOC_STATS_FILE at run time. Both default to empty, which is the
+    # published build and no writer. An image built with the feature keeps it
+    # until rebuilt — the server's startup line says which it is.
+    build:
+      args:
+        CARGO_FEATURES: "${SIMMER_CARGO_FEATURES:-}"
     environment:
       # simmer.stress.yaml reads this; S9 overrides it to catch a relay in flight.
       # Defaulted here so every other command renders `app` identically.
       SIMMER_SESSION_TIMEOUT: "${SIMMER_SESSION_TIMEOUT:-120s}"
+      SIMMER_ALLOC_STATS_FILE: "${SIMMER_ALLOC_STATS_FILE:-}"
     volumes:
       - stress-config:/config:ro
     depends_on:
@@ -57,6 +66,8 @@ services:
       # The Dockerfile's last stage is `acceptance` (the loadgen), so this pin is
       # load-bearing exactly as it is for `app`.
       target: runtime
+      args:
+        CARGO_FEATURES: "${SIMMER_CARGO_FEATURES:-}"    # D-092, as `app`
     cpus: "${STRESS_APP_CPUS:-2}"
     mem_limit: 1g
     ports:
@@ -79,6 +90,7 @@ services:
       SIMMER_CONFIG: "${SIMMER_CONFIG:-/app/simmer.yaml}"
       SIMMER_WARMUP_STARTED: "${SIMMER_WARMUP_STARTED:-2026-08-01T09:00:00Z}"
       SIMMER_SESSION_TIMEOUT: "${SIMMER_SESSION_TIMEOUT:-120s}"
+      SIMMER_ALLOC_STATS_FILE: "${SIMMER_ALLOC_STATS_FILE:-}"    # D-092, as `app`
       SIMMER_TLS_DIR: "/tls"
     volumes:
       - acceptance-tls:/tls:ro

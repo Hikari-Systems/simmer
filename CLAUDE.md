@@ -262,7 +262,11 @@ src/routing/thread.rs    §3.2 step 2a (D-090) — thread affinity. A REORDERING
 src/routing/partial.rs   §3.2 step 3c′ (D-091) — `schedule.share`. A KEYED HASH, not
                          a dice roll, so dry run and every instance agree. Past the
                          list's end the share is 1, NOT a cap's repeated last value
-src/metrics.rs           §9.1 counters, the recorder, and every `# HELP` line
+src/metrics.rs           §9.1 counters, the recorder, and every `# HELP` line. The
+                         recorder exists only with `admin.metrics` (D-093): off, every
+                         `metrics::` call is a no-op and /metrics is a 404
+src/alloc_stats.rs       D-092 — jemalloc's counters to a file for the soak. Behind the
+                         `alloc-stats` feature, which NO published image enables
 src/models/recipient_event.rs  §7.3's rows. A key is 16 bytes and never plaintext
 src/models/instance_config.rs  §7.3's salt: insert-if-absent, then read (D-050)
 src/db/mod.rs            the backend switch: one per build, never both (D-084)
@@ -316,6 +320,7 @@ tests/ingress_tls.rs     §5.1/§5.3 end to end. Every handshake VERIFIES agains
 tests/partial_ramp.rs    D-091 through the real walk; dry run agrees per recipient
 tests/admin_api.rs       §9. Pins dry run against the REAL walk, step for step
 tests/metrics_endpoint.rs  §9.1. Its own binary — one global recorder per process
+tests/metrics_idle.rs    D-093's counter expiry. Its own binary, for the same reason
 tests/link_proxy.rs      D-083 on the wire: raw client, recording upstream
 tests/acceptance.rs      §12.3 against real mail servers; behind --ignored
 simmer.acceptance.yaml   the acceptance stack's config (D-042)
@@ -334,6 +339,10 @@ layering, axum rather than actix, JSON logging rather than the house `logging::i
 the pool built from a URL rather than a `DbConfig`. Each divergence is a numbered
 entry in `DECISIONS.md` with its reason. See the `hs-rust-data-service` skill for
 the unmodified pattern.
+
+**No `unsafe` in this crate** (D-094): `[lints.rust] unsafe_code = "forbid"` in
+`Cargo.toml` covers the library, every binary and every test. If something seems
+to need `unsafe`, it belongs in a dependency or not at all — ask first.
 
 **`hs-utils` is not a dependency** (D-060). It was one, for a single stdlib-only
 function, which now lives in `src/healthcheck.rs` behaving identically. So the

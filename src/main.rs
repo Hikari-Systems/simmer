@@ -83,11 +83,20 @@ async fn run() -> anyhow::Result<()> {
     // here means a recorder is already installed, which cannot happen in a
     // process with one `main`, so it is reported and the service carries on
     // without an exporter rather than refusing to relay mail over it.
-    let metrics_handle = match simmer::metrics::install() {
-        Ok(handle) => Some(handle),
-        Err(e) => {
-            warn!(error = %e, "could not install the Prometheus recorder; /metrics will be empty");
-            None
+    //
+    // D-093: only when `admin.metrics` enables it. Otherwise no recorder is
+    // installed, every `metrics::` call stays a no-op, nothing is held for a
+    // scrape that will never come, and `/metrics` is not served.
+    let metrics_handle = if !config.admin.metrics().enabled {
+        info!("admin.metrics is off: no recorder, and /metrics is not served (D-093)");
+        None
+    } else {
+        match simmer::metrics::install(config.admin.metrics().idle_timeout) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                warn!(error = %e, "could not install the Prometheus recorder; /metrics will be empty");
+                None
+            }
         }
     };
 
@@ -105,7 +114,8 @@ async fn run() -> anyhow::Result<()> {
 
     // Non-fatal conditions worth a human's attention: migration-only headers
     // (§6.6), a future warm-up start (§7.2), recipient templates that force
-    // splitting (§6.3), and the §14.2 unmatched-sender caveat.
+    // splitting (§6.3), the §14.2 unmatched-sender caveat, and an unset
+    // `admin.metrics`, which since v0.7.0 means /metrics is off (D-093).
     for w in config::validate::warnings(&config) {
         warn!(path = %w.path, "{}", w.message);
     }
@@ -352,6 +362,28 @@ async fn run() -> anyhow::Result<()> {
         })
     });
 
+    // D-092 — the soak tier's allocator counters. Off unless the build has
+    // `alloc-stats` AND the environment names a file; neither is true of any
+    // published image.
+    let alloc_stats_task = match simmer::alloc_stats::configured() {
+        Some(path) if simmer::alloc_stats::compiled_in() => {
+            info!(path = %path.display(), "writing allocator stats (D-092)");
+            Some(tokio::spawn(simmer::alloc_stats::run(
+                path,
+                stop_accepting.clone(),
+            )))
+        }
+        Some(path) => {
+            warn!(
+                path = %path.display(),
+                "{} is set but this build has no alloc-stats feature; nothing will be written (D-092)",
+                simmer::alloc_stats::ENV
+            );
+            None
+        }
+        None => None,
+    };
+
     let admin_task = {
         let stop = stop_accepting.clone();
         tokio::spawn(async move {
@@ -412,6 +444,9 @@ async fn run() -> anyhow::Result<()> {
         let _ = task.await;
     }
     if let Some(task) = capture_sweeper {
+        let _ = task.await;
+    }
+    if let Some(task) = alloc_stats_task {
         let _ = task.await;
     }
     let _ = admin_task.await;

@@ -26,7 +26,10 @@ limitation met again on a different backend. An hour with D-091's partial ramp
 on (§12) sent 49.45% and 50.34% of the warming route's traffic to it at a share of
 0.5, delivered all 36,230 messages an instance, and met the same limitation a
 third time: `app2` failed `anon` at +2.84 MiB/h on a flat series, against a twin
-at −3.40.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
+at −3.40. The same hour with jemalloc's own counters sampled (§13) settled it:
+simmer's live heap is 1.5–2.0 MiB while `anon` swings across 60, so the anon gate
+has been judging the allocator. Its one real growth is F7, measured at about 204
+bytes per unmatched-sender series, which D-093 now expires.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
 step 5 summary". This document records what
 the soak tier is, what ten runs have established, and — at least as usefully —
 what they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
@@ -1487,3 +1490,130 @@ come from. That is an argument, not a measurement, and the measurement is
   which is what the feature is for, was not observed. It needs a cap small
   enough to be met within the run.
 - **The mssql build.** Postgres only.
+
+---
+
+## 13. What `anon` was measuring — the share hour with jemalloc's counters (D-092)
+
+§12's hour failed the `anon` gate on a series that stepped up once and then held,
+and nothing in the samples could say whether that was simmer holding memory or
+jemalloc keeping pages simmer had freed. D-092 added jemalloc's own counters to
+the samples. This hour repeats §12 with them on.
+
+### What was run
+
+- Images built from the working tree with `SIMMER_CARGO_FEATURES="--features
+  alloc-stats"` (`app` `d806f8b6…`, `app2` `604e203d…`), and
+  `SIMMER_ALLOC_STATS_FILE=/tmp/simmer-alloc-stats`. **Not a published build**:
+  jemalloc's `stats` option is on.
+- `share: [0.5]` on `warming-newbrand` and `SIMMER_WARMUP_STARTED` an hour back,
+  as §12. The line was reverted afterwards, as there.
+- The stack brought down with `-v` first, so quota rows and the sink started
+  empty.
+- The run script refused to start unless both instances were writing all six
+  counters, and logged a first reading from each before the load.
+  `target/soak-runs/2026-09-22-share-je-hour/run.sh`.
+
+2026-09-22, 10:02–11:02 UTC. `"senders": 2`.
+
+### The answer: simmer holds about 1.6 MiB, and `anon` is the allocator
+
+| MiB, whole hour | `app` | `app2` |
+|---|---|---|
+| `anon` | 5 – 69 | 5 – 71 |
+| `je_resident` (what jemalloc holds) | 7.7 – 68.7 | 7.5 – 70.9 |
+| **`je_allocated` (what simmer holds)** | **1.5 – 2.0** | **1.5 – 2.0** |
+| `je_metadata` | 5.2 – 7.4 | 5.1 – 5.4 |
+
+`anon` follows `je_resident`, and `je_resident` is 4 to 35 times what simmer
+actually holds. At 10 msg/s and about 20 ms a message, 0.2 messages are in flight
+on average, so live message bodies are tens of KiB. A 1 MiB message makes jemalloc
+map pages; simmer frees them within milliseconds; jemalloc keeps them resident
+for its dirty-page decay before returning them. The floors the anon gate judges
+are that decay's low points. A 3 MiB step in them, which failed §12, is how many
+freed pages jemalloc happened to be holding at the quietest sample, not a change
+in simmer.
+
+The same code under the same load, this hour: **`anon` passed on both
+instances**, +0.23 and −0.38 MiB/h. §12's failure was noise, as §10 predicted
+it could be.
+
+### The one real growth: F7, about 204 bytes per series
+
+`je_allocated` rose steadily on both instances: **+0.39 MiB/h** on `app` and
+**+0.38 MiB/h** on `app2` (Theil–Sen over the 5-minute floors), a fifth of the
+anon gate's limit. `allocated` counts only bytes simmer holds, so this is simmer's.
+Lined up against the unmatched-sender series count the soak scrapes from `app`
+every 30 s:
+
+| minute | unmatched series | `je_allocated` median |
+|---:|---:|---:|
+| 5 | 219 | 1.612 MiB |
+| 15 | 521 | 1.683 MiB |
+| 25 | 823 | 1.754 MiB |
+| 35 | 1,125 | 1.835 MiB |
+| 45 | 1,426 | 1.871 MiB |
+| 55 | 1,676 | 1.871 MiB |
+
+**r = 0.979, and the slope is about 204 bytes per series**: 1,457 new series,
+265 KiB. V3 mints one series per fresh `u<n>.soak.test` sender, and until now the
+exporter held every one for the life of the process. The rate is the soak's; the
+behaviour is simmer's. A long-running daemon fed new sender domains grows without
+bound, about 195 MiB per million, and only `/metrics` ever reads them. That is
+D-093: `/metrics` off unless `admin.metrics` enables it, and idle counters
+expired.
+
+`je_retained`, address space jemalloc keeps mapped for reuse, rose over the first
+ten minutes and then held around 150–160 MiB. Its hourly slopes (−9.54 and +2.82
+MiB/h) are that early rise and later wobble, not a trend. `je_metadata` was flat.
+
+### The split, again
+
+| | `app` | `app2` |
+|---|---|---|
+| offered to `warming-newbrand` / turned away | 17,050 / 17,159 | 17,229 / 16,980 |
+| share offered | 49.84% | 50.36% |
+| delivered, all routes | 36,230 | 36,230 |
+
+Every message delivered; overflow is again exactly the turned-away messages plus
+V3's 1,801. V4 unchanged: 220 accepted and 11 cut per instance, none at the dot,
+0 reservations in flight after the drain, 440 committed on `warming-cancel`.
+F7 XFAILed: 1,645 new series over 55 minutes.
+
+### What failed, and why: the instrument
+
+**Threads at rest, 5 against 4 before the first message, on both instances.**
+Every earlier hour read 3 → 3. The baseline itself was one higher, because the
+first version of D-092's writer used `tokio::fs`. Each call runs on tokio's
+blocking pool, whose threads linger about 10 s after use, so a write every 5 s
+kept one pool thread alive and sometimes started a second. **The check failed on
+the instrument, not on simmer.** The writer now uses `std::fs` directly on its
+task, which starts no thread (D-092). The next run with the counters on is the
+check that it did.
+
+**The analysis did not run at the end of the hour.** `metrics-util` had been
+added to `Cargo.toml` while the hour ran, for D-093, and the script's
+`cargo test --locked` refused to update the lockfile. Nothing was lost: every
+sample was on disk, and `soak_analyze` was run over them once the load was over.
+The figures above are from that run. **Do not edit `Cargo.toml` while a soak
+is running**; it is §6's no-builds rule, met from a new direction.
+
+**Latency: 4 messages over 200 ms on `app`, 5 on `app2`,** against none in §12.
+The slowest two are the same messages on both instances (`soak-*-24500` at
+~1.3 s, `soak-*-24480` at ~0.97 s), about 41 minutes in, so the cause is shared:
+the database, the sink or the host. It was not traced. Nothing was being built at
+the time.
+
+### What this hour did not establish
+
+- **That F7 is all of the growth.** A correlation of 0.979 over eleven windows
+  leaves little room, but a second source growing at the same rate would hide in
+  it. The metrics-off run is the test: with no recorder there is no F7, so
+  `je_allocated` should be flat.
+- **Anything about the published binary's memory.** jemalloc's `stats` option
+  changes the allocator slightly. The anon comparison with §12, same code
+  otherwise, suggests nothing material, but it was not measured.
+- **Whether the anon gate should be replaced.** `je_allocated` is the better
+  series for a leak gate: flat and quiet where `anon` swings by 60 MiB. Moving the
+  gate needs the feature in every soak image, and a limit. That is a decision for
+  after the metrics-off run.

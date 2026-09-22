@@ -307,12 +307,12 @@ and health-check the admin port's `/health`.
 ## Control plane
 
 On `admin.listen` (port 8080 by default). `/health`, `/healthcheck` and `/metrics`
-are open; everything else needs `Authorization: Bearer <token>`.
+(served only with `admin.metrics: true`, off by default since v0.7.0) are open; everything else needs `Authorization: Bearer <token>`.
 
 | | |
 |---|---|
 | `GET /health` | Liveness plus database reachability; `503` when the database is down |
-| `GET /metrics` | Prometheus exposition |
+| `GET /metrics` | Prometheus exposition, when `admin.metrics: true` (off by default since v0.7.0) |
 | `GET /routes`, `GET /routes/{name}` | Config plus live state: warm-up day, allowance and usage per group, preflight, pool stats |
 | `GET /quota?route=&group=` | The same windows, filtered |
 | `POST /routes/{name}/pause`, `/resume` | Take a route out of rotation without a restart |

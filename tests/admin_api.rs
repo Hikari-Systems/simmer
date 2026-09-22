@@ -289,8 +289,9 @@ async fn every_protected_endpoint_refuses_a_wrong_token(pool: PgPool) {
 #[sqlx::test]
 async fn health_and_metrics_stay_open(pool: PgPool) {
     // An orchestrator's probe and a Prometheus scrape cannot usually carry a
-    // credential, and a blind dashboard is its own outage (D-055).
-    let state = state(pool);
+    // credential, and a blind dashboard is its own outage (D-055). `/metrics`
+    // has to be switched on to exist at all (D-093).
+    let state = state_from(pool, metrics_on());
 
     assert_eq!(get(&state, "/health", None).await.status, StatusCode::OK);
     assert_eq!(
@@ -299,9 +300,37 @@ async fn health_and_metrics_stay_open(pool: PgPool) {
     );
     // 503 because this state has no recorder installed, not 401 — the point is
     // that authentication did not refuse it.
-    assert_ne!(
+    assert_eq!(
         get(&state, "/metrics", None).await.status,
-        StatusCode::UNAUTHORIZED
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+/// The fixture with `admin.metrics: true`.
+fn metrics_on() -> Config {
+    let yaml = CFG.replace(
+        "  auth_token: \"0123456789abcdef-default\"\n",
+        "  auth_token: \"0123456789abcdef-default\"\n  metrics: true\n",
+    );
+    assert_ne!(yaml, CFG, "the fixture's admin block moved");
+    simmer::config::from_str(&yaml, "test").expect("fixture is valid")
+}
+
+#[sqlx::test]
+async fn metrics_is_not_served_unless_enabled(pool: PgPool) {
+    // D-093: off by default, and off means absent — 404, with or without a
+    // token — not a 503 that reads like a fault.
+    let state = state(pool);
+    assert!(!state.engine.config.admin.metrics().enabled);
+    assert_eq!(
+        get(&state, "/metrics", None).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(&state, "/metrics", Some("0123456789abcdef-default"))
+            .await
+            .status,
+        StatusCode::NOT_FOUND
     );
 }
 

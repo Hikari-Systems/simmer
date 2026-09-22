@@ -264,6 +264,7 @@ database:
 admin:
   listen: "127.0.0.1:8080"
   auth_token: "${SIMMER_ADMIN_TOKEN}"
+  metrics: true                        # default false; or { enabled, idle_timeout } (§9.1)
 
 logging:
   level: info
@@ -398,6 +399,8 @@ not just the first.
 - A domain appears in more than one group.
 - A `warmup.schedule` array is empty, or contains a negative value.
 - An `overrides` key names a nonexistent domain group.
+- `admin.metrics.idle_timeout` is shorter than one minute, whether or not `admin.metrics` is
+  enabled. *(Added. See `DECISIONS.md` D-093.)*
 - A `warmup.schedule.share` value is not above 0 and at most 1; or a route with a non-empty
   `share` is the last route of any chain (sender rules and `default_chain`), where every
   message it is not offered would be §10.3's reply by design.
@@ -1054,7 +1057,19 @@ README.
 
 ### 9.1 Metrics
 
-Prometheus exposition on the admin listener. At minimum:
+Prometheus exposition on the admin listener, **when `admin.metrics` enables it**. It is off by
+default: every series is held only to answer a scrape, so with it off no recorder is installed,
+nothing is held, and `GET /metrics` is not served (`404`). `admin.metrics` is `true`, `false`, or
+`{ enabled, idle_timeout }`. A counter not incremented for `idle_timeout` (default 24h) is
+dropped from the exposition and reappears from zero on its next increment, which Prometheus reads
+as an ordinary counter reset. Without that, a series whose label the client controls —
+`simmer_unmatched_sender_total{domain}` — is held for the life of the process. The exporter prunes
+while rendering, so an enabled endpoint that nothing scrapes prunes nothing. Leaving
+`admin.metrics` unset, rather than `false`, logs a startup warning that `/metrics` is off, because
+a configuration from before this amendment loads cleanly and has lost it. *(Added. See
+`DECISIONS.md` D-093.)*
+
+At minimum:
 
 - `simmer_messages_total{route,domain_group,result}` — result: `delivered`, `deferred`, `rejected`
 - `simmer_quota_allowance{route,domain_group}` — today's ceiling
@@ -1097,7 +1112,7 @@ added; see D-090.)*
   today's share *(added, D-091)*.
 - `GET /routes/{name}` — as above for one route.
 - `GET /quota?route=&group=` — current window detail.
-- `GET /metrics` — Prometheus.
+- `GET /metrics` — Prometheus, when `admin.metrics` is enabled (§9.1).
 
 ### 9.3 Write API
 

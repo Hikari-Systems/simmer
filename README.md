@@ -641,15 +641,34 @@ permanent one.
 
 ## Control plane
 
+**`/metrics` is off unless you turn it on** (D-093, since v0.7.0):
+
+```yaml
+admin:
+  listen: "0.0.0.0:8080"
+  auth_token: "${SIMMER_ADMIN_TOKEN}"
+  metrics: true              # or { enabled: true, idle_timeout: 24h }
+```
+
+Off, no recorder is installed, nothing is held for a scrape, and `/metrics`
+answers `404`. **Upgrading from before v0.7.0:** a config that doesn't mention
+`admin.metrics` loads fine but has lost `/metrics`, so startup logs a warning
+saying so. Set `true` to keep it, or `false` to silence the warning. On, a counter nobody increments for `idle_timeout` (default 24h,
+at least 1m) is dropped and comes back from zero on its next increment, which
+`rate()` and `increase()` treat as a counter reset. That is what stops
+`simmer_unmatched_sender_total{domain}`, whose label the client chooses, from
+growing for the life of the process. The exporter prunes while rendering, so
+turn it on only where something scrapes it.
+
 On `admin.listen`, port 8080 by default. `/health`, `/healthcheck` and `/metrics`
-are open; everything else needs `Authorization: Bearer <token>`, including the
+(when enabled) are open; everything else needs `Authorization: Bearer <token>`, including the
 reads — `/routes` discloses every downstream hostname and the whole routing
 shape. See `DECISIONS.md` D-055.
 
 | | |
 |---|---|
 | `GET /health` | Liveness plus database reachability. `503` when the database is down |
-| `GET /metrics` | Prometheus exposition (§9.1) |
+| `GET /metrics` | Prometheus exposition (§9.1), when `admin.metrics` is on |
 | `GET /routes`, `GET /routes/{name}` | Configuration plus live state: warm-up day, per-group allowance and usage, paused, graduated, preflight results, pool statistics |
 | `GET /quota?route=&group=` | The same windows, filtered. Both filters optional and independent |
 | `POST /routes/{name}/pause`, `/resume` | Make a route ineligible without a restart. Persisted |
@@ -845,7 +864,8 @@ src/capture/    D-085's debugging capture and D-086's `server replay`.
                 Write-only from the delivery path's side; a record carries no
                 outcome, which is what keeps it from being a spool
 src/relay.rs    decide -> reserve -> rewrite -> relay -> commit/release
-src/metrics.rs  §9.1 counters and the Prometheus recorder
+src/metrics.rs  §9.1 counters and the Prometheus recorder, installed only with admin.metrics
+src/alloc_stats.rs  D-092: jemalloc's counters to a file, soak build only (alloc-stats)
 src/admin/      the §9 control plane: reads, writes, dry run, /metrics
   view.rs         §9.2's projections, as pure functions. D-026's drift flag
   auth.rs         §9.3's bearer token, and O-11's answer to whose it was
@@ -869,6 +889,7 @@ tests/partial_ramp.rs     D-091 through the real walk, and dry run against it
 tests/pool.rs        §8.3 from the downstream's side: connections, not intentions
 tests/ingress_tls.rs §5.1 and §5.3 end to end: STARTTLS, implicit TLS, the ACL
 tests/metrics_endpoint.rs  §9.1 against a real recorder; its own binary
+tests/metrics_idle.rs      D-093's idle expiry; its own binary, a one-second timeout
 tests/acceptance.rs  §12.3 against real mail servers; behind --ignored
 simmer.acceptance.yaml  config for the acceptance stack
 docs/SPEC.md    the specification
