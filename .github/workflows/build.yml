@@ -153,11 +153,34 @@ jobs:
       # image pushed to GHCR since phase 4 was the load generator, not the
       # server. CLAUDE.md and docker-compose.yml both say so; this is the
       # deployment pipeline they were warning. See DECISIONS.md D-073.
-      - name: Build and push to S3 registry
-        run: |
-          docker build --platform linux/${{ matrix.platform }} --target runtime \
-            -t localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }} .
-          docker push localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }}
+      #
+      # Built with buildx so the layers can live in the GitHub Actions cache.
+      # A fresh runner has no Docker layers, so without it every build compiled
+      # all ~240 dependencies from scratch, even when only src/ had changed —
+      # the Dockerfile's dependency-stub layer only pays off when that layer is
+      # found. `mode=max` caches the builder stage too, which is the one worth
+      # having. One scope per image, since each platform's layers differ.
+      # Written only from main, as the cargo caches are (`save-if` above):
+      # branches read main's layers without each writing a copy that would
+      # evict the others under the repository's 10 GB cache quota.
+      # `load: true` puts the image in the runner's Docker, so the push below
+      # is unchanged.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          platforms: linux/${{ matrix.platform }}
+          tags: localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }}
+          load: true
+          cache-from: type=gha,scope=simmer-${{ matrix.platform }}
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope=simmer-{0}', matrix.platform) || '' }}
+
+      - name: Push to S3 registry
+        run: docker push localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }}
 
   merge-manifest:
     runs-on: ubuntu-latest
@@ -293,12 +316,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
 
-      # `--target runtime` for the same reason as `build` (D-073).
+      # `target: runtime` for the same reason as `build` (D-073), and the
+      # Actions cache for the same reason too, in a scope of its own: the
+      # feature set compiles a different dependency graph.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
       - name: Build
-        run: |
-          docker build --platform linux/amd64 --target runtime \
-            --build-arg CARGO_FEATURES="--no-default-features --features mssql" \
-            -t ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${{ github.sha }}-mssql .
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64
+          build-args: |
+            CARGO_FEATURES=--no-default-features --features mssql
+          tags: ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${{ github.sha }}-mssql
+          load: true
+          cache-from: type=gha,scope=simmer-mssql
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=simmer-mssql' || '' }}
 
       - name: Push to GHCR
         run: |
