@@ -389,6 +389,32 @@ pub fn malformed_from_header() -> Reply {
     Reply::new(550, "5.6.0 malformed From header")
 }
 
+/// The DATA payload held an end-of-data marker with a bare CR or LF beside it —
+/// the SMTP-smuggling shape. Refused as a whole, never split.
+///
+/// §14.1 applied to a new failure path, as it asks to be (D-095). Unlike §10.3's
+/// carve-out, which is a policy statement about the *sender*, this one is about
+/// the bytes. Its rule is that Simmer must not make a client record permanent state
+/// about a message or recipient, because Simmer is temporary and that state is
+/// not. Both halves are answered here, and they are answered differently:
+///
+/// - **About the recipient — `554`, not `550`.** This is §14.1 straight: `550`
+///   reads as "mailbox unavailable" and is what puts a deliverable address on a
+///   suppression list that outlives Simmer by years. The recipient is fine. The
+///   bytes are the problem, and `554` says so about the transaction.
+/// - **About the message — permanent, against §14.1's default of `451`.** The
+///   condition is not Simmer's and does not pass: the same payload gets the same
+///   answer from any receiver applying the rule, so the state a client records is
+///   *correct* and survives the cutover. Bytes cannot become valid by waiting, so
+///   a `451` only holds the message in the client's queue, re-presents the same
+///   payload on every retry, and delays the bounce it was always going to get.
+pub fn ambiguous_terminator() -> Reply {
+    Reply::new(
+        554,
+        "5.6.0 bare CR or LF adjacent to an end-of-data marker; message refused",
+    )
+}
+
 /// §3.2 step 1 with `strict_senders: true`, and §10.3's explicit carve-out: this
 /// `550` is "a policy statement about the *sender*", cannot trigger recipient
 /// suppression, and "should be loud because it indicates misconfiguration".

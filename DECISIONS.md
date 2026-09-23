@@ -3826,6 +3826,127 @@ and libc. The least necessary is `unsafe-libyaml`, the YAML parser behind
 claims "zero `unsafe`", means the same thing: its own workspace, by the same
 lint, over dependencies that use it about as often.
 
+---
+
+## SMTP smuggling (2026-09-23)
+
+### D-095 — `DATA` is refused whole when an end-of-data marker has a bare CR or LF beside it
+
+**Found:** by review, in `tests/finding_smtp_smuggling.rs`. `read_data_inner` read
+each line with `read_until(b'\n')` and stripped an optional CR, so `<LF>.<LF>`
+ended `DATA` exactly as `<CRLF>.<CRLF>` does. RFC 5321 §4.1.1.4 says the
+terminator is `CRLF . CRLF` and nothing else, and the gap between those two
+readings is SMTP smuggling: a sender that honours only `CRLF.CRLF` writes
+`<LF>.<LF>` *inside* one message; Simmer ended the message there and read what
+followed as fresh commands — a second `MAIL FROM`/`RCPT TO`/`DATA`, with
+recipients the client's envelope never named, relayed under the route's warming
+identity. That identity, and its reputation, is the entire point of the product,
+which makes this the worst-shaped bug this codebase can have: it spends the asset
+it exists to build.
+
+**Decision:** a `.` line ends `DATA` only when the line it is on ends `CRLF` *and*
+the line before it did. Any other spelling is consumed as data — so what follows
+it is never executed and the session stays in step — a flag is set, and the
+message is refused with `554` (`reply::ambiguous_terminator`) once the real
+terminator arrives. Refused **whole**: nothing is relayed, and the payload is
+never split into "the part before the marker" and "the rest". Splitting is the
+attack; a receiver that refuses the transaction has nothing left to disagree with
+a downstream about.
+
+`554` and not `451`, and not `550`, is §14.1 applied to a new failure path as
+CLAUDE.md's third rule requires; the reasoning is on `reply::ambiguous_terminator`
+and does not repeat here. In short: the recipient is fine, so nothing may be
+recorded against it (`554`, not `550`), and the bytes are permanently bad in a way
+that is not about Simmer being temporary, so a permanent answer is correct and
+survives the cutover (`554`, not `451`).
+
+**§10.3's own test cuts the other way, and is worth stating rather than
+glossing.** It reads: "were Simmer removed, the application talking to the
+downstream would never see this reply at all — it would simply send." That is true
+here. A client emitting `<LF>.<LF>` and talking straight to its provider does not
+get a `554` from Simmer, because there is no Simmer; it gets whatever that
+provider does with the marker, which is either a smuggled second envelope or a
+mangled message. So this reply *is* an artefact of Simmer's presence by the letter
+of the test. The claim is that it is the right artefact: what §10.3 is protecting
+against is Simmer's own transient state — a day's ceiling, a paused chain —
+leaking into systems that outlive it, and nothing about this refusal is transient.
+The permanent state a client records is "this message was malformed", which was
+true before Simmer and stays true after. §14.1's principle survives; its worked
+example does not reach this case.
+
+**Put to the spec's author on 2026-09-23 as O-18, with `451` and a configurable
+`smuggling_reply` offered alongside, and answered: `554`, not configurable, and
+amend the spec.** §5.5 now carries the end-of-data rule, §9.1 the counter, and
+§10.3 this carve-out and its reasoning — written out in §10.3 rather than left
+here, so that the next person adding a failure path sees that §14.1 has an edge
+and where it is.
+
+**The CR half, and the mistake worth recording.** Simmer never ends `DATA` on
+`<CR>.<CR>` — it has no bare-CR line semantics at all — but it forwards bare CRs
+verbatim, so a downstream that *does* honour them splits the message on the way
+out instead. The first cut of this fix scanned for `<CR>.<CR>` in the line's
+**content**, after `strip_eol`. That is wrong, and wrong in the direction that
+matters: `strip_eol` has already taken the line's own CR, so a line whose content
+ends `...<CR>.` does not match — and §8.1's normalisation re-adds a CRLF on
+transmit, putting `...<CR>.<CR><LF>` on the wire byte-identical to what arrived.
+That is the spelling the published attack uses. The scan is over the whole `line`,
+line ending included, because **`line` is what gets forwarded**. The rule
+generalises past this bug: a check that exists to protect a downstream belongs on
+the bytes the downstream will see, not on the bytes after our own normalisation.
+
+Two neighbouring spellings were measured and are genuinely safe, for reasons that
+are not the ones above and should not be relied on without re-measuring:
+`<CRLF>.<CR>` and `<LF>.<CR>` reach the downstream with the dot gone, because
+`buffer::unstuff` takes it; a literally-stuffed `..<CR>` reaches it as `..`,
+because `stuff_into` puts the dot back. Neither leaves a lone dot on a
+CR-delimited line.
+
+**The counter is raised inside the reader, not from the reply.** A message that is
+both over-long and smuggling is still §5.5's `552` with the connection closed
+(D-020): the size is the fact the reader can state reliably, since an over-long
+line's discarded remainder is never inspected. But that ordering would otherwise
+let an attacker pad one line past `MAX_DATA_LINE` and mute
+`simmer_ambiguous_terminator_total` — the signal an operator is meant to alert on.
+So `read_data_inner` increments it at the terminator whenever the flag is set,
+whichever refusal wins, and `session::data`'s error arm keeps only the `WARN` and
+the reply.
+
+**Not chosen:** answering as soon as the marker is seen, mid-`DATA`. A reply
+before the dot puts a pipelining client out of step, which D-020 and D-082 have
+both already settled the other way — and here it would be worse than untidy, since
+the bytes still in flight are the smuggled commands, and leaving them unread is
+precisely the desynchronisation being defended against.
+
+**Not chosen:** normalising the marker away — rewriting `<LF>.<LF>` to something
+inert and relaying the rest. It is a rewrite that is not expressible as
+application-side config, so §1.1 forbids it, and it would silently alter a message
+whose sender is either broken or hostile. Refusing says so.
+
+**Verified:**
+
+- **`tests/finding_smtp_smuggling.rs`** — `<LF>.<LF>`, `<LF>.<CRLF>`,
+  `<CRLF>.<LF>`, `<CR>.<CR>` and `<CR>.<CRLF>` each get `554`, relay nothing, and
+  leave the session in step: an ordinary transaction on the same connection is
+  delivered afterwards and is the only thing the downstream ever sees. That last
+  assertion is what proves the smuggled `MAIL FROM` was consumed as data rather
+  than executed — had it run, the next `MAIL FROM` would be `503`.
+  `<CR>.<CRLF>` fails without the `line`-not-`content` scan above; it was
+  measured relaying the second envelope verbatim.
+- **The over-long case** — an over-long payload that also smuggles is `552` with
+  the connection closed, and relays nothing.
+- **§8.1's normalisation is untouched** — bare LFs *inside* a body that ends with a
+  proper `CRLF.CRLF` are still accepted and still promoted to CRLF.
+- **The gates.** `cargo test`: 1206 passed across 38 binaries, 0 failed.
+  `clippy --all-targets -D warnings` and `fmt --check` clean. On the SQL Server
+  build (D-084), `clippy --all-targets --no-default-features --features mssql
+  -D warnings` is clean and this file's seven tests pass; its full suite was not
+  run, for want of a SQL Server on this host. The change is in `src/smtp` and
+  touches nothing behind `QuotaStore`.
+- **Not run: the compose gate** (`docker compose up -d --build`) and the §12.3
+  acceptance suite. Neither exercises this path — no tier sends a malformed
+  terminator — but CLAUDE.md calls the compose build the real gate, so it is
+  outstanding.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -3850,6 +3971,7 @@ the phase that depends on each.
 | ~~O-16~~ | *Settled 2026-09-21 by the spec's author: amend the spec. §4.1, §4.2, §6.1 (step 5a), §6.2, §6.6 and §9.1 now carry `header_rewrites` — see **D-089**.* | | |
 | ~~O-17~~ | *Settled 2026-09-21 by the spec's author: amend the spec. Thread affinity is global, may take a pinned route past its cap (counted), and bypasses §7.3 on it. §2.1, §2.2, §3.2 (step 2a), §4.1, §4.2, §5.4, §7.3, §7.4, §9.1, §9.4 and §9.5 now carry it — see **D-090**.* | | |
 | O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment |
+| ~~O-18~~ | *Settled 2026-09-23 by the spec's author: `554`, not configurable, and amend the spec. §5.5 (the end-of-data marker is `CRLF . CRLF` and nothing else, and the whole payload is refused), §9.1 (`simmer_ambiguous_terminator_total`) and §10.3 (the one permanent reply that is a statement about the message, and why §14.1's worked example does not reach it) now carry it — see **D-095**.* | | |
 
 
 ---

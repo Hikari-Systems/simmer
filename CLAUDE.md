@@ -25,7 +25,9 @@ alone. The same rule produced the 2026-09-17 amendment for the link proxy
 lists), after O-16 was, and the same day's for thread affinity (§3.2 step 2a,
 §7.4's one exception to "overshoot is not acceptable", and the sections D-090
 lists), after O-17 was. And the same day's for the partial ramp (§3.2 step 3c′,
-§7.2, and the sections D-091 lists), which the author asked for directly.
+§7.2, and the sections D-091 lists), which the author asked for directly. And the
+2026-09-23 one for the end-of-data rule (§5.5, §9.1 and §10.3), after O-18 was —
+see D-095.
 
 ## The four things that will bite you
 
@@ -66,6 +68,14 @@ lists), after O-17 was. And the same day's for the partial ramp (§3.2 step 3c�
    years. Chain exhaustion is `451`. When adding any new failure path, apply this
    test to it — that is how the §10.1 `5xx` mapping came to be split by stage
    (`DECISIONS.md` D-008).
+
+   It has exactly one carve-out, and §10.3 now spells out why: §5.5's end-of-data
+   rule answers `554` on a smuggling-shaped payload (D-095). The test's literal
+   form — "were Simmer removed, the client would never see this reply" — is true
+   of it. What the rule protects is Simmer's own *transient* state escaping into
+   systems that outlive it, and a malformed message is not transient. Apply that
+   distinction, not the literal sentence, and if a new path seems to need the same
+   carve-out, say so out loud rather than assuming it.
 
 4. **A transaction carries exactly one recipient** (D-047). §5.6's
    `single_recipient_only` switch and §13's phase 9 splitting are gone, not

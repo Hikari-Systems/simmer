@@ -115,6 +115,13 @@ fn describe() {
          ALERT ON THIS: it is how a typo sends unwarmed traffic at full volume"
     );
     describe_counter!(
+        "simmer_ambiguous_terminator_total",
+        "Messages whose DATA held an end-of-data marker with a bare CR or LF beside it — \
+         the SMTP-smuggling shape (D-095). Every one is refused and relayed nowhere, \
+         with 554, or 552 if it was also over-length. ALERT ON THIS: it is either a \
+         client emitting bare line endings or an attempt to inject a second envelope"
+    );
+    describe_counter!(
         "simmer_sender_mismatch_total",
         "Transactions where the envelope sender and the From: header disagreed (§5.4)"
     );
@@ -453,6 +460,11 @@ pub fn ambiguous_delivery() {
 /// established identity, and this counter is the only thing that would show it.
 pub fn unmatched_sender(domain: &str) {
     counter!("simmer_unmatched_sender_total", "domain" => domain.to_string()).increment(1);
+}
+
+/// `simmer_ambiguous_terminator_total` — see [`crate::smtp`]'s DATA reader.
+pub fn ambiguous_terminator() {
+    counter!("simmer_ambiguous_terminator_total").increment(1);
 }
 
 /// §9.1 `simmer_sender_mismatch_total` (§5.4).

@@ -24,6 +24,7 @@ put to the spec's author and recorded rather than assumed:
 | **D-092** — allocator counters for the soak | An `alloc-stats` feature (jemalloc `stats` + `tikv-jemalloc-ctl`) writes six jemalloc counters to a file the soak samples. No published image enables it. `docs/SOAK.md` §13: simmer's live heap is 1.5–2.0 MiB while `anon` swings 5–70 MiB, so the anon gate judges the allocator |
 | **D-093** — `/metrics` opt-in | `admin.metrics` (`true`, `false`, or `{ enabled, idle_timeout }`), **off by default — breaking for monitoring**; unset logs a startup warning. Idle counters expire (default 24h), which bounds F7 (~204 bytes per unmatched sender domain, held forever before) by time. `SPEC.md` amended (§4.1, §4.2, §9.1, §9.2) |
 | **D-094** — no `unsafe` | `[lints.rust] unsafe_code = "forbid"` over the library, binaries and tests |
+| **D-095** — SMTP smuggling refused (*after this snapshot, unreleased*) | A `.` line ends `DATA` only with CRLF on both sides; any other spelling is consumed as data and the message is refused `554` whole, counted by `simmer_ambiguous_terminator_total`. After O-18; `SPEC.md` amended 2026-09-23 (§5.5 the end-of-data rule, §9.1 the counter, §10.3 the one permanent reply that is a statement about the message) |
 | Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp), `v0.7.0` (`/metrics` opt-in; allocator counters; no `unsafe`) |
 
 ---
@@ -691,6 +692,27 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 ---
 
 ## 6a. Known defects
+
+**One fixed after the `v0.7.0` snapshot, and the most serious the ingress path has
+had:**
+
+- **SMTP smuggling — `<LF>.<LF>` ended `DATA` (D-095).** `read_data_inner` read
+  lines with `read_until(b'\n')` and stripped an optional CR, so a `.` line with a
+  bare LF beside it terminated the message exactly as `CRLF.CRLF` does. A sender
+  that honours only `CRLF.CRLF` writes that sequence *inside* one message; Simmer
+  ended the message there and executed what followed as commands — a second
+  envelope, with recipients the client never named, relayed under the route's
+  warming identity. A `.` line now ends `DATA` only when its own line ending and
+  the previous line's are both CRLF; anything else is consumed as data and the
+  message is refused `554` at the real terminator, whole and unsplit.
+  `simmer_ambiguous_terminator_total` counts it, raised inside the reader so an
+  over-long payload cannot mute it. **The first fix was wrong in the way worth
+  remembering**: the bare-CR variant was scanned for in the line's *content*,
+  after `strip_eol` had taken the line's own CR, so `...<CR>.` did not match and
+  went out as `...<CR>.<CR><LF>` — byte-identical to what arrived, and the
+  spelling the published attack uses. A check that protects a downstream belongs
+  on the bytes the downstream will see. `tests/finding_smtp_smuggling.rs`; O-18
+  was answered the same day and `SPEC.md` is amended to match.
 
 **Two fixed at `v0.3.1`, and both worth reading as patterns rather than incidents:**
 

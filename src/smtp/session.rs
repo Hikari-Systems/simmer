@@ -710,6 +710,21 @@ impl Session {
                 let _ = self.send(&reply::session_timeout()).await;
                 return Ok(Some(SessionEnd::SessionTimeout));
             }
+            Err(DataError::AmbiguousTerminator) => {
+                // Nothing was relayed. The session is still in step — the real
+                // terminator has been read — so it carries on, exactly as it
+                // would after any other refused message.
+                tracing::warn!(
+                    peer = %self.peer,
+                    correlation_id = %self.correlation_id,
+                    "DATA held an end-of-data marker with a bare line ending; message refused"
+                );
+                self.reset_transaction();
+                self.send(&reply::ambiguous_terminator())
+                    .await
+                    .map_err(|_| ())?;
+                return Ok(None);
+            }
             Err(DataError::Closed) => return Ok(Some(SessionEnd::ClientClosed)),
             Err(DataError::Io) => return Err(()),
         }
@@ -950,6 +965,10 @@ impl Session {
     ) -> Result<(), DataError> {
         let mut line = Vec::with_capacity(1024);
         let mut over = false;
+        // The 354 reply leaves the client at the start of a line, so the first
+        // line of the payload counts as following a CRLF.
+        let mut after_crlf = true;
+        let mut ambiguous = false;
 
         loop {
             line.clear();
@@ -970,6 +989,10 @@ impl Session {
 
             if line.len() > MAX_DATA_LINE {
                 over = true;
+                // The discarded remainder ends in an LF we do not inspect, so
+                // what precedes the next line is unknown. Treating it as a CRLF
+                // is safe: the message is already refused as too large.
+                after_crlf = true;
                 // If the cap stopped the read short of the LF, the rest of the
                 // line is still in the stream, and is thrown away as it arrives.
                 // It cannot hold the terminator, which is a line of its own.
@@ -983,16 +1006,54 @@ impl Session {
             // being stripped here and re-added on transmit, which is the
             // normalisation §8.1's "canonical message" depends on.
             let content = strip_eol(&line);
+            let ends_crlf = line.ends_with(b"\r\n");
+            let preceded_by_crlf = std::mem::replace(&mut after_crlf, ends_crlf);
 
-            // The terminator is a lone dot on its own line.
+            // The terminator is `CRLF . CRLF` and nothing else (RFC 5321
+            // §4.1.1.4). A dot line with a bare LF on either side is what SMTP
+            // smuggling rides on: a sender that honours only CRLF.CRLF writes it
+            // inside one message, and a receiver that also honours LF.LF reads
+            // everything after it as fresh commands — a second envelope with
+            // recipients the first never had, relayed through a route whose
+            // reputation is the whole point. Such a line is consumed as data, so
+            // what follows it is never executed and the session stays in step,
+            // and the message is refused once the real terminator arrives.
             if content == b"." {
+                if !(ends_crlf && preceded_by_crlf) {
+                    ambiguous = true;
+                    continue;
+                }
+                if ambiguous {
+                    // Counted here rather than in the caller's error arm: an
+                    // over-long message is answered `552` and disconnected
+                    // (D-020) whatever else it held, and padding one line past
+                    // `MAX_DATA_LINE` must not be a way to mute the signal this
+                    // counter exists to raise.
+                    metrics::ambiguous_terminator();
+                }
                 if over {
                     return Err(DataError::TooLarge);
+                }
+                if ambiguous {
+                    return Err(DataError::AmbiguousTerminator);
                 }
                 // D-080: the spill file's last batch is written here, inside
                 // DATA, so a full spill area fails the way it always has (F5).
                 body.finish().await.map_err(|_| DataError::Io)?;
                 return Ok(());
+            }
+
+            // The same attack with CR: Simmer never ends DATA on `<CR>.<CR>`, but
+            // it forwards bare CRs verbatim, and a downstream that does honour it
+            // would split the message on the way out instead.
+            //
+            // Scanned over `line`, not `content`: `strip_eol` has already taken
+            // the line's own CR, and `...<CR>.` plus the CRLF that transmission
+            // restores is `...<CR>.<CR><LF>` on the wire — the same marker, and
+            // the spelling the published attack uses. `line` is what gets
+            // forwarded, so `line` is what has to be clean.
+            if has_cr_dot_cr(&line) {
+                ambiguous = true;
             }
 
             let content = buffer::unstuff(content);
@@ -1074,8 +1135,16 @@ enum DataError {
     /// D-081 — the session's deadline ran out, not the data budget.
     SessionTimeout,
     TooLarge,
+    /// A `.` line with a bare LF beside it, or a `<CR>.<CR>`: an end-of-data
+    /// marker that other SMTP implementations may honour and this one does not.
+    AmbiguousTerminator,
     Closed,
     Io,
+}
+
+/// Whether `content` holds `<CR>.<CR>`, the bare-CR spelling of a terminator.
+fn has_cr_dot_cr(content: &[u8]) -> bool {
+    content.windows(3).any(|w| w == b"\r.\r")
 }
 
 fn strip_eol(line: &[u8]) -> &[u8] {
@@ -1116,6 +1185,21 @@ mod tests {
         assert_eq!(strip_eol(b"abc"), b"abc");
         assert_eq!(strip_eol(b"\r\n"), b"");
         assert_eq!(strip_eol(b""), b"");
+    }
+
+    #[test]
+    fn finds_a_bare_cr_terminator_anywhere_in_a_line() {
+        // Fed the whole line, line ending included, because that is what gets
+        // forwarded.
+        assert!(has_cr_dot_cr(b"hello\r.\rMAIL FROM:<a@b>\r\n"));
+        assert!(has_cr_dot_cr(b"\r.\r"));
+        // The line's own CR completes the marker: on the wire this is
+        // `hello<CR>.<CR><LF>`, and `strip_eol` would have hidden it.
+        assert!(has_cr_dot_cr(b"hello\r.\r\n"));
+        assert!(has_cr_dot_cr(b"\r.\r\n"));
+        assert!(!has_cr_dot_cr(b"a.b\r\n"));
+        assert!(!has_cr_dot_cr(b"end.\r\n"));
+        assert!(!has_cr_dot_cr(b"\r.x\r\n"));
     }
 
     // -- §5.4 From: extraction -------------------------------------------

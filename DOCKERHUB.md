@@ -362,6 +362,12 @@ Every mutation is audited at `INFO` with the acting token's name.
   traffic at full volume via the default chain) and
   **`simmer_sender_not_permitted_total`** (a misconfigured app, or someone
   else's credentials).
+- **Alert on `simmer_ambiguous_terminator_total`**. A message
+  whose `DATA` held an end-of-data marker with a bare CR or LF beside it is
+  refused `554` and relayed nowhere — the SMTP-smuggling shape (D-095). A steady
+  low rate is usually one application emitting bare line endings; anything else
+  is an attempt to inject a second envelope through your warming identity, and
+  the sender is worth finding.
 
 ## docker compose example
 

@@ -588,6 +588,20 @@ causes `550 5.6.0 malformed From header` when `match_on` requires it.
 `max_message_bytes` is advertised via `SIZE` and enforced during `DATA`; exceeding it yields
 `552 5.3.4 message too large`. `max_recipients` yields `452 4.5.3 too many recipients`.
 
+**The end-of-data marker is `CRLF . CRLF` and nothing else** (RFC 5321 §4.1.1.4). A `.` line
+whose own line ending is a bare CR or bare LF, or whose preceding line ended with one, does
+**not** end `DATA`. It is consumed as data — so nothing following it is ever executed as a
+command and the session stays in step — and the message is refused `554 5.6.0 bare CR or LF
+adjacent to an end-of-data marker` when the real terminator arrives. A line that would reach a
+downstream carrying `<CR>.<CR>` is refused the same way: Simmer has no bare-CR line semantics,
+but it forwards bare CRs verbatim, and a receiver that honours them would split the message on
+the way out instead.
+
+The refusal is of the **whole payload**. A transaction smuggled inside a message is never
+separated from the message carrying it and relayed on its own, and nothing is relayed at all.
+`simmer_ambiguous_terminator_total` counts it (§9.1), and §10.3 records why the reply is
+permanent. *(Added. See `DECISIONS.md` D-095.)*
+
 ### 5.6 Multiple recipients
 
 **A transaction carries exactly one recipient.** A second `RCPT TO` is rejected with
@@ -1084,6 +1098,8 @@ At minimum:
 - `simmer_pool_connections{route,state}`
 - `simmer_unmatched_sender_total{domain}`
 - `simmer_sender_mismatch_total`
+- `simmer_ambiguous_terminator_total` — §5.5's end-of-data rule; raised whatever else the
+  message was also refused for *(added, D-095)*
 - `simmer_partial_delivery_total` — unreachable since §5.6 was amended; retained for
   continuity with the original list
 - `simmer_reservation_expired_total{route}`
@@ -1216,6 +1232,23 @@ answer to that risk is an overflow route, not a permanent failure code.
 immediately, and is used unconditionally for `strict_senders` rejection (§3.2 step 1) — that
 is a policy statement about the *sender*, will not trigger recipient suppression, and should
 be loud because it indicates misconfiguration.
+
+**One permanent reply is a statement about the message itself**: §5.5's end-of-data rule,
+`554 5.6.0`, on a payload carrying a smuggling-shaped terminator. The test above — were Simmer
+removed, the application would never see this reply — is true of it, and is nonetheless not
+decisive, which is worth stating plainly so that the next failure path added here is weighed
+rather than waved through. What this section protects against is Simmer's *own transient
+state* reaching systems that outlive it: a day's ceiling, a paused chain, a quota that resets
+at midnight. Nothing about a malformed terminator is transient. The permanent state a client
+records is "this message was malformed", which was true before Simmer was in the path and
+stays true once it is unplugged, so the reply does not distort the client's view of the world.
+
+`554` rather than `550` because the recipient is not the problem and must not be suppressed
+for it. Permanent rather than `451` because bytes do not become valid by waiting: a temporary
+failure would hold the message in the client's queue, re-present the same payload on every
+retry, and delay the bounce it was always going to get. Unlike `exhausted_chain_reply` this is
+**not configurable** — there is no deployment for which turning a refusal of this shape into a
+retry loop is the better answer. *(Added. See `DECISIONS.md` D-095.)*
 
 ### 10.4 Shutdown
 
