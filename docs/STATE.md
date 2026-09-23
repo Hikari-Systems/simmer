@@ -1,7 +1,7 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-09-23, at release `v0.7.1`.** (The previous snapshots were
-2026-09-22 at `v0.7.0`, 2026-09-21 at `v0.6.0`, 2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
+**Snapshot taken 2026-09-23, at release `v0.7.2`.** (The previous snapshots were
+2026-09-23 at `v0.7.1`, 2026-09-22 at `v0.7.0`, 2026-09-21 at `v0.6.0`, 2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
 numbers are the `v0.6.0` run; what was verified for `v0.4.0` and `v0.5.0` is
 stated there separately. This is a session-handover document, not a
 maintained one: `README.md` describes the service, `DECISIONS.md` records why it is
@@ -25,8 +25,8 @@ put to the spec's author and recorded rather than assumed:
 | **D-093** — `/metrics` opt-in | `admin.metrics` (`true`, `false`, or `{ enabled, idle_timeout }`), **off by default — breaking for monitoring**; unset logs a startup warning. Idle counters expire (default 24h), which bounds F7 (~204 bytes per unmatched sender domain, held forever before) by time. `SPEC.md` amended (§4.1, §4.2, §9.1, §9.2) |
 | **D-094** — no `unsafe` | `[lints.rust] unsafe_code = "forbid"` over the library, binaries and tests |
 | **D-095** — SMTP smuggling refused | A `.` line ends `DATA` only with CRLF on both sides; any other spelling is consumed as data and the message is refused `554` whole, counted by `simmer_ambiguous_terminator_total`. After O-18; `SPEC.md` amended 2026-09-23 (§5.5 the end-of-data rule, §9.1 the counter, §10.3 the one permanent reply that is a statement about the message) |
-| **D-096** — the `-mssql` image goes arm64 (*after this snapshot, unreleased*) | tiberius was never the blocker — it is pure Rust and the Dockerfile already carried OpenSSL on both stages. The gate was: Microsoft publishes no arm64 SQL Server (verified against the registry; every 2025 tag is a single-platform amd64 manifest). The arm64 leg runs against Azure SQL Edge — same engine, multi-arch, retired 2025-09-30 — verified at **1054 passed, 0 failed** before adopting. Babelfish rejected: it accepts and ignores table hints, so `UPDLOCK, SERIALIZABLE` would pass while not serialising |
-| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp), `v0.7.0` (`/metrics` opt-in; allocator counters; no `unsafe`), `v0.7.1` (the SMTP-smuggling fix) |
+| **D-096** — the `-mssql` image goes arm64 | tiberius was never the blocker — it is pure Rust and the Dockerfile already carried OpenSSL on both stages. The gate was: Microsoft publishes no arm64 SQL Server (verified against the registry; every 2025 tag is a single-platform amd64 manifest). The arm64 leg runs against Azure SQL Edge — same engine, multi-arch, retired 2025-09-30 — verified at **1054 passed, 0 failed** before adopting. Babelfish rejected: it accepts and ignores table hints, so `UPDLOCK, SERIALIZABLE` would pass while not serialising |
+| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp), `v0.7.0` (`/metrics` opt-in; allocator counters; no `unsafe`), `v0.7.1` (the SMTP-smuggling fix), `v0.7.2` (the `-mssql` image on arm64) |
 
 ---
 
@@ -176,6 +176,14 @@ The mssql suite needs a SQL Server and `MSSQL_URL` naming a login that may
 not re-run (CI runs it).
 
 For reference, the phase 11 snapshot read 830 passed on the default build alone.
+
+**For `v0.7.2` (D-096):** no source change at all — the release exists to publish
+the `-mssql` image for linux/arm64, and `src/`, `tests/`, `Cargo.toml` and the
+`Dockerfile` are untouched between `v0.7.1` and this tag. What was verified is the
+engine: the full mssql suite against Azure SQL Edge in the development jail,
+**1054 passed, 0 failed**, matching the SQL Server 2022 number plus D-095's eight
+tests. CI is the rest of the proof, and it is now the first arm64 `check-mssql`
+this repository has ever run — see D-096 on why it could not be run on a branch.
 
 **For `v0.7.1` (D-095):** **1206 passed, 0 failed** on the default build against
 Postgres — 1198 plus `tests/finding_smtp_smuggling.rs` (7), the `has_cr_dot_cr`
