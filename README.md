@@ -541,7 +541,7 @@ state lives (`DECISIONS.md` D-084):
 | Image | Database | Platforms |
 |---|---|---|
 | `hikarisystems/simmer:vX.Y.Z` | PostgreSQL | amd64, arm64 |
-| `hikarisystems/simmer:vX.Y.Z-mssql` | SQL Server 2017 or later, or Azure SQL | amd64 |
+| `hikarisystems/simmer:vX.Y.Z-mssql` | SQL Server 2017 or later, or Azure SQL | amd64, arm64 |
 
 The choice is made when the image is built, not by configuration: each image
 contains one storage layer and refuses the other's `database.url` at startup,

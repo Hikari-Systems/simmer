@@ -2845,9 +2845,10 @@ at runtime:
   Server build is `--no-default-features --features mssql`, so it contains no
   Postgres code and the Postgres build contains no SQL Server code.
 - Each release publishes `hikarisystems/simmer:vX.Y.Z` (Postgres, amd64 and
-  arm64) and `hikarisystems/simmer:vX.Y.Z-mssql` (SQL Server, **amd64 only**),
-  with `:latest` and `:latest-mssql`. The naming is the owner's. The release
-  gets both variants or neither.
+  arm64) and `hikarisystems/simmer:vX.Y.Z-mssql` (SQL Server, **amd64 only** up
+  to and including 0.7.1; amd64 and arm64 after, see **D-096**), with `:latest`
+  and `:latest-mssql`. The naming is the owner's. The release gets both variants
+  or neither.
 - `MssqlQuotaStore` implements the same `QuotaStore` trait operation for
   operation. Nothing above the trait changed. `AdminState.db` became a
   `PoolGauge` trait object so the `simmer_db_pool_*` gauges read either pool.
@@ -3946,6 +3947,83 @@ whose sender is either broken or hostile. Refusing says so.
   acceptance suite. Neither exercises this path — no tier sends a malformed
   terminator — but CLAUDE.md calls the compose build the real gate, so it is
   outstanding.
+
+### D-096 — The `-mssql` image goes multi-arch, gated on arm64 by Azure SQL Edge
+
+**Asked for** on 2026-09-23: why is the SQL Server image amd64 only, and would a
+different driver fix it?
+
+**It was never the driver.** tiberius is a pure-Rust TDS client; it compiles for
+arm64 unchanged. Its one native dependency is OpenSSL, via the `native-tls`
+feature D-084 chose over `rustls`, and the Dockerfile already carries it on both
+stages (`rust:1-bookworm` has `libssl-dev`, the runtime stage installs `libssl3`
+for `*mssql*` builds) on base images that are themselves multi-arch. The image
+would have built for arm64 at any point. Swapping to an ODBC-based driver would
+have made it worse, by putting Microsoft's `msodbcsql18` into a runtime image
+whose point is that it needs nothing beyond libc.
+
+**What actually blocked it was the test gate.** `check-mssql` needs a SQL Server
+to run `tests/store_mssql.rs` against, and Microsoft publishes none for arm64.
+Checked against the registry rather than the announcements, because the
+announcements are wrong: `mcr.microsoft.com/mssql/server:2025-latest` is a
+**single-platform amd64 manifest**, so is `2025-CU6-ubuntu-24.04`, and none of
+the repository's 284 tags mentions arm. Claims that SQL Server 2025 "supports
+ARM64" mean it runs under emulation on an ARM Mac, which is no use to a CI job.
+
+**Decision:** publish both arches, and gate arm64 against
+`mcr.microsoft.com/azure-sql-edge:latest` — the same SQL Server engine, genuinely
+multi-arch (`arm64/v8` and `amd64` in one manifest), and **retired since 30
+September 2025**. The amd64 leg keeps running against real SQL Server 2022, so
+the arch that carries almost all deployments loses no fidelity.
+
+**Why a retired image is acceptable *here*.** It is a test fixture, not something
+shipped: nobody runs it, it is pinned in one CI job, and its job is to answer "did
+the client behave" — the risk of a frozen engine is that it stops representing a
+current one, not that it exposes anyone. If it ever drifts far enough to matter,
+the amd64 leg against a supported SQL Server is what would catch it. The day
+Microsoft ships an arm64 SQL Server, this becomes a one-line image swap.
+
+**Verified before adopting it, not assumed.** The full mssql suite was run
+against Azure SQL Edge from the development jail: **1054 passed, 0 failed** —
+1046, the `v0.7.0` number against SQL Server 2022, plus D-095's eight new tests.
+Everything the store depends on works: `sp_getapplock`
+(`replicas_migrating_together_both_succeed`), the `UPDLOCK, SERIALIZABLE`
+key-range locks (`n_concurrent_reservations_never_overshoot`,
+`two_independent_pools_never_overshoot`,
+`concurrent_first_reservations_create_one_row`), `OUTPUT … INTO`, `@@ROWCOUNT`
+and the `Latin1_General_100_BIN2` collations.
+
+**Not chosen: Babelfish for PostgreSQL**, the obvious TDS-compatible substitute,
+and the reason is worth keeping. Its documentation says of table hints:
+"Accepted and ignored." `UPDATE … WITH (UPDLOCK, SERIALIZABLE)` would parse,
+execute, return the right rows and **silently not serialise** — the conformance
+suite would pass while the reservation protocol had no mutual exclusion at all.
+Its `SERIALIZABLE` (since Babelfish 3.4.0) is PostgreSQL MVCC, not SQL Server
+locking. D-084 already has the counter-example: the migration-lock bug surfaced
+only under full-suite load against the real engine, and a backend that ignores
+the hints would have reported it fixed. **A false green on the one invariant the
+store exists to guarantee is worse than an honest "amd64 only".**
+
+**Two mechanical consequences.**
+
+- **The `services:` block had to go.** Its health check ran `sqlcmd` inside the
+  container and Azure SQL Edge ships no `sqlcmd` at all. Both images log the same
+  readiness line, so the database is started with `docker run` in a step and
+  waited for by polling `docker logs` — one mechanism, both legs, and the log is
+  polled rather than the port because the listener binds before recovery
+  finishes, so a TCP check reports ready while a login would still fail.
+  `ACCEPT_EULA=Y` was checked against Edge, whose own documentation says `1`.
+- **`build-mssql` now builds per-arch and merges**, like `build`, rather than
+  building one platform and pushing it directly. One job with
+  `platforms: linux/amd64,linux/arm64` would emulate the foreign arch, and
+  QEMU-emulating a ~240-crate Rust compile is not a trade worth making when
+  native runners exist. `release.yml` needed nothing: it already copies with
+  `skopeo copy --all`, which carries a manifest list.
+
+**Not verified here.** CI changes only prove themselves on CI. The workflow
+parses, `actionlint` reports nothing this change introduced, and the engine
+question — the part that could not be answered by reading — was settled by
+running the suite. The rest is the first green run on a branch.
 
 ## Still open — to settle at the start of the phase that needs them
 

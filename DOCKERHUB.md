@@ -95,7 +95,7 @@ Each release is published twice, in the same repository:
 | Tag | Database | Platforms |
 |---|---|---|
 | `:vX.Y.Z`, `:latest` | PostgreSQL | linux/amd64, linux/arm64 |
-| `:vX.Y.Z-mssql`, `:latest-mssql` | SQL Server 2017+ / Azure SQL | linux/amd64 |
+| `:vX.Y.Z-mssql`, `:latest-mssql` | SQL Server 2017+ / Azure SQL | linux/amd64, linux/arm64 |
 
 Same code, same configuration file, same control plane and metrics; only the
 storage layer differs, and each image contains exactly one. Give either image
@@ -424,8 +424,11 @@ Your applications then send to `simmer:25` on the same network.
 - `:latest-mssql` — the most recent release, SQL Server.
 - `:vX.Y.Z-mssql` — a specific release, SQL Server.
 
-The Postgres images are multi-arch (**linux/amd64**, **linux/arm64**); the SQL
-Server images are **linux/amd64** only.
+Both images are multi-arch (**linux/amd64**, **linux/arm64**). The SQL Server
+image was amd64 only in releases up to and including 0.7.1. Its arm64 conformance
+gate runs against Azure SQL Edge rather than SQL Server, because Microsoft
+publishes no arm64 SQL Server container — see `DECISIONS.md` D-096 for what that
+does and does not prove.
 
 ```sh
 docker pull hikarisystems/simmer:latest

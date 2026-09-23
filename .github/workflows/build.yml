@@ -245,26 +245,29 @@ jobs:
   # plus the migration runner's own tests. Everything above the storage trait is
   # backend-neutral and runs here too; the Postgres-backed relay and admin tests
   # are compiled out of this build.
+  # Run on both arches (D-096). Microsoft still publishes no arm64 SQL Server
+  # image — every `mcr.microsoft.com/mssql/server` tag, 2025 included, is a
+  # single-platform amd64 manifest — so the arm64 leg runs against Azure SQL
+  # Edge, which is the same engine, is genuinely multi-arch, and is retired.
+  # D-096 records why a retired image is acceptable here and why the obvious
+  # alternative, Babelfish, is not.
   check-mssql:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
 
-    services:
-      # amd64 only — Microsoft publishes no arm64 SQL Server image, which is also
-      # why the `-mssql` image is amd64 only.
-      mssql:
-        image: mcr.microsoft.com/mssql/server:2022-latest
-        env:
-          ACCEPT_EULA: "Y"
-          MSSQL_SA_PASSWORD: Simmer-ci-1!
-          MSSQL_PID: Developer
-        ports:
-          - 1434:1433
-        options: >-
-          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'Simmer-ci-1!' -Q 'SELECT 1' -b"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 30
+    strategy:
+      # Both legs report. They run against different engines, so a failure on
+      # one is a fact about that engine and not a reason to hide the other.
+      fail-fast: false
+      matrix:
+        platform: [amd64, arm64]
+        include:
+          - platform: amd64
+            runner: blacksmith-2vcpu-ubuntu-2404
+            db_image: mcr.microsoft.com/mssql/server:2022-latest
+          - platform: arm64
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
+            db_image: mcr.microsoft.com/azure-sql-edge:latest
 
     env:
       # The login the harness creates one database per test with. Port 1434 on
@@ -275,11 +278,47 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
 
+      # Started here rather than as a `services:` container. The health check
+      # this job used to carry ran `sqlcmd` inside the container, and Azure SQL
+      # Edge ships no `sqlcmd` at all — so it cannot be reused on the arm64 leg.
+      # Both images log the same readiness line, so one wait covers both and the
+      # legs stay identical apart from the image name. `ACCEPT_EULA=Y` is
+      # accepted by both (Edge's own docs say `1`).
+      - name: Start SQL Server
+        run: |
+          docker run -d --name simmer-ci-db -p 1434:1433 \
+            -e ACCEPT_EULA=Y \
+            -e MSSQL_SA_PASSWORD='Simmer-ci-1!' \
+            -e MSSQL_PID=Developer \
+            ${{ matrix.db_image }}
+
+      # Polls the log rather than the port: the listener binds before recovery
+      # finishes, so a TCP check reports ready while a login would still fail.
+      - name: Wait for SQL Server
+        run: |
+          for _ in $(seq 1 60); do
+            if docker logs simmer-ci-db 2>&1 \
+                 | grep -q 'SQL Server is now ready for client connections'; then
+              echo "ready"
+              exit 0
+            fi
+            if ! docker ps --format '{{.Names}}' | grep -qx simmer-ci-db; then
+              echo "::error::${{ matrix.db_image }} exited before becoming ready"
+              docker logs --tail 50 simmer-ci-db
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "::error::${{ matrix.db_image }} was not ready within 5 minutes"
+          docker logs --tail 50 simmer-ci-db
+          exit 1
+
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          # Its own key: the feature sets resolve different dependency graphs.
-          key: mssql
+          # Its own key per arch: the feature sets resolve different dependency
+          # graphs, and the two runners' artefacts are not interchangeable.
+          key: mssql-${{ matrix.platform }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # `cargo fmt` is feature-independent and `check` already ran it.
@@ -290,35 +329,60 @@ jobs:
         run: cargo test --locked --no-default-features --features mssql
 
       - name: Install cargo-deny
+        if: matrix.platform == 'amd64'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
 
       # The mssql graph is not the default graph: tiberius, bb8 and OpenSSL are
-      # only in this one, so the licence and advisory gate has to see it.
+      # only in this one, so the licence and advisory gate has to see it. Once,
+      # on amd64: the resolved graph is the same on both arches, and `cargo deny`
+      # judges the graph rather than the build.
       - name: Licences, advisories, sources
+        if: matrix.platform == 'amd64'
         run: cargo deny --no-default-features --features mssql check
 
-  # amd64 only, and so a single-platform image: no manifest to merge, which is
-  # why this pushes to GHCR directly rather than through the S3 registry the
-  # multi-arch build uses as its staging area.
+  # Multi-arch since D-096, and so built the way `build` is: each platform on a
+  # runner of its own, staged in the S3 registry, merged by the job below. Not
+  # one job with `platforms: linux/amd64,linux/arm64` — that builds the foreign
+  # arch under QEMU, and emulating a ~240-crate Rust compile is not a trade worth
+  # making when native runners exist.
   build-mssql:
     needs: check-mssql
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    strategy:
+      matrix:
+        platform: [amd64, arm64]
+        include:
+          - platform: amd64
+            runner: blacksmith-2vcpu-ubuntu-2404
+          - platform: arm64
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
+    services:
+      registry:
+        image: registry:3.0
+        env:
+          REGISTRY_STORAGE: s3
+          REGISTRY_STORAGE_S3_ACCESSKEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          REGISTRY_STORAGE_S3_SECRETKEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          REGISTRY_STORAGE_S3_REGION: ${{ secrets.AWS_REGION }}
+          REGISTRY_STORAGE_S3_BUCKET: hikari-docker-registry
+          REGISTRY_HTTP_ADDR: :5000
+          REGISTRY_HTTP_SECRET: ${{ secrets.DOCKER_REGISTRY_SECRET }}
+        ports:
+          - 5000:5000
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
-
-      - name: Make branch name
-        run: echo "BRANCH_NAME=$(echo ${{ github.ref }} | sed -e 's/^refs\/heads\///' -e 's/[^A-Za-z0-9_.-]/-/g')" >> $GITHUB_ENV
 
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
 
       # `target: runtime` for the same reason as `build` (D-073), and the
-      # Actions cache for the same reason too, in a scope of its own: the
-      # feature set compiles a different dependency graph.
+      # Actions cache for the same reason too, in a scope of its own per arch:
+      # the feature set compiles a different dependency graph, and each
+      # platform's layers differ.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -327,20 +391,69 @@ jobs:
         with:
           context: .
           target: runtime
-          platforms: linux/amd64
+          platforms: linux/${{ matrix.platform }}
           build-args: |
             CARGO_FEATURES=--no-default-features --features mssql
-          tags: ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${{ github.sha }}-mssql
+          tags: localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-${{ matrix.platform }}
           load: true
-          cache-from: type=gha,scope=simmer-mssql
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=simmer-mssql' || '' }}
+          cache-from: type=gha,scope=simmer-mssql-${{ matrix.platform }}
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope=simmer-mssql-{0}', matrix.platform) || '' }}
 
-      - name: Push to GHCR
+      - name: Push to S3 registry
+        run: docker push localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-${{ matrix.platform }}
+
+  # The `-mssql` half of `merge-manifest`, kept separate so the two images can
+  # fail independently: a broken SQL Server build must not stop the Postgres
+  # image publishing, which is what almost every deployment runs.
+  merge-manifest-mssql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build-mssql
+    services:
+      registry:
+        image: registry:3.0
+        env:
+          REGISTRY_STORAGE: s3
+          REGISTRY_STORAGE_S3_ACCESSKEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          REGISTRY_STORAGE_S3_SECRETKEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          REGISTRY_STORAGE_S3_REGION: ${{ secrets.AWS_REGION }}
+          REGISTRY_STORAGE_S3_BUCKET: hikari-docker-registry
+          REGISTRY_HTTP_ADDR: :5000
+          REGISTRY_HTTP_SECRET: ${{ secrets.DOCKER_REGISTRY_SECRET }}
+          REGISTRY_STORAGE_DELETE_ENABLED: "true"
+        ports:
+          - 5000:5000
+    steps:
+      - name: Make repo name
+        run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
+
+      - name: Make branch name
+        run: echo "BRANCH_NAME=$(echo ${{ github.ref }} | sed -e 's/^refs\/heads\///' -e 's/[^A-Za-z0-9_.-]/-/g')" >> $GITHUB_ENV
+
+      - name: Install skopeo
         run: |
-          echo "${{ secrets.GH_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-          IMAGE=ghcr.io/hikari-systems/${{ env.REPO_NAME }}
-          docker push "$IMAGE:${{ github.sha }}-mssql"
-          for TAG in ${{ env.BRANCH_NAME }}-mssql latest-mssql; do
-            docker tag "$IMAGE:${{ github.sha }}-mssql" "$IMAGE:$TAG"
-            docker push "$IMAGE:$TAG"
+          sudo apt-get update -qq
+          sudo apt-get install -y skopeo
+
+      - name: Log in to GHCR via skopeo
+        run: |
+          skopeo login ghcr.io \
+            --username ${{ github.actor }} \
+            --password ${{ secrets.GH_TOKEN }}
+
+      - name: Create multi-arch manifest in S3 registry
+        run: |
+          docker manifest create --insecure localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql \
+            localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-amd64 \
+            localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-arm64
+          docker manifest push --insecure localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql
+
+      - name: Copy multi-arch manifest from S3 registry to GHCR
+        run: |
+          for TAG in ${{ github.sha }}-mssql ${{ env.BRANCH_NAME }}-mssql latest-mssql; do
+            skopeo copy \
+              --all \
+              --src-tls-verify=false \
+              docker://localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql \
+              docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${TAG}
           done

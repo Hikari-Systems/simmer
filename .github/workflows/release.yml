@@ -8,7 +8,7 @@ name: release
 # exact bytes, re-tagged. Rebuilding would ship an image nothing had tested.
 #
 #   * Docker Hub: hikarisystems/simmer:<tag> + :latest   (releases only)
-#                 hikarisystems/simmer:<tag>-mssql + :latest-mssql   (D-084, amd64)
+#                 hikarisystems/simmer:<tag>-mssql + :latest-mssql   (D-084; multi-arch since D-096)
 #   * GHCR:       ghcr.io/hikari-systems/simmer:<tag> + :<tag>-mssql
 #   * GitHub:     a release whose notes are the tag annotation + generated changelog
 #
@@ -153,7 +153,7 @@ jobs:
             echo "Images, built from \`${SHA}\`:"
             echo ""
             echo "- Postgres: \`hikarisystems/${{ env.REPO_NAME }}:${TAG}\` (linux/amd64, linux/arm64)"
-            echo "- SQL Server: \`hikarisystems/${{ env.REPO_NAME }}:${TAG}-mssql\` (linux/amd64)"
+            echo "- SQL Server: \`hikarisystems/${{ env.REPO_NAME }}:${TAG}-mssql\` (linux/amd64, linux/arm64)"
             echo "__RELEASE_NOTES__"
           } >> "$GITHUB_OUTPUT"
 
