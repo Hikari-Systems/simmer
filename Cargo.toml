@@ -1,6 +1,6 @@
 [package]
 name = "simmer"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 # Never goes to crates.io. Also what tells cargo-deny this crate's missing
 # `license` field is deliberate rather than an oversight.

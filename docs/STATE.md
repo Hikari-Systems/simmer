@@ -1,7 +1,7 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-09-22, at release `v0.7.0`.** (The previous snapshots were
-2026-09-21 at `v0.6.0`, 2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
+**Snapshot taken 2026-09-23, at release `v0.7.1`.** (The previous snapshots were
+2026-09-22 at `v0.7.0`, 2026-09-21 at `v0.6.0`, 2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
 numbers are the `v0.6.0` run; what was verified for `v0.4.0` and `v0.5.0` is
 stated there separately. This is a session-handover document, not a
 maintained one: `README.md` describes the service, `DECISIONS.md` records why it is
@@ -24,8 +24,8 @@ put to the spec's author and recorded rather than assumed:
 | **D-092** — allocator counters for the soak | An `alloc-stats` feature (jemalloc `stats` + `tikv-jemalloc-ctl`) writes six jemalloc counters to a file the soak samples. No published image enables it. `docs/SOAK.md` §13: simmer's live heap is 1.5–2.0 MiB while `anon` swings 5–70 MiB, so the anon gate judges the allocator |
 | **D-093** — `/metrics` opt-in | `admin.metrics` (`true`, `false`, or `{ enabled, idle_timeout }`), **off by default — breaking for monitoring**; unset logs a startup warning. Idle counters expire (default 24h), which bounds F7 (~204 bytes per unmatched sender domain, held forever before) by time. `SPEC.md` amended (§4.1, §4.2, §9.1, §9.2) |
 | **D-094** — no `unsafe` | `[lints.rust] unsafe_code = "forbid"` over the library, binaries and tests |
-| **D-095** — SMTP smuggling refused (*after this snapshot, unreleased*) | A `.` line ends `DATA` only with CRLF on both sides; any other spelling is consumed as data and the message is refused `554` whole, counted by `simmer_ambiguous_terminator_total`. After O-18; `SPEC.md` amended 2026-09-23 (§5.5 the end-of-data rule, §9.1 the counter, §10.3 the one permanent reply that is a statement about the message) |
-| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp), `v0.7.0` (`/metrics` opt-in; allocator counters; no `unsafe`) |
+| **D-095** — SMTP smuggling refused | A `.` line ends `DATA` only with CRLF on both sides; any other spelling is consumed as data and the message is refused `554` whole, counted by `simmer_ambiguous_terminator_total`. After O-18; `SPEC.md` amended 2026-09-23 (§5.5 the end-of-data rule, §9.1 the counter, §10.3 the one permanent reply that is a statement about the message) |
+| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp), `v0.7.0` (`/metrics` opt-in; allocator counters; no `unsafe`), `v0.7.1` (the SMTP-smuggling fix) |
 
 ---
 
@@ -175,6 +175,15 @@ The mssql suite needs a SQL Server and `MSSQL_URL` naming a login that may
 not re-run (CI runs it).
 
 For reference, the phase 11 snapshot read 830 passed on the default build alone.
+
+**For `v0.7.1` (D-095):** **1206 passed, 0 failed** on the default build against
+Postgres — 1198 plus `tests/finding_smtp_smuggling.rs` (7), the `has_cr_dot_cr`
+unit test, and the capture's tests. `cargo clippy --all-targets -D warnings` and
+`cargo fmt --check` clean on the default build, and clippy clean on the mssql
+build with the seven smuggling tests passing there; **the mssql suite was not run
+whole** — no SQL Server on the host — and the change is in `src/smtp`, behind
+nothing feature-gated. `cargo deny` is not installed in the jail. **Not run:** the
+compose gate and the acceptance tier; neither has a malformed-terminator case.
 
 **For `v0.7.0` (D-092, D-093, D-094):** **1198 passed, 0 failed** on the default
 build against Postgres and **1046 passed, 0 failed** on the mssql build against
@@ -693,8 +702,7 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 
 ## 6a. Known defects
 
-**One fixed after the `v0.7.0` snapshot, and the most serious the ingress path has
-had:**
+**One fixed at `v0.7.1`, and the most serious the ingress path has had:**
 
 - **SMTP smuggling — `<LF>.<LF>` ended `DATA` (D-095).** `read_data_inner` read
   lines with `read_until(b'\n')` and stripped an optional CR, so a `.` line with a
