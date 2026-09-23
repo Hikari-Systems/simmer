@@ -4023,7 +4023,17 @@ store exists to guarantee is worse than an honest "amd64 only".**
 **Not verified here.** CI changes only prove themselves on CI. The workflow
 parses, `actionlint` reports nothing this change introduced, and the engine
 question — the part that could not be answered by reading — was settled by
-running the suite. The rest is the first green run on a branch.
+running the suite. The rest was the first run on `main`.
+
+**It could not be proved on a branch first, and that was its own bug.**
+`on.push.branches` was `'*'`, and in a branch filter `*` matches every character
+*except* `/` — so pushing `feat/mssql-arm64` started no run at all. A workflow
+that never fires is indistinguishable from one that passes: nothing goes red,
+nothing appears in the checks list, and the only signal is an absence. The two
+branches already in the repository, `feat/link-proxy` and `feat/partial-ramp`,
+were never built either. Widened to `'**'` in the commit after this one. The
+sanitising `sed` in `merge-manifest` was already written for slashes, so nothing
+else had to change — `feat/mssql-arm64` publishes as `feat-mssql-arm64`.
 
 ## Still open — to settle at the start of the phase that needs them
 

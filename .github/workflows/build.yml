@@ -2,10 +2,17 @@ name: Build and push to GHCR
 
 on:
   push:
+    # `**`, not `*`: in a branch filter `*` matches any character *except* `/`,
+    # so `'*'` silently excluded every `feat/…`-style branch — the push simply
+    # started no run, which reads exactly like a green build. That is how
+    # D-096's workflow change reached `main` untested. `**` matches slashes too.
+    # Safe because the one place a branch name becomes an image tag
+    # (`merge-manifest`) already folds anything outside the tag alphabet to `-`,
+    # which is why it was written that way.
     branches:
-      - '*'
+      - '**'
     tags-ignore:
-      - '*'
+      - '**'
 
 jobs:
   # NOT the house shape. The standard hikari-systems build.yml runs no
@@ -204,9 +211,9 @@ jobs:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
 
-      # A branch name is not always a valid image tag. `on.push.branches: '*'`
-      # does not match a `/` today, so no such branch reaches here, but anything
-      # outside the tag alphabet becomes `-` in case the trigger is widened.
+      # A branch name is not always a valid image tag. Since the trigger widened
+      # to `**` a `feat/…` branch does reach here, and anything outside the tag
+      # alphabet becomes `-`: `feat/mssql-arm64` publishes as `feat-mssql-arm64`.
       - name: Make branch name
         run: echo "BRANCH_NAME=$(echo ${{ github.ref }} | sed -e 's/^refs\/heads\///' -e 's/[^A-Za-z0-9_.-]/-/g')" >> $GITHUB_ENV
 
