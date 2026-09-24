@@ -597,7 +597,27 @@ fn soak_analyze() {
             (
                 "anon",
                 series(&samples, |s| s.anon as f64),
-                2.0 * 1_048_576.0,
+                // 6 MiB/h, not the 2 this started at, and the change is a
+                // concession rather than a tuning (D-098). §10 and §11 both put
+                // the residual noise in these floors at a standard error near
+                // 3 MiB/h, so a one-hour run can only ever mean "no leak much
+                // above about 6". At 2 the gate was asserting a resolution it
+                // does not have, and it failed three hours on noise — §11 at
+                // +4.28 against a twin at −7.29, §12 at +2.84, §15 at +2.02 —
+                // each of which had to be read against its twin by hand before
+                // it could be dismissed.
+                //
+                // **What this gives up:** the 2 MiB/h limit was calibrated to
+                // catch a 64 B/message leak at 10 msg/s, which is 2.2 MiB/h.
+                // A one-hour run no longer catches that, and never really did
+                // on real floors — `harness_selftest.rs` still proves the
+                // algorithm catches it, because its synthetic floors are far
+                // quieter than a container's. Catching 64 B/message needs a
+                // longer judged run, whose slope has a smaller standard error,
+                // or a quieter series than cgroup anon: D-092's `je_allocated`
+                // is that series, and §15 is where the case for gating on it
+                // is set out.
+                6.0 * 1_048_576.0,
                 "MiB/h",
             ),
             ("fds", series(&samples, |s| s.fds as f64), 1.0, "fds/h"),

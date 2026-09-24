@@ -195,7 +195,18 @@ fn series(base_mib: f64, slope_mib_per_hour: f64) -> Vec<(f64, f64)> {
         .collect()
 }
 
+/// The limit `tests/soak.rs` actually judges `anon` against (D-098). Mirrored
+/// here so that "the gate the soak runs" is what these tests exercise; a copy
+/// that drifted would prove the algorithm and say nothing about the soak.
 fn soak_limits() -> Limits {
+    Limits {
+        slope_per_hour: 6.0 * MIB,
+    }
+}
+
+/// The limit the gate was originally calibrated against, kept so the property
+/// below can still be stated. See [`a_leak_just_over_the_limit_is_caught`].
+fn calibration_limits() -> Limits {
     Limits {
         slope_per_hour: 2.0 * MIB,
     }
@@ -233,14 +244,37 @@ fn a_flat_bursty_series_is_not_a_leak() {
 }
 
 #[test]
-fn a_planted_leak_just_over_the_threshold_is_caught_in_one_hour() {
-    // The calibration target, exactly: a 64 B/message leak at 10 msg/s is
-    // 2.2 MiB/h, over the one-hour nightly run. This is the case a fixed quartile
-    // gate got wrong — see leak.rs — so it is planted at that rate, not at some
-    // larger, easier one.
+fn a_leak_just_over_the_limit_is_caught() {
+    // The property that matters about the algorithm: a leak only just over
+    // whatever limit it is given still clears both gates. This is the case a
+    // fixed quartile gate got wrong — see leak.rs — so it is planted just over,
+    // not at some larger, easier rate. Stated at both limits the repository
+    // uses, because it is a property of the algorithm and not of either number.
+    for (limit, planted) in [(calibration_limits(), 2.2), (soak_limits(), 6.6)] {
+        let v = verdict(&series(200.0, planted), 600.0, 300.0, limit);
+        assert!(v.leaking, "planted {planted} MiB/h: {v:?}");
+        assert!((v.slope_per_hour / MIB - planted).abs() < 0.3, "{v:?}");
+    }
+}
+
+#[test]
+fn the_soaks_limit_no_longer_catches_a_64_byte_per_message_leak_in_an_hour() {
+    // D-098, stated as a test so it cannot be forgotten: 64 B/message at
+    // 10 msg/s is 2.2 MiB/h, which was the 2 MiB/h limit's calibration target
+    // and is **below** the 6 MiB/h the soak now judges against. An hour will
+    // not catch it, and this asserts that plainly rather than leaving the
+    // concession in a comment.
+    //
+    // It was never caught on real floors either — §10 and §11 put their noise
+    // at a standard error near 3 MiB/h, three times the signal. What changed is
+    // that the gate no longer claims otherwise. The remedy is a longer judged
+    // run or a quieter series (D-092's `je_allocated`), not a lower limit.
     let v = verdict(&series(200.0, 2.2), 600.0, 300.0, soak_limits());
-    assert!(v.leaking, "{v:?}");
-    assert!((v.slope_per_hour / MIB - 2.2).abs() < 0.3, "{v:?}");
+    assert!(!v.leaking, "{v:?}");
+    assert!(
+        (v.slope_per_hour / MIB - 2.2).abs() < 0.3,
+        "the leak is there: {v:?}"
+    );
 }
 
 #[test]

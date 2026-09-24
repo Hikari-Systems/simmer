@@ -4244,6 +4244,88 @@ arrives in a shape the controller handles well. The learned base rejected above
 is the answer if it does not.
 
 
+### D-098 — The soak's `anon` gate goes to 6 MiB/h, which is what it can actually resolve
+
+> **Settled 2026-09-24 by the spec's author**, who asked for the limit to be
+> raised because "that gate keeps flapping". The number asked for was 2.5; the
+> evidence said 2.5 would clear one of the three failures on record and leave
+> the other two red, and 6 was taken instead.
+
+**The problem.** `tests/soak.rs` judged the cgroup `anon` series at 2 MiB/h.
+Three hours failed it on noise:
+
+| | slope | quartile step | its twin |
+|---|---:|---:|---:|
+| `docs/SOAK.md` §11 | +4.28 MiB/h | +2.64 MiB | −7.29 MiB/h |
+| §12 | +2.84 MiB/h | +1.42 MiB | flat |
+| §15 | +2.02 MiB/h | +2.29 MiB | −1.88 MiB/h |
+
+In every one, the twin instance — carrying an identical stream through
+identical code — ran flat or downwards, and the series both slopes were fitted
+through swung by 40 MiB or more. Each failure had to be read against its twin by
+hand before it could be dismissed, and a gate that needs that is not a gate.
+
+**The limit was asserting a resolution the measurement does not have.** §10
+established, and §11 restated, that the residual noise in these floors puts the
+slope's standard error near **3 MiB/h** — so a "no leak" verdict from a one-hour
+run has only ever meant *"no leak much above about 6 MiB/h"*. Judging at 2 was
+therefore judging inside the error bar. 6 is the figure §10 and §11 already
+derived; this change adopts it rather than inventing one.
+
+**Why not 2.5, which is what was asked for.** It clears §15 and leaves §11 and
+§12 failing, so the flapping continues — and it is precisely the move §11
+declined: *"the limit was not adjusted to make this run pass, and the remedies
+remain §10's: a longer judged run, or a quieter series than cgroup anon."*
+Moving the limit to just above the run in hand is tuning to the sample. Moving
+it to the measurement's resolution is not, and it is defensible without knowing
+which hour prompted it.
+
+**What this gives up, stated plainly.** The 2 MiB/h limit was calibrated against
+a concrete leak: **64 bytes per message at 10 msg/s is 2.2 MiB/h**, and
+`tests/harness_selftest.rs` planted exactly that rate rather than a larger,
+easier one. A one-hour run no longer catches it. That is a real loss of
+sensitivity and should not be dressed up as a free win.
+
+It is, though, a loss of *claimed* sensitivity rather than actual: at a standard
+error near 3 MiB/h, a 2.2 MiB/h leak was already inside the noise on real
+floors, and the self-test only caught it because its synthetic floors are far
+quieter than a container's — which §11 had already noticed ("the real floors are
+noisy, and the self-test's are not"). The gate was failing on noise *and* would
+not reliably have caught the thing it was calibrated for. What changes here is
+that it stops claiming otherwise.
+
+`harness_selftest.rs` now states both halves as tests:
+`a_leak_just_over_the_limit_is_caught` proves the algorithm still clears both
+gates for a leak just over whatever limit it is given, at 2.2 against the old
+limit and 6.6 against the new one; and
+`the_soaks_limit_no_longer_catches_a_64_byte_per_message_leak_in_an_hour`
+asserts the concession directly, so it cannot quietly be forgotten.
+
+**What the gate is now.** A gross-leak tripwire. It still catches the planted
+50 MiB/h case, and it still catches anything that would exhaust a container.
+It is not a leak detector, and the two remedies for that remain the ones §10
+named:
+
+- **A longer judged run.** The slope's standard error falls with the span, so a
+  run of several hours resolves what one cannot. Nothing in the harness needs
+  changing; `SOAK_DURATION` is already the knob.
+- **A quieter series.** D-092 built exactly this and deliberately left the
+  decision open: *"which to gate on, and at what limit, is a decision the data
+  exists to inform."* There are now three hours of it. `je_allocated` — what the
+  program holds, as against the pages jemalloc keeps — ran at **+0.39, +0.38 and
+  +0.39 MiB/h** across them, a series whose scatter is in the hundredths where
+  `anon`'s is in the tens. Gating on it at something near 1 MiB/h would restore
+  the 64 B/message sensitivity and more. It is not done here because it is a
+  second decision, it costs every soak run the `alloc-stats` feature, and with
+  the feature off there would be no counters and so no gate at all. `SOAK.md`
+  §15 sets out the case.
+
+**Tested:** `tests/harness_selftest.rs` (32 cases, the two above among them).
+The change is a constant; what needed proving was that the algorithm is
+unchanged and that the concession is real, and both are now assertions rather
+than prose.
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

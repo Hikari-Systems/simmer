@@ -1781,6 +1781,13 @@ thread and task counts they started with, with no unaccounted descriptors.
 
 #### The one gate that failed: `app`'s `anon`, and it is §12's failure again
 
+> **Since retired as a failure (D-098).** This was the third hour the 2 MiB/h
+> limit failed on noise, and it prompted raising the limit to **6 MiB/h** — what
+> §10 and §11 had already established a one-hour run can resolve. Re-judged at 6,
+> this hour passes every gate. What follows is what the run reported at the time,
+> and the reasoning that made the limit change the right answer rather than a
+> tuning.
+
 `app` failed `anon` at **+2.02 MiB/h** with a quartile step of +2.29 MiB, while
 `app2` — running the identical path against the identical stream — came in at
 **−1.88 MiB/h**. The series both slopes are fitted through:
@@ -1830,4 +1837,43 @@ and a repeat that lands near it is the confirmation this hour cannot give.
 
 The controller's dynamics, for the reason given above — a share clamped at its
 ceiling exercises the arithmetic and the read, not the feedback. The `-mssql`
-build's run of it. And any memory verdict at all, at this gate's resolution.
+build's run of it. And any memory verdict at all, at this gate's resolution —
+which is now what the gate itself says, rather than something a reader had to
+find in §10.
+
+---
+
+### The case for gating on `je_allocated` (open)
+
+D-098 raised `anon` to 6 MiB/h because that is what it resolves, and said
+plainly what that gives up: a 64 B/message leak at 10 msg/s is 2.2 MiB/h and a
+one-hour run no longer catches it. The way to get that sensitivity back is not a
+lower limit on a noisy series but a gate on a quiet one, and D-092 built the
+instrument for it and deliberately left the decision open — *"which to gate on,
+and at what limit, is a decision the data exists to inform."*
+
+Three hours of that data now exist:
+
+| | `je_allocated` slope | `anon` slope, same hour |
+|---|---:|---:|
+| §13, `app` | +0.39 MiB/h | — |
+| §13, `app2` | +0.38 MiB/h | — |
+| §14 | +0.39 MiB/h | — |
+
+Scatter in the hundredths, against an `anon` series that swings between 4.5 and
+63 MiB in a single hour. §13 measured `je_allocated` climbing 1.582 → 1.754 MiB
+over its hour and tracking F7's unmatched-sender series at r = 0.979 — which is
+the point: on that series a real, small, explicable growth is *visible*, and
+gating near 1 MiB/h would restore the 64 B/message sensitivity and better.
+
+**What stops it being done today,** and what a decision would have to settle:
+
+- Every soak run would need `SIMMER_CARGO_FEATURES=alloc-stats`, and D-092 is
+  explicit that jemalloc's `stats` changes the allocator — so a gated run
+  measures a slightly different binary from the one that ships.
+- With the feature off there are no counters and so no gate. Either `anon`
+  stays as the fallback (two gates, two limits, one of them usually skipped) or
+  the soak refuses to run without the feature.
+- The limit itself. +0.39 MiB/h is F7, which is known, bounded by D-093's idle
+  expiry, and not a defect. A gate at 1 MiB/h passes it; a gate at 0.25 would
+  not. Picking the number means deciding what counts as F7's ceiling.
