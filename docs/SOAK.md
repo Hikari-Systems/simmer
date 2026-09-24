@@ -1698,3 +1698,136 @@ not traced.
   need an hour.
 - **The published binary.** As in §13, the counters need `alloc-stats`, which no
   published image has.
+
+---
+
+## 15. The computed share (D-097), on — `share: {mode: auto}` for an hour
+
+The first soak with D-097's controller. §12 ran the partial ramp at a **listed**
+`share: [0.5]`; this hour runs the same gate at the same fraction through the
+**computed** path, so the two are directly comparable and the difference between
+them is the new code and nothing else.
+
+### What was changed, and how to repeat it
+
+Four lines in `test/config/simmer.soak.yaml`, **reverted after the run** for
+§12's reason — the standard soak has to stay comparable with every hour above:
+
+```yaml
+  - name: warming-newbrand
+    warmup:
+      schedule:
+        default: [100000000]
+        share:
+          mode: auto
+          ceiling: 0.5
+```
+
+**Why the ceiling pins it, and why that is the point.** The allowance above
+cannot be met in a run — the soak's own soundness check requires that, since a
+route that exhausted its allowance would leave the rest of the hour measuring
+overflow. So `c` sits at 1 throughout, the ratio is above the ceiling at every
+sample, and the controller is clamped at 0.5 from the first message to the last.
+That is a *fixed* share of 0.5 reached through D-097's arithmetic, which is
+exactly what makes it a controlled comparison with §12.
+
+So this hour measures the auto path's **cost and agreement** — whether the extra
+non-locking read of the quota row on every message shows up in memory, in
+latency, or in the two instances disagreeing. It does **not** measure the
+controller's dynamics: the share moving as the cap fills, the window closing,
+the tail releasing. Those need a cap that can be met, which this tier cannot
+have. `tests/auto_share.rs` is where they are measured, against a cap of 40 on
+the acceptance stack's two mail traps.
+
+`SIMMER_WARMUP_STARTED` was set to an hour before the run, and `/routes` on both
+instances was read before the first message: both reported `day_index 0` and
+`partial_ramp: {mode: "auto", today: null, auto: {ceiling: 0.5, …}}`, with
+`partial_ramp_share: 0.5` on the `catchall` window. §12's trap — a stale config
+in the volume, or a day index past the end of a list — is checked the same way,
+and the `stress-config` image was rebuilt before the stack came up.
+
+### The hour — 2026-09-24, 09:12–10:13 UTC
+
+| | `app` | `app2` |
+|---|---:|---:|
+| messages | 36,010 | 36,010 |
+| accepted | 36,010 | 36,010 |
+| deferred / refused / transport | 0 / 0 / 0 | 0 / 0 / 0 |
+| sustained rate | 10.00 msg/s | 10.00 msg/s |
+| offered, and delivered on it | 17,282 | 17,084 |
+| turned away (`reason="partial_ramp"`) | 16,927 | 17,125 |
+| decisions | 34,209 | 34,209 |
+| **share offered** | **50.52%** | **49.94%** |
+| p50 / p90 / p99 | 7.8 / 37.2 / 47.9 ms | 8.3 / 38.9 / 51.6 ms |
+| messages over 200 ms | 3 | 2 |
+| `fds` | +0.00/h | +0.00/h |
+| `threads` | +0.00/h | +0.00/h |
+| at rest | threads 3 (3 before), tasks 11 (11 before), 0 unaccounted fds | same |
+
+**The share is what the controller computed, on both instances.** 50.52% and
+49.94% over 34,209 decisions each, against §12's 49.45% and 50.34% over the same
+34,209 at a listed 0.5. Both instances reported `simmer_partial_ramp_share` of
+exactly 0.5 throughout, and — the part that matters for a value read from shared
+state — **they never disagreed**: `simmer_quota_committed` for the route was
+34,366 on both, which is `17,282 + 17,084` exactly. The row the two instances
+share equals the sum of what they each delivered, to the message.
+
+**The extra read costs nothing a soak can see.** 3 and 2 messages over 200 ms,
+against §12's 0 and 0, §13's 4 and 5, and §14's 9 and 7 — the *lowest* tail
+since §12, on a path that now reads one more row per message per warming route.
+p99 is 47.9 and 51.6 ms, within the band every hour above sits in. Descriptors
+and threads are flat to two decimal places, and both instances returned to the
+thread and task counts they started with, with no unaccounted descriptors.
+
+#### The one gate that failed: `app`'s `anon`, and it is §12's failure again
+
+`app` failed `anon` at **+2.02 MiB/h** with a quartile step of +2.29 MiB, while
+`app2` — running the identical path against the identical stream — came in at
+**−1.88 MiB/h**. The series both slopes are fitted through:
+
+| | `app` | `app2` |
+|---|---:|---:|
+| minimum | 4.53 MiB | 4.53 MiB |
+| maximum | 58.95 MiB | 63.43 MiB |
+| at 5 min | 27.10 MiB | 55.61 MiB |
+| at 30 min | 17.48 MiB | 17.68 MiB |
+| at 60 min | 24.05 MiB | 20.76 MiB |
+
+A series that swings by 40 MiB is not one a 2 MiB/h trend can be read out of.
+This is §12's failure in every particular except which instance drew the short
+straw, and §12 already established what it is: *"a standard error near 3 MiB/h,
+so a one-hour run gives no memory verdict either way"*. D-092 then settled what
+the swing is made of — simmer's live heap is 1.5–2.0 MiB and nearly flat, while
+`anon` and `je_resident` swing between about 8 and 70 MiB as jemalloc holds and
+returns pages.
+
+**Two things make it very unlikely to be D-097's read.** `app2` is never scraped
+(F8), so it is the instance that carries the message path and nothing else — and
+it *shrank*. And the growth D-092 attributes to F7 lands on the scraped instance
+by construction: this hour's metric series went from 236 to 1,882, 1,797 of them
+unmatched-sender, which is the XFAIL below and D-093's subject.
+
+**It is not a clean bill, and should not be read as one.** No sample carried
+jemalloc's counters — this hour was built without `alloc-stats` — so the live
+heap was not measured, and this run cannot separate held bytes from retained
+pages by itself. It rests on `app2`'s sign and on §13 having answered the same
+question for the same series. D-092's instrument is what would settle it: an
+hour with `SIMMER_CARGO_FEATURES=alloc-stats` and `SIMMER_ALLOC_STATS_FILE` set,
+reading `je_allocated` rather than `anon`. §13 measured F7 there at +0.39 MiB/h,
+and a repeat that lands near it is the confirmation this hour cannot give.
+
+#### What else the hour reported
+
+- **XFAIL F7** — metric series 236 → 1,882 (unmatched-sender 151 → 1,797) over
+  55 minutes. Expected, known, D-093's subject, and unrelated to this change.
+- **V4 (F2)** — 220 accepted and 11 cut by the session timeout on each instance,
+  `reservations_in_flight` 0 after the drain on both, at most 2 reservation rows
+  across 121 samples, and the sweeper clearing the stranded ones. The cancelled
+  relay's ledger is unaffected by the share, as it should be: the gate runs
+  before the reservation, so a message it turns away never reaches the row.
+
+#### What this hour did not establish
+
+The controller's dynamics, for the reason given above — a share clamped at its
+ceiling exercises the arithmetic and the read, not the feedback. The `-mssql`
+build's run of it. And any memory verdict at all, at this gate's resolution.

@@ -205,6 +205,29 @@ planted `unsafe` block. An hour's soak with the counters on (SOAK.md §13) ran
 before the release; a 30-minute metrics-off soak was running when it was tagged,
 and is recorded in SOAK.md when complete. **Not run:** the acceptance tier.
 
+**For D-097 (`share: auto`), on the default build against Postgres in the
+development jail:** the full suite at **1,238 passed, 0 failed**, with `cargo
+clippy --all-targets` and `cargo fmt --check` clean. New: `src/routing/partial.rs`'s
+8 unit tests for the controller as arithmetic (both clamps as plateaus, the tail
+release, the window overstating the share, and no degenerate row producing a
+`NaN`), `src/quota/day.rs`'s `fraction_through_day`, 11 §4.2 cases in
+`tests/config_validation.rs`, 7 more in `tests/partial_ramp.rs` through the real
+walk, and 4 in `src/admin/view.rs` for what §9.2 reports. **The mail-trap tier is
+new** (`tests/auto_share.rs` on the acceptance stack, `test/config/simmer.autoshare.yaml`):
+3 tests, all passing, walking one ramp day in five readings against two real
+Mailpit mailboxes — the cap met exactly and never exceeded, nothing dropped at
+any reading, and the throttled route taking less of a burst than the same route
+after `POST /graduate`. **An hour's soak** (`docs/SOAK.md` §15) offered 50.52%
+and 49.94% of the route's traffic on the two instances at a clamped share of 0.5,
+delivered all 72,020 messages, and added no latency the tier can see. **Not
+established:** any memory verdict — the `anon` gate failed on the scraped
+instance at +2.02 MiB/h against −1.88 on the unscraped one, which is §12's
+failure again and, per §12, below this gate's resolution; no sample carried
+jemalloc's counters, so the live heap was not measured. **Not run:** the
+acceptance tier (it cannot run from the jail), the `-mssql` build's run of the
+trap tier, and the controller's *dynamics* under a soak — the soak's allowance
+cannot be met, so the share was clamped at its ceiling for the hour.
+
 **For `v0.6.0` (D-091) the full suite was re-run in the development jail on both
 builds:** **1188 passed, 0 failed** on the default
 build against Postgres, and **1037 passed, 0 failed** on the mssql build against

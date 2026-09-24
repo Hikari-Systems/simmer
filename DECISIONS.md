@@ -4209,15 +4209,29 @@ to an operator as a cap short of its schedule on a day whose traffic all arrived
 in the morning, and a test that walks traffic without walking the clock cannot
 see it. `Stack::restart_app_at_elapsed` is what walks the clock.
 
-**The soak was still running when this landed.** An hour at 10 msg/s per
-instance on the two-instance stack, with `share: {mode: auto, ceiling: 0.5}` on
-a route whose allowance cannot be met in a run — so the controller is pinned at
-its ceiling throughout, which is what makes the hour directly comparable to
-`docs/SOAK.md` §12 and §13, both hours at a fixed `share: [0.5]`. What it is
-measuring is the auto path's **cost and agreement**: whether the extra
-non-locking read on every message shows up in memory, in latency, or in the two
-instances disagreeing. Recorded in `docs/SOAK.md` §15 when it completes; until
-that section exists, this decision has no soak evidence behind it.
+**An hour's soak** (`docs/SOAK.md` §15), at `ceiling: 0.5` against an allowance
+too large to meet — so the controller is clamped at its ceiling throughout, which
+makes the hour a controlled comparison with §12's hour at a *listed*
+`share: [0.5]`. Both instances offered the computed share over 34,209 decisions
+each, **50.52% and 49.94%** against §12's 49.45% and 50.34%, and never disagreed:
+`simmer_quota_committed` for the route was 34,366 on both, which is the sum of
+what they each delivered, to the message. 72,020 messages, every one accepted,
+none deferred or refused. The extra read costs nothing the tier can see — 3 and 2
+messages over 200 ms, the lowest tail since §12 and against §13's 4 and 5 and
+§14's 9 and 7 — with descriptors and threads flat and both instances back at the
+thread and task counts they started with.
+
+**The `anon` gate failed on `app` (+2.02 MiB/h), and that is §12's failure
+again.** The never-scraped instance, running the identical path against the
+identical stream, came in at −1.88 MiB/h, and the series both slopes are fitted
+through swings between 4.5 and 63 MiB. §12 established that this gate's standard
+error is near 3 MiB/h and an hour gives no memory verdict either way; D-092
+established that the swing is jemalloc holding and returning pages around a live
+heap of 1.5–2.0 MiB. **It is not a clean bill**: no sample carried jemalloc's
+counters this hour, so the live heap was not measured, and the reading rests on
+the unscraped instance's sign. An hour with `alloc-stats` reading `je_allocated`
+is what would settle it, and §13's +0.39 MiB/h for F7 is the number a repeat
+should land near.
 
 **Not tested here:** the `-mssql` build's own run of the trap tier (the tier is
 Postgres, as the acceptance stack is; the walk is backend-neutral and
