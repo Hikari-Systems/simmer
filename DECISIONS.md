@@ -4185,7 +4185,49 @@ dry run giving the real walk's answer for every recipient); `admin/view.rs`
 (§9.2 reporting the parameters, the per-group share, and nothing at all for a
 graduated route or a route with no ramp).
 
-**Not tested here:** *(to be completed by the compose and soak runs)*
+**And on the mail-trap tier** (`tests/auto_share.rs`, `test/config/simmer.autoshare.yaml`
+— the acceptance stack, two real Mailpit mailboxes, a cap of 40 and `ceiling:
+0.5`): walking one ramp day in five readings, the warming route never carried
+more than its cap, every message it was not offered arrived at the established
+route, nothing was dropped at any reading, and past `fill_by` the cap was met
+exactly. The same burst at the same instant took materially less of the cap
+throttled than after `POST /graduate`, which is the trade D-097 makes, measured.
+`/routes` reported `mode: auto`, a `null` route-level `today`, the parameters,
+and a per-group share that fell as the cap filled and matched what the trap
+held.
+
+**The first version of that suite was wrong, and instructively.** It sent three
+times the cap in one burst an hour into the ramp day and expected the cap to
+fill. It measured 24 of 40, with `/routes` reporting a share of 0.1222 — which
+is the controller working exactly as specified: an hour in, `elapsed` is 1/24,
+so `t'` is 0.93 and `c` at 18 used is 0.55, and `(0.55/0.93)^4` is 0.122. With
+the whole day still ahead, taking the cap at once is precisely the burst D-091
+exists to prevent. **A single early burst does not fill the cap, and is not
+meant to**; what fills it is the day advancing, the window closing and the tail
+releasing. That is the consequence of the `fill_by` bargain above, it is visible
+to an operator as a cap short of its schedule on a day whose traffic all arrived
+in the morning, and a test that walks traffic without walking the clock cannot
+see it. `Stack::restart_app_at_elapsed` is what walks the clock.
+
+**The soak was still running when this landed.** An hour at 10 msg/s per
+instance on the two-instance stack, with `share: {mode: auto, ceiling: 0.5}` on
+a route whose allowance cannot be met in a run — so the controller is pinned at
+its ceiling throughout, which is what makes the hour directly comparable to
+`docs/SOAK.md` §12 and §13, both hours at a fixed `share: [0.5]`. What it is
+measuring is the auto path's **cost and agreement**: whether the extra
+non-locking read on every message shows up in memory, in latency, or in the two
+instances disagreeing. Recorded in `docs/SOAK.md` §15 when it completes; until
+that section exists, this decision has no soak evidence behind it.
+
+**Not tested here:** the `-mssql` build's own run of the trap tier (the tier is
+Postgres, as the acceptance stack is; the walk is backend-neutral and
+`tests/store_conformance/` owns the store). No run has yet exercised the
+controller against a cap being met **by real traffic over real hours** rather
+than by a simulated day — the trap tier moves `warmup.started` to reach a point
+on the day, which is the same mechanism §12.3 uses for the ramp and has the same
+limit: it proves the arithmetic at that point, not that a day's real traffic
+arrives in a shape the controller handles well. The learned base rejected above
+is the answer if it does not.
 
 
 ## Still open — to settle at the start of the phase that needs them
