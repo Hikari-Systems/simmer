@@ -23,6 +23,37 @@ docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile ac
 cargo test --test acceptance -- --ignored --test-threads=1
 ```
 
+**D-097's `share: auto` has its own tier on the same stack** — the traps, the
+loadgen and the certificate are these, and only `app`'s configuration differs
+(`test/config/simmer.autoshare.yaml`, a cap of 40 instead of the ramp's short
+schedule). It is separate because its warming route turns traffic away by
+design, which every assertion in `tests/acceptance.rs` is written against the
+absence of:
+
+```sh
+docker compose -f docker-compose.yml -f test/compose/acceptance.yml \
+  -f test/compose/autoshare.yml --profile acceptance --profile autoshare up -d --build
+cargo test --test auto_share -- --ignored --test-threads=1
+```
+
+It walks the ramp **day** rather than the ramp's days: D-097's share depends on
+how far through the current day the route is, so `Stack::restart_app_at_elapsed`
+moves `warmup.started` by a fraction of a day exactly as
+`restart_app_at_day` moves it by whole ones. A burst at 09:00 and the same burst
+at 21:00 are the same day index and a very different share, and a suite that
+could only reach whole days could not tell them apart.
+
+**From the development jail**, where Docker's published ports are unreachable,
+join the stack's network and name the containers — the same treatment
+`SIMMER_TEST_ADMIN` already gets:
+
+```sh
+docker network connect simmer_default "$(hostname)"
+export SIMMER_TEST_ADMIN=http://simmer-app-1:8080
+export SIMMER_TEST_TRAP_WARMING=http://simmer-trap-warming-1:8025
+export SIMMER_TEST_TRAP_OVERFLOW=http://simmer-trap-overflow-1:8025
+```
+
 Two details the design did not anticipate, both in D-042: every compose
 invocation has to carry `SIMMER_WARMUP_STARTED` or compose quietly resets the ramp
 mid-test, and quota state needs resetting between tests exactly as the traps do.

@@ -61,6 +61,15 @@ pub static ACCEPTANCE: Stack = Stack::new(
     "/app/simmer.acceptance.yaml",
 );
 
+/// D-097's mail-trap tier (`test/compose/autoshare.yml`): the acceptance stack
+/// with `app` running `test/config/simmer.autoshare.yaml`, so the traps measure
+/// a computed share against the same two mailboxes the ramp tests use.
+pub static AUTOSHARE: Stack = Stack::new(
+    &["acceptance", "autoshare"],
+    &["test/compose/acceptance.yml", "test/compose/autoshare.yml"],
+    "/config/simmer.autoshare.yaml",
+);
+
 /// The T2 server matrix (`test/compose/matrix.yml`): the acceptance stack plus
 /// five Postfix variants and a Mailpit trap they all deliver to, with `app`
 /// running `test/config/simmer.matrix.yaml`.
@@ -229,6 +238,35 @@ impl Stack {
             .status()
             .expect("docker compose up");
         assert!(status.success(), "failed to restart app at day {day}");
+    }
+
+    /// Restart `app` a given fraction of the way into day 0 of its ramp.
+    ///
+    /// [`Stack::restart_app_at_day`] walks §7.2's day *index*, which is all a cap
+    /// depends on. D-097's share also depends on how far through the current day
+    /// the route is, and that is a different axis: a burst at 09:00 and the same
+    /// burst at 21:00 are the same day index and a very different share. Moving
+    /// `warmup.started` back by a fraction of a day is how the suite reaches a
+    /// point on it, exactly as moving it back by whole days reaches a day.
+    pub fn restart_app_at_elapsed(&self, fraction: f64) {
+        assert!(
+            (0.0..1.0).contains(&fraction),
+            "a fraction of one day, not {fraction}"
+        );
+        let started = chrono::Utc::now()
+            - chrono::Duration::milliseconds((fraction * 24.0 * 3_600_000.0) as i64);
+        *self.warmup_started.lock().expect("lock") =
+            started.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let status = self
+            .compose()
+            .args(["up", "-d", "--force-recreate", "--wait", "app"])
+            .status()
+            .expect("docker compose up");
+        assert!(
+            status.success(),
+            "failed to restart app at {fraction} through day 0"
+        );
     }
 
     /// One SQL statement against the stack's database, as a command ready to run

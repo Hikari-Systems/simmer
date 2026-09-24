@@ -9,27 +9,49 @@ use std::time::{Duration, Instant};
 /// One Mailpit instance, by the base URL of its API.
 #[derive(Clone, Copy, Debug)]
 pub struct Trap {
-    pub base: &'static str,
+    /// The published loopback port, which is what a developer's machine reaches.
+    default: &'static str,
+    /// The variable that overrides it, for a runner that cannot reach a
+    /// published port — the development jail, where Docker's published ports are
+    /// unreachable and the way in is the container name on the compose network:
+    ///
+    /// ```sh
+    /// docker network connect simmer_default "$(hostname)"
+    /// SIMMER_TEST_TRAP_WARMING=http://simmer-trap-warming-1:8025 \
+    /// SIMMER_TEST_TRAP_OVERFLOW=http://simmer-trap-overflow-1:8025 ...
+    /// ```
+    ///
+    /// The same treatment `SIMMER_TEST_ADMIN` already gives the admin API
+    /// (`tests/compose/admin.rs`), and for the same reason.
+    env: &'static str,
 }
 
 /// The acceptance stack's two traps (`docker-compose.yml`).
 pub const WARMING: Trap = Trap {
-    base: "http://127.0.0.1:18025",
+    default: "http://127.0.0.1:18025",
+    env: "SIMMER_TEST_TRAP_WARMING",
 };
 pub const OVERFLOW: Trap = Trap {
-    base: "http://127.0.0.1:18026",
+    default: "http://127.0.0.1:18026",
+    env: "SIMMER_TEST_TRAP_OVERFLOW",
 };
 
 /// The T2 matrix's trap, which every Postfix variant relays into
 /// (`test/compose/matrix.yml`).
 pub const MATRIX: Trap = Trap {
-    base: "http://127.0.0.1:18027",
+    default: "http://127.0.0.1:18027",
+    env: "SIMMER_TEST_TRAP_MATRIX",
 };
 
 /// Mailpit's page size here. The API caps a page, so every listing pages.
 const PAGE: usize = 250;
 
 impl Trap {
+    /// Where this trap's API is, for this runner.
+    pub fn base(self) -> String {
+        std::env::var(self.env).unwrap_or_else(|_| self.default.to_string())
+    }
+
     /// Delete everything, and assert it is gone. `ACCEPTANCE.md` §6: reset
     /// between runs, or one run's assertions see the previous run's mail.
     pub fn reset(self) {
@@ -38,16 +60,16 @@ impl Trap {
                 "-sf",
                 "-X",
                 "DELETE",
-                &format!("{}/api/v1/messages", self.base),
+                &format!("{}/api/v1/messages", self.base()),
             ])
             .output()
             .expect("curl");
-        assert!(out.status.success(), "failed to reset {}", self.base);
-        assert_eq!(self.count(), 0, "{} did not reset", self.base);
+        assert!(out.status.success(), "failed to reset {}", self.base());
+        assert_eq!(self.count(), 0, "{} did not reset", self.base());
     }
 
     pub fn count(self) -> usize {
-        let v = json(&get(&format!("{}/api/v1/messages?limit=1", self.base)));
+        let v = json(&get(&format!("{}/api/v1/messages?limit=1", self.base())));
         v["total"].as_u64().expect("total") as usize
     }
 
@@ -89,7 +111,7 @@ impl Trap {
         loop {
             let v = json(&get(&format!(
                 "{}/api/v1/messages?start={}&limit={PAGE}",
-                self.base,
+                self.base(),
                 ids.len()
             )));
             let page = v["messages"].as_array().expect("messages");
@@ -110,7 +132,7 @@ impl Trap {
     pub fn raw_messages(self) -> Vec<String> {
         self.message_ids()
             .iter()
-            .map(|id| get(&format!("{}/api/v1/message/{id}/raw", self.base)))
+            .map(|id| get(&format!("{}/api/v1/message/{id}/raw", self.base())))
             .collect()
     }
 
@@ -119,7 +141,7 @@ impl Trap {
     pub fn raw_bytes(self) -> Vec<Vec<u8>> {
         self.message_ids()
             .iter()
-            .map(|id| get_bytes(&format!("{}/api/v1/message/{id}/raw", self.base)))
+            .map(|id| get_bytes(&format!("{}/api/v1/message/{id}/raw", self.base())))
             .collect()
     }
 
@@ -129,7 +151,7 @@ impl Trap {
         self.message_ids()
             .iter()
             .map(|id| {
-                let v = json(&get(&format!("{}/api/v1/message/{id}", self.base)));
+                let v = json(&get(&format!("{}/api/v1/message/{id}", self.base())));
                 v["ReturnPath"].as_str().unwrap_or_default().to_string()
             })
             .collect()
@@ -141,9 +163,9 @@ impl Trap {
         self.message_ids()
             .iter()
             .map(|id| {
-                let v = json(&get(&format!("{}/api/v1/message/{id}", self.base)));
+                let v = json(&get(&format!("{}/api/v1/message/{id}", self.base())));
                 let return_path = v["ReturnPath"].as_str().unwrap_or_default().to_string();
-                let raw = get(&format!("{}/api/v1/message/{id}/raw", self.base));
+                let raw = get(&format!("{}/api/v1/message/{id}/raw", self.base()));
                 (return_path, raw)
             })
             .collect()

@@ -136,6 +136,26 @@ routes:
       started: "${SIMMER_WARMUP_STARTED}"
       schedule:
         default: [100000000]
+        # D-097's computed share, on the soak's terms.
+        #
+        # The allowance above cannot be met in a run (the soak's own soundness
+        # check requires that: a route that exhausted its allowance would leave
+        # the rest of the run measuring overflow), so `c` sits at 1 and the
+        # controller is pinned at its ceiling for the whole hour. That is
+        # deliberate, and it is what makes the run *comparable*: SOAK.md §12 and
+        # §13 are hours at a fixed `share: [0.5]`, so this is the same gate at
+        # the same fraction, reached by the new code path — including its extra
+        # non-locking read of the quota row on every message.
+        #
+        # What the soak is therefore measuring is the auto path's **cost and
+        # agreement**: whether the added read shows up in memory, in latency or
+        # in the two instances disagreeing. The controller's *dynamics* — the
+        # share moving as the cap fills, the window closing, the tail releasing
+        # — cannot be seen against an allowance this size, and are the mail-trap
+        # tier's job (`tests/auto_share.rs`), where the cap is 40.
+        share:
+          mode: auto
+          ceiling: 0.5
 
   # V4's route (F2). A warming route, because a reservation with a ledger behind
   # it is what a cancelled relay strands; a pool of its own, because the sink

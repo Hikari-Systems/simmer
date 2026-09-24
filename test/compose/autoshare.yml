@@ -1,0 +1,39 @@
+# D-097's mail-trap tier: the acceptance stack, with `app` running
+# `test/config/simmer.autoshare.yaml` instead of the image's acceptance config.
+#
+#   docker compose -f docker-compose.yml -f test/compose/acceptance.yml \
+#     -f test/compose/autoshare.yml --profile acceptance --profile autoshare \
+#     up -d --build
+#   cargo test --test auto_share -- --ignored --test-threads=1
+#
+# `tests/compose/stack.rs`'s AUTOSHARE builds every command with both files, so
+# a test cannot forget either.
+#
+# The only thing this file adds is the config volume: the traps, the loadgen,
+# the certificate and the trust store all come from the acceptance profile,
+# which is the point — a difference in a trap is then a difference the share
+# made, and not a difference in the stack.
+#
+# An image populating a named volume rather than a bind mount, for the reason
+# `test/config/Dockerfile` gives: a bind mount of a host path silently mounts
+# empty under a sandboxed Docker daemon, and the tier then fails with a missing
+# config rather than a clear error.
+
+services:
+  app:
+    volumes:
+      - autoshare-config:/config:ro
+    depends_on:
+      autoshare-config:
+        condition: service_completed_successfully
+
+  autoshare-config:
+    profiles: ["autoshare"]
+    build:
+      context: .
+      dockerfile: test/config/Dockerfile
+    volumes:
+      - autoshare-config:/config
+
+volumes:
+  autoshare-config:
