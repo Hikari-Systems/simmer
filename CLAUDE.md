@@ -27,7 +27,9 @@ lists), after O-16 was, and the same day's for thread affinity (§3.2 step 2a,
 lists), after O-17 was. And the same day's for the partial ramp (§3.2 step 3c′,
 §7.2, and the sections D-091 lists), which the author asked for directly. And the
 2026-09-23 one for the end-of-data rule (§5.5, §9.1 and §10.3), after O-18 was —
-see D-095.
+see D-095. And the 2026-09-24 one for named ramps (§3.4 and §5.8, new, and the
+sections D-099 lists), which the author asked for directly; it re-defers O-14 and
+O-15 explicitly.
 
 ## The four things that will bite you
 
@@ -125,7 +127,11 @@ present this identity?" and can only refuse; nothing it knows reaches
 `routing::`. If a grant ever picked a chain, the outbound identity would depend on
 who authenticated, which no application-side config can express. There is a test
 that two users granted one identity produce byte-identical output — keep it
-passing. Alongside it, the `STARTTLS` injection check in `session::starttls` is the
+passing. **One amended exception** (D-099, §5.3): `grants.ramps` decides whether
+an `X-Simmer-Ramp` header is honoured, and so which *ramp* a message is routed
+in. It is not part of the ACL — it never refuses, a header it does not permit is
+ignored — and within a ramp the rule above holds unchanged. Do not widen it into
+anything that picks a chain or a route. Alongside it, the `STARTTLS` injection check in `session::starttls` is the
 **one** place the pipelining rule above is overridden: bytes buffered behind
 `STARTTLS` drop the connection rather than being answered. Do not "fix" it to keep
 the session in step, and do not reset `auth_failures` in the handshake reset

@@ -52,6 +52,12 @@ Two constraints follow, both testable:
 A route that happens to emit the identity it received still counts against quota. Warming
 applies to the domain, not to whether Simmer altered the message.
 
+The invariant holds per ramp (§3.4). Selecting a ramp by listener leaves nothing in the
+message. Selecting one by `X-Simmer-Ramp` (§5.8) leaves a header in the *application's*
+output, which Simmer always strips (§6.5), so it never reaches the downstream under either
+arrangement. After cutover the application drops it, or keeps sending it to nothing.
+*(Added. See `DECISIONS.md` D-099.)*
+
 ---
 
 ## 2. Scope
@@ -72,6 +78,9 @@ applies to the domain, not to whether Simmer altered the message.
   messages to one upstream (§5.7). *(Added. See `DECISIONS.md` D-083.)*
 - Optional thread affinity: an outbound reply into a conversation Simmer started leaves via the
   route that started it (§3.2 step 2a). *(Added. See `DECISIONS.md` D-090.)*
+- Several named ramps in one process, each an isolated routing profile, selected per message by
+  the listener it arrived on or by an `X-Simmer-Ramp` header (§3.4, §5.8). *(Added. See
+  `DECISIONS.md` D-099.)*
 
 ### 2.2 Explicitly out of scope
 
@@ -124,6 +133,10 @@ Neither is fixed by a lock, and neither is a quota-overshoot window:
    values, whichever writes the day's first row sets that day's ceiling and the other
    silently honours it. Either roll with an unchanged `routes:` block, or accept that a
    schedule change takes effect on the next day boundary after the roll rather than the first.
+   The same holds for everything that selects a ramp (§5.8): the `ramps:` blocks themselves,
+   listener `ramp` and `header_overrides_affinity`, and `grants.ramps`. Two instances that
+   disagree about any of them can send the same message under two identities depending on
+   which one took it. *(Widened. See `DECISIONS.md` D-099.)*
 2. **The §7.3 recipient-frequency bound.** The count is read outside the reservation
    transaction (D-049), so `C` concurrent sends that all read before any commits can take a
    window to `threshold + (C - 1)`. This is a documented property, not a defect: §7.3 is a
@@ -132,6 +145,12 @@ Neither is fixed by a lock, and neither is a quota-overshoot window:
    it.
 
 *(Added — see `docs/MULTI_INSTANCE.md`, which measures both.)*
+
+**The upgrade that introduced ramps is stop-the-world.** It rekeys every quota table by ramp
+(§11), and a pre-ramp instance against the migrated schema fails every reservation (§7.5's
+`451`) rather than miscounting. Stop every old instance, start one new instance, which migrates
+and adopts the old state into `default_ramp`, then start the rest. There is no downgrade path.
+*(Added. See `DECISIONS.md` D-099.)*
 
 **The link proxy is the one listener reached from an untrusted network**, and only indirectly.
 Recipients click tracking and unsubscribe links from anywhere, so §5.7's listener sits behind
@@ -172,14 +191,21 @@ heuristic grouping. A group whose domain list contains `*` is the catch-all and 
 *(Amended — was "a named list of literal recipient domains … no MX-based or heuristic
 grouping". See `DECISIONS.md` D-100.)*
 
+**Ramp** — a named, complete routing profile: its own domain groups, sender rules, default
+chain, routes and their schedules (§3.4). Every message is routed within exactly one ramp,
+chosen before §3.2 runs (§5.8). *(Added. See `DECISIONS.md` D-099.)* Not to be confused with the
+**partial ramp** (§7.2) or the **ramp day** (the `day_index`), both of which describe the
+warm-up schedule of one route, and keep that meaning.
+
 ### 3.2 Selection algorithm
 
-Given an accepted message with a resolved incoming identity:
+Given an accepted message with a resolved incoming identity, within the ramp §5.8 selected
+for it — every rule, group, chain and route below is that ramp's:
 
 1. **Match the sender rule.** First matching rule in configuration order wins (see §5.4). If
    no rule matches, the message is routed **directly to the overflow route** of a designated
    default chain; emit a `WARN` log and increment
-   `simmer_unmatched_sender_total{domain}`. If `strict_senders: true`, reject instead with
+   `simmer_unmatched_sender_total{ramp,domain}`. If `strict_senders: true`, reject instead with
    `550 5.7.1 sender domain not configured`.
 2. **Resolve the recipient's domain group.** Exact, case-insensitive match of the recipient
    domain against each group's domain list. Failing that, and only if some group lists `mx`
@@ -206,8 +232,8 @@ Given an accepted message with a resolved incoming identity:
    b. If the route has a `recipient_frequency` constraint and this recipient is at or over
       threshold within the window, skip. Evaluated **first** — it can eliminate routes outright.
    c′. If the route's `warmup.schedule.share` is below 1 right now (§7.2) and this message
-      is not in it, skip. Membership is a keyed hash of the normalised recipient, the route
-      and the day index under the §7.3 salt — deterministic, so every instance and §9.4's dry
+      is not in it, skip. Membership is a keyed hash of the normalised recipient, the ramp,
+      the route and the day index under the §7.3 salt — deterministic, so every instance and §9.4's dry
       run give the same answer. *(Added. See `DECISIONS.md` D-091.)* Under `mode: auto` the
       share itself is computed from the day's usage row and the clock, so the row is read
       — without a lock, and before the reservation — to decide it. *(Added. See
@@ -229,6 +255,31 @@ chain on a connection error, timeout, or downstream rejection. Doing so would si
 message under the wrong identity and corrupt both the ramp accounting and the reputation
 being built. The reservation is released and the client is told (§10.1).
 
+### 3.4 Ramps
+
+*(Added. See `DECISIONS.md` D-099.)*
+
+A ramp is a complete, independent routing profile. Configuration declares one or more under
+`ramps`, keyed by name, and names one of them `default_ramp`. Each carries its own
+`domain_groups`, `senders`, `default_chain`, `strict_senders`, `thread_affinity`,
+`exhausted_chain_reply` and `routes` — everything §3.2 consults — so two ramps can warm two
+unrelated identities on unrelated schedules from different start instants.
+
+**Ramps share nothing.** Route and domain-group names are scoped to their ramp, so two ramps may
+each have a route called `overflow`. Every piece of state is keyed by ramp as well as route:
+quota rows and reservations (§7.1, §7.4), pause, graduation and allowance overrides (§9.3),
+recipient-frequency history (§7.3) and the partial-ramp hash (§7.2). A thread-affinity pin
+(§3.2 step 2a) can only name a route in the selected ramp's chain. Each route has its own
+connection pool (§8.3), so two ramps pointing at one downstream present it with the sum of
+their `max_connections`.
+
+**What is global:** listeners, TLS and authentication (§5), which is what selects a ramp;
+`dot_insensitive_domains` (§7.3), a fact about mailbox providers rather than a routing policy;
+and the §7.3 salt, which is a key, not a history.
+
+A message never changes ramp once selected, and there is no failover between ramps, for §3.3's
+reason.
+
 ---
 
 ## 4. Configuration
@@ -245,7 +296,12 @@ server:
     - address: "127.0.0.1:25"
       auth: required                   # port 25 defaults to optional
     - address: "127.0.0.1:587"         # starttls_required, auth required
+      ramp: main                       # port affinity (§5.8); absent => header or default_ramp
     - address: "127.0.0.1:465"         # implicit TLS, auth required
+    - address: "127.0.0.1:1025"
+      auth: required
+      ramp: partner
+      header_overrides_affinity: true  # default false: the affinity wins over X-Simmer-Ramp
   tls:
     certificate: "/etc/simmer/tls/fullchain.pem"   # leaf first; should cover hostname
     private_key: "/etc/simmer/tls/privkey.pem"     # readable by the container's user
@@ -266,6 +322,7 @@ server:
         password_hash: "${SIMMER_CFAPP_HASH}"   # argon2id; `server hash-password` mints one
         grants:
           send_as: ["oldbrand.com", "*.oldbrand.com", "newbrand.com"]   # §5.3
+          ramps: [main, partner]       # may name these in X-Simmer-Ramp (§5.8); default none
 
 database:
   url: "${DATABASE_URL}"
@@ -295,120 +352,145 @@ link_proxy:                            # optional; absent => no listener (§5.7)
     upstream_response: 30s             # to response headers; 504 after
     idle: 60s
 
-domain_groups:
-  - name: google
-    domains: ["gmail.com", "googlemail.com"]
-    mx: ["google.com", "googlemail.com"]   # optional MX host suffixes (§3.2 step 2)
-  - name: microsoft
-    domains: ["outlook.com", "hotmail.com", "hotmail.co.uk", "live.com", "msn.com"]
-    mx: ["mail.protection.outlook.com", "olc.protection.outlook.com"]
-  - name: yahoo
-    domains: ["yahoo.com", "yahoo.co.uk", "ymail.com", "aol.com"]
-    mx: ["yahoodns.net"]
-  - name: catchall
-    domains: ["*"]                     # exactly one group must contain "*"
+default_ramp: main                     # required; the ramp for a session with no affinity
+                                       # and no usable header (§5.8)
+ramps:                                 # each is a complete, isolated routing profile (§3.4)
+  main:
+    domain_groups:
+      - name: google
+        domains: ["gmail.com", "googlemail.com"]
+        mx: ["google.com", "googlemail.com"]   # optional MX host suffixes (§3.2 step 2)
+      - name: microsoft
+        domains: ["outlook.com", "hotmail.com", "hotmail.co.uk", "live.com", "msn.com"]
+        mx: ["mail.protection.outlook.com", "olc.protection.outlook.com"]
+      - name: yahoo
+        domains: ["yahoo.com", "yahoo.co.uk", "ymail.com", "aol.com"]
+        mx: ["yahoodns.net"]
+      - name: catchall
+        domains: ["*"]                     # exactly one group must contain "*"
 
-senders:
-  - match: "oldbrand.com"              # exact domain
-    match_on: from_header              # from_header | envelope | either
-    chain: [warming-newbrand, overflow-established]
-  - match: "*.oldbrand.com"            # subdomain wildcard
-    match_on: from_header
-    chain: [warming-newbrand, overflow-established]
-  - match: "marketing@newbrand.com"    # full-address match
-    match_on: from_header
-    chain: [warming-newbrand, overflow-established]
-  - match: "newbrand.com"
-    match_on: from_header
-    chain: [warming-newbrand, overflow-established]
+    senders:
+      - match: "oldbrand.com"              # exact domain
+        match_on: from_header              # from_header | envelope | either
+        chain: [warming-newbrand, overflow-established]
+      - match: "*.oldbrand.com"            # subdomain wildcard
+        match_on: from_header
+        chain: [warming-newbrand, overflow-established]
+      - match: "marketing@newbrand.com"    # full-address match
+        match_on: from_header
+        chain: [warming-newbrand, overflow-established]
+      - match: "newbrand.com"
+        match_on: from_header
+        chain: [warming-newbrand, overflow-established]
 
-default_chain: [overflow-established]  # used for unmatched senders unless strict_senders
-strict_senders: false
-thread_affinity: false                 # true: replies stay on the route that started the
-                                       # thread (§3.2 step 2a); every route then needs a
-                                       # Message-ID with its own literal domain (§4.2)
+    default_chain: [overflow-established]  # used for unmatched senders unless strict_senders
+    strict_senders: false
+    thread_affinity: false                 # true: replies stay on the route that started the
+                                           # thread (§3.2 step 2a); every route then needs a
+                                           # Message-ID with its own literal domain (§4.2)
 
-routes:
-  - name: warming-newbrand
-    downstream:
-      host: "smtp.postal.internal"
-      port: 587
-      tls: required_verify             # off | opportunistic | required | required_verify
-      auth:
-        username: "${POSTAL_USER}"
-        password: "${POSTAL_PASS}"
-      pool:
-        max_connections: 4
-        idle_ttl: 60s
-        max_messages_per_connection: 100
-      timeouts:
-        connect: 10s
-        command: 30s
-        data: 120s
-    identity:
-      envelope_from: "bounce@newbrand.com"   # constant. See the note below §4.2
-      set_headers:
-        From: "{{original.from.display_name}} <sales@newbrand.com>"
-        Reply-To: "{{original.from.address}}"
-        Message-ID: "<{{uuid}}@newbrand.com>"
-        List-Unsubscribe: "<mailto:unsub@newbrand.com>, <https://newbrand.com/u/{{uuid}}>"
-        List-Unsubscribe-Post: "List-Unsubscribe=One-Click"
-        X-Simmer-Route: "{{route.name}}"
-        X-Simmer-Correlation-Id: "{{correlation_id}}"
-      unstable_headers: ["Reply-To"]   # migration-only; see §6.6
-      remove_headers: ["Return-Path", "X-Mailer"]
-      body_rewrites:
-        - pattern: 'https://oldbrand\.com/'
-          replacement: "https://newbrand.com/"
-      header_rewrites:                 # §6.2; between remove_headers and set_headers, so a
-        - header: List-Help            # header set_headers also names (List-Unsubscribe
-          pattern: '<https://oldbrand\.com/'   # above) is set, not rewritten
-          replacement: "<https://click.newbrand.com/"
-    preflight:
-      enabled: true
-      spf_include: "spf.postal.internal"
-      dkim_selector: "s1"
-      require_dmarc: true
-    warmup:
-      started: "2026-08-01T09:00:00Z"   # RFC 3339 instant, must be explicit
-      schedule:
-        default: [50, 100, 200, 400, 800, 1500, 3000, 5000]
-        share:   [0.1, 0.25, 0.5]      # optional (§7.2, D-091); every message from day 3
-        # or, computed instead of listed (§7.2, D-097) — every parameter optional:
-        # share:
-        #   mode: auto
-        #   floor:   0.05                # never offer less, until `tail` releases it
-        #   ceiling: 1.0                 # never offer more; the only promise about the peak
-        #   gain:    4.0                 # how sharply it reacts to running ahead of pace
-        #   fill_by: 0.6                 # meet the cap this far through the ramp day
-        #   tail: { below: 0.1, ceiling: 1.0 }   # release the last tenth of the cap
-        overrides:
-          google:    [20, 50, 100, 250, 500, 1000, 2000, 4000]
-          microsoft: [20, 50, 100, 250, 500, 1000, 2000, 4000]
-    recipient_frequency:
-      mode: to_address                 # to_address | to_domain
-      window: { unit: daily, count: 1 } # unit: hourly | daily | weekly
-      threshold: 3
+    routes:
+      - name: warming-newbrand
+        downstream:
+          host: "smtp.postal.internal"
+          port: 587
+          tls: required_verify             # off | opportunistic | required | required_verify
+          auth:
+            username: "${POSTAL_USER}"
+            password: "${POSTAL_PASS}"
+          pool:
+            max_connections: 4
+            idle_ttl: 60s
+            max_messages_per_connection: 100
+          timeouts:
+            connect: 10s
+            command: 30s
+            data: 120s
+        identity:
+          envelope_from: "bounce@newbrand.com"   # constant. See the note below §4.2
+          set_headers:
+            From: "{{original.from.display_name}} <sales@newbrand.com>"
+            Reply-To: "{{original.from.address}}"
+            Message-ID: "<{{uuid}}@newbrand.com>"
+            List-Unsubscribe: "<mailto:unsub@newbrand.com>, <https://newbrand.com/u/{{uuid}}>"
+            List-Unsubscribe-Post: "List-Unsubscribe=One-Click"
+            X-Simmer-Route: "{{route.name}}"
+            X-Simmer-Correlation-Id: "{{correlation_id}}"
+          unstable_headers: ["Reply-To"]   # migration-only; see §6.6
+          remove_headers: ["Return-Path", "X-Mailer"]
+          body_rewrites:
+            - pattern: 'https://oldbrand\.com/'
+              replacement: "https://newbrand.com/"
+          header_rewrites:                 # §6.2; between remove_headers and set_headers, so a
+            - header: List-Help            # header set_headers also names (List-Unsubscribe
+              pattern: '<https://oldbrand\.com/'   # above) is set, not rewritten
+              replacement: "<https://click.newbrand.com/"
+        preflight:
+          enabled: true
+          spf_include: "spf.postal.internal"
+          dkim_selector: "s1"
+          require_dmarc: true
+        warmup:
+          started: "2026-08-01T09:00:00Z"   # RFC 3339 instant, must be explicit
+          schedule:
+            default: [50, 100, 200, 400, 800, 1500, 3000, 5000]
+            share:   [0.1, 0.25, 0.5]      # optional (§7.2, D-091); every message from day 3
+            # or, computed instead of listed (§7.2, D-097) — every parameter optional:
+            # share:
+            #   mode: auto
+            #   floor:   0.05                # never offer less, until `tail` releases it
+            #   ceiling: 1.0                 # never offer more; the only promise about the peak
+            #   gain:    4.0                 # how sharply it reacts to running ahead of pace
+            #   fill_by: 0.6                 # meet the cap this far through the ramp day
+            #   tail: { below: 0.1, ceiling: 1.0 }   # release the last tenth of the cap
+            overrides:
+              google:    [20, 50, 100, 250, 500, 1000, 2000, 4000]
+              microsoft: [20, 50, 100, 250, 500, 1000, 2000, 4000]
+        recipient_frequency:
+          mode: to_address                 # to_address | to_domain
+          window: { unit: daily, count: 1 } # unit: hourly | daily | weekly
+          threshold: 3
 
-  - name: overflow-established
-    overflow: true
-    downstream:
-      host: "smtp.sendgrid.net"
-      port: 587
-      tls: required_verify
-      auth:
-        username: "apikey"
-        password: "${SENDGRID_KEY}"
-      pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
-    identity:
-      envelope_from: "bounce@mail.established.com"
-      set_headers:
-        From: "{{original.from.display_name}} <news@mail.established.com>"
-        Reply-To: "{{original.from.address}}"
-        Message-ID: "<{{uuid}}@mail.established.com>"
-        X-Simmer-Route: "{{route.name}}"
-      unstable_headers: ["Reply-To"]   # migration-only; see §6.6
+      - name: overflow-established
+        overflow: true
+        downstream:
+          host: "smtp.sendgrid.net"
+          port: 587
+          tls: required_verify
+          auth:
+            username: "apikey"
+            password: "${SENDGRID_KEY}"
+          pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@mail.established.com"
+          set_headers:
+            From: "{{original.from.display_name}} <news@mail.established.com>"
+            Reply-To: "{{original.from.address}}"
+            Message-ID: "<{{uuid}}@mail.established.com>"
+            X-Simmer-Route: "{{route.name}}"
+          unstable_headers: ["Reply-To"]   # migration-only; see §6.6
+
+  # A second ramp: its own groups, rules, routes, schedules and quota, sharing nothing with
+  # `main`. Route names are scoped per ramp, so it may reuse them.
+  partner:
+    domain_groups:
+      - { name: catchall, domains: ["*"] }
+    senders:
+      - { match: "partnerbrand.com", match_on: from_header, chain: [warming, overflow] }
+    default_chain: [overflow]
+    routes:
+      - name: warming
+        # ... downstream, identity, warmup { started, schedule } as above
+      - name: overflow
+        overflow: true
+        # ... downstream, identity
 ```
+
+*(Amended — `domain_groups`, `senders`, `default_chain`, `strict_senders`, `thread_affinity`,
+`exhausted_chain_reply` and `routes` were top-level keys; they now sit, unchanged, inside each
+entry of `ramps`, and a configuration that still carries any of them at the top level is refused
+with a pointer to the new shape. `default_ramp`, a listener's `ramp` and
+`header_overrides_affinity`, and `grants.ramps` are new. See `DECISIONS.md` D-099.)*
 
 ### 4.2 Startup validation
 
@@ -472,6 +554,17 @@ this inverts: plaintext AUTH is now refused unless allowed. The rest are new. Se
   `Message-ID:` domain. A route whose IDs name no route can never be pinned, and a shared domain
   would pin every reply to whichever of the two is listed first. *(Added; see `DECISIONS.md`
   D-090.)*
+- Any of the following, about ramps *(added, see `DECISIONS.md` D-099)*. The rules above that
+  concern routes, chains, domain groups, senders and schedules apply **within each ramp**, and a
+  violation names its ramp.
+  - `ramps` is empty, or `default_ramp` is absent or names no ramp.
+  - A ramp's name is not 1–64 characters of `[A-Za-z0-9][A-Za-z0-9._-]*`, or two are equal.
+  - Any of `domain_groups`, `senders`, `default_chain`, `strict_senders`, `thread_affinity`,
+    `exhausted_chain_reply` or `routes` appears at the top level, where it was before ramps.
+    The message says where it now belongs.
+  - A listener's `ramp` names no ramp, or a listener sets `header_overrides_affinity: true`
+    without a `ramp`, where it could have no effect.
+  - A user's `grants.ramps` names a ramp that does not exist, contains `*`, or repeats a name.
 - `link_proxy` is present and any of the following hold *(added, see `DECISIONS.md` D-083)*:
   - `upstream` is not an absolute `http` or `https` URI with a host, or it carries
     credentials, a query or a fragment.
@@ -516,6 +609,12 @@ One or more listeners, each with its own `tls` and `auth` mode. The deployment a
 | `disabled` | `AUTH` is not advertised; the command is `503` |
 | `optional` | Advertised where usable; an unauthenticated session may still send |
 | `required` | `MAIL FROM` before a successful `AUTH` is `530 5.7.0` |
+
+A listener may also carry `ramp`, which gives it **port affinity**: mail arriving on it is
+routed within that ramp. With `header_overrides_affinity: true` an `X-Simmer-Ramp` header the
+session may use takes precedence instead; the default, `false`, is that the affinity wins. A
+listener with no `ramp` routes by the header or `default_ramp`. See §5.8. *(Added. See
+`DECISIONS.md` D-099.)*
 
 A listener that names only an address takes its port's RFC defaults: 465 is `implicit` and
 `required` (RFC 8314), 587 is `starttls_required` and `required` (RFC 6409), and every other
@@ -564,7 +663,9 @@ is constant-time. Failed attempts are rate-limited per connection (three failure
 and disconnect).
 
 Authentication is **authentication only**. The authenticated username plays no part in route
-selection.
+selection **within a ramp**. It has one bearing on which ramp: a user's `grants.ramps` lists the
+ramps it may name in `X-Simmer-Ramp` (§5.8). *(Amended — was "plays no part in route
+selection". See `DECISIONS.md` D-099.)*
 
 Each user carries `grants.send_as`: the sender identities it may present, in §5.4's pattern
 grammar. For an authenticated session, the `MAIL FROM` address and the first `From:` address
@@ -575,7 +676,9 @@ judged by its `From:`. Default deny: nothing outside the grants is permitted.
 
 The ACL **gates acceptance and never routing**, which is why the sentence above still holds: a
 message it admits is routed by §5.4 exactly as it would be without it, and two users granted
-the same identity produce byte-identical output. It applies only to sessions that
+the same identity — and the same `ramps` — produce byte-identical output. `grants.ramps` is not
+part of the ACL: it never refuses a message, it only decides whether a header is honoured, and a
+header that is not is ignored (§5.8). It applies only to sessions that
 authenticated; see §2.3 for `auth: optional`. `550` is safe here for the reason §10.3 gives
 for `strict_senders`: it is a statement about the sender, not the recipient.
 
@@ -606,7 +709,10 @@ rather than at `RCPT TO`. This is legal and accepted. When all rules use `envelo
 should decide early and reject at `RCPT TO` to avoid a wasted body transfer — unless
 `thread_affinity` is on, since a pinned reply can take a route past its cap and whether a
 message is one is in headers that have not yet arrived. *(Amended — the exception is new. See
-`DECISIONS.md` D-090.)*
+`DECISIONS.md` D-090.)* Nor unless the ramp is already fixed at `RCPT TO` — the listener has
+affinity without an override, or nothing the session may name in `X-Simmer-Ramp` could change
+the ramp — since that header, too, has not yet arrived (§5.8). *(Amended. See `DECISIONS.md`
+D-099.)*
 
 If the envelope and header senders disagree, log at `WARN` with both values and increment
 `simmer_sender_mismatch_total`.
@@ -713,6 +819,41 @@ byte for byte. Response bodies are never rewritten, and redirects are never foll
 answer for a link in someone's inbox. Nothing is retried. A one-click unsubscribe (RFC 8058) is
 a `POST`, and replaying it is the §10.2 hazard in another protocol.
 
+### 5.8 Ramp selection
+
+*(Added. See `DECISIONS.md` D-099.)*
+
+Each message is routed within exactly one ramp (§3.4), chosen at the final dot, before §3.2
+runs:
+
+1. If the listener has a `ramp` and `header_overrides_affinity` is false, that ramp.
+2. Otherwise, if `X-Simmer-Ramp` gives a usable value the session may name, that ramp.
+3. Otherwise, the listener's `ramp`.
+4. Otherwise, `default_ramp`.
+
+**Rights.** An authenticated session may name the ramps in its user's `grants.ramps` (§5.3),
+and no others. An unauthenticated session may name none, so on `auth: optional` the header is
+always ignored.
+
+**The header's value** is trimmed and compared exactly, case-sensitively, with the ramp names.
+It is **unusable** — ignored, logged at `WARN` with the value truncated to 64 characters, and
+counted in `simmer_ramp_header_rejected_total{reason}` — when it:
+
+| `reason` | |
+|---|---|
+| `unknown` | names no ramp |
+| `not_permitted` | names a ramp the session may not name |
+| `malformed` | is empty, over 64 characters, not ASCII, or an RFC 2047 encoded-word |
+| `conflicting` | occurs more than once with different values; identical repeats count once |
+| `affinity_locked` | names a ramp other than the listener's under rule 1 |
+
+An unusable header is never a refusal. Selection falls through to rule 3 or 4 exactly as if
+there were no header. A `550` would be §14.1's hazard for a typo, and a `451` would defer a
+message that has a ramp the operator chose.
+
+**The header is always stripped** before relay, every occurrence, whether it was used, ignored
+or overridden (§6.5). It is Simmer's input, not part of the message.
+
 ---
 
 ## 6. Rewriting engine
@@ -721,8 +862,8 @@ a `POST`, and replaying it is the §10.2 hazard in another protocol.
 
 1. Buffer the full `DATA` payload (§8.1).
 2. Parse into headers and MIME structure.
-3. Resolve incoming identity; select route (§3.2).
-4. Strip authentication artefacts (§6.5).
+3. Select the ramp (§5.8); resolve incoming identity; select route (§3.2).
+4. Strip authentication artefacts and `X-Simmer-Ramp` (§6.5).
 5. Apply `remove_headers`.
 
    5a. Apply `header_rewrites` to the named headers' decoded values (§6.2).
@@ -733,7 +874,7 @@ a `POST`, and replaying it is the §10.2 hazard in another protocol.
 10. Serialise and transmit.
 
 *(Amended — step 5a is new; it is numbered so that no existing step reference changes. See
-`DECISIONS.md` D-089.)*
+`DECISIONS.md` D-089. Steps 3 and 4 name the ramp; see D-099.)*
 
 ### 6.2 Rewritable fields
 
@@ -838,6 +979,10 @@ strips before forwarding:
 - `DKIM-Signature`
 - `Authentication-Results`
 - `ARC-Seal`, `ARC-Message-Signature`, `ARC-Authentication-Results`
+
+and, for a different reason, `X-Simmer-Ramp` (§5.8): it is an instruction to Simmer, and never
+reaches a downstream. A route's `set_headers` could set it again; that is a startup warning.
+*(Added. See `DECISIONS.md` D-099.)*
 
 SPF requires no per-message action: it authorises the *transmitting* IP, which belongs to the
 downstream, against the envelope sender's domain. It is satisfied by DNS records published for
@@ -952,11 +1097,13 @@ link in the chain.
 ### 7.1 Key
 
 ```
-(route, domain_group) → daily allowance
+(ramp, route, domain_group) → daily allowance
 ```
 
 The route carries the outbound sending identity, which is what accrues domain reputation, so
-the route is the correct first axis. The domain group is the second axis because mailbox
+the route is the correct first axis; the ramp in front of it only scopes the route's name, since
+two ramps may each have a route of the same name (§3.4). *(Amended — was `(route,
+domain_group)`. See `DECISIONS.md` D-099.)* The domain group is the second axis because mailbox
 providers throttle independently of one another.
 
 ### 7.2 Warm-up day index
@@ -985,7 +1132,7 @@ is unchanged: a partial ramp decides which messages may *try* the route, never h
 carry. *(Added. See `DECISIONS.md` D-091.)*
 
 **A computed share.** `share: {mode: auto}` replaces the list with a controller, evaluated
-per `(route, domain_group)` at each decision:
+per `(ramp, route, domain_group)` at each decision:
 
 ```
 c  = (allowance - used) / allowance      the cap still to fill, 1 -> 0
@@ -1031,7 +1178,7 @@ Nothing is ever dropped by it.
 
 Normalisation for `to_address`: lowercase, strip everything from `+` to `@` in the local part,
 and remove dots from the local part when the domain is a known dot-insensitive provider
-(configurable list, defaulting to the `google` group's domains). `Bob.Smith+news@gmail.com`
+(configurable list, defaulting to the `google` group's domains; one list for every ramp). `Bob.Smith+news@gmail.com`
 and `bobsmith@gmail.com` are the same inbox and a determined recipient will complain about
 both.
 
@@ -1046,7 +1193,9 @@ Its event is recorded as usual, so the window stays true for the next message th
 reply. *(Added. See `DECISIONS.md` D-090.)*
 
 Window is `count × unit` (`hourly`, `daily`, `weekly`) evaluated as a **rolling** window, so
-per-event timestamps are stored rather than a counter. A sweeper evicts rows older than the
+per-event timestamps are stored rather than a counter. Events are kept per ramp and route: a
+recipient mailed by one ramp is unseen by another's threshold (§3.4). *(Added. See
+`DECISIONS.md` D-099.)* A sweeper evicts rows older than the
 longest configured window plus a margin, on an interval.
 
 ### 7.4 Reservation protocol
@@ -1055,7 +1204,7 @@ Counters increment on downstream success only. A failed send must not consume al
 requires a three-phase protocol, because a post-hoc increment allows two concurrent sessions to
 both observe the last remaining slot:
 
-1. **Reserve.** In one transaction: lock the usage row for `(route, domain_group, day_index)`,
+1. **Reserve.** In one transaction: lock the usage row for `(ramp, route, domain_group, day_index)`,
    read `committed + reserved`, compare against the allowance, and if there is headroom for
    `recipient_count`, insert a reservation row and increment `reserved`. Otherwise fail.
 2. **Send.** Conduct the downstream transaction, holding the client connection.
@@ -1145,7 +1294,9 @@ while rendering, so an enabled endpoint that nothing scrapes prunes nothing. Lea
 a configuration from before this amendment loads cleanly and has lost it. *(Added. See
 `DECISIONS.md` D-093.)*
 
-At minimum:
+At minimum the list below. **Every series labelled `route` also carries `ramp`**, first, since
+a route name is only unique within its ramp (§3.4); the list omits it for brevity. *(Amended.
+See `DECISIONS.md` D-099.)*
 
 - `simmer_messages_total{route,domain_group,result}` — result: `delivered`, `deferred`, `rejected`
 - `simmer_quota_allowance{route,domain_group}` — today's ceiling
@@ -1158,7 +1309,10 @@ At minimum:
 - `simmer_downstream_latency_seconds{route}` — histogram
 - `simmer_downstream_errors_total{route,class}`
 - `simmer_pool_connections{route,state}`
-- `simmer_unmatched_sender_total{domain}`
+- `simmer_unmatched_sender_total{ramp,domain}`
+- `simmer_ramp_selected_total{ramp,source}` — source: `affinity`, `header`, `default` (§5.8)
+- `simmer_ramp_header_rejected_total{reason}` — §5.8's reasons. Deliberately no value label:
+  the value is the client's
 - `simmer_sender_mismatch_total`
 - `simmer_ambiguous_terminator_total` — §5.5's end-of-data rule; raised whatever else the
   message was also refused for *(added, D-095)*
@@ -1182,33 +1336,46 @@ At minimum:
 
 *(The four `simmer_link_proxy_*` metrics are added. See `DECISIONS.md` D-083.
 `simmer_header_rewrite_skipped_total` is added; see D-089. `simmer_thread_affinity_total` is
-added; see D-090. `simmer_mx_lookups_total` is added; see D-100.)*
+added; see D-090. The two `simmer_ramp_*` metrics and the `ramp` label are added; see D-099.
+`simmer_mx_lookups_total` is added; see D-100.)*
 
 ### 9.2 Read API
 
 - `GET /health` — liveness; includes database reachability.
-- `GET /routes` — configuration summary plus live state: warm-up day, allowance and usage per
-  domain group, paused flag, preflight results, pool statistics, and the `share` list with
-  today's share *(added, D-091)*. Each domain-group window also carries the share in force
-  for it right now, which under `mode: auto` differs between groups and moves as the cap
-  fills; the route-level `today` is then `null`, and the `auto` parameters are reported
-  beside the mode *(added, D-097)*.
-- `GET /routes/{name}` — as above for one route.
-- `GET /quota?route=&group=` — current window detail.
+- `GET /ramps` — each ramp's name, whether it is `default_ramp`, the listeners with affinity
+  to it, and its routes' names. `GET /ramps/{ramp}` — one of them.
+- `GET /ramps/{ramp}/routes` — configuration summary plus live state: warm-up day, allowance
+  and usage per domain group, paused flag, preflight results, pool statistics, and the `share`
+  list with today's share *(added, D-091)*. Each domain-group window also carries the share in
+  force for it right now, which under `mode: auto` differs between groups and moves as the cap
+  fills; the route-level `today` is then `null`, and the `auto` parameters are reported beside
+  the mode *(added, D-097)*.
+- `GET /ramps/{ramp}/routes/{name}` — as above for one route.
+- `GET /quota?ramp=&route=&group=` — current window detail. `ramp` is required once more than
+  one ramp is configured.
 - `GET /metrics` — Prometheus, when `admin.metrics` is enabled (§9.1).
+
+The pre-ramp paths `/routes` and `/routes/{name}`, and every write path under them, answer
+`410 Gone` with the path that replaces them, rather than acting on `default_ramp`: a mutation
+that silently landed on the wrong ramp is the lie this section exists to prevent. *(Amended.
+See `DECISIONS.md` D-099.)*
 
 ### 9.3 Write API
 
 All require the bearer token. All mutations are logged at `INFO` with the acting token's
 identifier.
 
-- `POST /routes/{name}/pause` and `/resume` — makes a route ineligible for selection without a
-  restart. Persisted, so it survives restart.
-- `POST /routes/{name}/graduate` — pins the route to the final schedule value immediately.
-- `POST /routes/{name}/allowance` — override today's allowance for a domain group; expires at
-  the next day boundary.
-- `POST /quota/reset` — reset counters for a route/group. Destructive; requires an explicit
-  confirmation field in the body.
+- `POST /ramps/{ramp}/routes/{name}/pause` and `/resume` — makes a route ineligible for
+  selection without a restart. Persisted, so it survives restart.
+- `POST /ramps/{ramp}/routes/{name}/graduate` — pins the route to the final schedule value
+  immediately.
+- `POST /ramps/{ramp}/routes/{name}/allowance` — override today's allowance for a domain group;
+  expires at the next day boundary.
+- `POST /quota/reset` — reset counters for a ramp/route/group; `ramp` is required. Destructive;
+  requires an explicit confirmation field in the body.
+
+Every mutation acts within one ramp, and the chains it reports emptied are that ramp's.
+*(Amended — the paths gained `/ramps/{ramp}`. See `DECISIONS.md` D-099.)*
 
 ### 9.4 Dry run
 
@@ -1230,6 +1397,11 @@ answer **as of now**: the share is computed from the same row and the same clock
 would read, and that row moves. This is the standard the headroom check beside it has always
 held to. *(Added. See `DECISIONS.md` D-097.)*
 
+The ramp is either given as `ramp`, or selected from `listener` (an address from
+`server.listeners`), an optional `auth_user` and an optional `ramp_header`, by the same §5.8
+function the session calls. The response reports the ramp, which rule chose it, and what became
+of the header. *(Added. See `DECISIONS.md` D-099.)*
+
 Each recipient's domain group is reported with the basis it was chosen on: `literal`,
 `mx:<host>` (the exchange host that matched), `fallback`, or `fallback:mx-unavailable`. The
 lookup is the real one and fills the same cache the walk reads. *(Added. See `DECISIONS.md`
@@ -1241,7 +1413,7 @@ should be treated as a first-class feature rather than a debugging afterthought.
 ### 9.5 Logging
 
 Structured JSON. Every message carries a `correlation_id` propagated through every log line
-and emitted as `X-Simmer-Correlation-Id` when configured. Log the incoming identity, matched
+and emitted as `X-Simmer-Correlation-Id` when configured. Log the ramp and which §5.8 rule chose it, the incoming identity, matched
 rule, chain evaluation with skip reasons, the thread-affinity pin (§3.2 step 2a) and whether
 the selected route was reserved past its cap, selected route, downstream reply code and text,
 and total latency. Message bodies are never logged; recipient addresses are logged only at `DEBUG`.
@@ -1345,15 +1517,20 @@ startup.
 
 Indicative tables:
 
-- `quota_usage(route, domain_group, day_index, allowance, committed, reserved, updated_at)`
-  — primary key on the first three.
-- `quota_reservation(id, route, domain_group, day_index, count, correlation_id, created_at,
+- `quota_usage(ramp, route, domain_group, day_index, allowance, committed, reserved, updated_at)`
+  — primary key on the first four.
+- `quota_reservation(id, ramp, route, domain_group, day_index, count, correlation_id, created_at,
   expires_at)` — indexed on `expires_at` for the sweeper.
-- `recipient_event(recipient_hash, route, sent_at)` — indexed on `(recipient_hash, sent_at)`
+- `recipient_event(recipient_hash, ramp, route, sent_at)` — indexed on `(recipient_hash, sent_at)`
   and on `sent_at` for the sweeper. This is the high-cardinality table.
-- `route_state(route, paused, graduated, allowance_override, override_expires_at, updated_at)`
-  — admin mutations, so they survive restart.
+- `route_state(ramp, route, paused, graduated, allowance_override, override_expires_at,
+  updated_at)` — admin mutations, so they survive restart.
 - `instance_config(key, value)` — the recipient hash salt and similar singletons.
+
+*(Amended — `ramp` is new in every table but `instance_config`. The migration that adds it
+fills existing rows with a sentinel that cannot be a ramp name and then drops the column
+default, so a pre-ramp instance cannot write; startup moves the sentinel rows into
+`default_ramp`, once, under a lock. See `DECISIONS.md` D-099 and §2.3.)*
 
 The storage layer sits behind a trait so the concrete backend can be substituted, but no
 alternative backend is implemented in v1.
@@ -1422,6 +1599,9 @@ Each phase should end in a working, testable artefact.
 11. Inbound listeners on 25/465/587, inbound TLS, and the sender ACL (§5.1, §5.3).
     *(Added — beyond the original ten. See `DECISIONS.md` D-070, D-071 and `docs/INGRESS.md`.)*
 12. The optional link proxy (§5.7). *(Added. See `DECISIONS.md` D-083.)*
+13. Named ramps (§3.4, §5.8): the ramps-only schema, storage keyed by ramp with legacy
+    adoption, the control plane per ramp, then selection by listener and header.
+    *(Added. See `DECISIONS.md` D-099.)*
 
 ---
 

@@ -4326,6 +4326,230 @@ unchanged and that the concession is real, and both are now assertions rather
 than prose.
 
 
+### D-099 — Named ramps: several isolated routing profiles in one process, chosen by port or header
+
+> **Settled 2026-09-24 by the spec's author, who asked for it, and the spec
+> amended in the same change:** §1.1, §2.1, §2.3, §3.1, §3.4 (new), §4.1, §4.2,
+> §5.1, §5.3, §5.4, §5.8 (new), §6.1, §6.5, §7.1, §7.2, §7.3, §9.1–§9.5, §11 and
+> §13. The author made these calls:
+> - a ramp is a **complete routing profile**, and ramps share nothing;
+> - the configuration is **ramps-only**, and existing state is **migrated**;
+> - `default_ramp` is an **explicit key**;
+> - a listener's **port affinity wins by default**, with a per-listener
+>   `header_overrides_affinity` switch;
+> - header rights are **per grant** and are **never given without AUTH**, which
+>   amends §5.3 rather than recording a divergence from it;
+> - a bad header is **ignored and falls back**;
+> - legacy state is adopted **automatically into `default_ramp`**;
+> - SQL Server names shrink to **128 characters**.
+>
+> Implementation is phased: `docs/STATE.md` records how far it has reached.
+
+**The problem.** One Simmer carries one routing profile. Sender rules pick a
+chain, and every listener feeds the same rules. Warming two unrelated
+programmes (two brands, two ESP accounts, two start dates) needs two Simmers,
+each with its own database. The author wants one process to carry several ramps,
+each with its own schedule, start, routes and quota. A client picks a ramp by
+the port it connects to or by an `X-Simmer-Ramp` header.
+
+**What a ramp is.** The whole routing block from before this change:
+- `domain_groups`
+- `senders`
+- `default_chain`
+- `strict_senders`
+- `thread_affinity`
+- `exhausted_chain_reply`
+- `routes`
+
+It moves unchanged under `ramps.<name>`, and a required top-level
+`default_ramp` names one of them.
+
+Route names are scoped to their ramp, so two ramps may each have a route called
+`overflow`, and all persisted state is keyed `(ramp, route)`. Nothing crosses
+between ramps: not quota, not pause or graduation, not §7.3 history, not a
+thread pin (§3.2 step 2a only pins a route in the selected ramp's chain), and
+not a domain group.
+
+**What stays global**, and why each is not routing policy:
+- **Listeners, TLS and AUTH.** Ingress is what selects a ramp, so it sits
+  outside every ramp.
+- **`dot_insensitive_domains`.** It states a fact about mailbox providers.
+  Two ramps disagreeing over whether `a.b@gmail.com` and `ab@gmail.com` are one
+  inbox would make one of them wrong.
+- **The §7.3 salt.** It is a key, not a history. Per-ramp histories under one
+  salt stay separate because the ramp is part of every stored key.
+- **Downstream pools**, which stay **per (ramp, route)**, not global. Two ramps
+  pointing at one downstream each hold their own `max_connections`, and the
+  downstream sees the sum. "Nothing shared" was the author's call. An operator
+  who needs one bound sizes the two pools to fit it.
+
+**Selection** (§5.8), per message, at the final dot:
+1. If the listener has a `ramp` and `header_overrides_affinity` is false (the
+   default), use that ramp. A header naming a different ramp is ignored.
+2. Otherwise, if exactly one valid ramp name is given by `X-Simmer-Ramp` and the
+   session may name it, use that ramp.
+3. Otherwise, the listener's `ramp`.
+4. Otherwise, `default_ramp`.
+
+**Header rights.** A user's `grants.ramps` lists the ramps it may name, and
+defaults to none. An unauthenticated session has no rights, so on
+`auth: optional` a header is always ignored. §2.3 already says such a session
+is trusted less.
+
+**What makes a header value unusable.** Each case is ignored rather than
+refused, and counted in `simmer_ramp_header_rejected_total{reason}`:
+- `unknown`: it names no ramp.
+- `not_permitted`: the session may not name it.
+- `malformed`: empty, over 64 characters, non-ASCII, or an encoded word.
+- `conflicting`: two occurrences disagree. Identical repeats collapse to one.
+- `affinity_locked`: the listener's affinity wins over it.
+
+The counter has no value label, because the value is client-controlled (D-093's
+lesson).
+
+**Why ignore and not refuse.** A `550` would record permanent state about a
+deliverable recipient because of a header typo, which §14.1 forbids. A `451`
+would defer a message that has a perfectly good ramp to fall back to. Ignoring
+it lands the message on a ramp the operator chose, as affinity or the default,
+and the counter and the `WARN` line make the typo visible.
+
+**Why conflicting duplicates are unusable, and not "first wins".** Which copy
+counts as "first" depends on where each was added: an application template, a
+library, a relay in between. A second, unauthorised copy could then shadow or
+promote the first without anyone intending it. With no winner, the message
+falls back like any other unusable header.
+
+**The header is always stripped.** It is removed with §6.5's artefacts, every
+occurrence, whether it was honoured, ignored or overridden by affinity. It is
+Simmer's control input, not part of the message. Leaving it would put a
+Simmer-ism in front of the downstream and the recipient. Stripping it
+unconditionally means its absence from the output never depends on selection.
+
+**§1.1.** The header is application-side residue. At cutover the application
+stops sending it (or keeps sending it, harmlessly, to nothing), and output
+under either arrangement is unchanged, because the header never reaches it.
+Port affinity leaves no residue at all.
+
+**§5.3 is amended, not diverged from.** D-071 says the authenticated username
+plays no part in route selection. Per-grant rights break that: with the same
+bytes, one user's header is honoured and another's is ignored, so the two leave
+under different identities. The author chose this over rights by listener only.
+§5.3 now says the username plays no part in selection **within a ramp**, and
+that a grant may authorise a ramp header. `grants.ramps` is kept separate from
+`send_as` so that the ACL's refusals are unchanged. The test that two users
+granted one identity produce byte-identical output stays, now with identical
+`ramps` grants. A second test pins the divergence when the grants differ.
+
+**The §5.4 early decision.** The header arrives only with `DATA`. So the early
+refusal at `RCPT TO` is attempted only when the ramp is already fixed at that
+point. That is the case when:
+- the listener has affinity and no override; or
+- nothing the session may name could change the ramp, which includes every
+  unauthenticated session.
+
+Otherwise the decision waits for the final dot, as it already does for
+`from_header` rules. That costs a body transfer only for envelope-only configs
+on an overridable listener, and it means a header-selected ramp is never refused
+because another ramp is exhausted.
+
+**Storage.** A `ramp` column joins every key:
+- `quota_usage`: primary key `(ramp, route, domain_group, day_index)`
+- `route_state`: primary key `(ramp, route)`
+- `quota_reservation` and `recipient_event`: their indexes
+
+The migration adds the column filled with `''`, which is impossible as a ramp
+name, and then **drops the default**. At startup, before any listener binds,
+`QuotaStore::adopt_legacy_rows(default_ramp)` does the following:
+- It moves every `''` row into `default_ramp`, in one transaction under an
+  advisory or application lock.
+- It refuses to start if a legacy key already exists under the target ramp.
+- It logs how many rows it moved, and it is idempotent.
+
+A legacy route name that is not a route of the target ramp is a `WARN`, not a
+refusal, because `route_state` rows outlive deleted routes.
+
+**Why the default is dropped: it is the fence.** A v0.8 binary against the
+migrated schema:
+- on Postgres, finds that its `ON CONFLICT (route, domain_group, day_index)`
+  matches no constraint;
+- on SQL Server, inserts rows with no `ramp`.
+
+Either way every reservation fails, and every message gets §7.5's `451`. A
+restarted v0.8 Postgres binary refuses to start on the unknown migration. A
+restarted SQL Server one starts and answers `451`. Nothing miscounts. That
+matters most for the sweeper: v0.8's joins on `(route, domain_group,
+day_index)` would release reservations into both ramps' rows once two ramps
+shared a route name.
+
+**The upgrade is therefore stop-the-world.** Stop every v0.8 instance, start one
+v0.9 instance (which migrates and adopts), then start the rest. There is no
+downgrade path. The release notes say to take a backup. §2.3's config-skew
+constraint widens accordingly: two instances must also agree on the `ramps:`
+blocks, listener affinity, overrides and `grants.ramps`, or one message can
+leave under two different identities depending on which instance took it.
+
+**SQL Server key width.** Keys are `NVARCHAR` under the 900-byte clustered-key
+limit. Today's `(route, domain_group, day_index)` at 200 characters is 808
+bytes, and adding `ramp` at 200 would be 1,208. Names shrink to 128 characters
+for route, domain group and ramp (776 bytes), and `MAX_NAME_CHARS` goes from 200
+to 128 in both builds' §4.2 check. A stored name longer than 128 makes the
+migration fail loudly rather than truncate. The alternative, a nonclustered
+primary key, keeps 200 but turns the hottest table into a heap under the
+reserve path's `UPDLOCK`. Nobody has a 129-character route name.
+
+**Consequences, each deliberate.**
+- **The partial-ramp hash gains the ramp**, `(recipient, ramp, route, day)`, so
+  two ramps' same-named routes decide independently. On the upgrade day this
+  reshuffles *which* recipients are offered. The fraction and the cap are
+  unchanged. Keeping the legacy key shape for the adopted ramp would be a
+  permanent special case to avoid a one-day reshuffle.
+- **Admin paths move under `/ramps/{ramp}/…`.** The old `/routes…` paths answer
+  `410` with a pointer, rather than aliasing the default ramp. A mutation that
+  silently landed on the wrong ramp is the lie §9 forbids.
+- **Every route-labelled metric gains `ramp`.** That breaks dashboards and
+  alerts, and the release notes say so. Two new counters:
+  `simmer_ramp_selected_total{ramp,source}` and
+  `simmer_ramp_header_rejected_total{reason}`.
+- **The capture (D-085) records the listener address, not the ramp.** A
+  resolved ramp is derived state, which D-085 excludes. The listener is an
+  ingress fact. The record keeps `X-Simmer-Ramp` in its body, because the
+  capture precedes the rewrite, so a replay re-selects at its target. The
+  record format goes to version 2, and version 1 still replays.
+- **"Ramp" now names two things.** "Partial ramp", "ramp day" and
+  `reason="partial_ramp"` keep their meaning: the warm-up schedule of one route.
+  §3.1 gains a glossary line.
+- **There is no `{{ramp.name}}` template variable.** D-037's rule is that
+  Simmer adds nothing unasked, and a ramp name in an outbound header is a
+  Simmer-ism the application could not reproduce after cutover.
+- **The version is 0.9.0**, because the config, admin and metrics surfaces all
+  break.
+
+**Alternatives, rejected.**
+- *Namespaced route strings* (`"ramp/route"` in the existing column). No key
+  change, but every admin path, metric and view would parse a string, and
+  "keyed by (ramp, route)" would be a convention rather than a constraint.
+- *A ramp as a named chain over shared routes.* Routes, and so their quota,
+  would be shared between ramps, which is not the independence asked for.
+- *Rights by listener only*, which leaves D-071 intact. The author preferred
+  per-grant rights.
+- *Adopting legacy state with a CLI subcommand.* That is a second rollout step
+  that can be forgotten, and CLAUDE.md's subcommands run before the config
+  (and so `default_ramp`) is read.
+- *The first ramp in document order as the default.* Reordering YAML would
+  silently change routing.
+- *Refusing unmatched mail.* Every listener would need an affinity or every
+  client a header. `default_ramp` makes the fallback a named choice instead.
+
+**O-14 and O-15 are deferred again**, explicitly. This amendment touches neither
+the SQL Server build's standing in §11–§13 (beyond the key width, recorded
+here) nor the capture's standing in §2.2. Both remain divergences, and both
+remain due before the *next* amendment.
+
+**Tested:** nothing yet. This entry precedes the code. `docs/STATE.md` tracks
+the phases (config, storage, control plane, selection, acceptance) and what
+each verified.
+
+
 ### D-100 — Domain groups by MX host: a Workspace company domain counts against `google`
 
 > **Approved 2026-09-25 in plan review, spec amendment included:** §3.1, §3.2
@@ -4346,7 +4570,7 @@ addresses correctly, and it is unchanged.
 
 **The rule.**
 1. A literal `domains` match wins, as before, with no DNS.
-2. Otherwise, if any group lists `mx` suffixes, look up the domain's MX
+2. Otherwise, if any group in the ramp lists `mx` suffixes, look up the domain's MX
    records. Take the exchange hosts at the **lowest preference**. The first group in
    configuration order with a suffix that matches one of those hosts on a label
    boundary wins.
@@ -4403,8 +4627,8 @@ addresses correctly, and it is unchanged.
 **Tested:** unit tests in `routing/domain_group.rs` against `resolver::Fake`
 (Workspace, including `smtp.google.com`; M365; the label boundary;
 lowest-preference only; null MX; failure; timeout; the cache; no lookup for a
-literal match or a config without `mx`), and validation tests in
-`tests/config_validation.rs`. Full suites: Postgres 1254 passed, SQL Server 1095
+literal match or a ramp without `mx`), and validation tests in
+`tests/config_validation.rs`. Full suites: Postgres 1266 passed, SQL Server 1107
 passed. Checked by hand once against live DNS: `anthropic.com` resolved to
 `google` via `mx:aspmx.l.google.com`, and `nhs.net` and `hikari-systems.com`
 resolved to `microsoft`.
@@ -4422,6 +4646,7 @@ cannot reach its traps), gave the day-0 result over real SMTP: 5 in
 
 **Not run:** `cargo test --test acceptance` itself, which cannot run from the
 jail, and a dry run against a deployed instance.
+
 
 ## Still open — to settle at the start of the phase that needs them
 
@@ -4443,10 +4668,10 @@ the phase that depends on each.
 | ~~O-11~~ | *Settled in phase 7 — see **D-053**. Named `admin.tokens` alongside `auth_token`, which is the token named `default`. The working assumption held: named tokens, not dropped wording.* | | |
 | ~~O-12~~ | *Settled in phase 3: DST transitions both directions, a start inside a DST gap, and a future start are all tested; the leap-second case is asserted to be a no-op rather than merely argued.* | | |
 | ~~O-13~~ | *Settled 2026-09-17 by the spec's author: amend the spec. §2.1, §2.2, §2.3, §4.1, §4.2, §5.7 (new), §9.1, §9.5, §10.4, §12.1 and §13 now carry the link proxy — see **D-083**.* | | |
-| O-15 | Does the D-085 capture need a `SPEC.md` amendment, or does it stay a recorded divergence? It is off by default, never read by the delivery path, and carries no delivery state — but it *is* message persistence, and §2.2, §8.1, §7.3 and §9.5 each say something a reader of the spec alone would take to exclude it. If amended, the sections are §2.2 (a carve-out), §4.1/§4.2 (the block and its rules), §9.1 (eleven metrics), §9.5 (where bodies *do* go), §12.2 (the volume) and §13 (a phase 13). | A divergence, recorded in D-085 and D-086. `SPEC.md` is unchanged and no phase 13 is added — D-084's precedent, and it follows from the owner's own framing: §13's phases describe the product, and a debugging mode that ships off and plays no part in delivery is not one of them | Before the next spec amendment |
+| O-15 | Does the D-085 capture need a `SPEC.md` amendment, or does it stay a recorded divergence? It is off by default, never read by the delivery path, and carries no delivery state — but it *is* message persistence, and §2.2, §8.1, §7.3 and §9.5 each say something a reader of the spec alone would take to exclude it. If amended, the sections are §2.2 (a carve-out), §4.1/§4.2 (the block and its rules), §9.1 (eleven metrics), §9.5 (where bodies *do* go), §12.2 (the volume) and §13 (a phase 13). | A divergence, recorded in D-085 and D-086. `SPEC.md` is unchanged and no phase 13 is added — D-084's precedent, and it follows from the owner's own framing: §13's phases describe the product, and a debugging mode that ships off and plays no part in delivery is not one of them | Before the next spec amendment. *Deferred again, explicitly, by the 2026-09-24 amendment — see **D-099**.* |
 | ~~O-16~~ | *Settled 2026-09-21 by the spec's author: amend the spec. §4.1, §4.2, §6.1 (step 5a), §6.2, §6.6 and §9.1 now carry `header_rewrites` — see **D-089**.* | | |
 | ~~O-17~~ | *Settled 2026-09-21 by the spec's author: amend the spec. Thread affinity is global, may take a pinned route past its cap (counted), and bypasses §7.3 on it. §2.1, §2.2, §3.2 (step 2a), §4.1, §4.2, §5.4, §7.3, §7.4, §9.1, §9.4 and §9.5 now carry it — see **D-090**.* | | |
-| O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment |
+| O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment. *Deferred again, explicitly, by the 2026-09-24 amendment — see **D-099**.* |
 | ~~O-18~~ | *Settled 2026-09-23 by the spec's author: `554`, not configurable, and amend the spec. §5.5 (the end-of-data marker is `CRLF . CRLF` and nothing else, and the whole payload is refused), §9.1 (`simmer_ambiguous_terminator_total`) and §10.3 (the one permanent reply that is a statement about the message, and why §14.1's worked example does not reach it) now carry it — see **D-095**.* | | |
 
 
