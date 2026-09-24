@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use super::{Config, Identity, IngressAuth, Route};
+use super::{AutoShare, Config, Identity, IngressAuth, Route, ShareSchedule};
 use crate::rewrite::{stability, RouteRewrite};
 
 /// The identity fields of §6.6. A stability violation in one of these is fatal
@@ -1251,20 +1251,77 @@ fn check_schedule(cfg: &Config, route: &Route, warmup: &super::Warmup, v: &mut V
     check_share(&warmup.schedule.share, &at("share"), v);
 }
 
-/// §4.2 for D-091's `schedule.share`. Where a route carrying one may sit in a
-/// chain is [`check_chain`]'s business.
-fn check_share(share: &[f64], path: &str, v: &mut ViolationList) {
-    for (i, value) in share.iter().enumerate() {
-        // Written so that NaN fails it too.
-        if !(*value > 0.0 && *value <= 1.0) {
-            v.push(
-                format!("{path}[{i}]"),
-                format!(
-                    "is {value}; a share must be above 0 and at most 1. To offer the route \
-                     nothing, pause it (§9.3)"
-                ),
-            );
+/// §4.2 for D-091's `schedule.share` and D-097's `auto`. Where a route carrying
+/// one may sit in a chain is [`check_chain`]'s business.
+fn check_share(share: &ShareSchedule, path: &str, v: &mut ViolationList) {
+    match share {
+        ShareSchedule::Days(days) => {
+            for (i, value) in days.iter().enumerate() {
+                check_fraction(*value, &format!("{path}[{i}]"), v);
+            }
         }
+        ShareSchedule::Auto(auto) => check_auto_share(auto, path, v),
+    }
+}
+
+/// Every D-097 parameter, reported together as §4.2 requires.
+fn check_auto_share(auto: &AutoShare, path: &str, v: &mut ViolationList) {
+    let at = |suffix: &str| format!("{path}.{suffix}");
+
+    check_fraction(auto.floor, &at("floor"), v);
+    check_fraction(auto.ceiling, &at("ceiling"), v);
+    check_fraction(auto.fill_by, &at("fill_by"), v);
+    check_fraction(auto.tail.ceiling, &at("tail.ceiling"), v);
+
+    // The release threshold alone may be zero, which disables it. It may not be
+    // 1: releasing an empty cap is no ramp at all, and §4.2 would rather say so
+    // than let a route look ramped while offering everything.
+    if !(auto.tail.below >= 0.0 && auto.tail.below < 1.0) {
+        v.push(
+            at("tail.below"),
+            format!(
+                "is {}; the tail release threshold must be at least 0 and below 1. Use 0 to \
+                 disable the release (§4.2, D-097)",
+                auto.tail.below
+            ),
+        );
+    }
+
+    if !(auto.gain > 0.0 && auto.gain.is_finite()) {
+        v.push(
+            at("gain"),
+            format!(
+                "is {}; the gain must be above 0 and finite. 1 is proportional; higher \
+                 throttles harder when the route runs ahead of pace (§4.2, D-097)",
+                auto.gain
+            ),
+        );
+    }
+
+    // Both ends have already been reported as fractions if either is unusable;
+    // this is the one rule about the pair, and NaN fails it silently there.
+    if auto.floor > auto.ceiling {
+        v.push(
+            at("floor"),
+            format!(
+                "is {}, above the ceiling of {}; the share would have no value it could \
+                 take (§4.2, D-097)",
+                auto.floor, auto.ceiling
+            ),
+        );
+    }
+}
+
+/// A share-shaped number: above 0 and at most 1. Written so that NaN fails too.
+fn check_fraction(value: f64, path: &str, v: &mut ViolationList) {
+    if !(value > 0.0 && value <= 1.0) {
+        v.push(
+            path,
+            format!(
+                "is {value}; a share must be above 0 and at most 1. To offer the route \
+                 nothing, pause it (§9.3)"
+            ),
+        );
     }
 }
 
@@ -1552,11 +1609,12 @@ fn check_chain(cfg: &Config, chain: &[String], path: &str, v: &mut ViolationList
 
         // D-091: a partially-ramped route turns messages away while it still
         // has headroom. Last in a chain, each of those is §10.3's `451` by
-        // design, which is an outage dressed up as a ramp.
+        // design, which is an outage dressed up as a ramp. D-097's `auto` is
+        // the same rule for the same reason — more so, since it has no end.
         let partial = route
             .warmup
             .as_ref()
-            .is_some_and(|w| !w.schedule.share.is_empty());
+            .is_some_and(|w| w.schedule.has_partial_ramp());
         if partial && i == chain.len() - 1 {
             v.push(
                 path,

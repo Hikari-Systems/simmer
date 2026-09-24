@@ -589,9 +589,11 @@ fn explain(reason: SkipReason) -> &'static str {
         }
         SkipReason::Preflight => "§6.7's DNS preflight failed with preflight.strict",
         SkipReason::PartialRamp => {
-            "warmup.schedule.share is below 1 today and this message is not in the route's \
-             share (§3.2 step 3c′, D-091). The route has headroom; it is being given less \
-             traffic on purpose, until the share list runs out"
+            "the route's share is below 1 right now and this message is not in it (§3.2 \
+             step 3c′, D-091). The route has headroom; it is being given less traffic on \
+             purpose. Under a share list that ends when the list does; under share: auto \
+             the share moves with how full the day's cap is and how far through the day \
+             it is, so /routes is where to read what it is now (D-097)"
         }
         SkipReason::Unknown => {
             "the chain names a route that is not defined. §4.2 refuses to start on this, \

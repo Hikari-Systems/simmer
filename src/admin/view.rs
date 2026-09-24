@@ -25,13 +25,15 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::config::{Config, DomainGroup, RecipientFrequency, Route, TlsMode};
+use crate::config::{Config, DomainGroup, RecipientFrequency, Route, ShareSchedule, TlsMode};
 use crate::quota::store::{RouteState, Usage};
 use crate::quota::{self, Allowance};
 
 /// One `(route, domain_group)` window: what the schedule says, what the row
 /// says, and what is left.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// Not `Eq`: D-097's computed share is an `f64`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GroupWindow {
     pub domain_group: String,
     /// What §7.2's schedule says for this day index, from the configuration as
@@ -51,6 +53,15 @@ pub struct GroupWindow {
     /// The row and the configured schedule disagree (D-026). Not an error: it is
     /// the expected state for the rest of the day after a schedule edit.
     pub drift: bool,
+    /// The partial ramp's share for this window right now, or `null` when every
+    /// message is offered (§3.2 step 3c′). Under D-091's list this is the day's
+    /// entry, the same for every group; under D-097 it is computed from the
+    /// numbers above and the clock, so it moves as the cap fills and differs
+    /// between groups.
+    ///
+    /// Computed by the function the walk calls, so §9's control plane cannot
+    /// describe a decision the walk did not make.
+    pub partial_ramp_share: Option<f64>,
     /// False means nothing has been sent on this route and group today, so the
     /// numbers above are what the first message will create rather than what is
     /// stored.
@@ -93,16 +104,40 @@ pub struct FrequencyView {
     pub threshold: u32,
 }
 
-/// D-091's `warmup.schedule.share` as configuration, plus the share in force
-/// today. Carries nothing about which messages were or were not offered: that
-/// is per recipient, and a read endpoint emits no recipient (§7.3).
+/// D-091's and D-097's `warmup.schedule.share` as configuration, plus the share
+/// in force today. Carries nothing about which messages were or were not
+/// offered: that is per recipient, and a read endpoint emits no recipient
+/// (§7.3).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PartialRampView {
+    /// `"days"` for D-091's list, `"auto"` for D-097's controller.
+    pub mode: &'static str,
+    /// The configured list. Empty under `auto`.
     pub share: Vec<f64>,
     /// `null` when every message is offered today: before `warmup.started`,
     /// past the end of `share`, at a share of 1, or when the route is graduated
     /// — the same rule the walk applies, by the same function.
+    ///
+    /// Always `null` under `auto`, and not because nothing is in force: the
+    /// share is then per domain group, and each window carries its own. Saying
+    /// one number here would be picking a group and not saying which.
     pub today: Option<f64>,
+    /// D-097's parameters, under `auto`.
+    pub auto: Option<AutoShareView>,
+}
+
+/// D-097's `share: {mode: auto}` as configuration. Mirrored rather than
+/// serialising the config struct, for [`tls_name`]'s reason: these are API field
+/// values, and renaming a config field should not silently change what a client
+/// sees.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct AutoShareView {
+    pub floor: f64,
+    pub ceiling: f64,
+    pub gain: f64,
+    pub fill_by: f64,
+    pub tail_below: f64,
+    pub tail_ceiling: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -218,11 +253,12 @@ pub fn project_route(
         .domain_groups
         .iter()
         .map(|group| {
-            project_group(
-                group,
-                quota::allowance_for(route, &group.name, day_index, state),
-                usage.get(&(route.name.clone(), group.name.clone())),
-            )
+            let scheduled = quota::allowance_for(route, &group.name, day_index, state);
+            let usage = usage.get(&(route.name.clone(), group.name.clone()));
+            let share = crate::routing::partial::share_for_group(
+                route, day_index, state, now, scheduled, usage,
+            );
+            project_group(group, scheduled, usage, share)
         })
         .collect();
 
@@ -248,10 +284,27 @@ pub fn project_route(
         partial_ramp: route
             .warmup
             .as_ref()
-            .filter(|w| !w.schedule.share.is_empty())
-            .map(|w| PartialRampView {
-                share: w.schedule.share.clone(),
-                today: crate::routing::partial::share_today(route, day_index, state),
+            .filter(|w| w.schedule.has_partial_ramp())
+            .map(|w| match &w.schedule.share {
+                ShareSchedule::Days(days) => PartialRampView {
+                    mode: "days",
+                    share: days.clone(),
+                    today: crate::routing::partial::share_today(route, day_index, state),
+                    auto: None,
+                },
+                ShareSchedule::Auto(a) => PartialRampView {
+                    mode: "auto",
+                    share: Vec::new(),
+                    today: None,
+                    auto: Some(AutoShareView {
+                        floor: a.floor,
+                        ceiling: a.ceiling,
+                        gain: a.gain,
+                        fill_by: a.fill_by,
+                        tail_below: a.tail.below,
+                        tail_ceiling: a.tail.ceiling,
+                    }),
+                },
             }),
         groups,
         preflight: preflight_view(route, preflight),
@@ -264,6 +317,7 @@ pub fn project_group(
     group: &DomainGroup,
     scheduled: Allowance,
     usage: Option<&Usage>,
+    partial_ramp_share: Option<f64>,
 ) -> GroupWindow {
     let scheduled_column = scheduled.as_column();
 
@@ -280,6 +334,7 @@ pub fn project_group(
             reserved: 0,
             headroom: scheduled_column,
             drift: false,
+            partial_ramp_share,
             row_exists: false,
         },
         Some(u) => GroupWindow {
@@ -294,6 +349,7 @@ pub fn project_group(
             // override is a deliberate act by an operator who already knows,
             // whereas drift is something that happened to them.
             drift: u.allowance != scheduled_column,
+            partial_ramp_share,
             row_exists: true,
         },
     }
@@ -843,14 +899,117 @@ routes:
         assert_eq!(v.routes[0].status, RouteStatus::Active);
     }
 
+    // -- D-091 and D-097: what §9.2 says about a partial ramp -------------
+
+    /// `CFG` with a `share` on the warming route's schedule.
+    fn with_share(share: &str) -> Config {
+        let yaml = CFG.replace(
+            "        default: [50, 100, 200]\n",
+            &format!("        default: [50, 100, 200]\n        share: {share}\n"),
+        );
+        crate::config::from_str(&yaml, "test").expect("fixture is valid")
+    }
+
+    #[test]
+    fn a_listed_share_reports_the_list_and_todays_entry() {
+        let cfg = with_share("[0.1, 0.25, 0.5]");
+        let v = view(&cfg, "warming", RouteState::default(), &UsageByRoute::new());
+        let ramp = v.partial_ramp.as_ref().expect("a ramp is configured");
+
+        assert_eq!(ramp.mode, "days");
+        assert_eq!(ramp.share, vec![0.1, 0.25, 0.5]);
+        assert_eq!(ramp.today, Some(0.5), "day 2 of the list");
+        assert!(ramp.auto.is_none());
+
+        // A list applies one value to every group, so each window repeats it.
+        for group in ["google", "catchall"] {
+            assert_eq!(window(&v, group).partial_ramp_share, Some(0.5));
+        }
+    }
+
+    #[test]
+    fn an_auto_share_reports_its_parameters_and_a_share_per_group() {
+        // Day 2: catchall's cap is 200 and google's 40. Half of catchall is
+        // gone and none of google's, so the two windows cannot share a number —
+        // which is why `today` is null and the windows carry it instead.
+        let cfg = with_share("{mode: auto, ceiling: 0.8, floor: 0.01, tail: {below: 0}}");
+        let mut usage = UsageByRoute::new();
+        usage.insert(
+            ("warming".into(), "catchall".into()),
+            Usage {
+                allowance: Some(200),
+                allowance_override: None,
+                committed: 100,
+                reserved: 0,
+            },
+        );
+
+        let v = view(&cfg, "warming", RouteState::default(), &usage);
+        let ramp = v.partial_ramp.as_ref().expect("a ramp is configured");
+        assert_eq!(ramp.mode, "auto");
+        assert!(ramp.share.is_empty());
+        assert_eq!(
+            ramp.today, None,
+            "the share is per group under auto, and naming one would not say which"
+        );
+        let auto = ramp.auto.expect("parameters");
+        assert_eq!(auto.ceiling, 0.8);
+        assert_eq!(auto.floor, 0.01);
+        assert_eq!(auto.fill_by, crate::config::AutoShare::DEFAULT_FILL_BY);
+        assert_eq!(auto.tail_below, 0.0);
+
+        let filled = window(&v, "catchall")
+            .partial_ramp_share
+            .expect("throttled");
+        let untouched = window(&v, "google").partial_ramp_share;
+        assert!(
+            untouched.is_none() || untouched.expect("share") > filled,
+            "the group whose cap is untouched must not be the throttled one: \
+             google {untouched:?} vs catchall {filled}"
+        );
+    }
+
+    #[test]
+    fn a_graduated_route_reports_no_share_at_all() {
+        // §9.3's graduate jumps to the end of the ramp, and the ramp is part of
+        // it — under either kind of share.
+        for share in ["[0.1, 0.25, 0.5]", "{mode: auto}"] {
+            let cfg = with_share(share);
+            let state = RouteState {
+                graduated: true,
+                ..RouteState::default()
+            };
+            let v = view(&cfg, "warming", state, &UsageByRoute::new());
+            assert_eq!(v.partial_ramp.as_ref().expect("configured").today, None);
+            for group in ["google", "catchall"] {
+                assert_eq!(window(&v, group).partial_ramp_share, None, "{share}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_route_with_no_ramp_reports_none() {
+        let cfg = config();
+        let v = view(&cfg, "warming", RouteState::default(), &UsageByRoute::new());
+        assert!(v.partial_ramp.is_none());
+        assert_eq!(window(&v, "catchall").partial_ramp_share, None);
+    }
+
     #[test]
     fn project_group_is_callable_on_its_own() {
         let g = group("catchall");
-        let w = project_group(&g, Allowance::Limited(10), None);
+        let w = project_group(&g, Allowance::Limited(10), None, None);
         assert_eq!(w.domain_group, "catchall");
         assert_eq!(w.headroom, Some(10));
+        assert_eq!(
+            w.partial_ramp_share, None,
+            "no ramp means no share reported"
+        );
 
-        let w = project_group(&g, Allowance::NotStarted, None);
+        let w = project_group(&g, Allowance::Limited(10), None, Some(0.25));
+        assert_eq!(w.partial_ramp_share, Some(0.25));
+
+        let w = project_group(&g, Allowance::NotStarted, None, None);
         assert_eq!(
             w.scheduled, None,
             "a route that has not started has no ceiling to report; RouteStatus says why"

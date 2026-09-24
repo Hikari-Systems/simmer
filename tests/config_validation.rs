@@ -6,7 +6,7 @@
 //! that takes minutes to build should not be discovered to be misconfigured one
 //! error at a time.
 
-use simmer::config::{self, LoadError};
+use simmer::config::{self, AutoShare, LoadError, ShareSchedule, Tail};
 
 /// A minimal configuration that passes every rule. Tests mutate one thing.
 const BASE: &str = r#"
@@ -1458,7 +1458,10 @@ fn accepts_a_share_list_followed_by_another_route() {
         .as_ref()
         .unwrap()
         .schedule;
-    assert_eq!(schedule.share, vec![0.1, 0.25, 0.5]);
+    assert!(matches!(
+        &schedule.share,
+        ShareSchedule::Days(days) if *days == vec![0.1, 0.25, 0.5]
+    ));
 
     // Indexed like the caps; past the end, and at 1, every message is offered.
     assert_eq!(schedule.share_for(-1), None);
@@ -1482,7 +1485,7 @@ fn accepts_a_share_list_followed_by_another_route() {
     assert_eq!(schedule.share_for(1), Some(0.5));
 
     // And absent, or empty, is no partial ramp at all.
-    assert!(load(BASE)
+    assert!(!load(BASE)
         .unwrap()
         .route("warming")
         .unwrap()
@@ -1490,8 +1493,7 @@ fn accepts_a_share_list_followed_by_another_route() {
         .as_ref()
         .unwrap()
         .schedule
-        .share
-        .is_empty());
+        .has_partial_ramp());
     load(&with_share("[]")).expect("an empty list is no partial ramp");
 }
 
@@ -1541,6 +1543,162 @@ fn share_violations_are_reported_together() {
             for needle in [
                 "schedule.share[0]",
                 "schedule.share[1]",
+                "is last in the chain",
+            ] {
+                assert!(v.mentions(needle), "missing '{needle}' in:\n{v}");
+            }
+        }
+        Ok(_) => panic!("accepted"),
+        Err(other) => panic!("expected a validation failure, got: {other}"),
+    }
+}
+
+// -- §4.2: warmup.schedule.share: {mode: auto} (D-097) ---------------------
+
+/// `BASE` with an `auto` share, given as inline YAML parameters.
+fn with_auto_share(params: &str) -> String {
+    with_share(&format!("{{mode: auto{params}}}"))
+}
+
+#[test]
+fn accepts_an_auto_share_at_its_defaults() {
+    let cfg = load(&with_auto_share("")).expect("valid");
+    let schedule = &cfg
+        .route("warming")
+        .unwrap()
+        .warmup
+        .as_ref()
+        .unwrap()
+        .schedule;
+
+    // The shortest form is the whole feature: `mode` and nothing else.
+    let auto = schedule.share.auto().expect("auto");
+    assert_eq!(auto.floor, AutoShare::DEFAULT_FLOOR);
+    assert_eq!(auto.ceiling, AutoShare::DEFAULT_CEILING);
+    assert_eq!(auto.gain, AutoShare::DEFAULT_GAIN);
+    assert_eq!(auto.fill_by, AutoShare::DEFAULT_FILL_BY);
+    assert_eq!(auto.tail.below, Tail::DEFAULT_BELOW);
+    assert_eq!(auto.tail.ceiling, Tail::DEFAULT_CEILING);
+
+    assert!(schedule.has_partial_ramp());
+    // The share is not a function of the day alone, so the day-indexed accessor
+    // reports nothing. `routing::partial` is what resolves it.
+    assert_eq!(schedule.share_for(0), None);
+    assert_eq!(schedule.share_for(9), None);
+}
+
+#[test]
+fn accepts_an_auto_share_with_every_parameter_set() {
+    let yaml = with_auto_share(
+        ", floor: 0.02, ceiling: 0.5, gain: 2.5, fill_by: 0.75,          tail: {below: 0.2, ceiling: 0.8}",
+    );
+    let cfg = load(&yaml).expect("valid");
+    let auto = cfg
+        .route("warming")
+        .unwrap()
+        .warmup
+        .as_ref()
+        .unwrap()
+        .schedule
+        .share
+        .auto()
+        .expect("auto");
+    assert_eq!(auto.floor, 0.02);
+    assert_eq!(auto.ceiling, 0.5);
+    assert_eq!(auto.gain, 2.5);
+    assert_eq!(auto.fill_by, 0.75);
+    assert_eq!(auto.tail.below, 0.2);
+    assert_eq!(auto.tail.ceiling, 0.8);
+}
+
+#[test]
+fn rejects_an_auto_share_parameter_outside_zero_to_one() {
+    for bad in ["0", "-0.5", "1.01", ".nan", ".inf"] {
+        for key in ["floor", "ceiling", "fill_by"] {
+            rejected_for(
+                &with_auto_share(&format!(", {key}: {bad}")),
+                &format!("schedule.share.{key}"),
+            );
+        }
+        rejected_for(
+            &with_auto_share(&format!(", tail: {{ceiling: {bad}}}")),
+            "schedule.share.tail.ceiling",
+        );
+    }
+}
+
+#[test]
+fn rejects_a_tail_threshold_that_is_not_a_proportion_of_the_cap() {
+    // Zero is allowed — it disables the release — but negative is not, and
+    // neither is 1: releasing an empty cap is no ramp at all.
+    load(&with_auto_share(", tail: {below: 0}")).expect("0 disables the release");
+    for bad in ["-0.1", "1", "1.5", ".nan"] {
+        rejected_for(
+            &with_auto_share(&format!(", tail: {{below: {bad}}}")),
+            "schedule.share.tail.below",
+        );
+    }
+}
+
+#[test]
+fn rejects_a_gain_that_is_not_above_zero_and_finite() {
+    for bad in ["0", "-1", ".nan", ".inf"] {
+        rejected_for(
+            &with_auto_share(&format!(", gain: {bad}")),
+            "schedule.share.gain",
+        );
+    }
+    load(&with_auto_share(", gain: 12")).expect("a high gain is legal, if brutal");
+}
+
+#[test]
+fn rejects_a_floor_above_the_ceiling() {
+    rejected_for(
+        &with_auto_share(", floor: 0.6, ceiling: 0.4"),
+        "above the ceiling",
+    );
+    // Equal is fine: a fixed share, expressed the long way round.
+    load(&with_auto_share(", floor: 0.4, ceiling: 0.4")).expect("valid");
+}
+
+#[test]
+fn rejects_an_auto_share_route_that_is_last_in_a_chain() {
+    // The D-091 rule, for the same reason and more so: `auto` has no end, so
+    // every message it turned away would be §10.3's `451` for good.
+    let yaml = with_auto_share("").replace("chain: [warming, overflow]", "chain: [warming]");
+    rejected_for(&yaml, "is last in the chain");
+}
+
+#[test]
+fn rejects_an_unknown_key_by_name() {
+    // The reason the `Deserialize` is written by hand: `#[serde(untagged)]`
+    // would say only "did not match any variant".
+    let err = load(&with_auto_share(", flor: 0.1")).expect_err("rejected");
+    let text = err.to_string();
+    assert!(text.contains("flor"), "must name the key, got: {text}");
+}
+
+#[test]
+fn rejects_a_share_that_is_neither_a_list_nor_an_auto_map() {
+    for bad in ["0.5", "\"auto\"", "true"] {
+        load(&with_share(bad)).expect_err("neither a list nor a map");
+    }
+    // A map without `mode` is not an auto share either.
+    load(&with_share("{floor: 0.1}")).expect_err("no mode");
+    // And `mode` must be `auto`.
+    load(&with_share("{mode: manual}")).expect_err("unknown mode");
+}
+
+#[test]
+fn auto_share_violations_are_reported_together() {
+    let yaml = with_auto_share(", floor: 0, gain: 0, fill_by: 2")
+        .replace("chain: [warming, overflow]", "chain: [warming]");
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            for needle in [
+                "schedule.share.floor",
+                "schedule.share.gain",
+                "schedule.share.fill_by",
                 "is last in the chain",
             ] {
                 assert!(v.mentions(needle), "missing '{needle}' in:\n{v}");

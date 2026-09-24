@@ -59,6 +59,15 @@ counted too, though never capped.
 The `quota_usage` updates change only non-indexed columns, so Postgres can
 apply them as heap-only (HOT) updates, with no index writes.
 
+**One extra read, only under `share: {mode: auto}`.** D-097's partial ramp paces
+against how full the day's cap is, so §3.2 step 3c′ reads the `quota_usage` row
+before deciding — one indexed `SELECT` per message per `auto` route the walk
+evaluates, outside any transaction, taking no lock and writing no row version.
+A listed share, and every route with no partial ramp, read nothing. Against the
+two write transactions above it is noise: at 144,000 messages a day with one
+`auto` route in the chain, 144,000 extra primary-key lookups of a table holding
+one row per route and group per day — which is in cache.
+
 A reservation lasts only as long as the relay: a few seconds for a 4 MB body.
 At 100 messages a minute that is a handful of `quota_reservation` rows live at
 any moment.

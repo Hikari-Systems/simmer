@@ -258,3 +258,312 @@ async fn dry_run_gives_the_real_walks_answer(pool: PgPool) {
         assert_eq!(chain::render(&dry), chain::render(&real), "{r}");
     }
 }
+
+// -- D-097: share: {mode: auto} ---------------------------------------------
+
+/// A warming route whose share is computed, `hours` into day 0 of its ramp,
+/// with an explicit cap so the controller has something to pace against.
+///
+/// `google` gets its own, smaller cap, so that "the share is per domain group"
+/// is a thing the fixture can show rather than a thing the code asserts.
+fn auto_config(hours: f64, cap: i64, google_cap: i64, params: &str) -> simmer::config::Config {
+    let started =
+        (Utc::now() - chrono::Duration::milliseconds((hours * 3_600_000.0) as i64)).to_rfc3339();
+    let yaml = format!(
+        r#"
+server:
+  listeners:
+    - address: "127.0.0.1:0"
+  hostname: "simmer.test"
+  max_message_bytes: 100000
+  max_recipients: 1
+  max_concurrent_sessions: 16
+  allowed_cidrs: ["127.0.0.0/8"]
+  timeouts: {{ command: 5s, data: 5s, session: 60s }}
+  auth: {{ allow_insecure_auth: true }}
+database:
+  url: "postgres://u:p@localhost/simmer"
+  connect_timeout: 5s
+  fail_closed: true
+admin: {{ listen: "127.0.0.1:0", auth_token: "t" }}
+logging: {{ level: warn, format: text }}
+domain_groups:
+  - {{ name: google, domains: ["gmail.com"] }}
+  - {{ name: catchall, domains: ["*"] }}
+senders:
+  - {{ match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }}
+default_chain: [overflow]
+routes:
+  - name: warming
+    downstream:
+      host: "127.0.0.1"
+      port: 2525
+      tls: off
+      pool: {{ max_connections: 1, idle_ttl: 60s, max_messages_per_connection: 10 }}
+    identity: {{ envelope_from: "b@newbrand.com" }}
+    warmup:
+      started: "{started}"
+      schedule:
+        default: [{cap}]
+        overrides: {{ google: [{google_cap}] }}
+        share: {{ mode: auto{params} }}
+  - name: overflow
+    overflow: true
+    downstream:
+      host: "127.0.0.1"
+      port: 2526
+      tls: off
+      pool: {{ max_connections: 1, idle_ttl: 60s, max_messages_per_connection: 10 }}
+    identity: {{ envelope_from: "b@established.com" }}
+"#
+    );
+    simmer::config::from_str(&yaml, "test").expect("fixture is valid")
+}
+
+/// Push a group's row up to `count` used, the way a day's traffic would, without
+/// walking anything: the reservation protocol's own phase 1, which is what the
+/// controller reads.
+async fn fill(store: &Arc<dyn QuotaStore>, cfg: &simmer::config::Config, group: &str, count: i64) {
+    use simmer::quota::store::{ReserveRequest, Reserved};
+    let taken = store
+        .reserve(&ReserveRequest {
+            route: "warming".to_string(),
+            domain_group: group.to_string(),
+            day_index: day_index(cfg),
+            allowance: None,
+            count,
+            correlation_id: "fill".to_string(),
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            over_cap: false,
+        })
+        .await
+        .expect("reserve");
+    assert!(
+        matches!(taken, Reserved::Taken(_)),
+        "the fixture must be able to take {count}"
+    );
+}
+
+/// How many of `n` recipients the **dry run** says would be offered to the
+/// warming route. The dry run, so that counting does not itself fill the cap and
+/// move the number being counted.
+async fn offered_count(
+    cfg: &simmer::config::Config,
+    store: &Arc<dyn QuotaStore>,
+    n: usize,
+) -> usize {
+    let chain = vec!["warming".to_string(), "overflow".to_string()];
+    let mut offered = 0;
+    for r in recipients(n) {
+        let dry = chain::dry_walk(
+            cfg,
+            store,
+            &Frequency::new(),
+            &simmer::preflight::Registry::new(),
+            &chain,
+            None,
+            &r,
+            Utc::now(),
+        )
+        .await
+        .expect("dry walk");
+        let steered = dry
+            .iter()
+            .any(|s| s.route == "warming" && s.outcome == Err(SkipReason::PartialRamp));
+        if !steered {
+            offered += 1;
+        }
+    }
+    offered
+}
+
+#[sqlx::test]
+async fn the_auto_share_falls_as_the_cap_fills(pool: PgPool) {
+    // A fifth of the way into the day, against a fill window ending at 60% of
+    // it: on pace would be a third of the cap gone.
+    let cfg = auto_config(
+        24.0 * 0.2,
+        200,
+        200,
+        ", ceiling: 0.8, floor: 0.01, tail: {below: 0}",
+    );
+    let store = store(pool);
+
+    let empty = offered_count(&cfg, &store, 200).await;
+    fill(&store, &cfg, "catchall", 120).await;
+    let filled = offered_count(&cfg, &store, 200).await;
+
+    assert!(
+        filled < empty,
+        "the share must fall as the cap fills: {empty} offered empty, {filled} at 120/200"
+    );
+
+    // And the walk agrees with what the dry run just counted: a message the
+    // share turns away steers without touching the row.
+    let before = warming_reserved(&store, &cfg).await;
+    let mut steered = 0;
+    for r in recipients(200) {
+        let (_, eval) = walk(&cfg, &store, None, &r).await;
+        if eval
+            .iter()
+            .any(|s| s.route == "warming" && s.outcome == Err(SkipReason::PartialRamp))
+        {
+            steered += 1;
+        }
+    }
+    assert!(steered > 0, "some messages must have been turned away");
+    let after = warming_reserved(&store, &cfg).await;
+    assert_eq!(
+        after - before,
+        200 - steered,
+        "every message not turned away, and only those, reserved"
+    );
+}
+
+#[sqlx::test]
+async fn the_tail_release_closes_the_cap(pool: PgPool) {
+    // Early in the day and far ahead of pace, so the controller alone would sit
+    // at its floor and the last of the cap would take all day to go out.
+    let cfg = auto_config(
+        1.0,
+        200,
+        200,
+        ", floor: 0.01, tail: {below: 0.1, ceiling: 1.0}",
+    );
+    let store = store(pool);
+
+    // 21 left of 200 is above a tenth: still throttled.
+    fill(&store, &cfg, "catchall", 179).await;
+    let throttled = offered_count(&cfg, &store, 100).await;
+    assert!(
+        throttled < 100,
+        "above the threshold the route is still being throttled, got {throttled}/100"
+    );
+
+    // 20 left is the threshold, and the release is unconditional from there.
+    fill(&store, &cfg, "catchall", 1).await;
+    assert_eq!(
+        offered_count(&cfg, &store, 100).await,
+        100,
+        "under the tail threshold every message must be offered, or the ramp \
+         never finishes its cap"
+    );
+}
+
+#[sqlx::test]
+async fn past_the_fill_window_every_message_is_offered(pool: PgPool) {
+    // 80% through the day, with the window closing at 60% and half the cap
+    // still to go. The share opens to its ceiling, which here is 1.
+    let cfg = auto_config(24.0 * 0.8, 200, 200, ", fill_by: 0.6, tail: {below: 0}");
+    let store = store(pool);
+    fill(&store, &cfg, "catchall", 100).await;
+
+    assert_eq!(offered_count(&cfg, &store, 100).await, 100);
+}
+
+#[sqlx::test]
+async fn the_auto_share_is_computed_per_domain_group(pool: PgPool) {
+    // The one behaviour that differs from D-091's list, which applies one value
+    // to every group: the cap the controller paces against is per group, so the
+    // share is too.
+    let cfg = auto_config(
+        24.0 * 0.2,
+        200,
+        200,
+        ", ceiling: 0.8, floor: 0.01, tail: {below: 0}",
+    );
+    let store = store(pool);
+    let day = day_index(&cfg);
+    let route = cfg.route("warming").expect("route");
+    let state = simmer::quota::store::RouteState::default();
+
+    fill(&store, &cfg, "catchall", 150).await;
+
+    let share_of = |group: &'static str| {
+        let store = store.clone();
+        async move {
+            let usage = store.usage("warming", group, day).await.expect("usage");
+            partial::share_for_group(
+                route,
+                day,
+                state,
+                Utc::now(),
+                simmer::quota::allowance_for(route, group, day, state),
+                Some(&usage),
+            )
+        }
+    };
+
+    let catchall = share_of("catchall").await.expect("throttled");
+    let google = share_of("google").await;
+    assert!(
+        google.is_none() || google.expect("share") > catchall,
+        "google's cap is untouched, so its share must be the looser one: \
+         google {google:?} vs catchall {catchall}"
+    );
+}
+
+#[sqlx::test]
+async fn a_graduated_route_is_offered_everything_under_auto(pool: PgPool) {
+    let cfg = auto_config(1.0, 200, 200, ", floor: 0.01, tail: {below: 0}");
+    let store = store(pool);
+    fill(&store, &cfg, "catchall", 190).await;
+    store
+        .set_graduated("warming", true)
+        .await
+        .expect("graduate");
+
+    // §9.3's graduate jumps to the end of the ramp, and the ramp is part of it.
+    assert_eq!(offered_count(&cfg, &store, 60).await, 60);
+}
+
+#[sqlx::test]
+async fn a_pinned_reply_is_exempt_under_auto(pool: PgPool) {
+    // D-090: a reply that changed identity because arithmetic said so is exactly
+    // what thread affinity exists to prevent.
+    let cfg = auto_config(
+        1.0,
+        200,
+        200,
+        ", floor: 0.01, ceiling: 0.02, tail: {below: 0}",
+    );
+    let store = store(pool);
+    fill(&store, &cfg, "catchall", 150).await;
+
+    for r in recipients(30) {
+        let (selected, _) = walk(&cfg, &store, Some("warming"), &r).await;
+        assert_eq!(selected.as_deref(), Some("warming"), "{r}");
+    }
+}
+
+#[sqlx::test]
+async fn dry_run_gives_the_real_walks_answer_under_auto(pool: PgPool) {
+    let cfg = auto_config(
+        24.0 * 0.25,
+        200,
+        200,
+        ", ceiling: 0.9, floor: 0.01, tail: {below: 0}",
+    );
+    let store = store(pool);
+    fill(&store, &cfg, "catchall", 100).await;
+    let chain = vec!["warming".to_string(), "overflow".to_string()];
+
+    // §9 says the control plane must not lie. It reads the same row and the same
+    // clock as the walk, so its answer is the walk's — not a probability.
+    for r in recipients(40) {
+        let dry = chain::dry_walk(
+            &cfg,
+            &store,
+            &Frequency::new(),
+            &simmer::preflight::Registry::new(),
+            &chain,
+            None,
+            &r,
+            Utc::now(),
+        )
+        .await
+        .expect("dry walk");
+        let (_, real) = walk(&cfg, &store, None, &r).await;
+        assert_eq!(chain::render(&dry), chain::render(&real), "{r}");
+    }
+}

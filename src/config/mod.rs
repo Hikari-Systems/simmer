@@ -1060,20 +1060,25 @@ pub struct Schedule {
     /// Keyed by domain group name. §4.2 rejects a key naming a nonexistent group.
     #[serde(default)]
     pub overrides: BTreeMap<String, Vec<i64>>,
-    /// D-091's partial ramp: on day `i`, only `share[i]` of the messages that
-    /// reach this route in the walk are offered to it, and the rest skip to the
-    /// next link. The cap is then reached later in the day, and the route's
-    /// volume is spread across it rather than spent in its first hours.
+    /// D-091's partial ramp: only part of the messages that reach this route in
+    /// the walk are offered to it, and the rest skip to the next link. The cap
+    /// is then reached later in the day, and the route's volume is spread
+    /// across it rather than spent in its first hours.
     ///
-    /// Indexed like `default`, for every domain group. Past its end the share is
-    /// **1** — not §7.2's "final value repeats", which would leave a list ending
-    /// below 1 throttling the route forever. Empty, the default, is no partial
-    /// ramp at all. Each value is in `(0, 1]`; §4.2 refuses anything else.
+    /// A **list** is indexed like `default`, for every domain group. Past its
+    /// end the share is **1** — not §7.2's "final value repeats", which would
+    /// leave a list ending below 1 throttling the route forever. Empty, the
+    /// default, is no partial ramp at all. Each value is in `(0, 1]`; §4.2
+    /// refuses anything else.
     ///
-    /// Which messages are offered is a keyed hash, not a dice roll
+    /// `mode: auto` computes the share instead, per domain group, from how full
+    /// the day's cap is and how far through the ramp day it is (D-097). See
+    /// [`AutoShare`].
+    ///
+    /// Which messages are offered is a keyed hash either way, not a dice roll
     /// (`routing::partial`), so every instance and §9.4's dry run agree.
     #[serde(default)]
-    pub share: Vec<f64>,
+    pub share: ShareSchedule,
 }
 
 impl Schedule {
@@ -1093,11 +1098,207 @@ impl Schedule {
         series.get(idx).map(|v| u64::try_from(*v).unwrap_or(0))
     }
 
-    /// D-091: the share of traffic offered on `day_index`, or `None` for all of
-    /// it — before the ramp starts, past the end of `share`, or at a share of 1.
+    /// D-091: the share of traffic a **list** offers on `day_index`, or `None`
+    /// for all of it — before the ramp starts, past the end of the list, or at a
+    /// share of 1.
+    ///
+    /// `auto` is also `None` here, and deliberately so: its value is not a
+    /// function of the day alone. `routing::partial::share_for_group` is the one
+    /// place that resolves either kind, which is what stops the walk, the dry run
+    /// and `/routes` from disagreeing.
     pub fn share_for(&self, day_index: i64) -> Option<f64> {
+        let ShareSchedule::Days(days) = &self.share else {
+            return None;
+        };
         let idx = usize::try_from(day_index).ok()?;
-        self.share.get(idx).copied().filter(|s| *s < 1.0)
+        days.get(idx).copied().filter(|s| *s < 1.0)
+    }
+
+    /// Is a partial ramp configured at all? §4.2's chain-position rule turns on
+    /// this, and an empty list is no ramp.
+    pub fn has_partial_ramp(&self) -> bool {
+        self.share.is_configured()
+    }
+}
+
+/// D-091's `schedule.share`: a list indexed by day, or D-097's `auto`.
+#[derive(Debug, Clone)]
+pub enum ShareSchedule {
+    /// One value per day index, for every domain group. Empty is no ramp.
+    Days(Vec<f64>),
+    /// Computed per `(route, domain_group)` from the day's cap and the clock.
+    Auto(AutoShare),
+}
+
+impl Default for ShareSchedule {
+    fn default() -> Self {
+        Self::Days(Vec::new())
+    }
+}
+
+impl ShareSchedule {
+    pub fn is_configured(&self) -> bool {
+        match self {
+            Self::Days(days) => !days.is_empty(),
+            Self::Auto(_) => true,
+        }
+    }
+
+    pub fn auto(&self) -> Option<&AutoShare> {
+        match self {
+            Self::Auto(a) => Some(a),
+            Self::Days(_) => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShareSchedule {
+    /// A list of fractions, or a map with `mode: auto`. By hand rather than
+    /// `#[serde(untagged)]`, whose only error is "did not match any variant" —
+    /// §4.2 is worth a message that says which key was wrong.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ShareSchedule;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a list of shares, one per day, or a map with `mode: auto`")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<ShareSchedule, A::Error> {
+                let days =
+                    Vec::<f64>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
+                Ok(ShareSchedule::Days(days))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<ShareSchedule, A::Error> {
+                let auto =
+                    AutoShare::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(ShareSchedule::Auto(auto))
+            }
+        }
+
+        d.deserialize_any(V)
+    }
+}
+
+/// D-097's `share: {mode: auto}` — the partial ramp computed rather than listed.
+///
+/// The share is `(c / t') ^ gain`, clamped to `[floor, ceiling]`, where `c` is
+/// the fraction of the day's cap still to fill and `t'` the fraction of the
+/// **fill window** still to run. `fill_by` makes that window shorter than the
+/// day, which overstates the share throughout and pins it at `ceiling` once the
+/// window closes: the cap is met early rather than exactly, because simmer
+/// cannot delay a message and so cannot rely on later traffic existing.
+///
+/// `tail` closes the last of the cap. A floor alone does not finish a ramp — at
+/// 0.05, the last 40 messages of an 800 cap need some 800 offered messages to
+/// arrive — so under `tail.below` of the cap the throttle is released.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoShare {
+    /// Never offer less than this, until `tail` releases it.
+    pub floor: f64,
+    /// Never offer more than this. The only hard promise about the peak the
+    /// receiving provider sees, and the one clamp every other arm resolves to.
+    pub ceiling: f64,
+    /// How sharply the share reacts to being ahead of pace. 1 is proportional;
+    /// higher tracks the pace line more tightly and throttles harder.
+    pub gain: f64,
+    /// Meet the cap this far through the ramp day. Past it the share is
+    /// `ceiling`.
+    pub fill_by: f64,
+    pub tail: Tail,
+}
+
+/// D-097's tail release: what happens when the cap is nearly met.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tail {
+    /// Release the throttle once the remaining cap is at or under this fraction
+    /// of it. `0` disables the release.
+    #[serde(default = "Tail::default_below")]
+    pub below: f64,
+    /// What the release opens to. Its own value rather than `AutoShare::ceiling`
+    /// so that a route held well under the ceiling all day can still close out.
+    #[serde(default = "Tail::default_ceiling")]
+    pub ceiling: f64,
+}
+
+impl Tail {
+    pub const DEFAULT_BELOW: f64 = 0.1;
+    pub const DEFAULT_CEILING: f64 = 1.0;
+
+    fn default_below() -> f64 {
+        Self::DEFAULT_BELOW
+    }
+
+    fn default_ceiling() -> f64 {
+        Self::DEFAULT_CEILING
+    }
+}
+
+impl Default for Tail {
+    fn default() -> Self {
+        Self {
+            below: Self::DEFAULT_BELOW,
+            ceiling: Self::DEFAULT_CEILING,
+        }
+    }
+}
+
+impl AutoShare {
+    pub const DEFAULT_FLOOR: f64 = 0.05;
+    pub const DEFAULT_CEILING: f64 = 1.0;
+    pub const DEFAULT_GAIN: f64 = 4.0;
+    pub const DEFAULT_FILL_BY: f64 = 0.6;
+}
+
+impl Default for AutoShare {
+    fn default() -> Self {
+        Self {
+            floor: Self::DEFAULT_FLOOR,
+            ceiling: Self::DEFAULT_CEILING,
+            gain: Self::DEFAULT_GAIN,
+            fill_by: Self::DEFAULT_FILL_BY,
+            tail: Tail::default(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoShare {
+    /// `mode` is required and every parameter optional, so that the shortest
+    /// form — `share: {mode: auto}` — is the whole feature at its defaults.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Mode {
+            Auto,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            #[allow(dead_code)]
+            mode: Mode,
+            floor: Option<f64>,
+            ceiling: Option<f64>,
+            gain: Option<f64>,
+            fill_by: Option<f64>,
+            tail: Option<Tail>,
+        }
+
+        let t = Table::deserialize(d)?;
+        let d = AutoShare::default();
+        Ok(AutoShare {
+            floor: t.floor.unwrap_or(d.floor),
+            ceiling: t.ceiling.unwrap_or(d.ceiling),
+            gain: t.gain.unwrap_or(d.gain),
+            fill_by: t.fill_by.unwrap_or(d.fill_by),
+            tail: t.tail.unwrap_or(d.tail),
+        })
     }
 }
 

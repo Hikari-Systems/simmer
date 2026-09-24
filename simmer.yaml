@@ -327,6 +327,32 @@ routes:
         # thread-affinity replies are exempt.
         #
         # share: [0.1, 0.25, 0.5]
+        #
+        # D-097 — or let the share compute itself, per domain group, from how
+        # full the day's cap is and how far through the ramp day it is. Ahead of
+        # pace it collapses; behind, or out of window, it opens to `ceiling`.
+        # Every parameter below is optional and shown at its default, so
+        # `share: {mode: auto}` on its own is the whole thing.
+        #
+        # `fill_by` is under 1 deliberately: simmer never delays a message, so
+        # it cannot smooth a bursty sender — only take a fraction of each burst.
+        # Pacing to the day boundary would lose the cap whenever the traffic is
+        # front-loaded, so aim earlier and hit it early instead of not at all.
+        #
+        # `tail` is what makes the ramp finish. A floor cannot: at 0.05 the last
+        # 40 messages of an 800 cap need some 800 offered messages to arrive.
+        # Under `below` of the cap the throttle comes off. `below: 0` disables.
+        #
+        # `ceiling` is the only hard promise about the peak a provider sees.
+        # It defaults to 1, which promises nothing. Set it if you care.
+        #
+        # share:
+        #   mode: auto
+        #   floor:   0.05
+        #   ceiling: 1.0
+        #   gain:    4.0
+        #   fill_by: 0.6
+        #   tail: { below: 0.1, ceiling: 1.0 }
     # §7.3: a steering rule, not a suppression rule. Over threshold makes this
     # route ineligible so the message falls through; nothing is ever dropped.
     recipient_frequency:

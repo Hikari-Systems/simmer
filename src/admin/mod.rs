@@ -318,6 +318,11 @@ async fn refresh_quota_gauges(state: &AdminState) -> Result<(), quota::QuotaErro
                 group.committed as f64,
             );
             crate::metrics::quota_reserved(&route.name, &group.domain_group, group.reserved as f64);
+            // Absent, not 1, when every message is offered: the series existing
+            // is what says a partial ramp is in force (D-091, D-097).
+            if let Some(share) = group.partial_ramp_share {
+                crate::metrics::partial_ramp_share(&route.name, &group.domain_group, share);
+            }
         }
     }
 

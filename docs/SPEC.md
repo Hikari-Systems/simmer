@@ -196,10 +196,13 @@ Given an accepted message with a resolved incoming identity:
    a. If the route is paused (admin API, §9.3), skip.
    b. If the route has a `recipient_frequency` constraint and this recipient is at or over
       threshold within the window, skip. Evaluated **first** — it can eliminate routes outright.
-   c′. If the route's `warmup.schedule.share` for today is below 1 (§7.2) and this message
+   c′. If the route's `warmup.schedule.share` is below 1 right now (§7.2) and this message
       is not in it, skip. Membership is a keyed hash of the normalised recipient, the route
       and the day index under the §7.3 salt — deterministic, so every instance and §9.4's dry
-      run give the same answer. *(Added. See `DECISIONS.md` D-091.)*
+      run give the same answer. *(Added. See `DECISIONS.md` D-091.)* Under `mode: auto` the
+      share itself is computed from the day's usage row and the clock, so the row is read
+      — without a lock, and before the reservation — to decide it. *(Added. See
+      `DECISIONS.md` D-097.)*
    c. If the route is warming and has no remaining headroom for this domain group today,
       skip.
    d. Otherwise, attempt reservation (§7.4). If reservation fails due to a concurrent
@@ -359,6 +362,14 @@ routes:
       schedule:
         default: [50, 100, 200, 400, 800, 1500, 3000, 5000]
         share:   [0.1, 0.25, 0.5]      # optional (§7.2, D-091); every message from day 3
+        # or, computed instead of listed (§7.2, D-097) — every parameter optional:
+        # share:
+        #   mode: auto
+        #   floor:   0.05                # never offer less, until `tail` releases it
+        #   ceiling: 1.0                 # never offer more; the only promise about the peak
+        #   gain:    4.0                 # how sharply it reacts to running ahead of pace
+        #   fill_by: 0.6                 # meet the cap this far through the ramp day
+        #   tail: { below: 0.1, ceiling: 1.0 }   # release the last tenth of the cap
         overrides:
           google:    [20, 50, 100, 250, 500, 1000, 2000, 4000]
           microsoft: [20, 50, 100, 250, 500, 1000, 2000, 4000]
@@ -405,6 +416,11 @@ not just the first.
   `share` is the last route of any chain (sender rules and `default_chain`), where every
   message it is not offered would be §10.3's reply by design.
   *(Added. See `DECISIONS.md` D-091.)*
+- Under `share: {mode: auto}`: `floor`, `ceiling`, `fill_by` or `tail.ceiling` is not above 0
+  and at most 1; `tail.below` is below 0 or at least 1 (0 disables the release); `gain` is not
+  above 0 and finite; or `floor` is above `ceiling`. The chain-position rule above applies to
+  an `auto` route too, and more so: there is no day on which the gate lifts.
+  *(Added. See `DECISIONS.md` D-097.)*
 - `${ENV_VAR}` interpolation cannot be resolved.
 - `server.listeners` is empty, or two listeners share an address.
 - A listener's `tls` is not `off` and `server.tls` is absent.
@@ -953,6 +969,37 @@ route forever. A graduated route (§9.3) is offered every message too. The allow
 is unchanged: a partial ramp decides which messages may *try* the route, never how many it may
 carry. *(Added. See `DECISIONS.md` D-091.)*
 
+**A computed share.** `share: {mode: auto}` replaces the list with a controller, evaluated
+per `(route, domain_group)` at each decision:
+
+```
+c  = (allowance - used) / allowance      the cap still to fill, 1 -> 0
+t' = (fill_by - elapsed) / fill_by       the fill window still to run, 1 -> 0
+
+remaining <= tail.below * allowance  ->  tail.ceiling   (the release)
+t' == 0                              ->  ceiling        (past the deadline)
+otherwise      clamp(floor, ceiling, (c / t') ^ gain)
+```
+
+`allowance` is the one §7.4 will enforce — the row's once a row exists, and §9.3's override
+where set — and `used` is `committed + reserved`. `elapsed` is the fraction of the route's
+current day that has passed, measured from the same origin `day_index` counts from.
+
+Three things follow from the shape. **`fill_by` is below 1 on purpose:** pacing to land at
+the day boundary loses the cap whenever the traffic is front-loaded, because Simmer cannot
+delay a message (§8.1) and so cannot rely on later traffic existing. A shorter window
+overstates the share throughout and opens it fully once the window closes. **The tail is
+released, not floored:** finishing the cap needs the share to *rise* as the remaining cap
+falls, which no monotone function of the fill does; `tail.below: 0` disables the release.
+**`ceiling` is the only hard promise about the peak**, since every arm resolves to it.
+
+Unlike a list, `auto` has no end: it applies for as long as the route is warming and not
+graduated. It cannot throttle a route forever by accident, because once the cap is
+comfortably above the traffic the ratio sits at the ceiling and every message is offered.
+Everything else is unchanged — *which* messages are offered is still the keyed hash, the
+allowance is still untouched, and §3.2 step 2a's pinned reply is still exempt.
+*(Added. See `DECISIONS.md` D-097.)*
+
 An unused allowance does not carry over. A route that sent nothing yesterday still advances
 its `day_index`, because the index is a function of elapsed time only.
 
@@ -1125,7 +1172,10 @@ added; see D-090.)*
 - `GET /health` — liveness; includes database reachability.
 - `GET /routes` — configuration summary plus live state: warm-up day, allowance and usage per
   domain group, paused flag, preflight results, pool statistics, and the `share` list with
-  today's share *(added, D-091)*.
+  today's share *(added, D-091)*. Each domain-group window also carries the share in force
+  for it right now, which under `mode: auto` differs between groups and moves as the cap
+  fills; the route-level `today` is then `null`, and the `auto` parameters are reported
+  beside the mode *(added, D-097)*.
 - `GET /routes/{name}` — as above for one route.
 - `GET /quota?route=&group=` — current window detail.
 - `GET /metrics` — Prometheus, when `admin.metrics` is enabled (§9.1).
@@ -1158,7 +1208,10 @@ with reason `over_cap`. *(Added. See `DECISIONS.md` D-090.)*
 
 A route passed over by its partial ramp (§3.2 step 3c′) is reported with reason
 `partial_ramp`. The hash is the real walk's, so this is the real answer for that recipient,
-not an estimate. *(Added. See `DECISIONS.md` D-091.)*
+not an estimate. *(Added. See `DECISIONS.md` D-091.)* Under `mode: auto` it is the real
+answer **as of now**: the share is computed from the same row and the same clock the walk
+would read, and that row moves. This is the standard the headroom check beside it has always
+held to. *(Added. See `DECISIONS.md` D-097.)*
 
 This is the primary tool for validating a configuration before it carries live traffic, and
 should be treated as a first-class feature rather than a debugging afterthought.

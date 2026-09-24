@@ -269,9 +269,15 @@ src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve a
 src/routing/thread.rs    §3.2 step 2a (D-090) — thread affinity. A REORDERING plus two
                          exemptions for the pinned route only: no §7.3 threshold, and
                          an ordinary reservation first, then `over_cap` past the cap
-src/routing/partial.rs   §3.2 step 3c′ (D-091) — `schedule.share`. A KEYED HASH, not
-                         a dice roll, so dry run and every instance agree. Past the
-                         list's end the share is 1, NOT a cap's repeated last value
+src/routing/partial.rs   §3.2 step 3c′ (D-091, D-097) — `schedule.share`. A KEYED
+                         HASH, not a dice roll, so dry run and every instance agree.
+                         Past a list's end the share is 1, NOT a cap's repeated last
+                         value. `mode: auto` computes the share from the day's row
+                         and the clock instead: `auto_share` is the arithmetic and
+                         has no clock or config lookup in it, `share_for_group` is
+                         the ONE entry point the walk, the dry run and /routes all
+                         call. `fill_by` is under 1 on purpose and `tail` is what
+                         makes a ramp finish — a floor cannot
 src/metrics.rs           §9.1 counters, the recorder, and every `# HELP` line. The
                          recorder exists only with `admin.metrics` (D-093): off, every
                          `metrics::` call is a no-op and /metrics is a 404

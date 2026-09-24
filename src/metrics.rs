@@ -176,6 +176,13 @@ fn describe() {
         "Reservations outstanding right now for this route and domain group (§7.4)"
     );
     describe_gauge!(
+        "simmer_partial_ramp_share",
+        "The fraction of the traffic reaching this route and domain group that is offered \
+         to it right now (§3.2 step 3c′). Absent when every message is offered. Under \
+         share: auto it moves as the cap fills (D-097); watch it against \
+         simmer_route_skipped_total{reason=\"partial_ramp\"}"
+    );
+    describe_gauge!(
         "simmer_warmup_day",
         "Elapsed-duration day index since warmup.started (§7.2). Never calendar arithmetic. \
          Negative means the route has not started, and its allowance reads 0"
@@ -711,6 +718,21 @@ pub fn quota_reserved(route: &str, domain_group: &str, reserved: f64) {
         "domain_group" => domain_group.to_string(),
     )
     .set(reserved);
+}
+
+/// §9.1 `simmer_partial_ramp_share{route,domain_group}` — §3.2 step 3c′'s share.
+///
+/// Recomputed at every scrape from the same function the walk calls (D-056), so
+/// a dashboard cannot show a share the walk was not applying. A route offered
+/// every message reports nothing at all rather than 1: the series existing is
+/// what says a ramp is in force.
+pub fn partial_ramp_share(route: &str, domain_group: &str, share: f64) {
+    metrics::gauge!(
+        "simmer_partial_ramp_share",
+        "route" => route.to_string(),
+        "domain_group" => domain_group.to_string(),
+    )
+    .set(share);
 }
 
 /// §9.1 `simmer_preflight_ok{route,check}` — §6.7's three checks, as 1 or 0.

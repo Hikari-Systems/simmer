@@ -369,6 +369,58 @@ Watch `simmer_route_skipped_total{reason="partial_ramp"}` against
 `reason="quota"`. `/routes` reports the list and `today`'s share (`null` when
 every message is offered).
 
+### A share that tunes itself
+
+The list above is a hand-tuned guess at one number — the cap divided by the
+volume the chain carries — and it is wrong whenever that volume changes. Set it
+too low and the cap never fills, so the ramp quietly falls behind its own
+schedule; too high and the day is a burst again. `mode: auto` computes it
+instead, per domain group, from how full the day's cap is and how far through the
+day it is (§7.2, D-097):
+
+```yaml
+    warmup:
+      started: "2026-08-01T09:00:00Z"
+      schedule:
+        default: [50, 100, 200, 400, 800]
+        share:
+          mode: auto
+          floor:   0.05     # never offer less, until the tail releases it
+          ceiling: 1.0      # never offer more — the only promise about the peak
+          gain:    4.0      # how sharply it reacts to running ahead of pace
+          fill_by: 0.6      # meet the cap 60% of the way through the ramp day
+          tail: { below: 0.1, ceiling: 1.0 }   # release the last tenth
+```
+
+Every parameter is optional and the values shown are the defaults, so
+`share: {mode: auto}` on its own is the whole feature.
+
+Run ahead of pace and the share collapses; fall behind, or run out of window, and
+it opens back up to the `ceiling`. Two details are worth understanding before
+setting the knobs:
+
+- **`fill_by` is below 1 on purpose.** Simmer never delays a message — a message
+  it does not offer to the warming route goes down the chain immediately — so it
+  cannot smooth a bursty sender. It can only take a fraction of each burst.
+  Pacing to land exactly at the day boundary therefore loses the cap whenever the
+  traffic is front-loaded: the ramp throttles the morning to save room for an
+  afternoon that never comes. Aiming at a deadline earlier than the day means
+  hitting the cap early rather than not at all.
+- **The last of the cap is released, not floored.** A floor does not finish a
+  ramp; at 0.05, the last 40 messages of an 800 cap need some 800 offered
+  messages to arrive. Under `tail.below` of the cap the throttle comes off
+  entirely, to `tail.ceiling`. Set `tail.below: 0` to disable that.
+
+`ceiling` is the one hard promise: "this route never takes more than this much of
+what the chain carries, whatever the arithmetic says." It defaults to 1, which
+promises nothing — set it if you care about the peak a provider sees.
+
+Unlike a list, `auto` never ends; it applies while the route is warming and not
+graduated. That cannot throttle a route forever, because once the cap is well
+above the traffic the share sits at the ceiling and every message is offered.
+`/routes` reports the share **per domain group** under `auto` (the cap it paces
+against is per group), and the route-level `today` is `null`.
+
 ### Thread affinity
 
 Off by default. With it on, a reply the application sends into a conversation

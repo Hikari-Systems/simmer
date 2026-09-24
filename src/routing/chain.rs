@@ -251,22 +251,35 @@ pub async fn walk_and_reserve<'a>(
             continue;
         }
 
-        // (c′) D-091's partial ramp. After the start check because it needs the
-        // day index, and before the reservation so that a message turned away
-        // here never touches the row lock. A pinned reply is exempt.
-        if let Some(share) = partial::share_today(route, day_index, state).filter(|_| !is_pinned) {
-            let keyer = frequency.keyer(store.as_ref()).await?;
-            let recipient = recipients.first().map(String::as_str).unwrap_or_default();
-            if !partial::offered(
-                keyer,
-                name,
-                recipient,
-                day_index,
-                share,
-                &cfg.dot_insensitive_domains,
-            ) {
-                record(evaluation, name, Err(SkipReason::PartialRamp));
-                continue;
+        // (c′) D-091's partial ramp, and D-097's computed share. After the start
+        // check because it needs the day index, and before the reservation so
+        // that a message turned away here never touches the row lock. A pinned
+        // reply is exempt.
+        if !is_pinned {
+            // D-097 paces against how full the day's cap is, so the row is read
+            // first — without the lock, since nothing here writes. A listed
+            // share, and every route with no ramp at all, still read nothing.
+            let usage = if partial::needs_usage(route, state) {
+                Some(store.usage(name, &group, day_index).await?)
+            } else {
+                None
+            };
+            if let Some(share) =
+                partial::share_for_group(route, day_index, state, now, allowance, usage.as_ref())
+            {
+                let keyer = frequency.keyer(store.as_ref()).await?;
+                let recipient = recipients.first().map(String::as_str).unwrap_or_default();
+                if !partial::offered(
+                    keyer,
+                    name,
+                    recipient,
+                    day_index,
+                    share,
+                    &cfg.dot_insensitive_domains,
+                ) {
+                    record(evaluation, name, Err(SkipReason::PartialRamp));
+                    continue;
+                }
             }
         }
 
@@ -430,24 +443,34 @@ pub async fn dry_walk(
             continue;
         }
 
-        // D-091, in `walk_and_reserve`'s position. The hash is the real walk's,
-        // so this is its answer and not an estimate of it.
-        if let Some(share) = partial::share_today(route, day_index, state).filter(|_| !is_pinned) {
-            let keyer = frequency.keyer(store.as_ref()).await?;
-            if !partial::offered(
-                keyer,
-                name,
-                recipient,
-                day_index,
-                share,
-                &cfg.dot_insensitive_domains,
-            ) {
-                evaluation.push(step(name, Err(SkipReason::PartialRamp)));
-                continue;
+        // Read once, and before the partial ramp, because D-097's share is paced
+        // against this row. `walk_and_reserve` reads it only when the ramp needs
+        // it and then takes the lock; the dry run needs it regardless, since it
+        // reports headroom below without reserving anything.
+        let usage = store.usage(name, &group, day_index).await?;
+
+        // D-091 and D-097, in `walk_and_reserve`'s position. The hash and the
+        // arithmetic are the real walk's, so this is its answer and not an
+        // estimate of it.
+        if !is_pinned {
+            if let Some(share) =
+                partial::share_for_group(route, day_index, state, now, allowance, Some(&usage))
+            {
+                let keyer = frequency.keyer(store.as_ref()).await?;
+                if !partial::offered(
+                    keyer,
+                    name,
+                    recipient,
+                    day_index,
+                    share,
+                    &cfg.dot_insensitive_domains,
+                ) {
+                    evaluation.push(step(name, Err(SkipReason::PartialRamp)));
+                    continue;
+                }
             }
         }
 
-        let usage = store.usage(name, &group, day_index).await?;
         // An absent row reads as all-zero, so a fresh day is eligible against the
         // schedule's ceiling — which is what the reservation would write.
         let effective = Usage {

@@ -68,6 +68,28 @@ pub fn next_boundary(route: &Route, now: DateTime<Utc>) -> DateTime<Utc> {
     boundary(origin(route), for_route(route, now) + 1)
 }
 
+/// How far through the current day an elapsed-duration ramp is, in `[0, 1)`.
+///
+/// D-097's partial ramp paces against this. Elapsed milliseconds over the day's
+/// milliseconds, from the same origin [`index`] counts from — never calendar
+/// arithmetic, so it is immune to DST for the reason §7.2 gives.
+///
+/// Before `started` this is 0: nothing has elapsed of a day that has not begun,
+/// and §7.2 has made the route ineligible anyway.
+pub fn fraction_through_day(started: DateTime<Utc>, now: DateTime<Utc>) -> f64 {
+    let day_index = index(started, now);
+    if day_index < 0 {
+        return 0.0;
+    }
+    let elapsed = now.timestamp_millis() - boundary(started, day_index).timestamp_millis();
+    (elapsed as f64 / MILLIS_PER_DAY as f64).clamp(0.0, 1.0)
+}
+
+/// How far through its current day a route is.
+pub fn fraction_elapsed(route: &Route, now: DateTime<Utc>) -> f64 {
+    fraction_through_day(origin(route), now)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +117,40 @@ mod tests {
         assert_eq!(index(started, utc("2026-08-02T09:00:00Z")), 1);
         assert_eq!(index(started, utc("2026-08-03T09:00:00Z")), 2);
         assert_eq!(index(started, utc("2026-08-31T09:00:00Z")), 30);
+    }
+
+    #[test]
+    fn the_fraction_through_the_day_runs_from_zero_to_one() {
+        let started = utc("2026-08-01T09:00:00Z");
+        let at = |s| fraction_through_day(started, utc(s));
+
+        // The boundary is 0, not 1: a new day has nothing elapsed.
+        assert_eq!(at("2026-08-01T09:00:00Z"), 0.0);
+        assert!((at("2026-08-01T15:00:00Z") - 0.25).abs() < 1e-9);
+        assert!((at("2026-08-01T21:00:00Z") - 0.5).abs() < 1e-9);
+
+        // And it resets on the anniversary of the start time, not at midnight.
+        assert_eq!(at("2026-08-02T09:00:00Z"), 0.0);
+        assert!((at("2026-08-02T15:00:00Z") - 0.25).abs() < 1e-9);
+
+        // Every day, however far in.
+        assert!((at("2026-09-15T21:00:00Z") - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn nothing_has_elapsed_of_a_day_that_has_not_begun() {
+        // §7.2 makes a route with a future start ineligible; D-097 must not
+        // read a negative day index as a window that has already closed, which
+        // would open the share to its ceiling.
+        let started = utc("2026-08-10T09:00:00Z");
+        assert_eq!(
+            fraction_through_day(started, utc("2026-08-09T09:00:00Z")),
+            0.0
+        );
+        assert_eq!(
+            fraction_through_day(started, utc("2026-01-01T00:00:00Z")),
+            0.0
+        );
     }
 
     #[test]

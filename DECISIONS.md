@@ -4035,6 +4035,159 @@ were never built either. Widened to `'**'` in the commit after this one. The
 sanitising `sed` in `merge-manifest` was already written for slashes, so nothing
 else had to change — `feat/mssql-arm64` publishes as `feat-mssql-arm64`.
 
+### D-097 — `share: auto`: the partial ramp computes its own share
+
+> **Settled 2026-09-24 by the spec's author, who asked for it, and the spec
+> amended in the same change:** §3.2 (step 3c′), §4.1, §4.2, §7.2, §9.1, §9.2
+> and §9.4. Four calls were the author's: the controller weighs the cap against
+> the **clock**; it paces to a deadline **earlier than the day boundary**, so
+> the cap is met early rather than exactly; the tail is **released** rather than
+> floored; and the release gets its **own ceiling**.
+
+**The problem.** D-091's `share` list is a hand-tuned guess at one number —
+`cap ÷ the volume the chain carries` — and it is wrong whenever that volume
+changes. Set too low, the cap never fills and the ramp stalls below the schedule
+it is supposed to be following. Set too high, the day is a burst again, which is
+what D-091 existed to stop. Nobody knows the right number on day 0, and it moves.
+
+**What it does.** `share: {mode: auto}` computes the share instead, per
+`(route, domain_group)`, from the day's quota row and the clock:
+
+```
+c  = (allowance - used) / allowance      the cap still to fill, 1 -> 0
+t' = (fill_by - elapsed) / fill_by       the fill window still to run, 1 -> 0
+
+remaining <= tail.below * allowance  ->  tail.ceiling   (the release)
+t' == 0                              ->  ceiling        (past the deadline)
+otherwise      clamp(floor, ceiling, (c / t') ^ gain)
+```
+
+Ahead of pace the ratio falls and the share collapses; behind it, the ratio
+rises and the share opens. Everything else about the ramp is D-091 unchanged:
+*which* messages are offered is still the §7.3 keyed hash, the cap itself is
+untouched, a pinned thread-affinity reply is exempt, and a graduated route is
+offered everything.
+
+**Why the clock is in it.** A share that reads only how full the cap is cannot
+tell "ahead of schedule" from "the traffic already came and went". Those need
+opposite responses — throttle, and open up — and a fill-level-only controller
+gives the same answer to both. It also cannot finish: the share decays with the
+fill, so the last of the cap goes out asymptotically slowly, and the floor only
+makes the stall linear instead of exponential. At a floor of 0.05, the last 40
+messages of an 800 cap need some 800 offered messages to arrive.
+
+**Why the window is shorter than the day.** Because **simmer cannot delay a
+message.** There is no spool — a body is held in memory or on tmpfs while it is
+relayed — so a message not offered to the warming route goes down the chain
+*now*, and simmer cannot smooth a bursty source. It can only choose what fraction
+of each burst the warming route takes. Pacing to land exactly at the day boundary
+therefore loses the cap whenever the traffic is front-loaded: the controller
+throttles the morning burst to save room for an afternoon that never arrives.
+`fill_by` overstates the share by roughly `1/fill_by` throughout and pins it at
+the ceiling once the window closes. The cap is met early rather than exactly,
+which is the trade the author asked for.
+
+**Why the tail is released rather than floored, and why to its own ceiling.**
+The floor is a rate; finishing needs the share to *rise* as the remaining cap
+falls, which no monotone function of the fill does. `tail.below` is the one
+non-monotone rule, expressed as a clamp rather than a curve so that `/routes`
+and the dry run can explain it in a sentence. Its ceiling is its own so that a
+route held well under `ceiling` all day — which is how an operator bounds the
+peak a provider sees — can still close out its last few messages. Setting
+`tail.below: 0` disables it, and §4.2 allows that; setting it to 1 would release
+an empty cap, and §4.2 refuses that.
+
+**The ceiling stops being cosmetic.** Every arm above resolves to it, so it is
+the only hard promise the configuration makes about the peak: "this route never
+takes more than this fraction of what the chain carries, whatever the arithmetic
+says". It defaults to 1, which promises nothing; a ramp that cares about the
+peak sets it.
+
+*Alternatives, rejected:*
+
+- **A fill-level-only decay** (`share = f(remaining / cap)`, no clock). The
+  literal first shape asked for. It cannot distinguish the two cases above, and
+  it needs the floor to be load-bearing, which makes the floor a traffic-
+  dependent guess — the same guess `auto` exists to remove.
+- **A sliding allowance gate** (`offer while used < cap × elapsed + burst`). It
+  bounds the peak properly and is completely insensitive to burstiness, which
+  the fill/clock ratio is not. It also routinely leaves the cap unfilled when
+  the traffic is front-loaded, and it gives up the keyed hash — admission
+  becomes first-come — which §9.4's dry run and two-instance agreement rest on.
+  Still the right shape if what is wanted is "present all day" rather than "cap
+  met"; it is not what was asked for.
+- **A base learned from yesterday's volume** (`base = cap ÷ offered yesterday`,
+  corrected by the fill ratio). Under a bursty source this is the shape that is
+  actually *right*: a near-flat fraction of every burst, which is the best a
+  relay that cannot delay a message can do. Deferred, not refused — it needs a
+  global count of messages *offered*, which simmer has never kept. The cheap
+  form is an `offered` column folded into the `UPDATE` that `commit` already
+  runs, so no extra transactions, but it is a migration in both stores. It
+  composes with the above by multiplying the clamped expression, so it can be
+  added without revisiting any of this.
+- **Per-day `auto` parameters**, indexed like the caps. More to validate and to
+  read, for a need nobody has yet, and the controller already adapts across days
+  because the cap it paces against does.
+
+**Four consequences, each deliberate.**
+
+- **The share is no longer a pure function of configuration.** It depends on the
+  quota row and the clock, so D-091's "deterministic, so two instances agree
+  with no shared state" becomes "deterministic *given the row*". Two instances
+  agree to within row propagation and clock skew, and §9.4's dry run reports the
+  answer **as of now**. This is the same standard as the headroom check
+  immediately below it in the walk (§3.2 step 3c), which has always read shared
+  state and has always been a snapshot — so the control plane is no less honest
+  than it was, but it is honest about a moving number.
+- **It is computed per domain group.** A list applies one value to every group;
+  the cap `auto` paces against is per group, so its share is too. §9.2 therefore
+  reports the share on each window rather than once per route, and `today` is
+  `null` under `auto` — naming one group's number there would be picking a group
+  without saying which.
+- **It has no end.** A list ends, and past its end every message is offered;
+  `auto` applies for as long as the route is warming and not graduated. This
+  cannot throttle a route forever by accident, which is the failure §7.2's
+  "past the end is 1, not the last value repeated" was written to prevent: once
+  the cap is comfortably above the traffic the ratio sits at the ceiling and
+  every message is offered anyway. §9.3's graduate lifts it, as it lifts a list.
+- **The walk reads one more row.** Step 3c′ now needs the day's usage before it
+  can decide, so an `auto` route costs one non-locking `SELECT` per message per
+  route evaluated. A listed share, and every route without a ramp, read nothing:
+  `partial::needs_usage` is what keeps that true. Against the two write
+  transactions each message already runs (`docs/DB_LOAD.md`), one more read is
+  noise, and it takes no lock and writes no row version.
+
+**§4.2.** `floor`, `ceiling`, `fill_by` and `tail.ceiling` in `(0, 1]`;
+`tail.below` in `[0, 1)`; `gain` above 0 and finite; `floor <= ceiling`; and
+D-091's chain-position rule extends to `auto` — a route whose share can turn
+messages away may not be last in a chain, more so here because there is no day
+on which the gate lifts. Every violation is reported together, and the
+`Deserialize` is written by hand (as `admin.metrics` is, D-093) so that an
+unknown key is named rather than met with `#[serde(untagged)]`'s "did not match
+any variant".
+
+**Tested:** `routing/partial.rs` (the controller as arithmetic: never rising as
+the cap fills and never falling as the window closes, both clamps as plateaus,
+the release and its ceiling, `tail.below: 0` disabling it, the window
+overstating the share against the same row paced over the whole day, and that no
+degenerate row — a cap of 0, a negative cap, `used` past the cap from D-090's
+over-cap reservation — produces a `NaN` or anything outside the clamps; the
+worked table above is a test); `quota/day.rs` (`fraction_through_day` at both
+boundaries, on the anniversary rather than midnight, and 0 before the ramp
+starts); `tests/config_validation.rs` (the defaults, every parameter set, each
+§4.2 rule, the unknown key named, a share that is neither a list nor an auto
+map, and violations reported together); `tests/partial_ramp.rs` through the real
+walk on Postgres (the share falling as the cap fills, with the row moving by
+exactly the messages that were not turned away; the tail release closing the
+cap; the window closing opening the route; the share differing between two
+groups of one route; graduation lifting it; a pinned reply exempt; and §9.4's
+dry run giving the real walk's answer for every recipient); `admin/view.rs`
+(§9.2 reporting the parameters, the per-group share, and nothing at all for a
+graduated route or a route with no ramp).
+
+**Not tested here:** *(to be completed by the compose and soak runs)*
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
