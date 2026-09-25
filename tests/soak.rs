@@ -1194,7 +1194,7 @@ fn analyze_v4(failures: &mut Vec<String>) {
                 .filter_map(|(_, body)| {
                     metric(
                         body.as_deref()?,
-                        &format!("simmer_reservation_expired_total{{route=\"{V4_ROUTE}\"}}"),
+                        &format!("simmer_reservation_expired_total{{ramp=\"main\",route=\"{V4_ROUTE}\"}}"),
                     )
                 })
                 .sum();

@@ -160,7 +160,7 @@ pub fn resolve_chain<'a>(ramp: &'a Ramp, senders: &Senders) -> Result<&'a [Strin
                 domain = %domain,
                 "sender matched no rule; falling back to default_chain"
             );
-            metrics::unmatched_sender(&domain);
+            metrics::unmatched_sender(&ramp.name, &domain);
 
             // O-6: walk it normally, like any other chain.
             Ok(ramp
@@ -187,15 +187,20 @@ pub async fn check_early(
     match chain::any_eligible(ramp, &engine.groups, &engine.quota, chain, recipient).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(SelectError::ChainExhausted),
-        Err(e) => Err(quota_failure(&engine.config, e, "early eligibility check")),
+        Err(e) => Err(quota_failure(
+            &engine.config,
+            ramp,
+            e,
+            "early eligibility check",
+        )),
     }
 }
 
 /// §7.5 — turn a storage failure into the configured posture.
-fn quota_failure(cfg: &Config, e: quota::QuotaError, during: &str) -> SelectError {
+fn quota_failure(cfg: &Config, ramp: &Ramp, e: quota::QuotaError, during: &str) -> SelectError {
     if cfg.database.fail_closed {
         tracing::error!(error = %e, during, "quota store unavailable; failing closed");
-        metrics::quota_unavailable("-");
+        metrics::quota_unavailable(&ramp.name, "-");
         SelectError::QuotaUnavailable
     } else {
         // Explicitly opted out of §7.5's default. Loud, because it means the
@@ -262,11 +267,11 @@ pub async fn reserve_relay_commit(
     .await
     {
         Ok(Walk::Selected(s)) => {
-            thread::observe(&pin, Some(&s.route.name), s.over_cap);
+            thread::observe(&ramp.name, &pin, Some(&s.route.name), s.over_cap);
             s
         }
         Ok(Walk::Exhausted) => {
-            thread::observe(&pin, None, false);
+            thread::observe(&ramp.name, &pin, None, false);
             // §10.3, and the whole of §14.1: `451` by default, because a `550`
             // here would permanently suppress a deliverable recipient in systems
             // that outlive Simmer by years.
@@ -279,7 +284,7 @@ pub async fn reserve_relay_commit(
             return SelectError::ChainExhausted.to_reply(ramp);
         }
         Err(e) => {
-            let err = quota_failure(cfg, e, "reservation");
+            let err = quota_failure(cfg, ramp, e, "reservation");
             return err.to_reply(ramp);
         }
     };
@@ -329,11 +334,16 @@ pub async fn reserve_relay_commit(
     // §6.4 — a `text/*` part the route's `body_rewrites` did not reach. The
     // engine has already logged each one; this is the counter §9.1 asks for.
     for reason in &rewritten.skipped_parts {
-        metrics::body_rewrite_skipped(&selected.route.name, reason.as_str());
+        metrics::body_rewrite_skipped(&selected.route.ramp, &selected.route.name, reason.as_str());
     }
     // D-089 — the same, for a header a `header_rewrites` entry named.
     for (header, reason) in &rewritten.skipped_headers {
-        metrics::header_rewrite_skipped(&selected.route.name, header, reason.as_str());
+        metrics::header_rewrite_skipped(
+            &selected.route.ramp,
+            &selected.route.name,
+            header,
+            reason.as_str(),
+        );
     }
 
     tracing::info!(
@@ -372,7 +382,11 @@ pub async fn reserve_relay_commit(
     )
     .await;
     let elapsed = started.elapsed();
-    metrics::downstream_latency(&selected.route.name, elapsed.as_secs_f64());
+    metrics::downstream_latency(
+        &selected.route.ramp,
+        &selected.route.name,
+        elapsed.as_secs_f64(),
+    );
 
     let outcome = match &result {
         Ok(d) => {
@@ -385,7 +399,7 @@ pub async fn reserve_relay_commit(
             );
             downstream::outcome::delivered(&selected.route.name, d)
         }
-        Err(e) => downstream::outcome::failed(&selected.route.name, e),
+        Err(e) => downstream::outcome::failed(&selected.route.ramp, &selected.route.name, e),
     };
 
     // -- §7.4 phase 3 -------------------------------------------------
@@ -432,11 +446,13 @@ pub async fn reserve_relay_commit(
             .await
         {
             metrics::quota_committed(
+                &selected.route.ramp,
                 &selected.route.name,
                 &selected.domain_group,
                 usage.committed as f64,
             );
             metrics::quota_reserved(
+                &selected.route.ramp,
                 &selected.route.name,
                 &selected.domain_group,
                 usage.reserved as f64,
@@ -444,7 +460,12 @@ pub async fn reserve_relay_commit(
         }
     }
 
-    metrics::message(&selected.route.name, &selected.domain_group, outcome.result);
+    metrics::message(
+        &selected.route.ramp,
+        &selected.route.name,
+        &selected.domain_group,
+        outcome.result,
+    );
     outcome.reply
 }
 

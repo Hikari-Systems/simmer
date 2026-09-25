@@ -161,7 +161,7 @@ fn the_ramp_takes_less_of_a_burst_than_an_ungated_route_would() {
             // could differ in some other way.
             let (status, body) = compose::admin::post(
                 &AUTOSHARE,
-                "/routes/warming-newbrand/graduate",
+                "/ramps/main/routes/warming-newbrand/graduate",
                 &serde_json::json!({}),
             );
             assert!((200..300).contains(&status), "graduate: {status} {body}");
@@ -198,7 +198,7 @@ fn routes_reports_the_share_it_is_actually_applying() {
     AUTOSHARE.restart_app_at_elapsed(0.05);
     reset();
 
-    let route = || compose::admin::get(&AUTOSHARE, "/routes/warming-newbrand");
+    let route = || compose::admin::get(&AUTOSHARE, "/ramps/main/routes/warming-newbrand");
     let catchall = |v: &serde_json::Value| -> serde_json::Value {
         v["groups"]
             .as_array()

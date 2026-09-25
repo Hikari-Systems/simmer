@@ -220,7 +220,7 @@ async fn quota_gauges_are_refreshed_from_storage_on_every_scrape(pool: PgPool) {
         value(
             &body,
             "simmer_quota_allowance",
-            &[("domain_group", group), ("route", route)],
+            &[("domain_group", group), ("ramp", "main"), ("route", route)],
         )
     };
 
@@ -264,7 +264,11 @@ async fn a_reservation_moves_the_gauges_without_a_relay(pool: PgPool) {
         panic!("expected a reservation");
     };
 
-    let labels = [("domain_group", "google"), ("route", "warming")];
+    let labels = [
+        ("domain_group", "google"),
+        ("ramp", "main"),
+        ("route", "warming"),
+    ];
 
     let (_, body) = scrape(&state).await;
     assert_eq!(
@@ -292,7 +296,7 @@ async fn an_allowance_override_is_what_the_gauge_reports(pool: PgPool) {
     // showing the schedule while the reservation protocol honours something else
     // is the D-026 trap in the place nobody checks.
     let state = state(pool.clone());
-    let request = Request::post("/routes/warming/allowance")
+    let request = Request::post("/ramps/main/routes/warming/allowance")
         .header("authorization", format!("Bearer {TOKEN}"))
         .header("content-type", "application/json")
         .body(Body::from(
@@ -307,7 +311,11 @@ async fn an_allowance_override_is_what_the_gauge_reports(pool: PgPool) {
         value(
             &body,
             "simmer_quota_allowance",
-            &[("domain_group", "google"), ("route", "warming")]
+            &[
+                ("domain_group", "google"),
+                ("ramp", "main"),
+                ("route", "warming")
+            ]
         ),
         "99"
     );
@@ -355,14 +363,22 @@ async fn a_route_that_has_not_started_reports_a_ceiling_of_zero_not_infinity(poo
         value(
             &body,
             "simmer_quota_allowance",
-            &[("domain_group", "google"), ("route", "warming")]
+            &[
+                ("domain_group", "google"),
+                ("ramp", "main"),
+                ("route", "warming")
+            ]
         ),
         "0"
     );
     assert!(
-        value(&body, "simmer_warmup_day", &[("route", "warming")])
-            .parse::<f64>()
-            .unwrap()
+        value(
+            &body,
+            "simmer_warmup_day",
+            &[("ramp", "main"), ("route", "warming")]
+        )
+        .parse::<f64>()
+        .unwrap()
             < 0.0,
         "the day index is what says the route has not begun: {body}"
     );
@@ -371,7 +387,11 @@ async fn a_route_that_has_not_started_reports_a_ceiling_of_zero_not_infinity(poo
         value(
             &body,
             "simmer_quota_allowance",
-            &[("domain_group", "google"), ("route", "overflow")]
+            &[
+                ("domain_group", "google"),
+                ("ramp", "main"),
+                ("route", "overflow")
+            ]
         )
         .parse::<f64>()
         .unwrap(),
@@ -390,11 +410,15 @@ async fn a_paused_route_is_visible_on_a_dashboard_with_no_traffic(pool: PgPool) 
 
     let (_, body) = scrape(&state).await;
     assert_eq!(
-        value(&body, "simmer_route_paused", &[("route", "warming")]),
+        value(
+            &body,
+            "simmer_route_paused",
+            &[("ramp", "main"), ("route", "warming")]
+        ),
         "0"
     );
 
-    let request = Request::post("/routes/warming/pause")
+    let request = Request::post("/ramps/main/routes/warming/pause")
         .header("authorization", format!("Bearer {TOKEN}"))
         .body(Body::empty())
         .unwrap();
@@ -403,11 +427,19 @@ async fn a_paused_route_is_visible_on_a_dashboard_with_no_traffic(pool: PgPool) 
 
     let (_, body) = scrape(&state).await;
     assert_eq!(
-        value(&body, "simmer_route_paused", &[("route", "warming")]),
+        value(
+            &body,
+            "simmer_route_paused",
+            &[("ramp", "main"), ("route", "warming")]
+        ),
         "1"
     );
     assert_eq!(
-        value(&body, "simmer_route_paused", &[("route", "overflow")]),
+        value(
+            &body,
+            "simmer_route_paused",
+            &[("ramp", "main"), ("route", "overflow")]
+        ),
         "0",
         "only the route that was paused"
     );
@@ -417,8 +449,18 @@ async fn a_paused_route_is_visible_on_a_dashboard_with_no_traffic(pool: PgPool) 
 async fn the_warmup_day_gauge_is_exported_for_every_route(pool: PgPool) {
     let _serialised = exclusive().await;
     let (_, body) = scrape(&state(pool)).await;
-    assert!(!value(&body, "simmer_warmup_day", &[("route", "warming")]).is_empty());
-    assert!(!value(&body, "simmer_warmup_day", &[("route", "overflow")]).is_empty());
+    assert!(!value(
+        &body,
+        "simmer_warmup_day",
+        &[("ramp", "main"), ("route", "warming")]
+    )
+    .is_empty());
+    assert!(!value(
+        &body,
+        "simmer_warmup_day",
+        &[("ramp", "main"), ("route", "overflow")]
+    )
+    .is_empty());
 }
 
 #[sqlx::test]
@@ -437,7 +479,7 @@ async fn the_pool_gauges_are_exported_for_a_route_that_has_never_sent(pool: PgPo
                 value(
                     &body,
                     "simmer_pool_connections",
-                    &[("route", route), ("state", state_label)]
+                    &[("ramp", "main"), ("route", route), ("state", state_label)]
                 ),
                 "0",
                 "{route}/{state_label} in:\n{body}"
@@ -455,13 +497,14 @@ async fn counters_recorded_through_the_named_functions_reach_the_scrape(pool: Pg
     let state = state(pool);
 
     simmer::metrics::message(
+        "main",
         "warming",
         "google",
         simmer::metrics::MessageResult::Delivered,
     );
-    simmer::metrics::route_skipped("warming", "quota");
-    simmer::metrics::downstream_latency("warming", 0.42);
-    simmer::metrics::body_rewrite_skipped("warming", "signed");
+    simmer::metrics::route_skipped("main", "warming", "quota");
+    simmer::metrics::downstream_latency("main", "warming", 0.42);
+    simmer::metrics::body_rewrite_skipped("main", "warming", "signed");
     simmer::metrics::recipient_events_evicted(3);
 
     let (_, body) = scrape(&state).await;
@@ -474,6 +517,7 @@ async fn counters_recorded_through_the_named_functions_reach_the_scrape(pool: Pg
             &[
                 ("domain_group", "google"),
                 ("result", "delivered"),
+                ("ramp", "main"),
                 ("route", "warming")
             ]
         ),
@@ -485,7 +529,7 @@ async fn counters_recorded_through_the_named_functions_reach_the_scrape(pool: Pg
         value(
             &body,
             "simmer_route_skipped_total",
-            &[("reason", "quota"), ("route", "warming")]
+            &[("reason", "quota"), ("ramp", "main"), ("route", "warming")]
         ),
         "1"
     );
@@ -493,7 +537,7 @@ async fn counters_recorded_through_the_named_functions_reach_the_scrape(pool: Pg
         value(
             &body,
             "simmer_body_rewrite_skipped_total",
-            &[("reason", "signed"), ("route", "warming")]
+            &[("reason", "signed"), ("ramp", "main"), ("route", "warming")]
         ),
         "1"
     );
@@ -522,7 +566,7 @@ async fn the_metrics_carry_help_text(pool: PgPool) {
     let _serialised = exclusive().await;
     // The audience for a metric name at 3am is not the person who chose it.
     let state = state(pool);
-    simmer::metrics::unmatched_sender("example.com");
+    simmer::metrics::unmatched_sender("main", "example.com");
 
     let (_, body) = scrape(&state).await;
     assert!(
@@ -532,17 +576,18 @@ async fn the_metrics_carry_help_text(pool: PgPool) {
     // §14.2's caveat, in the exposition itself.
     assert!(body.contains("ALERT ON THIS"), "{body}");
 
-    // D-090's counter, with outcome and route as its only labels.
-    simmer::metrics::thread_affinity("warming", "over_cap");
+    // D-090's counter, labelled ramp, route and outcome (§9.1: every series
+    // labelled `route` carries `ramp` first).
+    simmer::metrics::thread_affinity("main", "warming", "over_cap");
     let (_, body) = scrape(&state).await;
     assert!(
         body.contains("# HELP simmer_thread_affinity_total"),
         "{body}"
     );
     assert!(
-        body.contains(r#"simmer_thread_affinity_total{route="warming",outcome="over_cap"} 1"#)
-            || body
-                .contains(r#"simmer_thread_affinity_total{outcome="over_cap",route="warming"} 1"#),
+        body.contains(
+            r#"simmer_thread_affinity_total{ramp="main",route="warming",outcome="over_cap"} 1"#
+        ),
         "{body}"
     );
 }

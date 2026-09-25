@@ -387,10 +387,10 @@ fn describe() {
 /// whole job is to produce the `(route, domain_group)` pair the quota is keyed
 /// on. See D-054 — this is the single call site D-021 said phase 7 would not
 /// need to touch, and it is worth understanding rather than preserving.
-pub fn message(route: &str, domain_group: &str, result: MessageResult) {
+pub fn message(ramp: &str, route: &str, domain_group: &str, result: MessageResult) {
     counter!(
         "simmer_messages_total",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "domain_group" => domain_group.to_string(),
         "result" => result.as_str(),
     )
@@ -441,8 +441,8 @@ impl MessageResult {
 }
 
 /// §9.1 `simmer_downstream_errors_total{route,class}`.
-pub fn downstream_error(route: &str, class: &'static str) {
-    counter!("simmer_downstream_errors_total", "route" => route.to_string(), "class" => class)
+pub fn downstream_error(ramp: &str, route: &str, class: &'static str) {
+    counter!("simmer_downstream_errors_total", "ramp" => ramp.to_string(), "route" => route.to_string(), "class" => class)
         .increment(1);
 }
 
@@ -451,10 +451,10 @@ pub fn downstream_error(route: &str, class: &'static str) {
 /// The signal that catches the §6.5 provisioning risk — a downstream rejecting
 /// our envelope sender because provider domain authentication is unfinished —
 /// which is otherwise completely invisible in the mail flow. **Alert on this.**
-pub fn downstream_config_error(route: &str, stage: &'static str) {
+pub fn downstream_config_error(ramp: &str, route: &str, stage: &'static str) {
     counter!(
         "simmer_downstream_config_error_total",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "stage" => stage,
     )
     .increment(1);
@@ -470,8 +470,13 @@ pub fn ambiguous_delivery() {
 ///
 /// §14.2: a typo in a sender rule sends unwarmed traffic at full volume via the
 /// established identity, and this counter is the only thing that would show it.
-pub fn unmatched_sender(domain: &str) {
-    counter!("simmer_unmatched_sender_total", "domain" => domain.to_string()).increment(1);
+pub fn unmatched_sender(ramp: &str, domain: &str) {
+    counter!(
+        "simmer_unmatched_sender_total",
+        "ramp" => ramp.to_string(),
+        "domain" => domain.to_string(),
+    )
+    .increment(1);
 }
 
 /// `simmer_ambiguous_terminator_total` — see [`crate::smtp`]'s DATA reader.
@@ -492,10 +497,10 @@ pub fn sender_mismatch() {
 /// cannot read or cannot write back. A rewrite that silently stops applying is
 /// invisible everywhere else in the mail flow, which is why the reasons that are
 /// working as designed are counted alongside the ones that are not.
-pub fn body_rewrite_skipped(route: &str, reason: &'static str) {
+pub fn body_rewrite_skipped(ramp: &str, route: &str, reason: &'static str) {
     counter!(
         "simmer_body_rewrite_skipped_total",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "reason" => reason,
     )
     .increment(1);
@@ -506,10 +511,10 @@ pub fn body_rewrite_skipped(route: &str, reason: &'static str) {
 /// rewrite that silently stops applying is invisible everywhere else. `header`
 /// is bounded by configuration — it is always a name some route's
 /// `header_rewrites` spells — never by what a message carries.
-pub fn header_rewrite_skipped(route: &str, header: &str, reason: &'static str) {
+pub fn header_rewrite_skipped(ramp: &str, route: &str, header: &str, reason: &'static str) {
     counter!(
         "simmer_header_rewrite_skipped_total",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "header" => header.to_string(),
         "reason" => reason,
     )
@@ -522,10 +527,10 @@ pub fn header_rewrite_skipped(route: &str, header: &str, reason: &'static str) {
 /// mid-thread. `ineligible` is a thread that did change identity. `route` is
 /// bounded by configuration — a pinned route is always a configured one — and
 /// is `-` for `unmatched`, which names no route.
-pub fn thread_affinity(route: &str, outcome: &'static str) {
+pub fn thread_affinity(ramp: &str, route: &str, outcome: &'static str) {
     counter!(
         "simmer_thread_affinity_total",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "outcome" => outcome,
     )
     .increment(1);
@@ -538,8 +543,8 @@ pub fn mx_lookup(result: &'static str) {
 }
 
 /// §9.1 `simmer_downstream_latency_seconds{route}` — a histogram in phase 7.
-pub fn downstream_latency(route: &str, seconds: f64) {
-    metrics::histogram!("simmer_downstream_latency_seconds", "route" => route.to_string())
+pub fn downstream_latency(ramp: &str, route: &str, seconds: f64) {
+    metrics::histogram!("simmer_downstream_latency_seconds", "ramp" => ramp.to_string(), "route" => route.to_string())
         .record(seconds);
 }
 
@@ -673,10 +678,10 @@ pub fn tasks_alive(n: usize) {
 /// from one that has not been opened yet, and the difference between "four active"
 /// and "four permits gone" is the difference between a busy downstream and a
 /// stuck one.
-pub fn pool_connections(route: &str, state: &'static str, count: f64) {
+pub fn pool_connections(ramp: &str, route: &str, state: &'static str, count: f64) {
     metrics::gauge!(
         "simmer_pool_connections",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "state" => state,
     )
     .set(count);
@@ -689,8 +694,9 @@ pub fn pool_connections(route: &str, state: &'static str, count: f64) {
 /// client sees a normal `250` — and a steady rate is the signal that a route's
 /// `idle_ttl` is longer than the downstream's own idle timeout, which costs an
 /// extra connection and an extra round trip on that fraction of all mail.
-pub fn pool_retry(route: &str) {
-    counter!("simmer_pool_retries_total", "route" => route.to_string()).increment(1);
+pub fn pool_retry(ramp: &str, route: &str) {
+    counter!("simmer_pool_retries_total", "ramp" => ramp.to_string(), "route" => route.to_string())
+        .increment(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -702,30 +708,30 @@ pub fn pool_retry(route: &str) {
 /// An overflow route reports `+Inf` rather than being omitted: §3.1 says it is
 /// never quota-limited, and `+Inf` says exactly that in a way a dashboard can
 /// plot alongside the warming routes (D-024).
-pub fn quota_allowance(route: &str, domain_group: &str, allowance: f64) {
+pub fn quota_allowance(ramp: &str, route: &str, domain_group: &str, allowance: f64) {
     metrics::gauge!(
         "simmer_quota_allowance",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "domain_group" => domain_group.to_string(),
     )
     .set(allowance);
 }
 
 /// §9.1 `simmer_quota_committed{route,domain_group}` — used today.
-pub fn quota_committed(route: &str, domain_group: &str, committed: f64) {
+pub fn quota_committed(ramp: &str, route: &str, domain_group: &str, committed: f64) {
     metrics::gauge!(
         "simmer_quota_committed",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "domain_group" => domain_group.to_string(),
     )
     .set(committed);
 }
 
 /// §9.1 `simmer_quota_reserved{route,domain_group}`.
-pub fn quota_reserved(route: &str, domain_group: &str, reserved: f64) {
+pub fn quota_reserved(ramp: &str, route: &str, domain_group: &str, reserved: f64) {
     metrics::gauge!(
         "simmer_quota_reserved",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "domain_group" => domain_group.to_string(),
     )
     .set(reserved);
@@ -737,10 +743,10 @@ pub fn quota_reserved(route: &str, domain_group: &str, reserved: f64) {
 /// a dashboard cannot show a share the walk was not applying. A route offered
 /// every message reports nothing at all rather than 1: the series existing is
 /// what says a ramp is in force.
-pub fn partial_ramp_share(route: &str, domain_group: &str, share: f64) {
+pub fn partial_ramp_share(ramp: &str, route: &str, domain_group: &str, share: f64) {
     metrics::gauge!(
         "simmer_partial_ramp_share",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "domain_group" => domain_group.to_string(),
     )
     .set(share);
@@ -755,18 +761,19 @@ pub fn partial_ramp_share(route: &str, domain_group: &str, share: f64) {
 /// Only routes preflight actually checks ever emit this. A route with the block
 /// absent, disabled, or with a non-constant identity domain (D-064) publishes no
 /// series at all rather than a misleading `1`.
-pub fn preflight_ok(route: &str, check: &str, ok: bool) {
+pub fn preflight_ok(ramp: &str, route: &str, check: &str, ok: bool) {
     metrics::gauge!(
         "simmer_preflight_ok",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "check" => check.to_string(),
     )
     .set(if ok { 1.0 } else { 0.0 });
 }
 
 /// §9.1 `simmer_warmup_day{route}`.
-pub fn warmup_day(route: &str, day_index: i64) {
-    metrics::gauge!("simmer_warmup_day", "route" => route.to_string()).set(day_index as f64);
+pub fn warmup_day(ramp: &str, route: &str, day_index: i64) {
+    metrics::gauge!("simmer_warmup_day", "ramp" => ramp.to_string(), "route" => route.to_string())
+        .set(day_index as f64);
 }
 
 /// §9.3's pause, as a gauge. Not in §9.1's list — see D-056.
@@ -776,8 +783,8 @@ pub fn warmup_day(route: &str, day_index: i64) {
 /// nothing currently reaches leaves no trace at all. That is precisely the state
 /// somebody eventually goes looking for, usually while asking why a ramp stopped
 /// advancing.
-pub fn route_paused(route: &str, paused: bool) {
-    metrics::gauge!("simmer_route_paused", "route" => route.to_string()).set(if paused {
+pub fn route_paused(ramp: &str, route: &str, paused: bool) {
+    metrics::gauge!("simmer_route_paused", "ramp" => ramp.to_string(), "route" => route.to_string()).set(if paused {
         1.0
     } else {
         0.0
@@ -787,10 +794,10 @@ pub fn route_paused(route: &str, paused: bool) {
 /// §9.1 `simmer_route_skipped_total{route,reason}` — reason: `quota`,
 /// `frequency`, `paused`, `preflight`, `not_started`, and `partial_ramp` (D-091;
 /// see `chain::SkipReason`).
-pub fn route_skipped(route: &str, reason: &str) {
+pub fn route_skipped(ramp: &str, route: &str, reason: &str) {
     counter!(
         "simmer_route_skipped_total",
-        "route" => route.to_string(),
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
         "reason" => reason.to_string(),
     )
     .increment(1);
@@ -801,8 +808,8 @@ pub fn route_skipped(route: &str, reason: &str) {
 /// §7.4: "a nonzero rate indicates crashes or a mistuned timeout." **Alert on
 /// this** — a mistuned expiry silently under-reports headroom for the rest of
 /// the day.
-pub fn reservation_expired(route: &str, count: i64) {
-    counter!("simmer_reservation_expired_total", "route" => route.to_string())
+pub fn reservation_expired(ramp: &str, route: &str, count: i64) {
+    counter!("simmer_reservation_expired_total", "ramp" => ramp.to_string(), "route" => route.to_string())
         .increment(count.max(0) as u64);
 }
 
@@ -819,8 +826,8 @@ pub fn recipient_events_evicted(count: u64) {
 /// §7.5 — a message answered `451` because the quota store was unreachable.
 /// Not in §9.1's list; added because fail-closed is otherwise indistinguishable
 /// from a downstream outage in the metrics.
-pub fn quota_unavailable(route: &str) {
-    counter!("simmer_quota_unavailable_total", "route" => route.to_string()).increment(1);
+pub fn quota_unavailable(ramp: &str, route: &str) {
+    counter!("simmer_quota_unavailable_total", "ramp" => ramp.to_string(), "route" => route.to_string()).increment(1);
 }
 
 /// D-083 — one link proxy request. `origin` is `upstream` or `proxy`.

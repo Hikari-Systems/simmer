@@ -704,7 +704,7 @@ fn s6_mixed_realistic_traffic_holds_every_invariant() {
 fn pin_the_s6_allowance() {
     let (status, body) = admin::post(
         &STRESS,
-        "/routes/warming-newbrand/allowance",
+        "/ramps/main/routes/warming-newbrand/allowance",
         &serde_json::json!({ "domain_group": "catchall", "allowance": S6_ALLOWANCE }),
     );
     assert_eq!(status, 200, "pinning the allowance: {body}");
@@ -888,7 +888,7 @@ fn s7_two_instances_spend_one_allowance_exactly_once() {
 fn pin_the_warming_allowance() {
     let (status, body) = admin::post(
         &STRESS,
-        "/routes/warming-newbrand/allowance",
+        "/ramps/main/routes/warming-newbrand/allowance",
         &serde_json::json!({ "domain_group": "catchall", "allowance": S7_ALLOWANCE }),
     );
     assert_eq!(status, 200, "pinning the allowance: {body}");
@@ -1760,7 +1760,7 @@ fn quiesce() -> Result<(), String> {
 }
 
 fn pool_active() -> u64 {
-    let v = admin::get(&STRESS, "/routes");
+    let v = admin::get(&STRESS, "/ramps/main/routes");
     let routes = v.get("routes").unwrap_or(&v).as_array().expect("routes");
     routes
         .iter()

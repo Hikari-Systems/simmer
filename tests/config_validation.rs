@@ -257,6 +257,58 @@ fn rejects_malformed_mx_suffixes() {
     }
 }
 
+// -- §4.2: ramp affinity and header rights (D-099) ------------------------
+
+fn with_listener(extra: &str) -> String {
+    let yaml = BASE.replace(
+        "    - address: \"127.0.0.1:25\"\n      auth: required\n",
+        &format!("    - address: \"127.0.0.1:25\"\n      auth: required\n{extra}"),
+    );
+    assert_ne!(yaml, BASE, "the fixture rewrite must have applied");
+    yaml
+}
+
+fn with_grant_ramps(list: &str) -> String {
+    let yaml = BASE.replace(
+        r#"grants: { send_as: ["oldbrand.com"] }"#,
+        &format!(r#"grants: {{ send_as: ["oldbrand.com"], ramps: {list} }}"#),
+    );
+    assert_ne!(yaml, BASE, "the fixture rewrite must have applied");
+    yaml
+}
+
+#[test]
+fn accepts_a_listener_affinity_and_a_ramp_grant() {
+    let cfg = load(&with_grant_ramps(r#"["main"]"#)).expect("valid");
+    assert_eq!(cfg.server.auth.users[0].grants.ramps, ["main"]);
+    let cfg = load(&with_listener(
+        "      ramp: main\n      header_overrides_affinity: true\n",
+    ))
+    .expect("valid");
+    assert_eq!(cfg.server.listeners[0].ramp.as_deref(), Some("main"));
+    assert!(cfg.server.listeners[0].header_overrides_affinity);
+}
+
+#[test]
+fn rejects_a_listener_affinity_naming_no_ramp() {
+    rejected_for(&with_listener("      ramp: mian\n"), "names no ramp");
+}
+
+#[test]
+fn rejects_an_affinity_override_without_an_affinity() {
+    rejected_for(
+        &with_listener("      header_overrides_affinity: true\n"),
+        "no `ramp`",
+    );
+}
+
+#[test]
+fn rejects_bad_ramp_grants() {
+    rejected_for(&with_grant_ramps(r#"["mian"]"#), "names no ramp");
+    rejected_for(&with_grant_ramps(r#"["*"]"#), "wildcard");
+    rejected_for(&with_grant_ramps(r#"["main", "main"]"#), "repeats");
+}
+
 // -- §4.2: schedules -----------------------------------------------------
 
 #[test]
@@ -401,6 +453,8 @@ fn defaults_by_port() {
         address: address.to_string(),
         tls: None,
         auth: None,
+        ramp: None,
+        header_overrides_affinity: false,
     };
     assert_eq!(
         (at("0.0.0.0:25").tls_mode(), at("0.0.0.0:25").auth_mode()),
@@ -426,6 +480,8 @@ fn defaults_by_port() {
         address: "0.0.0.0:465".into(),
         tls: Some(T::Off),
         auth: Some(A::Disabled),
+        ramp: None,
+        header_overrides_affinity: false,
     };
     assert_eq!(
         (explicit.tls_mode(), explicit.auth_mode()),

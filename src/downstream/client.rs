@@ -156,7 +156,7 @@ pub async fn relay(
             error = ?result.as_ref().err(),
             "pooled connection was dead on reuse; retrying once on a fresh connection"
         );
-        metrics::pool_retry(&route.name);
+        metrics::pool_retry(&route.ramp, &route.name);
         checkout.reopen(route, tls, hostname).await?;
         result = checkout.conn().deliver(message, budget).await;
     }

@@ -36,7 +36,7 @@ pub mod view;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -96,15 +96,26 @@ pub fn router(state: AdminState) -> Router {
         // make Docker restart-loop a container that a restart cannot fix.
         .route("/healthcheck", get(healthcheck))
         // -- §9.2 read -------------------------------------------------
-        .route("/routes", get(routes))
-        .route("/routes/{name}", get(route_by_name))
+        .route("/ramps", get(ramps))
+        .route("/ramps/{ramp}", get(ramp_by_name))
+        .route("/ramps/{ramp}/routes", get(routes))
+        .route("/ramps/{ramp}/routes/{name}", get(route_by_name))
         .route("/quota", get(quota_detail))
         // -- §9.3 write ------------------------------------------------
-        .route("/routes/{name}/pause", post(mutate::pause))
-        .route("/routes/{name}/resume", post(mutate::resume))
-        .route("/routes/{name}/graduate", post(mutate::graduate))
-        .route("/routes/{name}/allowance", post(mutate::allowance))
+        .route("/ramps/{ramp}/routes/{name}/pause", post(mutate::pause))
+        .route("/ramps/{ramp}/routes/{name}/resume", post(mutate::resume))
+        .route(
+            "/ramps/{ramp}/routes/{name}/graduate",
+            post(mutate::graduate),
+        )
+        .route(
+            "/ramps/{ramp}/routes/{name}/allowance",
+            post(mutate::allowance),
+        )
         .route("/quota/reset", post(mutate::reset))
+        // -- D-099: the pre-ramp paths, gone rather than aliased ---------
+        .route("/routes", any(gone))
+        .route("/routes/{*rest}", any(gone))
         // -- §9.4 ------------------------------------------------------
         .route("/dryrun", post(dryrun::dryrun));
     let router = if metrics_enabled {
@@ -262,19 +273,26 @@ fn refresh_runtime_gauges(state: &AdminState) {
 /// Unlike the quota gauges this needs no storage, so it cannot fail and is not
 /// inside the fallible path above.
 fn refresh_pool_gauges(state: &AdminState) {
-    for route in &state.config().default_ramp().routes {
+    for route in state.config().all_routes() {
         let Some(stats) = state.engine.pools.stats(&route.name) else {
             continue;
         };
-        crate::metrics::pool_connections(&route.name, "idle", stats.idle as f64);
-        crate::metrics::pool_connections(&route.name, "active", stats.active as f64);
+        crate::metrics::pool_connections(&route.ramp, &route.name, "idle", stats.idle as f64);
+        crate::metrics::pool_connections(&route.ramp, &route.name, "active", stats.active as f64);
     }
 }
 
 async fn refresh_quota_gauges(state: &AdminState) -> Result<(), quota::QuotaError> {
-    let cfg = state.config();
-    // §3.4 (D-099): per ramp from phase 3; the default ramp until then.
-    let ramp = cfg.default_ramp();
+    for ramp in state.config().ramps.iter() {
+        refresh_ramp_quota_gauges(state, ramp).await?;
+    }
+    Ok(())
+}
+
+async fn refresh_ramp_quota_gauges(
+    state: &AdminState,
+    ramp: &crate::config::Ramp,
+) -> Result<(), quota::QuotaError> {
     let now = Utc::now();
     let states = state.store().route_states(&ramp.name).await?;
     let usage = state
@@ -292,12 +310,12 @@ async fn refresh_quota_gauges(state: &AdminState) -> Result<(), quota::QuotaErro
             &state.engine.pools,
             now,
         );
-        crate::metrics::warmup_day(&route.name, projected.day_index);
+        crate::metrics::warmup_day(&route.ramp, &route.name, projected.day_index);
         // §9.3's pause has no other trace on a dashboard. `route_skipped_total`
         // only moves when a message is steered, so a route paused three weeks ago
         // on a chain nothing reaches is invisible — which is exactly the state
         // somebody eventually goes looking for. Not in §9.1's list; see D-056.
-        crate::metrics::route_paused(&route.name, projected.paused);
+        crate::metrics::route_paused(&route.ramp, &route.name, projected.paused);
 
         for group in &projected.groups {
             let allowance = match projected.status {
@@ -316,17 +334,33 @@ async fn refresh_quota_gauges(state: &AdminState) -> Result<(), quota::QuotaErro
                     .or(group.allowance)
                     .map_or(f64::INFINITY, |a| a as f64),
             };
-            crate::metrics::quota_allowance(&route.name, &group.domain_group, allowance);
+            crate::metrics::quota_allowance(
+                &route.ramp,
+                &route.name,
+                &group.domain_group,
+                allowance,
+            );
             crate::metrics::quota_committed(
+                &route.ramp,
                 &route.name,
                 &group.domain_group,
                 group.committed as f64,
             );
-            crate::metrics::quota_reserved(&route.name, &group.domain_group, group.reserved as f64);
+            crate::metrics::quota_reserved(
+                &route.ramp,
+                &route.name,
+                &group.domain_group,
+                group.reserved as f64,
+            );
             // Absent, not 1, when every message is offered: the series existing
             // is what says a partial ramp is in force (D-091, D-097).
             if let Some(share) = group.partial_ramp_share {
-                crate::metrics::partial_ramp_share(&route.name, &group.domain_group, share);
+                crate::metrics::partial_ramp_share(
+                    &route.ramp,
+                    &route.name,
+                    &group.domain_group,
+                    share,
+                );
             }
         }
     }
@@ -357,14 +391,83 @@ fn keys_for(ramp: &crate::config::Ramp, now: chrono::DateTime<Utc>) -> Vec<Usage
     keys
 }
 
-/// §9.2 `GET /routes`.
+/// §9.2 `GET /ramps` — each ramp's name, whether it is `default_ramp`, the
+/// listeners with affinity to it, and its routes' names (D-099).
+async fn ramps(State(state): State<AdminState>, _actor: Actor) -> Json<serde_json::Value> {
+    let cfg = state.config();
+    Json(json!({
+        "ramps": cfg.ramps.iter().map(|r| ramp_summary(cfg, r)).collect::<Vec<_>>(),
+    }))
+}
+
+/// §9.2 `GET /ramps/{ramp}`.
+async fn ramp_by_name(
+    State(state): State<AdminState>,
+    Path(ramp): Path<String>,
+    _actor: Actor,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let cfg = state.config();
+    let ramp = ramp_named(cfg, &ramp)?;
+    Ok(Json(ramp_summary(cfg, ramp)))
+}
+
+fn ramp_summary(cfg: &crate::config::Config, ramp: &crate::config::Ramp) -> serde_json::Value {
+    json!({
+        "name": ramp.name,
+        "default": ramp.name == cfg.default_ramp,
+        "listeners": cfg
+            .server
+            .listeners
+            .iter()
+            .filter(|l| l.ramp.as_deref() == Some(ramp.name.as_str()))
+            .map(|l| l.address.clone())
+            .collect::<Vec<_>>(),
+        "routes": ramp.routes.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+    })
+}
+
+/// The ramp a read path names. Never `default_ramp` by omission (D-099).
+fn ramp_named<'a>(
+    cfg: &'a crate::config::Config,
+    name: &str,
+) -> Result<&'a crate::config::Ramp, ApiError> {
+    cfg.ramps
+        .get(name)
+        .ok_or_else(|| ApiError::not_found("ramp", name))
+}
+
+/// D-099: `/routes` and everything under it moved to `/ramps/{ramp}/routes`.
+/// `410`, not an alias for `default_ramp`: a mutation that silently landed on
+/// the wrong ramp is the lie §9 exists to prevent. Behind the token like every
+/// other path, and it names every ramp so the caller can pick.
+async fn gone(State(state): State<AdminState>, uri: axum::http::Uri, _actor: Actor) -> ApiError {
+    let replacement = format!("/ramps/{{ramp}}{}", uri.path());
+    let names: Vec<&str> = state
+        .config()
+        .ramps
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    ApiError::new(
+        axum::http::StatusCode::GONE,
+        "gone",
+        format!(
+            "{} moved under /ramps/{{ramp}} when named ramps arrived (D-099). Use {replacement}, \
+             where {{ramp}} is one of: {}",
+            uri.path(),
+            names.join(", ")
+        ),
+    )
+}
+
+/// §9.2 `GET /ramps/{ramp}/routes`.
 async fn routes(
     State(state): State<AdminState>,
+    Path(ramp): Path<String>,
     _actor: Actor,
 ) -> Result<Json<view::RoutesView>, ApiError> {
     let cfg = state.config();
-    // §3.4 (D-099): per ramp from phase 3; the default ramp until then.
-    let ramp = cfg.default_ramp();
+    let ramp = ramp_named(cfg, &ramp)?;
     let now = Utc::now();
     let states = state.store().route_states(&ramp.name).await?;
     let usage = state
@@ -382,15 +485,14 @@ async fn routes(
     )))
 }
 
-/// §9.2 `GET /routes/{name}`.
+/// §9.2 `GET /ramps/{ramp}/routes/{name}`.
 async fn route_by_name(
     State(state): State<AdminState>,
-    Path(name): Path<String>,
+    Path((ramp, name)): Path<(String, String)>,
     _actor: Actor,
 ) -> Result<Json<view::RouteView>, ApiError> {
     let cfg = state.config();
-    // §3.4 (D-099): per ramp from phase 3; the default ramp until then.
-    let ramp = cfg.default_ramp();
+    let ramp = ramp_named(cfg, &ramp)?;
     let route = ramp
         .route(&name)
         .ok_or_else(|| ApiError::not_found("route", &name))?;
@@ -422,6 +524,9 @@ async fn route_by_name(
 
 #[derive(serde::Deserialize)]
 pub struct QuotaQuery {
+    /// Required once more than one ramp is configured (§9.2, D-099). With one,
+    /// there is nothing to choose between.
+    ramp: Option<String>,
     route: Option<String>,
     group: Option<String>,
 }
@@ -437,8 +542,15 @@ async fn quota_detail(
     _actor: Actor,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let cfg = state.config();
-    // §3.4 (D-099): per ramp from phase 3; the default ramp until then.
-    let ramp = cfg.default_ramp();
+    let ramp = match &q.ramp {
+        Some(name) => ramp_named(cfg, name)?,
+        None if cfg.ramps.len() == 1 => cfg.default_ramp(),
+        None => {
+            return Err(ApiError::bad_request(
+                "ramp is required when more than one ramp is configured (§9.2)",
+            ))
+        }
+    };
 
     if let Some(route) = &q.route {
         if ramp.route(route).is_none() {
@@ -500,6 +612,7 @@ async fn quota_detail(
 
     Ok(Json(json!({
         "generated_at": now,
+        "ramp": ramp.name,
         "windows": windows,
     })))
 }

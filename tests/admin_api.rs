@@ -205,7 +205,7 @@ async fn post(state: &AdminState, uri: &str, token: Option<&str>, body: &str) ->
     .await
 }
 
-/// Find one route in a `/routes` document.
+/// Find one route in a `/ramps/main/routes` document.
 fn route_of(doc: &serde_json::Value, name: &str) -> serde_json::Value {
     doc["routes"]
         .as_array()
@@ -232,21 +232,21 @@ fn group_of(route: &serde_json::Value, name: &str) -> serde_json::Value {
 
 /// Every path that must refuse an anonymous request, as `(method, uri, body)`.
 const PROTECTED: &[(&str, &str, &str)] = &[
-    ("GET", "/routes", ""),
-    ("GET", "/routes/warming", ""),
+    ("GET", "/ramps/main/routes", ""),
+    ("GET", "/ramps/main/routes/warming", ""),
     ("GET", "/quota", ""),
-    ("POST", "/routes/warming/pause", ""),
-    ("POST", "/routes/warming/resume", ""),
-    ("POST", "/routes/warming/graduate", ""),
+    ("POST", "/ramps/main/routes/warming/pause", ""),
+    ("POST", "/ramps/main/routes/warming/resume", ""),
+    ("POST", "/ramps/main/routes/warming/graduate", ""),
     (
         "POST",
-        "/routes/warming/allowance",
+        "/ramps/main/routes/warming/allowance",
         r#"{"domain_group":"google","allowance":5}"#,
     ),
     (
         "POST",
         "/quota/reset",
-        r#"{"route":"warming","domain_group":"google","confirm":"reset"}"#,
+        r#"{"ramp":"main","route":"warming","domain_group":"google","confirm":"reset"}"#,
     ),
     (
         "POST",
@@ -342,7 +342,11 @@ async fn metrics_is_not_served_unless_enabled(pool: PgPool) {
 async fn a_401_carries_a_challenge_and_no_hint(pool: PgPool) {
     let state = state(pool);
     let response = admin::router(state.clone())
-        .oneshot(Request::get("/routes").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/ramps/main/routes")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -350,8 +354,8 @@ async fn a_401_carries_a_challenge_and_no_hint(pool: PgPool) {
     assert!(response.headers().contains_key("www-authenticate"));
 
     // A missing token and a wrong token must be indistinguishable to the client.
-    let missing = get(&state, "/routes", None).await;
-    let wrong = get(&state, "/routes", Some("wrong")).await;
+    let missing = get(&state, "/ramps/main/routes", None).await;
+    let wrong = get(&state, "/ramps/main/routes", Some("wrong")).await;
     assert_eq!(missing.body, wrong.body);
 }
 
@@ -360,11 +364,11 @@ async fn a_named_token_is_recorded_as_the_actor(pool: PgPool) {
     // O-11 / D-053 — the whole reason named tokens exist.
     let state = state(pool);
 
-    let response = post(&state, "/routes/warming/pause", Some(ONCALL), "").await;
+    let response = post(&state, "/ramps/main/routes/warming/pause", Some(ONCALL), "").await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.json()["actor"], "oncall");
 
-    let response = post(&state, "/routes/warming/resume", Some(TOKEN), "").await;
+    let response = post(&state, "/ramps/main/routes/warming/resume", Some(TOKEN), "").await;
     assert_eq!(response.json()["actor"], "default");
 }
 
@@ -375,7 +379,7 @@ async fn a_named_token_is_recorded_as_the_actor(pool: PgPool) {
 #[sqlx::test]
 async fn routes_reports_every_route_and_every_group(pool: PgPool) {
     let state = state(pool);
-    let doc = get(&state, "/routes", Some(TOKEN)).await.json();
+    let doc = get(&state, "/ramps/main/routes", Some(TOKEN)).await.json();
 
     assert_eq!(doc["routes"].as_array().unwrap().len(), 2);
 
@@ -400,7 +404,7 @@ async fn routes_reports_the_pool_statistics_9_2_asks_for(pool: PgPool) {
     // so the honest answer is its configured ceiling and zeros against it —
     // rather than the `null` this field carried while there was no pool.
     let state = state(pool);
-    let doc = get(&state, "/routes", Some(TOKEN)).await.json();
+    let doc = get(&state, "/ramps/main/routes", Some(TOKEN)).await.json();
 
     let warming = route_of(&doc, "warming")["pool"].clone();
     assert!(
@@ -441,7 +445,10 @@ async fn a_reservation_shows_up_as_reserved_and_reduces_headroom(pool: PgPool) {
         .await
         .expect("reserved");
 
-    let warming = route_of(&get(&state, "/routes", Some(TOKEN)).await.json(), "warming");
+    let warming = route_of(
+        &get(&state, "/ramps/main/routes", Some(TOKEN)).await.json(),
+        "warming",
+    );
     let group = group_of(&warming, "catchall");
 
     assert_eq!(group["row_exists"], true);
@@ -476,7 +483,10 @@ async fn the_read_api_reports_the_row_when_the_schedule_has_moved_under_it(pool:
 
     // ...and a configuration that now says 3.
     let group = group_of(
-        &route_of(&get(&state, "/routes", Some(TOKEN)).await.json(), "warming"),
+        &route_of(
+            &get(&state, "/ramps/main/routes", Some(TOKEN)).await.json(),
+            "warming",
+        ),
         "catchall",
     );
 
@@ -492,8 +502,13 @@ async fn the_read_api_reports_the_row_when_the_schedule_has_moved_under_it(pool:
 #[sqlx::test]
 async fn a_single_route_reads_the_same_as_its_entry_in_the_list(pool: PgPool) {
     let state = state(pool);
-    let from_list = route_of(&get(&state, "/routes", Some(TOKEN)).await.json(), "warming");
-    let alone = get(&state, "/routes/warming", Some(TOKEN)).await.json();
+    let from_list = route_of(
+        &get(&state, "/ramps/main/routes", Some(TOKEN)).await.json(),
+        "warming",
+    );
+    let alone = get(&state, "/ramps/main/routes/warming", Some(TOKEN))
+        .await
+        .json();
 
     // `generated_at` differs by microseconds between the two calls; everything
     // that describes the route must not.
@@ -505,7 +520,7 @@ async fn a_single_route_reads_the_same_as_its_entry_in_the_list(pool: PgPool) {
 #[sqlx::test]
 async fn an_unknown_route_is_a_404(pool: PgPool) {
     let state = state(pool);
-    let response = get(&state, "/routes/nonexistent", Some(TOKEN)).await;
+    let response = get(&state, "/ramps/main/routes/nonexistent", Some(TOKEN)).await;
     assert_eq!(response.status, StatusCode::NOT_FOUND);
     assert_eq!(response.json()["error"], "not_found");
 }
@@ -565,20 +580,24 @@ async fn quota_404s_on_a_filter_that_names_nothing(pool: PgPool) {
 async fn pause_and_resume_round_trip_through_storage(pool: PgPool) {
     let state = state(pool);
 
-    let paused = post(&state, "/routes/warming/pause", Some(TOKEN), "").await;
+    let paused = post(&state, "/ramps/main/routes/warming/pause", Some(TOKEN), "").await;
     assert_eq!(paused.status, StatusCode::OK);
     assert_eq!(paused.json()["paused"], true);
     assert_eq!(paused.json()["previous"], false);
 
-    let doc = get(&state, "/routes/warming", Some(TOKEN)).await.json();
+    let doc = get(&state, "/ramps/main/routes/warming", Some(TOKEN))
+        .await
+        .json();
     assert_eq!(doc["paused"], true);
     assert_eq!(doc["status"], "paused");
 
-    let resumed = post(&state, "/routes/warming/resume", Some(TOKEN), "").await;
+    let resumed = post(&state, "/ramps/main/routes/warming/resume", Some(TOKEN), "").await;
     assert_eq!(resumed.json()["paused"], false);
     assert_eq!(resumed.json()["previous"], true);
 
-    let doc = get(&state, "/routes/warming", Some(TOKEN)).await.json();
+    let doc = get(&state, "/ramps/main/routes/warming", Some(TOKEN))
+        .await
+        .json();
     assert_eq!(doc["status"], "active");
 }
 
@@ -587,7 +606,7 @@ async fn a_paused_route_is_skipped_by_the_real_chain_walk(pool: PgPool) {
     // The mutation is only worth anything if the message path sees it. §9.3's
     // "without a restart" is this assertion.
     let state = state(pool);
-    post(&state, "/routes/warming/pause", Some(TOKEN), "")
+    post(&state, "/ramps/main/routes/warming/pause", Some(TOKEN), "")
         .await
         .json();
 
@@ -622,7 +641,13 @@ async fn a_paused_route_is_skipped_by_the_real_chain_walk(pool: PgPool) {
 async fn graduate_pins_the_route_and_can_be_reversed(pool: PgPool) {
     let state = state(pool);
 
-    let response = post(&state, "/routes/warming/graduate", Some(TOKEN), "").await;
+    let response = post(
+        &state,
+        "/ramps/main/routes/warming/graduate",
+        Some(TOKEN),
+        "",
+    )
+    .await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(
         response.json()["graduated"],
@@ -631,13 +656,15 @@ async fn graduate_pins_the_route_and_can_be_reversed(pool: PgPool) {
     );
 
     assert_eq!(
-        get(&state, "/routes/warming", Some(TOKEN)).await.json()["graduated"],
+        get(&state, "/ramps/main/routes/warming", Some(TOKEN))
+            .await
+            .json()["graduated"],
         true
     );
 
     let response = post(
         &state,
-        "/routes/warming/graduate",
+        "/ramps/main/routes/warming/graduate",
         Some(TOKEN),
         r#"{"graduated": false}"#,
     )
@@ -651,7 +678,13 @@ async fn an_overflow_route_cannot_be_graduated(pool: PgPool) {
     // §3.1: it carries no warm-up schedule, so there is no final value to pin
     // it to. Storing the flag would report success for a no-op.
     let state = state(pool);
-    let response = post(&state, "/routes/overflow/graduate", Some(TOKEN), "").await;
+    let response = post(
+        &state,
+        "/ramps/main/routes/overflow/graduate",
+        Some(TOKEN),
+        "",
+    )
+    .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     assert!(response.body.contains("overflow"));
 }
@@ -662,7 +695,7 @@ async fn an_allowance_override_wins_over_the_schedule_and_is_visible_immediately
 
     let response = post(
         &state,
-        "/routes/warming/allowance",
+        "/ramps/main/routes/warming/allowance",
         Some(ONCALL),
         r#"{"domain_group":"google","allowance":50}"#,
     )
@@ -676,7 +709,9 @@ async fn an_allowance_override_wins_over_the_schedule_and_is_visible_immediately
     );
 
     let group = group_of(
-        &get(&state, "/routes/warming", Some(TOKEN)).await.json(),
+        &get(&state, "/ramps/main/routes/warming", Some(TOKEN))
+            .await
+            .json(),
         "google",
     );
     assert_eq!(group["scheduled"], 1, "the schedule is unchanged");
@@ -691,14 +726,14 @@ async fn an_override_can_be_cleared_with_null(pool: PgPool) {
 
     post(
         &state,
-        "/routes/warming/allowance",
+        "/ramps/main/routes/warming/allowance",
         Some(TOKEN),
         r#"{"domain_group":"google","allowance":50}"#,
     )
     .await;
     let cleared = post(
         &state,
-        "/routes/warming/allowance",
+        "/ramps/main/routes/warming/allowance",
         Some(TOKEN),
         r#"{"domain_group":"google","allowance":null}"#,
     )
@@ -708,7 +743,9 @@ async fn an_override_can_be_cleared_with_null(pool: PgPool) {
     assert_eq!(cleared.json()["previous"], 50);
 
     let group = group_of(
-        &get(&state, "/routes/warming", Some(TOKEN)).await.json(),
+        &get(&state, "/ramps/main/routes/warming", Some(TOKEN))
+            .await
+            .json(),
         "google",
     );
     assert!(group["override"].is_null());
@@ -724,7 +761,7 @@ async fn an_override_takes_effect_on_the_next_reservation(pool: PgPool) {
 
     post(
         &state,
-        "/routes/warming/allowance",
+        "/ramps/main/routes/warming/allowance",
         Some(TOKEN),
         r#"{"domain_group":"google","allowance":3}"#,
     )
@@ -757,7 +794,7 @@ async fn a_negative_allowance_is_refused(pool: PgPool) {
     let state = state(pool);
     let response = post(
         &state,
-        "/routes/warming/allowance",
+        "/ramps/main/routes/warming/allowance",
         Some(TOKEN),
         r#"{"domain_group":"google","allowance":-1}"#,
     )
@@ -770,7 +807,7 @@ async fn an_unknown_domain_group_is_a_404(pool: PgPool) {
     let state = state(pool);
     let response = post(
         &state,
-        "/routes/warming/allowance",
+        "/ramps/main/routes/warming/allowance",
         Some(TOKEN),
         r#"{"domain_group":"nope","allowance":1}"#,
     )
@@ -791,7 +828,7 @@ async fn an_allowance_of_zero_is_allowed_and_warned_about(pool: PgPool) {
 
     let response = post(
         &state,
-        "/routes/overflow/allowance",
+        "/ramps/main/routes/overflow/allowance",
         Some(TOKEN),
         r#"{"domain_group":"google","allowance":0}"#,
     )
@@ -804,7 +841,7 @@ async fn an_allowance_of_zero_is_allowed_and_warned_about(pool: PgPool) {
 
     let response = post(
         &state,
-        "/routes/warming/allowance",
+        "/ramps/main/routes/warming/allowance",
         Some(ONCALL),
         r#"{"domain_group":"google","allowance":0}"#,
     )
@@ -836,13 +873,13 @@ async fn an_allowance_of_zero_is_allowed_and_warned_about(pool: PgPool) {
 async fn pausing_every_route_in_a_chain_is_warned_about(pool: PgPool) {
     let state = state(pool);
 
-    let first = post(&state, "/routes/warming/pause", Some(TOKEN), "").await;
+    let first = post(&state, "/ramps/main/routes/warming/pause", Some(TOKEN), "").await;
     assert!(
         first.json()["warnings"].as_array().unwrap().is_empty(),
         "the overflow route is still eligible, so nothing is exhausted yet"
     );
 
-    let second = post(&state, "/routes/overflow/pause", Some(TOKEN), "").await;
+    let second = post(&state, "/ramps/main/routes/overflow/pause", Some(TOKEN), "").await;
     let warnings = second.json()["warnings"].as_array().unwrap().clone();
     assert!(
         !warnings.is_empty(),
@@ -857,7 +894,7 @@ async fn an_ordinary_mutation_produces_no_warnings(pool: PgPool) {
     let state = state(pool);
     let response = post(
         &state,
-        "/routes/warming/allowance",
+        "/ramps/main/routes/warming/allowance",
         Some(TOKEN),
         r#"{"domain_group":"google","allowance":10}"#,
     )
@@ -876,7 +913,7 @@ async fn a_reset_without_the_confirmation_is_refused(pool: PgPool) {
         &state,
         "/quota/reset",
         Some(TOKEN),
-        r#"{"route":"warming","domain_group":"google","confirm":"yes"}"#,
+        r#"{"ramp":"main","route":"warming","domain_group":"google","confirm":"yes"}"#,
     )
     .await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
@@ -931,7 +968,7 @@ async fn a_reset_zeroes_committed_and_keeps_live_reservations(pool: PgPool) {
         &state,
         "/quota/reset",
         Some(ONCALL),
-        r#"{"route":"warming","domain_group":"catchall","confirm":"reset"}"#,
+        r#"{"ramp":"main","route":"warming","domain_group":"catchall","confirm":"reset"}"#,
     )
     .await;
     assert_eq!(response.status, StatusCode::OK);
@@ -959,7 +996,7 @@ async fn resetting_a_row_that_does_not_exist_is_a_no_op_rather_than_a_404(pool: 
         &state,
         "/quota/reset",
         Some(TOKEN),
-        r#"{"route":"warming","domain_group":"google","confirm":"reset"}"#,
+        r#"{"ramp":"main","route":"warming","domain_group":"google","confirm":"reset"}"#,
     )
     .await;
     assert_eq!(response.status, StatusCode::OK);
@@ -1069,7 +1106,7 @@ async fn a_dry_run_reports_a_pattern_that_matched_nothing(pool: PgPool) {
 #[sqlx::test]
 async fn a_dry_run_explains_each_skip(pool: PgPool) {
     let state = state(pool);
-    post(&state, "/routes/warming/pause", Some(TOKEN), "").await;
+    post(&state, "/ramps/main/routes/warming/pause", Some(TOKEN), "").await;
 
     let doc = post(&state, "/dryrun", Some(TOKEN), DRYRUN).await.json();
     let evaluation = &doc["recipients"][0]["evaluation"];
@@ -1143,8 +1180,8 @@ async fn a_dry_run_evaluates_each_recipient_independently(pool: PgPool) {
 #[sqlx::test]
 async fn an_exhausted_chain_reports_the_reply_the_client_would_get(pool: PgPool) {
     let state = state(pool);
-    post(&state, "/routes/warming/pause", Some(TOKEN), "").await;
-    post(&state, "/routes/overflow/pause", Some(TOKEN), "").await;
+    post(&state, "/ramps/main/routes/warming/pause", Some(TOKEN), "").await;
+    post(&state, "/ramps/main/routes/overflow/pause", Some(TOKEN), "").await;
 
     let doc = post(&state, "/dryrun", Some(TOKEN), DRYRUN).await.json();
     let outcome = &doc["recipients"][0];
@@ -1285,7 +1322,7 @@ async fn dry_run_agrees_with_the_real_walk_when_everything_is_eligible(pool: PgP
 #[sqlx::test]
 async fn dry_run_agrees_with_the_real_walk_on_a_paused_route(pool: PgPool) {
     let state = state(pool);
-    post(&state, "/routes/warming/pause", Some(TOKEN), "").await;
+    post(&state, "/ramps/main/routes/warming/pause", Some(TOKEN), "").await;
 
     let (dry, real) = compare_walks(&state, "someone@gmail.com").await;
     assert_eq!(dry, real);
@@ -1446,7 +1483,12 @@ async fn no_endpoint_exposes_a_recipient(pool: PgPool) {
         .await
         .expect("commit");
 
-    for uri in ["/routes", "/routes/warming", "/quota", "/health"] {
+    for uri in [
+        "/ramps/main/routes",
+        "/ramps/main/routes/warming",
+        "/quota",
+        "/health",
+    ] {
         let body = get(&state, uri, Some(TOKEN)).await.body;
         assert!(!body.contains("victim"), "{uri} leaked a recipient: {body}");
         assert!(
@@ -1521,7 +1563,13 @@ async fn a_bad_request_body_is_a_400_rather_than_a_500(pool: PgPool) {
         r#"{"domain_group":"google","allowance":"lots"}"#,
         r#"{"domain_grp":"google","allowance":1}"#,
     ] {
-        let response = post(&state, "/routes/warming/allowance", Some(TOKEN), body).await;
+        let response = post(
+            &state,
+            "/ramps/main/routes/warming/allowance",
+            Some(TOKEN),
+            body,
+        )
+        .await;
         assert!(
             response.status.is_client_error(),
             "body {body:?} produced {}",
@@ -1536,7 +1584,7 @@ async fn a_body_free_post_is_accepted_without_an_empty_object(pool: PgPool) {
     let state = state(pool);
     let response = send(
         &state,
-        Request::post("/routes/warming/pause")
+        Request::post("/ramps/main/routes/warming/pause")
             .header("authorization", format!("Bearer {TOKEN}"))
             .body(Body::empty())
             .unwrap(),
@@ -1657,7 +1705,7 @@ async fn dry_run_agrees_with_the_real_walk_on_a_pinned_route_over_its_frequency(
 #[sqlx::test]
 async fn dry_run_agrees_with_the_real_walk_on_a_paused_pinned_route(pool: PgPool) {
     let state = affinity_state(pool);
-    post(&state, "/routes/warming/pause", Some(TOKEN), "").await;
+    post(&state, "/ramps/main/routes/warming/pause", Some(TOKEN), "").await;
     let (dry, real) = compare_pinned_walks(&state, "a@gmail.com", Some("warming")).await;
     assert_eq!(dry, real);
     assert_eq!(dry, "warming=paused,overflow=selected");
@@ -1756,9 +1804,163 @@ async fn the_quota_view_reports_replies_past_the_cap_truthfully(pool: PgPool) {
         .unwrap();
     assert_eq!((u.committed, u.reserved), (1, 2));
 
-    let warming = route_of(&get(&state, "/routes", Some(TOKEN)).await.json(), "warming");
+    let warming = route_of(
+        &get(&state, "/ramps/main/routes", Some(TOKEN)).await.json(),
+        "warming",
+    );
     let group = group_of(&warming, "google");
     assert_eq!(group["allowance"], 1, "{group}");
     assert_eq!(group["reserved"], 2, "{group}");
     assert_eq!(group["headroom"], 0, "{group}");
+}
+
+// ---------------------------------------------------------------------------
+// D-099 — the control plane is per ramp
+// ---------------------------------------------------------------------------
+
+#[sqlx::test]
+async fn the_pre_ramp_paths_are_gone_not_aliased(pool: PgPool) {
+    // A mutation that silently landed on the wrong ramp is the lie §9 exists
+    // to prevent, so the old paths answer 410 rather than act on default_ramp.
+    let state = state(pool);
+    for (method, uri) in [
+        ("GET", "/routes"),
+        ("GET", "/routes/warming"),
+        ("POST", "/routes/warming/pause"),
+        ("POST", "/routes/warming/resume"),
+        ("POST", "/routes/warming/graduate"),
+        ("POST", "/routes/warming/allowance"),
+    ] {
+        let response = if method == "GET" {
+            get(&state, uri, Some(TOKEN)).await
+        } else {
+            post(&state, uri, Some(TOKEN), "").await
+        };
+        assert_eq!(response.status, StatusCode::GONE, "{method} {uri}");
+        let message = response.json()["message"].as_str().unwrap().to_string();
+        assert!(
+            message.contains(&format!("/ramps/{{ramp}}{uri}")) && message.contains("main"),
+            "{method} {uri}: {message}"
+        );
+    }
+    // Nothing was paused by the POST that used to pause.
+    let doc = get(&state, "/ramps/main/routes/warming", Some(TOKEN))
+        .await
+        .json();
+    assert_eq!(doc["paused"], false, "{doc}");
+    // And the 410 is behind the token like everything else.
+    assert_eq!(
+        get(&state, "/routes", None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[sqlx::test]
+async fn ramps_are_listed_with_their_routes(pool: PgPool) {
+    let state = state(pool);
+    let doc = get(&state, "/ramps", Some(TOKEN)).await.json();
+    let ramps = doc["ramps"].as_array().expect("an array");
+    assert_eq!(ramps.len(), 1, "{doc}");
+    assert_eq!(ramps[0]["name"], "main");
+    assert_eq!(ramps[0]["default"], true);
+    assert!(ramps[0]["listeners"].as_array().unwrap().is_empty());
+    let routes: Vec<&str> = ramps[0]["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect();
+    assert!(
+        routes.contains(&"warming") && routes.contains(&"overflow"),
+        "{doc}"
+    );
+
+    assert_eq!(
+        get(&state, "/ramps/main", Some(TOKEN)).await.json(),
+        ramps[0]
+    );
+    assert_eq!(
+        get(&state, "/ramps/nonesuch", Some(TOKEN)).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[sqlx::test]
+async fn an_unknown_ramp_is_404_on_every_path(pool: PgPool) {
+    let state = state(pool);
+    for uri in ["/ramps/other/routes", "/ramps/other/routes/warming"] {
+        assert_eq!(
+            get(&state, uri, Some(TOKEN)).await.status,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    for uri in [
+        "/ramps/other/routes/warming/pause",
+        "/ramps/other/routes/warming/graduate",
+    ] {
+        let response = post(&state, uri, Some(TOKEN), "").await;
+        assert_eq!(response.status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(response.body.contains("ramp"), "{}", response.body);
+    }
+    assert_eq!(
+        get(&state, "/quota?ramp=other", Some(TOKEN)).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[sqlx::test]
+async fn a_mutation_reports_its_ramp(pool: PgPool) {
+    let state = state(pool);
+    let response = post(&state, "/ramps/main/routes/warming/pause", Some(TOKEN), "").await;
+    assert_eq!(response.status, StatusCode::OK, "{}", response.body);
+    assert_eq!(response.json()["ramp"], "main");
+    assert_eq!(
+        get(&state, "/quota", Some(TOKEN)).await.json()["ramp"],
+        "main",
+        "with one ramp, /quota needs no ramp parameter"
+    );
+}
+
+#[sqlx::test]
+async fn a_reset_must_name_its_ramp(pool: PgPool) {
+    let state = state(pool);
+    let response = post(
+        &state,
+        "/quota/reset",
+        Some(TOKEN),
+        r#"{"route":"warming","domain_group":"google","confirm":"reset"}"#,
+    )
+    .await;
+    assert!(
+        response.status.is_client_error(),
+        "{}: {}",
+        response.status,
+        response.body
+    );
+    assert!(response.body.contains("ramp"), "{}", response.body);
+}
+
+#[sqlx::test]
+async fn a_dry_run_reports_the_ramp_it_used(pool: PgPool) {
+    let state = state(pool);
+    let body = |ramp: &str| {
+        format!(
+            r#"{{"envelope_from":"app@oldbrand.com","from_header":"app@oldbrand.com",
+                "recipients":["bob@gmail.com"]{ramp}}}"#
+        )
+    };
+    let doc = post(&state, "/dryrun", Some(TOKEN), &body("")).await.json();
+    assert_eq!(
+        (doc["ramp"].as_str(), doc["ramp_source"].as_str()),
+        (Some("main"), Some("default"))
+    );
+
+    let doc = post(&state, "/dryrun", Some(TOKEN), &body(r#","ramp":"main""#))
+        .await
+        .json();
+    assert_eq!(doc["ramp_source"], "given");
+
+    let missing = post(&state, "/dryrun", Some(TOKEN), &body(r#","ramp":"other""#)).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND, "{}", missing.body);
 }

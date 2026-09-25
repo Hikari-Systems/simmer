@@ -89,6 +89,8 @@ pub struct MutationResponse {
     pub action: &'static str,
     /// O-11 / D-053 — the configured name of the token presented.
     pub actor: String,
+    /// The ramp the mutation acted in (D-099). Every mutation acts within one.
+    pub ramp: String,
     #[serde(flatten)]
     pub detail: serde_json::Value,
     /// §14.1's operational warnings. Empty is the ordinary case.
@@ -101,31 +103,31 @@ pub struct MutationResponse {
 
 pub async fn pause(
     State(state): State<AdminState>,
-    Path(name): Path<String>,
+    Path((ramp, name)): Path<(String, String)>,
     actor: Actor,
     MaybeJson(_): MaybeJson<NoBody>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    set_paused(state, name, actor, true).await
+    set_paused(state, ramp, name, actor, true).await
 }
 
 pub async fn resume(
     State(state): State<AdminState>,
-    Path(name): Path<String>,
+    Path((ramp, name)): Path<(String, String)>,
     actor: Actor,
     MaybeJson(_): MaybeJson<NoBody>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    set_paused(state, name, actor, false).await
+    set_paused(state, ramp, name, actor, false).await
 }
 
 async fn set_paused(
     state: AdminState,
+    ramp_name: String,
     name: String,
     actor: Actor,
     paused: bool,
 ) -> Result<Json<MutationResponse>, ApiError> {
     let action = if paused { "pause" } else { "resume" };
-    // §3.4 (D-099): the default ramp until the control plane takes a ramp.
-    let ramp = state.config().default_ramp();
+    let ramp = known_ramp(&state, &ramp_name, action)?;
     known_route(ramp, &name, action)?;
 
     // Read before writing, so the audit line can say what it replaced. Racy in
@@ -147,11 +149,12 @@ async fn set_paused(
             metrics::admin_mutation(action, "failed");
         })?;
 
-    let warnings = exhaustion_warnings(&state).await?;
+    let warnings = exhaustion_warnings(&state, ramp).await?;
 
     audit(
         action,
         &actor,
+        &ramp.name,
         &name,
         json!({ "paused": paused, "previous": previous }),
         &warnings,
@@ -160,6 +163,7 @@ async fn set_paused(
     Ok(Json(MutationResponse {
         action,
         actor: actor.name,
+        ramp: ramp.name.clone(),
         detail: json!({ "route": name, "paused": paused, "previous": previous }),
         warnings,
     }))
@@ -191,11 +195,11 @@ fn yes() -> bool {
 
 pub async fn graduate(
     State(state): State<AdminState>,
-    Path(name): Path<String>,
+    Path((ramp_name, name)): Path<(String, String)>,
     actor: Actor,
     MaybeJson(body): MaybeJson<GraduateBody>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    let ramp = state.config().default_ramp();
+    let ramp = known_ramp(&state, &ramp_name, "graduate")?;
     let route = known_route(ramp, &name, "graduate")?;
 
     if route.overflow {
@@ -228,11 +232,12 @@ pub async fn graduate(
     // rows already written. `quota_usage.allowance` is authoritative once
     // written (D-026), so today's row keeps today's number and the pinned value
     // takes effect at the next day boundary.
-    let warnings = exhaustion_warnings(&state).await?;
+    let warnings = exhaustion_warnings(&state, ramp).await?;
 
     audit(
         "graduate",
         &actor,
+        &ramp.name,
         &name,
         json!({ "graduated": body.graduated, "previous": previous }),
         &warnings,
@@ -241,6 +246,7 @@ pub async fn graduate(
     Ok(Json(MutationResponse {
         action: "graduate",
         actor: actor.name,
+        ramp: ramp.name.clone(),
         detail: json!({
             "route": name,
             "graduated": body.graduated,
@@ -281,11 +287,11 @@ pub struct AllowanceBody {
 
 pub async fn allowance(
     State(state): State<AdminState>,
-    Path(name): Path<String>,
+    Path((ramp_name, name)): Path<(String, String)>,
     actor: Actor,
     Json(body): Json<AllowanceBody>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    let ramp = state.config().default_ramp();
+    let ramp = known_ramp(&state, &ramp_name, "allowance")?;
     let route = known_route(ramp, &name, "allowance")?;
 
     if ramp.domain_group(&body.domain_group).is_none() {
@@ -328,11 +334,12 @@ pub async fn allowance(
         .await
         .inspect_err(|_| metrics::admin_mutation("allowance", "failed"))?;
 
-    let warnings = exhaustion_warnings(&state).await?;
+    let warnings = exhaustion_warnings(&state, ramp).await?;
 
     audit(
         "allowance",
         &actor,
+        &ramp.name,
         &name,
         json!({
             "domain_group": body.domain_group,
@@ -346,6 +353,7 @@ pub async fn allowance(
     Ok(Json(MutationResponse {
         action: "allowance",
         actor: actor.name,
+        ramp: ramp.name.clone(),
         detail: json!({
             "route": name,
             "domain_group": body.domain_group,
@@ -371,6 +379,8 @@ const RESET_CONFIRMATION: &str = "reset";
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResetBody {
+    /// Required (§9.3, D-099): a reset names the ramp it destroys a count in.
+    pub ramp: String,
     pub route: String,
     pub domain_group: String,
     /// Must be the literal `"reset"`. A boolean would be satisfied by a `true`
@@ -383,7 +393,7 @@ pub async fn reset(
     actor: Actor,
     Json(body): Json<ResetBody>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    let ramp = state.config().default_ramp();
+    let ramp = known_ramp(&state, &body.ramp, "reset")?;
     let route = known_route(ramp, &body.route, "reset")?;
 
     if ramp.domain_group(&body.domain_group).is_none() {
@@ -416,6 +426,7 @@ pub async fn reset(
         return Ok(Json(MutationResponse {
             action: "reset",
             actor: actor.name,
+            ramp: ramp.name.clone(),
             detail: json!({
                 "route": body.route,
                 "domain_group": body.domain_group,
@@ -427,11 +438,12 @@ pub async fn reset(
         }));
     };
 
-    let warnings = exhaustion_warnings(&state).await?;
+    let warnings = exhaustion_warnings(&state, ramp).await?;
 
     audit(
         "reset",
         &actor,
+        &ramp.name,
         &body.route,
         json!({
             "domain_group": body.domain_group,
@@ -446,6 +458,7 @@ pub async fn reset(
     Ok(Json(MutationResponse {
         action: "reset",
         actor: actor.name,
+        ramp: ramp.name.clone(),
         detail: json!({
             "route": body.route,
             "domain_group": body.domain_group,
@@ -478,10 +491,12 @@ pub async fn reset(
 /// would be a guess dressed as a warning.
 ///
 /// Empty is both the ordinary case and the cheap case.
-pub async fn exhaustion_warnings(state: &AdminState) -> Result<Vec<String>, QuotaError> {
+pub async fn exhaustion_warnings(
+    state: &AdminState,
+    ramp: &Ramp,
+) -> Result<Vec<String>, QuotaError> {
     // D-057 within one ramp (D-099): a ramp's routes can only empty its own
-    // chains. The default ramp until phase 3 scopes mutations by path.
-    let ramp = state.config().default_ramp();
+    // chains, so only its own chains are checked.
     let now = Utc::now();
     let states = state.store().route_states(&ramp.name).await?;
     let usage = state
@@ -523,6 +538,20 @@ pub async fn exhaustion_warnings(state: &AdminState) -> Result<Vec<String>, Quot
 
 /// Could this route carry one more message for this group right now?
 ///
+/// The ramp a mutation's path (or, for a reset, its body) names. A mutation
+/// never falls back to `default_ramp`: one that landed on the wrong ramp is the
+/// lie §9 exists to prevent (D-099).
+fn known_ramp<'a>(
+    state: &'a AdminState,
+    name: &str,
+    action: &'static str,
+) -> Result<&'a Ramp, ApiError> {
+    state.config().ramps.get(name).ok_or_else(|| {
+        metrics::admin_mutation(action, "rejected");
+        ApiError::not_found("ramp", name)
+    })
+}
+
 /// The same three questions `chain::walk_and_reserve` asks, minus §7.3's, which
 /// needs a recipient.
 fn eligible(
@@ -571,6 +600,7 @@ fn known_route<'a>(
 fn audit(
     action: &'static str,
     actor: &Actor,
+    ramp: &str,
     route: &str,
     detail: serde_json::Value,
     warnings: &[String],
@@ -580,6 +610,7 @@ fn audit(
     tracing::info!(
         admin_action = action,
         actor = %actor,
+        ramp = %ramp,
         route = %route,
         detail = %detail,
         "admin mutation applied"
@@ -644,7 +675,7 @@ mod tests {
     #[test]
     fn the_reset_confirmation_is_a_word_rather_than_a_flag() {
         let body: ResetBody = serde_json::from_str(
-            r#"{"route":"warming","domain_group":"google","confirm":"reset"}"#,
+            r#"{"ramp":"main","route":"warming","domain_group":"google","confirm":"reset"}"#,
         )
         .unwrap();
         assert_eq!(body.confirm, RESET_CONFIRMATION);

@@ -173,7 +173,7 @@ pub async fn walk_and_reserve<'a>(
 
     for name in chain {
         let Some(route) = ramp.route(name) else {
-            record(evaluation, name, Err(SkipReason::Unknown));
+            record(evaluation, &ramp.name, name, Err(SkipReason::Unknown));
             continue;
         };
         let state = states.get(name).copied().unwrap_or_default();
@@ -181,7 +181,7 @@ pub async fn walk_and_reserve<'a>(
 
         // (a) paused.
         if state.paused {
-            record(evaluation, name, Err(SkipReason::Paused));
+            record(evaluation, &ramp.name, name, Err(SkipReason::Paused));
             continue;
         }
 
@@ -195,7 +195,7 @@ pub async fn walk_and_reserve<'a>(
         // Non-strict routes never reach `blocks`, and a route with no report
         // fails open — a slow resolver at boot must not empty a chain.
         if preflight.blocks(route) {
-            record(evaluation, name, Err(SkipReason::Preflight));
+            record(evaluation, &ramp.name, name, Err(SkipReason::Preflight));
             continue;
         }
 
@@ -242,7 +242,7 @@ pub async fn walk_and_reserve<'a>(
                 }
 
                 if over {
-                    record(evaluation, name, Err(SkipReason::Frequency));
+                    record(evaluation, &ramp.name, name, Err(SkipReason::Frequency));
                     continue;
                 }
                 keys
@@ -253,7 +253,7 @@ pub async fn walk_and_reserve<'a>(
         let allowance = quota::allowance_for(route, &group, day_index, state);
 
         if allowance == Allowance::NotStarted {
-            record(evaluation, name, Err(SkipReason::NotStarted));
+            record(evaluation, &ramp.name, name, Err(SkipReason::NotStarted));
             continue;
         }
 
@@ -284,7 +284,7 @@ pub async fn walk_and_reserve<'a>(
                     share,
                     dot_insensitive_domains,
                 ) {
-                    record(evaluation, name, Err(SkipReason::PartialRamp));
+                    record(evaluation, &ramp.name, name, Err(SkipReason::PartialRamp));
                     continue;
                 }
             }
@@ -337,11 +337,11 @@ pub async fn walk_and_reserve<'a>(
                     outcome: Ok(()),
                     over_cap,
                 });
-                metrics::warmup_day(name, day_index);
+                metrics::warmup_day(&ramp.name, name, day_index);
                 if let Allowance::Limited(a) = allowance {
-                    metrics::quota_allowance(name, &group, a as f64);
+                    metrics::quota_allowance(&ramp.name, name, &group, a as f64);
                 } else {
-                    metrics::quota_allowance(name, &group, f64::INFINITY);
+                    metrics::quota_allowance(&ramp.name, name, &group, f64::INFINITY);
                 }
                 return Ok(Walk::Selected(Box::new(Selected {
                     route,
@@ -362,7 +362,7 @@ pub async fn walk_and_reserve<'a>(
                     reserved = usage.reserved,
                     "route has no headroom today"
                 );
-                record(evaluation, name, Err(SkipReason::Quota));
+                record(evaluation, &ramp.name, name, Err(SkipReason::Quota));
             }
         }
     }
@@ -573,9 +573,9 @@ pub async fn any_eligible(
     Ok(false)
 }
 
-fn record(evaluation: &mut Vec<Step>, route: &str, outcome: Result<(), SkipReason>) {
+fn record(evaluation: &mut Vec<Step>, ramp: &str, route: &str, outcome: Result<(), SkipReason>) {
     if let Err(reason) = outcome {
-        metrics::route_skipped(route, reason.as_str());
+        metrics::route_skipped(ramp, route, reason.as_str());
     }
     evaluation.push(Step {
         route: route.to_string(),

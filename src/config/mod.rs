@@ -159,6 +159,9 @@ impl<'de> Deserialize<'de> for Ramps {
             {
                 let mut out = Vec::new();
                 while let Some((name, mut ramp)) = map.next_entry::<String, Ramp>()? {
+                    for route in &mut ramp.routes {
+                        route.ramp = name.clone();
+                    }
                     ramp.name = name;
                     out.push(ramp);
                 }
@@ -221,6 +224,14 @@ pub struct ListenerConfig {
     /// Absent means the port's RFC default — see [`ListenerConfig::auth_mode`].
     #[serde(default)]
     pub auth: Option<IngressAuth>,
+    /// §5.1, §5.8 (D-099) — port affinity: mail arriving here is routed in this
+    /// ramp. Absent: the `X-Simmer-Ramp` header, or `default_ramp`.
+    #[serde(default)]
+    pub ramp: Option<String>,
+    /// §5.8 (D-099) — let a permitted `X-Simmer-Ramp` header override `ramp`.
+    /// Default false: the affinity wins. Meaningless, and refused, without one.
+    #[serde(default)]
+    pub header_overrides_affinity: bool,
 }
 
 /// §5.1 inbound TLS, per listener.
@@ -401,6 +412,11 @@ pub struct Grants {
     /// exact domain, `*.subdomain`, or full address. Checked against the
     /// envelope sender at `MAIL FROM` and the `From:` header at the final dot.
     pub send_as: Vec<String>,
+    /// §5.3, §5.8 (D-099) — the ramps this user may name in `X-Simmer-Ramp`.
+    /// Default none. Never refuses anything: a header naming a ramp not listed
+    /// here is ignored, and the message falls back like any other.
+    #[serde(default)]
+    pub ramps: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -689,6 +705,12 @@ pub enum MatchOn {
 #[serde(deny_unknown_fields)]
 pub struct Route {
     pub name: String,
+    /// The ramp this route belongs to (D-099). Not configured: filled in from
+    /// the key it is declared under, as `Ramp::name` is, so that anything
+    /// holding a route can label what it emits `{ramp, route}` — a route name
+    /// is only unique within its ramp (§3.4, §9.1).
+    #[serde(skip)]
+    pub ramp: String,
     /// §3.1. An overflow route carries no warm-up schedule, is never
     /// quota-limited, and must be last in any chain containing it.
     #[serde(default)]

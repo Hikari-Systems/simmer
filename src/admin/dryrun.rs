@@ -88,11 +88,18 @@ pub struct DryRunRequest {
     /// is almost always the headers and which patterns fired.
     #[serde(default)]
     pub include_message: bool,
+    /// §9.4 (D-099) — the ramp to route in. Absent: `default_ramp`.
+    #[serde(default)]
+    pub ramp: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DryRunResponse {
     pub evaluated_at: chrono::DateTime<Utc>,
+    /// The ramp everything below was evaluated in (D-099).
+    pub ramp: String,
+    /// Which rule chose it: `given` (the request's `ramp`) or `default`.
+    pub ramp_source: &'static str,
     /// Which sender rule matched, or `null` for the default chain.
     pub matched_rule: Option<MatchedRule>,
     /// Where the chain came from — a sender rule's path, or `default_chain`.
@@ -207,8 +214,15 @@ pub async fn dryrun(
     Json(request): Json<DryRunRequest>,
 ) -> Result<Json<DryRunResponse>, ApiError> {
     let cfg = state.config();
-    // §5.8 (D-099): the default ramp until selection is implemented.
-    let ramp = cfg.default_ramp();
+    let (ramp, ramp_source) = match &request.ramp {
+        Some(name) => (
+            cfg.ramps
+                .get(name)
+                .ok_or_else(|| ApiError::not_found("ramp", name))?,
+            "given",
+        ),
+        None => (cfg.default_ramp(), "default"),
+    };
     let now = Utc::now();
 
     if request.recipients.is_empty() {
@@ -238,6 +252,8 @@ pub async fn dryrun(
         Err(e) => {
             return Ok(Json(DryRunResponse {
                 evaluated_at: now,
+                ramp: ramp.name.clone(),
+                ramp_source,
                 matched_rule: None,
                 chain_source: "none".to_string(),
                 chain: Vec::new(),
@@ -278,10 +294,12 @@ pub async fn dryrun(
 
     let mut recipients = Vec::with_capacity(request.recipients.len());
     for recipient in &request.recipients {
-        recipients.push(evaluate_one(&state, chain, &pin, recipient, &request, now).await?);
+        recipients.push(evaluate_one(&state, ramp, chain, &pin, recipient, &request, now).await?);
     }
 
     Ok(Json(DryRunResponse {
+        ramp: ramp.name.clone(),
+        ramp_source,
         evaluated_at: now,
         matched_rule,
         chain_source,
@@ -348,8 +366,10 @@ fn refusal_explanation(e: &relay::SelectError) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn evaluate_one(
     state: &AdminState,
+    ramp: &crate::config::Ramp,
     chain: &[String],
     pin: &crate::routing::thread::Pin,
     recipient: &str,
@@ -357,7 +377,6 @@ async fn evaluate_one(
     now: chrono::DateTime<Utc>,
 ) -> Result<RecipientOutcome, ApiError> {
     let cfg = state.config();
-    let ramp = cfg.default_ramp();
 
     // The walk resolves the group again; the second answer comes from the
     // cache this one just filled, so the two cannot disagree in practice.
@@ -639,6 +658,7 @@ mod tests {
             in_reply_to: None,
             references: None,
             include_message: false,
+            ramp: None,
         }
     }
 

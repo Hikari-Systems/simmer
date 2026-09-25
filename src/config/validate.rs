@@ -557,6 +557,23 @@ fn check_listeners(cfg: &Config, v: &mut ViolationList) {
             Ok(_) => {}
         }
 
+        // §4.2 (D-099): an affinity must name a ramp, and an override needs an
+        // affinity to override.
+        if let Some(ramp) = &l.ramp {
+            if cfg.ramps.get(ramp).is_none() {
+                v.push(
+                    format!("{path}.ramp"),
+                    format!("'{ramp}' names no ramp in `ramps`"),
+                );
+            }
+        } else if l.header_overrides_affinity {
+            v.push(
+                format!("{path}.header_overrides_affinity"),
+                "is true on a listener with no `ramp`, where there is no affinity for a \
+                 header to override; a listener without one already routes by the header",
+            );
+        }
+
         let tls = l.tls_mode();
         if tls.can_encrypt() && cfg.server.tls.is_none() {
             v.push(
@@ -942,6 +959,23 @@ fn check_auth(cfg: &Config, v: &mut ViolationList) {
                     format!("server.auth.users[{i}].grants.send_as[{j}]"),
                     format!("'{pattern}' {problem}"),
                 );
+            }
+        }
+
+        // §4.2 (D-099): each entry a real ramp, named once, and never `*` — a
+        // wildcard would grant ramps added later without anyone deciding to.
+        let mut named: BTreeMap<&str, usize> = BTreeMap::new();
+        for (j, ramp) in user.grants.ramps.iter().enumerate() {
+            let path = format!("server.auth.users[{i}].grants.ramps[{j}]");
+            if ramp.contains('*') {
+                v.push(
+                    path,
+                    format!("'{ramp}' is a wildcard; name each ramp this user may select"),
+                );
+            } else if cfg.ramps.get(ramp).is_none() {
+                v.push(path, format!("'{ramp}' names no ramp in `ramps`"));
+            } else if let Some(prev) = named.insert(ramp, j) {
+                v.push(path, format!("'{ramp}' repeats grants.ramps[{prev}]"));
             }
         }
     }

@@ -344,6 +344,7 @@ mod tests {
     fn grants() -> crate::config::Grants {
         crate::config::Grants {
             send_as: vec!["oldbrand.com".into()],
+            ramps: Vec::new(),
         }
     }
 

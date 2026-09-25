@@ -73,6 +73,7 @@ mod tests {
                     password_hash: "$argon2id$unused".to_string(),
                     grants: Grants {
                         send_as: grants.iter().map(|s| s.to_string()).collect(),
+                        ramps: Vec::new(),
                     },
                 })
                 .collect(),

@@ -181,10 +181,10 @@ pub fn order(chain: &[String], pin: &Pin) -> Vec<String> {
 /// `simmer_thread_affinity_total`, once the walk has an answer. `selected` is
 /// the route that reserved, or `None` for an exhausted chain; `over_cap` is
 /// whether it was reserved past the day's cap.
-pub fn observe(pin: &Pin, selected: Option<&str>, over_cap: bool) {
+pub fn observe(ramp: &str, pin: &Pin, selected: Option<&str>, over_cap: bool) {
     if let Some(outcome) = outcome(pin, selected, over_cap) {
         let route = pin.route().unwrap_or("-");
-        crate::metrics::thread_affinity(route, outcome);
+        crate::metrics::thread_affinity(ramp, route, outcome);
     }
 }
 

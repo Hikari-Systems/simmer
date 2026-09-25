@@ -55,7 +55,7 @@ pub async fn sweep_once(store: &dyn QuotaStore) {
                     "released an expired reservation; the process either died mid-send \
                      or the reservation expiry is shorter than real downstream latency (§7.4)"
                 );
-                metrics::reservation_expired(&e.route, e.count);
+                metrics::reservation_expired(&e.ramp, &e.route, e.count);
             }
         }
         Err(e) => {

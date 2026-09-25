@@ -122,7 +122,7 @@ fn a_part_the_engine_cannot_read_is_relayed_untouched_and_counted() {
     let _logs = MATRIX.logs_on_failure();
     fresh();
     let series = format!(
-        r#"simmer_body_rewrite_skipped_total{{route="{WARMING}",reason="unsupported_charset"}}"#
+        r#"simmer_body_rewrite_skipped_total{{ramp="main",route="{WARMING}",reason="unsupported_charset"}}"#
     );
     let before = admin::metric(&series);
 
@@ -271,7 +271,7 @@ fn the_control_plane_steers_live_traffic_and_says_what_it_empties() {
     // mailpit-direct still takes the chain.
     let (status, response) = admin::post(
         &MATRIX,
-        &format!("/routes/{WARMING}/allowance"),
+        &format!("/ramps/main/routes/{WARMING}/allowance"),
         &json!({ "domain_group": "catchall", "allowance": 0 }),
     );
     assert_eq!(status, 200, "{response}");
@@ -282,7 +282,7 @@ fn the_control_plane_steers_live_traffic_and_says_what_it_empties() {
     // Clearing it (an explicit null) gives warming back.
     let (status, response) = admin::post(
         &MATRIX,
-        &format!("/routes/{WARMING}/allowance"),
+        &format!("/ramps/main/routes/{WARMING}/allowance"),
         &json!({ "domain_group": "catchall", "allowance": null }),
     );
     assert_eq!(status, 200, "{response}");
@@ -291,8 +291,11 @@ fn the_control_plane_steers_live_traffic_and_says_what_it_empties() {
 
     // Pausing the default chain's only route empties it, and the response says so
     // (D-057)...
-    let (status, response) =
-        admin::post(&MATRIX, &format!("/routes/{NEXT_LINK}/pause"), &json!({}));
+    let (status, response) = admin::post(
+        &MATRIX,
+        &format!("/ramps/main/routes/{NEXT_LINK}/pause"),
+        &json!({}),
+    );
     assert_eq!(status, 200, "{response}");
     let warnings: Vec<String> = serde_json::from_value(response["warnings"].clone()).unwrap();
     assert!(
@@ -311,8 +314,11 @@ fn the_control_plane_steers_live_traffic_and_says_what_it_empties() {
     assert_eq!(deliver(FLOWS_FROM, "ctl-e", &mut delivered), WARMING);
 
     // Resuming clears the warning, and the default chain delivers again.
-    let (status, response) =
-        admin::post(&MATRIX, &format!("/routes/{NEXT_LINK}/resume"), &json!({}));
+    let (status, response) = admin::post(
+        &MATRIX,
+        &format!("/ramps/main/routes/{NEXT_LINK}/resume"),
+        &json!({}),
+    );
     assert_eq!(status, 200, "{response}");
     assert_eq!(response["warnings"], json!([]), "{response}");
     assert_eq!(
@@ -322,19 +328,22 @@ fn the_control_plane_steers_live_traffic_and_says_what_it_empties() {
 
     // Graduation: accepted for a warming route, and undone the same way; refused
     // for an overflow route, which has no schedule to graduate to.
-    let (status, response) =
-        admin::post(&MATRIX, &format!("/routes/{WARMING}/graduate"), &json!({}));
+    let (status, response) = admin::post(
+        &MATRIX,
+        &format!("/ramps/main/routes/{WARMING}/graduate"),
+        &json!({}),
+    );
     assert_eq!(status, 200, "{response}");
     assert_eq!(response["graduated"], json!(true), "{response}");
     let (status, response) = admin::post(
         &MATRIX,
-        &format!("/routes/{NEXT_LINK}/graduate"),
+        &format!("/ramps/main/routes/{NEXT_LINK}/graduate"),
         &json!({}),
     );
     assert_eq!(status, 400, "{response}");
     let (status, response) = admin::post(
         &MATRIX,
-        &format!("/routes/{WARMING}/graduate"),
+        &format!("/ramps/main/routes/{WARMING}/graduate"),
         &json!({ "graduated": false }),
     );
     assert_eq!(status, 200, "{response}");

@@ -156,6 +156,8 @@ pub fn literal_domain(envelope_from: &str) -> Option<&str> {
 /// One route's checks, resolved from configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
+    /// The route's ramp (D-099), for the metric's `ramp` label.
+    pub ramp: String,
     pub route: String,
     pub domain: String,
     pub spf_include: Option<String>,
@@ -176,6 +178,7 @@ pub fn plan(cfg: &Config) -> Vec<Plan> {
             let domain = literal_domain(&route.identity.envelope_from)?;
             let p = route.preflight.as_ref()?;
             Some(Plan {
+                ramp: route.ramp.clone(),
                 route: route.name.clone(),
                 domain: domain.to_string(),
                 spf_include: p.spf_include.clone(),
@@ -356,7 +359,7 @@ pub async fn check_once(plans: &[Plan], resolver: &dyn TxtResolver, registry: &R
         let report = check_route(plan, resolver).await;
 
         for c in &report.checks {
-            metrics::preflight_ok(&plan.route, c.check.as_str(), c.ok);
+            metrics::preflight_ok(&plan.ramp, &plan.route, c.check.as_str(), c.ok);
             if !c.ok {
                 // WARN, not ERROR: on a non-strict route nothing has stopped, and
                 // §6.5 is explicit that this is the failure nothing else in the

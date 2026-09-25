@@ -212,7 +212,8 @@ fn a_strict_server_gets_honest_deferrals_and_never_a_loss() {
     // message may arrive, and a 7-bit message that fits must still go.
     let _logs = MATRIX.logs_on_failure();
     traps::MATRIX.reset();
-    let capability = r#"simmer_downstream_errors_total{route="postfix-strict",class="capability"}"#;
+    let capability =
+        r#"simmer_downstream_errors_total{ramp="main",route="postfix-strict",class="capability"}"#;
     let capability_before = metric(capability);
 
     let eight_bit = send("strict", "strict8bit", 1, &["--charset", "latin1"]);
@@ -288,7 +289,7 @@ fn a_pooled_connection_the_server_reaped_is_replaced_not_deferred() {
     // validation or the one retry must catch it; the client must never see it.
     let _logs = MATRIX.logs_on_failure();
     await_rate_window(); // also leaves a freshly used connection in the pool
-    let retries = r#"simmer_pool_retries_total{route="postfix-ratelimit"}"#;
+    let retries = r#"simmer_pool_retries_total{ramp="main",route="postfix-ratelimit"}"#;
     let before = pool_stats("postfix-ratelimit");
     let retries_before = metric(retries);
 
@@ -484,7 +485,7 @@ fn metric(series: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// A route's pool counters from `/routes`.
+/// A route's pool counters from `/ramps/main/routes`.
 fn pool_stats(route: &str) -> serde_json::Value {
     let token = String::from_utf8_lossy(
         &MATRIX
@@ -495,16 +496,17 @@ fn pool_stats(route: &str) -> serde_json::Value {
     .to_string();
     let out = Command::new("curl")
         .args(["-sf", "-H", &format!("Authorization: Bearer {token}")])
-        .arg(format!("{ADMIN}/routes"))
+        .arg(format!("{ADMIN}/ramps/main/routes"))
         .output()
         .expect("curl");
-    assert!(out.status.success(), "GET /routes failed");
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("/routes JSON");
+    assert!(out.status.success(), "GET /ramps/main/routes failed");
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("/ramps/main/routes JSON");
     let routes = v.get("routes").unwrap_or(&v).as_array().expect("routes");
     routes
         .iter()
         .find(|r| r["name"] == route)
-        .unwrap_or_else(|| panic!("no route {route} in /routes"))["pool"]
+        .unwrap_or_else(|| panic!("no route {route} in /ramps/main/routes"))["pool"]
         .clone()
 }
 

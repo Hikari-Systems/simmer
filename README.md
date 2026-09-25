@@ -324,7 +324,7 @@ A warming route's `warmup.schedule` is indexed by **elapsed days from
 `warmup.started`**, not by calendar date. A route started at 09:00 rolls over at
 09:00 every day, is immune to DST, and can never see a 23- or 25-hour window. Past
 the end of the array the final value repeats — routes never auto-graduate to
-uncapped; that is a deliberate act (`POST /routes/{name}/graduate`, or editing the
+uncapped; that is a deliberate act (`POST /ramps/{ramp}/routes/{name}/graduate`, or editing the
 config).
 
 Quota is keyed on `(route, domain_group)` because mailbox providers throttle
@@ -400,7 +400,7 @@ offered everything. §4.2 refuses a share outside `(0, 1]`, and a route with a
 would be a `451`.
 
 Watch `simmer_route_skipped_total{reason="partial_ramp"}` against
-`reason="quota"`. `/routes` reports the list and `today`'s share (`null` when
+`reason="quota"`. `/ramps/{ramp}/routes` reports the list and `today`'s share (`null` when
 every message is offered).
 
 ### A share that tunes itself
@@ -452,7 +452,7 @@ promises nothing — set it if you care about the peak a provider sees.
 Unlike a list, `auto` never ends; it applies while the route is warming and not
 graduated. That cannot throttle a route forever, because once the cap is well
 above the traffic the share sits at the ceiling and every message is offered.
-`/routes` reports the share **per domain group** under `auto` (the cap it paces
+`/ramps/{ramp}/routes` reports the share **per domain group** under `auto` (the cap it paces
 against is per group), and the route-level `today` is `null`.
 
 ### Thread affinity
@@ -499,7 +499,7 @@ ordinarily.
   ordinary slot, so replies within the cap spend it like any message and new
   conversations spill to overflow sooner. When the cap is already met, the reply
   still goes out on its route, **past the cap, and counted**: `committed` reads
-  above `allowance` in `/routes` and `/quota`, the allowance itself never
+  above `allowance` in `/ramps/{ramp}/routes` and `/quota`, the allowance itself never
   changes, and every message that is not a pinned reply is still refused at it.
   `simmer_thread_affinity_total{outcome="over_cap"}` counts them — watch it,
   because each is a send the ramp did not schedule.
@@ -721,7 +721,7 @@ SIMMER_REPLAY_PASSWORD_CFAPP=... server replay \
   the run, and know that a full disk then answers `451`.
 
 Nothing about the capture is reachable through the control plane, deliberately:
-a `/routes` or `/quota` response carrying a recipient would undo §7.3's whole
+a route or `/quota` response carrying a recipient would undo §7.3's whole
 reason for hashing, and a capture browser would turn a debugging mode into a
 permanent one.
 
@@ -742,37 +742,50 @@ answers `404`. **Upgrading from before v0.7.0:** a config that doesn't mention
 saying so. Set `true` to keep it, or `false` to silence the warning. On, a counter nobody increments for `idle_timeout` (default 24h,
 at least 1m) is dropped and comes back from zero on its next increment, which
 `rate()` and `increase()` treat as a counter reset. That is what stops
-`simmer_unmatched_sender_total{domain}`, whose label the client chooses, from
+`simmer_unmatched_sender_total{ramp,domain}`, whose `domain` label the client chooses, from
 growing for the life of the process. The exporter prunes while rendering, so
 turn it on only where something scrapes it.
 
+**Every series labelled `route` also carries `ramp`, first** (§9.1, D-099): a
+route name is only unique within its ramp. **Upgrading from before v0.9.0:** a
+dashboard or alert that matches `{route="warming"}` still matches, because
+Prometheus matching is by the labels named. But a `sum by (route)` now merges
+same-named routes across ramps. Add `ramp` to the `by` clause.
+
 On `admin.listen`, port 8080 by default. `/health`, `/healthcheck` and `/metrics`
 (when enabled) are open; everything else needs `Authorization: Bearer <token>`, including the
-reads — `/routes` discloses every downstream hostname and the whole routing
-shape. See `DECISIONS.md` D-055.
+reads — `/ramps/{ramp}/routes` discloses every downstream hostname and the whole
+routing shape. See `DECISIONS.md` D-055.
+
+Every route lives in a ramp (D-099), so every route path names one. The pre-ramp
+paths (`/routes`, and everything under them) answer `410 Gone`, naming the path
+that replaces them, rather than acting on `default_ramp`: a mutation that
+silently landed on the wrong ramp is the one failure the control plane must not
+have.
 
 | | |
 |---|---|
 | `GET /health` | Liveness plus database reachability. `503` when the database is down |
 | `GET /metrics` | Prometheus exposition (§9.1), when `admin.metrics` is on |
-| `GET /routes`, `GET /routes/{name}` | Configuration plus live state: warm-up day, per-group allowance and usage, paused, graduated, preflight results, pool statistics |
-| `GET /quota?route=&group=` | The same windows, filtered. Both filters optional and independent |
-| `POST /routes/{name}/pause`, `/resume` | Make a route ineligible without a restart. Persisted |
-| `POST /routes/{name}/graduate` | Pin to the final schedule value. `{"graduated": false}` reverses it |
-| `POST /routes/{name}/allowance` | `{"domain_group": …, "allowance": N\|null}`. Expires at the route's next day boundary |
-| `POST /quota/reset` | Destructive. Needs `"confirm": "reset"` |
-| `POST /dryrun` | What *would* happen. Sends nothing, reserves nothing, writes nothing |
+| `GET /ramps`, `GET /ramps/{ramp}` | Each ramp: its name, whether it is `default_ramp`, the listeners with affinity to it, its routes |
+| `GET /ramps/{ramp}/routes`, `…/routes/{name}` | Configuration plus live state: warm-up day, per-group allowance and usage, paused, graduated, preflight results, pool statistics |
+| `GET /quota?ramp=&route=&group=` | The same windows, filtered. `ramp` is required once more than one ramp is configured; the other two are optional and independent |
+| `POST /ramps/{ramp}/routes/{name}/pause`, `/resume` | Make a route ineligible without a restart. Persisted |
+| `POST /ramps/{ramp}/routes/{name}/graduate` | Pin to the final schedule value. `{"graduated": false}` reverses it |
+| `POST /ramps/{ramp}/routes/{name}/allowance` | `{"domain_group": …, "allowance": N\|null}`. Expires at the route's next day boundary |
+| `POST /quota/reset` | Destructive. Needs `"ramp"` and `"confirm": "reset"` |
+| `POST /dryrun` | What *would* happen. Sends nothing, reserves nothing, writes nothing. Takes an optional `ramp` |
 
 ```sh
 TOKEN=$SIMMER_ADMIN_TOKEN
 
 # Why is mail deferring for Google?
-curl -sH "Authorization: Bearer $TOKEN" localhost:8080/quota?group=google | jq
+curl -sH "Authorization: Bearer $TOKEN" 'localhost:8080/quota?ramp=main&group=google' | jq
 
 # Let the warming route send more to Google, today only.
 curl -sXPOST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"domain_group":"google","allowance":500}' \
-  localhost:8080/routes/warming/allowance | jq
+  localhost:8080/ramps/main/routes/warming/allowance | jq
 
 # What would this message do?
 curl -sXPOST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
@@ -781,7 +794,7 @@ curl -sXPOST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/jso
   localhost:8080/dryrun | jq
 ```
 
-**Reading `/routes`.** Each route also reports its `preflight` verdict — `null`
+**Reading `/ramps/{ramp}/routes`.** Each route also reports its `preflight` verdict — `null`
 means nothing has been checked, which is not the same as a pass and is reported
 differently on purpose — and its `pool`: `max_connections` and the live `idle` and
 `active` counts, plus lifetime `opened`, `reused`, `retired` and `discarded`.
