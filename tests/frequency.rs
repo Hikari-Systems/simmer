@@ -130,7 +130,7 @@ async fn seed(pool: &PgPool, route: &str, address: &str, when: chrono::DateTime<
         .await
         .key_for(address, FrequencyMode::ToAddress, &dot_insensitive());
     let mut tx = pool.begin().await.expect("begin");
-    simmer::models::recipient_event::record(&mut tx, route, &[key], when)
+    simmer::models::recipient_event::record(&mut tx, "main", route, &[key], when)
         .await
         .expect("record");
     tx.commit().await.expect("commit");
@@ -141,7 +141,12 @@ async fn count(pool: &PgPool, route: &str, address: &str, since_hours: i64) -> i
         .await
         .key_for(address, FrequencyMode::ToAddress, &dot_insensitive());
     store(pool.clone())
-        .recipient_event_count(route, &key, Utc::now() - Duration::hours(since_hours))
+        .recipient_event_count(
+            "main",
+            route,
+            &key,
+            Utc::now() - Duration::hours(since_hours),
+        )
         .await
         .expect("count")
 }
@@ -455,9 +460,15 @@ async fn to_domain_mode_pools_every_recipient_at_one_provider(pool: PgPool) {
         .await
         .key_for("anyone@example.com", FrequencyMode::ToDomain, &[]);
     let mut tx = pool.begin().await.expect("begin");
-    simmer::models::recipient_event::record(&mut tx, "warming", &[key.clone(), key], Utc::now())
-        .await
-        .expect("record");
+    simmer::models::recipient_event::record(
+        &mut tx,
+        "main",
+        "warming",
+        &[key.clone(), key],
+        Utc::now(),
+    )
+    .await
+    .expect("record");
     tx.commit().await.expect("commit");
 
     let (selected, _) = walk(&cfg, &store, "someone-else@example.com").await;

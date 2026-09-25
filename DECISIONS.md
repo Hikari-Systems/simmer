@@ -4545,9 +4545,16 @@ the SQL Server build's standing in §11–§13 (beyond the key width, recorded
 here) nor the capture's standing in §2.2. Both remain divergences, and both
 remain due before the *next* amendment.
 
-**Tested:** nothing yet. This entry precedes the code. `docs/STATE.md` tracks
-the phases (config, storage, control plane, selection, acceptance) and what
-each verified.
+**Tested:** phase by phase. `docs/STATE.md` §0 tracks the phases (config,
+storage, control plane, selection, acceptance) and what each verified.
+
+**Found while building storage.** `usage_many` takes the ramp as its own
+argument and leaves it out of `UsageKey`. Every read view is of one ramp, so
+the answer stays keyed by `(route, domain_group)`. The SQL Server migration
+names every statement about the new `ramp` column through `EXEC`, because a
+T-SQL batch is compiled whole before any of it runs. `route_state`'s primary
+key there was declared inline, so its generated name is looked up rather than
+assumed.
 
 
 ### D-100 — Domain groups by MX host: a Workspace company domain counts against `google`

@@ -21,8 +21,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::store::{
-    Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset, RouteState,
-    Usage, UsageKey,
+    Adoption, Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset,
+    RouteState, Usage, UsageKey,
 };
 use crate::models;
 
@@ -49,6 +49,7 @@ impl QuotaStore for PgQuotaStore {
         // behind it, which is what makes the read-then-write safe.
         let usage = models::quota::lock_usage(
             &mut tx,
+            &req.ramp,
             &req.route,
             &req.domain_group,
             req.day_index,
@@ -71,6 +72,7 @@ impl QuotaStore for PgQuotaStore {
 
         Ok(Reserved::Taken(Reservation {
             id,
+            ramp: req.ramp.clone(),
             route: req.route.clone(),
             domain_group: req.domain_group.clone(),
             day_index: req.day_index,
@@ -90,6 +92,7 @@ impl QuotaStore for PgQuotaStore {
             // The sweeper beat us: the send took longer than `expires_at`. The
             // message was still delivered, so the ramp has to count it.
             tracing::warn!(
+                ramp = %reservation.ramp,
                 route = %reservation.route,
                 reservation = %reservation.id,
                 "reservation expired before the downstream replied; committing anyway. \
@@ -100,6 +103,7 @@ impl QuotaStore for PgQuotaStore {
 
         models::quota::commit_usage(
             &mut tx,
+            &reservation.ramp,
             &reservation.route,
             &reservation.domain_group,
             reservation.day_index,
@@ -114,6 +118,7 @@ impl QuotaStore for PgQuotaStore {
         if !recipient_keys.is_empty() {
             models::recipient_event::record(
                 &mut tx,
+                &reservation.ramp,
                 &reservation.route,
                 recipient_keys,
                 chrono::Utc::now(),
@@ -131,6 +136,7 @@ impl QuotaStore for PgQuotaStore {
         if models::quota::take_reservation(&mut tx, reservation.id).await? {
             models::quota::release_usage(
                 &mut tx,
+                &reservation.ramp,
                 &reservation.route,
                 &reservation.domain_group,
                 reservation.day_index,
@@ -147,12 +153,13 @@ impl QuotaStore for PgQuotaStore {
 
     async fn usage(
         &self,
+        ramp: &str,
         route: &str,
         domain_group: &str,
         day_index: i64,
     ) -> Result<Usage, QuotaError> {
         Ok(
-            models::quota::read_usage(&self.pool, route, domain_group, day_index)
+            models::quota::read_usage(&self.pool, ramp, route, domain_group, day_index)
                 .await?
                 .unwrap_or_default(),
         )
@@ -160,21 +167,28 @@ impl QuotaStore for PgQuotaStore {
 
     async fn usage_many(
         &self,
+        ramp: &str,
         keys: &[UsageKey],
     ) -> Result<std::collections::HashMap<(String, String), Usage>, QuotaError> {
-        models::quota::read_usage_many(&self.pool, keys).await
+        models::quota::read_usage_many(&self.pool, ramp, keys).await
     }
 
-    async fn set_paused(&self, route: &str, paused: bool) -> Result<(), QuotaError> {
-        models::route_state::set_paused(&self.pool, route, paused).await
+    async fn set_paused(&self, ramp: &str, route: &str, paused: bool) -> Result<(), QuotaError> {
+        models::route_state::set_paused(&self.pool, ramp, route, paused).await
     }
 
-    async fn set_graduated(&self, route: &str, graduated: bool) -> Result<(), QuotaError> {
-        models::route_state::set_graduated(&self.pool, route, graduated).await
+    async fn set_graduated(
+        &self,
+        ramp: &str,
+        route: &str,
+        graduated: bool,
+    ) -> Result<(), QuotaError> {
+        models::route_state::set_graduated(&self.pool, ramp, route, graduated).await
     }
 
     async fn set_allowance_override(
         &self,
+        ramp: &str,
         route: &str,
         domain_group: &str,
         day_index: i64,
@@ -183,6 +197,7 @@ impl QuotaStore for PgQuotaStore {
     ) -> Result<(), QuotaError> {
         models::route_state::set_allowance_override(
             &self.pool,
+            ramp,
             route,
             domain_group,
             day_index,
@@ -194,17 +209,19 @@ impl QuotaStore for PgQuotaStore {
 
     async fn reset_counters(
         &self,
+        ramp: &str,
         route: &str,
         domain_group: &str,
         day_index: i64,
     ) -> Result<Option<Reset>, QuotaError> {
-        models::quota::reset_counters(&self.pool, route, domain_group, day_index).await
+        models::quota::reset_counters(&self.pool, ramp, route, domain_group, day_index).await
     }
 
     async fn route_states(
         &self,
+        ramp: &str,
     ) -> Result<std::collections::HashMap<String, RouteState>, QuotaError> {
-        models::route_state::all(&self.pool).await
+        models::route_state::all(&self.pool, ramp).await
     }
 
     async fn sweep_expired(&self) -> Result<Vec<Expired>, QuotaError> {
@@ -213,11 +230,12 @@ impl QuotaStore for PgQuotaStore {
 
     async fn recipient_event_count(
         &self,
+        ramp: &str,
         route: &str,
         key: &crate::frequency::Key,
         since: chrono::DateTime<chrono::Utc>,
     ) -> Result<i64, QuotaError> {
-        models::recipient_event::count_since(&self.pool, route, key, since).await
+        models::recipient_event::count_since(&self.pool, ramp, route, key, since).await
     }
 
     async fn recipient_hash_salt(&self) -> Result<Vec<u8>, QuotaError> {
@@ -250,6 +268,10 @@ impl QuotaStore for PgQuotaStore {
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, QuotaError> {
         models::recipient_event::evict_before(&self.pool, cutoff).await
+    }
+
+    async fn adopt_legacy_rows(&self, ramp: &str) -> Result<Adoption, QuotaError> {
+        models::legacy::adopt(&self.pool, ramp).await
     }
 
     async fn is_available(&self) -> bool {

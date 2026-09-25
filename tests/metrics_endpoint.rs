@@ -248,6 +248,7 @@ async fn a_reservation_moves_the_gauges_without_a_relay(pool: PgPool) {
         .engine
         .quota
         .reserve(&ReserveRequest {
+            ramp: "main".into(),
             route: "warming".into(),
             domain_group: "google".into(),
             day_index: day,
@@ -589,6 +590,7 @@ async fn the_runtime_gauges_are_exported_on_every_scrape(pool: PgPool) {
         .engine
         .registry
         .insert(&simmer::quota::store::Reservation {
+            ramp: "main".into(),
             id: uuid::Uuid::new_v4(),
             route: "warming".into(),
             domain_group: "catchall".into(),

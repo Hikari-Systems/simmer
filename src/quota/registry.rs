@@ -73,6 +73,7 @@ mod tests {
     fn reservation(n: i64) -> Reservation {
         Reservation {
             id: Uuid::new_v4(),
+            ramp: "main".into(),
             route: "warming".into(),
             domain_group: "catchall".into(),
             day_index: 0,

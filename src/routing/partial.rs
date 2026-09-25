@@ -11,11 +11,13 @@
 //! as long as the route is warming and not graduated.
 //!
 //! Which messages are offered is a **keyed hash**, not a dice roll: the §7.3
-//! salt over the normalised recipient, the route and the day index. That is what
+//! salt over the normalised recipient, the ramp, the route and the day index.
+//! That is what
 //! lets two instances agree without sharing any state, and what lets §9.4's dry
 //! run report the real result rather than a probability. The route is in the
-//! hash so two partial routes in one chain decide independently; the day index
-//! is in it so a recipient's route can change from one day to the next.
+//! hash so two partial routes in one chain decide independently; the ramp is in
+//! it so two ramps' same-named routes do too (D-099); the day index is in it so
+//! a recipient's route can change from one day to the next.
 //!
 //! Nothing about the recipient leaves this module — not in a log line, not in a
 //! metric. §7.3 hashes so that the container keeps no record of who was mailed.
@@ -157,6 +159,7 @@ pub fn auto_share(p: &AutoShare, allowance: i64, used: i64, elapsed: f64) -> f64
 /// Is this message offered to `route` today, at `share`?
 pub fn offered(
     keyer: &Keyer,
+    ramp: &str,
     route: &str,
     recipient: &str,
     day_index: i64,
@@ -167,7 +170,7 @@ pub fn offered(
         return true;
     }
     let normalised = frequency::normalise(recipient, FrequencyMode::ToAddress, dot_insensitive);
-    let key = keyer.key(&format!("{normalised}\0{route}\0{day_index}"));
+    let key = keyer.key(&format!("{normalised}\0{ramp}\0{route}\0{day_index}"));
     let mut head = [0u8; 8];
     head.copy_from_slice(&key.as_bytes()[..8]);
     // A uniform draw from [0, 1) with 53 bits of precision, which is all an f64
@@ -424,7 +427,7 @@ mod tests {
 
     fn offered_set(k: &Keyer, route: &str, day: i64, share: f64) -> Vec<bool> {
         recipients(2000)
-            .map(|r| offered(k, route, &r, day, share, &[]))
+            .map(|r| offered(k, "main", route, &r, day, share, &[]))
             .collect()
     }
 
@@ -448,7 +451,7 @@ mod tests {
         for share in [0.05, 0.25, 0.5, 0.9] {
             let n = 10_000;
             let hit = recipients(n)
-                .filter(|r| offered(&k, "warming", r, 0, share, &[]))
+                .filter(|r| offered(&k, "main", "warming", r, 0, share, &[]))
                 .count();
             let got = hit as f64 / n as f64;
             assert!((got - share).abs() < 0.02, "share {share}: offered {got}");
@@ -470,6 +473,19 @@ mod tests {
     }
 
     #[test]
+    fn the_ramp_changes_the_decision() {
+        // D-099: two ramps may each have a route called `warming`, and each
+        // offers its own share of recipients.
+        let k = keyer();
+        let in_ramp = |ramp: &str| -> Vec<bool> {
+            recipients(2000)
+                .map(|r| offered(&k, ramp, "warming", &r, 0, 0.5, &[]))
+                .collect()
+        };
+        assert_ne!(in_ramp("main"), in_ramp("brand-b"));
+    }
+
+    #[test]
     fn recipients_that_normalise_alike_get_the_same_answer() {
         let k = keyer();
         let dots = vec!["gmail.com".to_string()];
@@ -477,8 +493,8 @@ mod tests {
             let plain = format!("bobsmith{i}@gmail.com");
             let dressed = format!("Bob.Smith{i}+news@GMAIL.com");
             assert_eq!(
-                offered(&k, "warming", &plain, 2, 0.5, &dots),
-                offered(&k, "warming", &dressed, 2, 0.5, &dots),
+                offered(&k, "main", "warming", &plain, 2, 0.5, &dots),
+                offered(&k, "main", "warming", &dressed, 2, 0.5, &dots),
             );
         }
     }

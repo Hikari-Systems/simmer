@@ -133,7 +133,7 @@ async fn migrations_are_idempotent_and_recorded() {
             .unwrap()
             .get::<i64, _>("n")
             .unwrap();
-        assert_eq!(n, 3);
+        assert_eq!(n, 4, "one row per file in migrations-mssql/");
     })
     .await;
 }
@@ -188,7 +188,7 @@ async fn an_unreachable_server_is_unavailable_not_a_panic() {
     };
     let store = MssqlQuotaStore::new(mssql::build_pool(&cfg).expect("lazy pool"));
     assert!(!store.is_available().await);
-    assert!(store.route_states().await.is_err());
+    assert!(store.route_states("main").await.is_err());
 }
 
 #[test]
@@ -211,4 +211,124 @@ fn ado_and_jdbc_strings_both_parse() {
 fn the_url_parser_never_echoes_a_password() {
     let err = mssql::parse_url("server=tcp:db,notaport;password=hunter2").unwrap_err();
     assert!(!format!("{err:#}").contains("hunter2"), "{err:#}");
+}
+
+// ---------------------------------------------------------------------------
+// D-099 — the upgrade from a v0.8 schema that already holds rows
+// ---------------------------------------------------------------------------
+
+const V08: [&str; 3] = [
+    include_str!("../migrations-mssql/20260807000000_baseline.sql"),
+    include_str!("../migrations-mssql/20260807000001_quota.sql"),
+    include_str!("../migrations-mssql/20260810000000_recipient_event.sql"),
+];
+const RAMP: &str = include_str!("../migrations-mssql/20260925000000_ramp.sql");
+
+/// Run one batch on the test database, as `mssql::migrate` does: in a
+/// transaction, with XACT_ABORT on.
+async fn batch(pool: &mssql::Pool, sql: &str) -> Result<(), tiberius::error::Error> {
+    let mut conn = pool.get().await.expect("connection");
+    conn.broken = true;
+    let client = &mut conn.client;
+    client
+        .simple_query("SET XACT_ABORT ON; BEGIN TRANSACTION")
+        .await?
+        .into_results()
+        .await?;
+    client.simple_query(sql).await?.into_results().await?;
+    client
+        .simple_query("COMMIT TRANSACTION")
+        .await?
+        .into_results()
+        .await?;
+    Ok(())
+}
+
+async fn v08_with_rows(pool: &mssql::Pool, route: &str) {
+    for sql in V08 {
+        batch(pool, sql).await.expect("v0.8 schema");
+    }
+    batch(
+        pool,
+        &format!(
+            "INSERT INTO dbo.quota_usage \
+                 (route, domain_group, day_index, allowance, committed, reserved) \
+                 VALUES (N'{route}', N'google', 3, 100, 7, 1); \
+             INSERT INTO dbo.quota_reservation \
+                 (id, route, domain_group, day_index, [count], correlation_id, expires_at) \
+                 VALUES (NEWID(), N'{route}', N'google', 3, 1, N'c', \
+                         DATEADD(hour, 1, SYSUTCDATETIME())); \
+             INSERT INTO dbo.route_state (route, paused) VALUES (N'{route}', 1); \
+             INSERT INTO dbo.recipient_event (recipient_hash, route) \
+                 VALUES (0x00, N'{route}');"
+        ),
+    )
+    .await
+    .expect("v0.8 rows");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_keeps_existing_rows_under_the_empty_ramp_and_adopts_them() {
+    with_database(|cfg| async move {
+        let pool = mssql::build_pool(&cfg).expect("pool");
+        v08_with_rows(&pool, "warming").await;
+        batch(&pool, RAMP).await.expect("the ramp migration");
+
+        // D-099's fence: a v0.8 insert names no ramp, and there is no default.
+        let v08_insert = batch(
+            &pool,
+            "INSERT INTO dbo.quota_usage (route, domain_group, day_index, allowance) \
+             VALUES (N'warming', N'google', 4, 100);",
+        )
+        .await;
+        assert!(v08_insert.is_err(), "a v0.8 write must fail");
+
+        let store = MssqlQuotaStore::new(pool.clone());
+        let adopted = store.adopt_legacy_rows("main").await.expect("adopt");
+        assert_eq!(
+            (
+                adopted.quota_usage,
+                adopted.quota_reservation,
+                adopted.route_state,
+                adopted.recipient_event
+            ),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(adopted.routes, vec!["warming"]);
+        let usage = store.usage("main", "warming", "google", 3).await.unwrap();
+        assert_eq!(
+            (usage.allowance, usage.committed, usage.reserved),
+            (Some(100), 7, 1)
+        );
+        assert!(store.route_states("main").await.unwrap()["warming"].paused);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upgrade_refuses_a_stored_name_longer_than_128() {
+    with_database(|cfg| async move {
+        let pool = mssql::build_pool(&cfg).expect("pool");
+        v08_with_rows(&pool, &"r".repeat(129)).await;
+
+        let err = batch(&pool, RAMP)
+            .await
+            .expect_err("a 129-character route must stop the migration");
+        assert!(err.to_string().contains("128"), "{err}");
+
+        // Nothing changed: the schema is still v0.8's.
+        let mut conn = pool.get().await.unwrap();
+        let has_ramp = conn
+            .client
+            .simple_query("SELECT COL_LENGTH(N'dbo.quota_usage', N'ramp') AS n")
+            .await
+            .unwrap()
+            .into_row()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i16, _>("n");
+        assert_eq!(has_ramp, None, "the migration rolled back whole");
+    })
+    .await;
 }

@@ -49,6 +49,7 @@ pub async fn sweep_once(store: &dyn QuotaStore) {
         Ok(expired) => {
             for e in &expired {
                 tracing::warn!(
+                    ramp = %e.ramp,
                     route = %e.route,
                     count = e.count,
                     "released an expired reservation; the process either died mid-send \

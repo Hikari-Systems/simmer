@@ -19,13 +19,16 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     pub id: Uuid,
+    /// D-099: every key is `(ramp, route, …)`. Two ramps may each have a route
+    /// of the same name, and nothing they persist is shared.
+    pub ramp: String,
     pub route: String,
     pub domain_group: String,
     pub day_index: i64,
     pub count: i64,
 }
 
-/// What one `(route, domain_group, day_index)` row says.
+/// What one `(ramp, route, domain_group, day_index)` row says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Usage {
     /// `None` is *no ceiling* — an overflow route (D-024).
@@ -52,7 +55,10 @@ impl Usage {
     }
 }
 
-/// A `(route, domain_group, day_index)` address, for the §9.2 read API.
+/// A `(route, domain_group, day_index)` address within one ramp, for the §9.2
+/// read API. The ramp is [`QuotaStore::usage_many`]'s own argument: every read
+/// view is of one ramp, and keeping it out of the key keeps the answer keyed by
+/// `(route, domain_group)` as before.
 ///
 /// The day index is part of the key rather than a parameter because it is
 /// per-route: a warming route's day begins on its own `warmup.started`
@@ -89,6 +95,8 @@ pub struct RouteState {
 /// Everything a reservation attempt needs to know.
 #[derive(Debug, Clone)]
 pub struct ReserveRequest {
+    /// D-099 — the ramp the message is being routed in.
+    pub ramp: String,
     pub route: String,
     pub domain_group: String,
     pub day_index: i64,
@@ -127,6 +135,11 @@ pub enum QuotaError {
     /// all".
     #[error("quota storage: {0}")]
     Storage(String),
+    /// D-099: `adopt_legacy_rows` found a pre-ramps key that already exists
+    /// under the target ramp. Moving it would merge two histories, so startup
+    /// stops and says which.
+    #[error("adopting pre-ramps state: {0}")]
+    LegacyConflict(String),
 }
 
 #[cfg(feature = "postgres")]
@@ -139,8 +152,28 @@ impl From<sqlx::Error> for QuotaError {
 /// What a reservation was worth when it was swept away unresolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expired {
+    pub ramp: String,
     pub route: String,
     pub count: i64,
+}
+
+/// What [`QuotaStore::adopt_legacy_rows`] moved into the default ramp (D-099).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Adoption {
+    pub quota_usage: u64,
+    pub quota_reservation: u64,
+    pub route_state: u64,
+    pub recipient_event: u64,
+    /// Every distinct route name among the moved rows. The caller warns about
+    /// any that the ramp does not configure: `route_state` rows outlive deleted
+    /// routes, so that is worth a line, not a refusal.
+    pub routes: Vec<String>,
+}
+
+impl Adoption {
+    pub fn total(&self) -> u64 {
+        self.quota_usage + self.quota_reservation + self.route_state + self.recipient_event
+    }
 }
 
 #[async_trait]
@@ -174,6 +207,7 @@ pub trait QuotaStore: Send + Sync + 'static {
     /// for §9.2.
     async fn usage(
         &self,
+        ramp: &str,
         route: &str,
         domain_group: &str,
         day_index: i64,
@@ -185,14 +219,20 @@ pub trait QuotaStore: Send + Sync + 'static {
     /// input, and a route only ever has one *current* day.
     async fn usage_many(
         &self,
+        ramp: &str,
         keys: &[UsageKey],
     ) -> Result<std::collections::HashMap<(String, String), Usage>, QuotaError>;
 
     /// §9.3 `POST /routes/{name}/pause` and `/resume`.
-    async fn set_paused(&self, route: &str, paused: bool) -> Result<(), QuotaError>;
+    async fn set_paused(&self, ramp: &str, route: &str, paused: bool) -> Result<(), QuotaError>;
 
     /// §9.3 `POST /routes/{name}/graduate` — pin to the final schedule value.
-    async fn set_graduated(&self, route: &str, graduated: bool) -> Result<(), QuotaError>;
+    async fn set_graduated(
+        &self,
+        ramp: &str,
+        route: &str,
+        graduated: bool,
+    ) -> Result<(), QuotaError>;
 
     /// §9.3 `POST /routes/{name}/allowance`. `allowance: None` clears the
     /// override; `scheduled` is what to write into `allowance` if the row does
@@ -200,6 +240,7 @@ pub trait QuotaStore: Send + Sync + 'static {
     /// schedule's own number behind rather than a null (D-025).
     async fn set_allowance_override(
         &self,
+        ramp: &str,
         route: &str,
         domain_group: &str,
         day_index: i64,
@@ -210,17 +251,19 @@ pub trait QuotaStore: Send + Sync + 'static {
     /// §9.3 `POST /quota/reset`. `None` means there was no row to reset.
     async fn reset_counters(
         &self,
+        ramp: &str,
         route: &str,
         domain_group: &str,
         day_index: i64,
     ) -> Result<Option<Reset>, QuotaError>;
 
-    /// §9.3 state for every route, in one query. Read per message rather than
+    /// §9.3 state for every route of one ramp, in one query. Read per message rather than
     /// cached: at warm-up volumes the query costs nothing, and a cache would
     /// mean `POST /routes/{name}/pause` did not take effect immediately, which
     /// is the one thing an operator reaching for it needs.
     async fn route_states(
         &self,
+        ramp: &str,
     ) -> Result<std::collections::HashMap<String, RouteState>, QuotaError>;
 
     /// §7.4 — release reservations past their expiry. Returns what was released
@@ -231,6 +274,7 @@ pub trait QuotaStore: Send + Sync + 'static {
     /// the window. Unlocked, and outside the reservation transaction (D-049).
     async fn recipient_event_count(
         &self,
+        ramp: &str,
         route: &str,
         key: &crate::frequency::Key,
         since: DateTime<Utc>,
@@ -246,6 +290,13 @@ pub trait QuotaStore: Send + Sync + 'static {
 
     /// §7.3's sweeper — evict events older than `cutoff`. Returns how many.
     async fn sweep_recipient_events(&self, cutoff: DateTime<Utc>) -> Result<u64, QuotaError>;
+
+    /// D-099 — move every pre-ramps row (`ramp = ''`, which the migration
+    /// wrote) into `ramp`, in one transaction under a lock that serialises
+    /// replicas starting together. Idempotent: a second call finds nothing.
+    /// Refuses with [`QuotaError::LegacyConflict`] if a legacy
+    /// `quota_usage` or `route_state` key already exists under `ramp`.
+    async fn adopt_legacy_rows(&self, ramp: &str) -> Result<Adoption, QuotaError>;
 
     /// Is the backing store reachable? §7.5.
     async fn is_available(&self) -> bool;

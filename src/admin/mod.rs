@@ -276,8 +276,11 @@ async fn refresh_quota_gauges(state: &AdminState) -> Result<(), quota::QuotaErro
     // §3.4 (D-099): per ramp from phase 3; the default ramp until then.
     let ramp = cfg.default_ramp();
     let now = Utc::now();
-    let states = state.store().route_states().await?;
-    let usage = state.store().usage_many(&keys_for(ramp, now)).await?;
+    let states = state.store().route_states(&ramp.name).await?;
+    let usage = state
+        .store()
+        .usage_many(&ramp.name, &keys_for(ramp, now))
+        .await?;
 
     for route in &ramp.routes {
         let projected = view::project_route(
@@ -363,8 +366,11 @@ async fn routes(
     // §3.4 (D-099): per ramp from phase 3; the default ramp until then.
     let ramp = cfg.default_ramp();
     let now = Utc::now();
-    let states = state.store().route_states().await?;
-    let usage = state.store().usage_many(&keys_for(ramp, now)).await?;
+    let states = state.store().route_states(&ramp.name).await?;
+    let usage = state
+        .store()
+        .usage_many(&ramp.name, &keys_for(ramp, now))
+        .await?;
 
     Ok(Json(view::project_routes(
         ramp,
@@ -390,7 +396,7 @@ async fn route_by_name(
         .ok_or_else(|| ApiError::not_found("route", &name))?;
 
     let now = Utc::now();
-    let states = state.store().route_states().await?;
+    let states = state.store().route_states(&ramp.name).await?;
     let day_index = quota::day::for_route(route, now);
     let keys: Vec<UsageKey> = ramp
         .domain_groups
@@ -401,7 +407,7 @@ async fn route_by_name(
             day_index,
         })
         .collect();
-    let usage = state.store().usage_many(&keys).await?;
+    let usage = state.store().usage_many(&ramp.name, &keys).await?;
 
     Ok(Json(view::project_route(
         ramp,
@@ -446,8 +452,11 @@ async fn quota_detail(
     }
 
     let now = Utc::now();
-    let states = state.store().route_states().await?;
-    let usage = state.store().usage_many(&keys_for(ramp, now)).await?;
+    let states = state.store().route_states(&ramp.name).await?;
+    let usage = state
+        .store()
+        .usage_many(&ramp.name, &keys_for(ramp, now))
+        .await?;
     let projected = view::project_routes(
         ramp,
         &states,

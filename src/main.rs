@@ -133,6 +133,41 @@ async fn run() -> anyhow::Result<()> {
     let backend = db::open(&config.database).await?;
     info!(backend = db::BACKEND, "migrations applied");
 
+    // D-099 — move pre-ramps state into `default_ramp`, before any listener
+    // binds. Migrations have just succeeded, so the database is reachable; a
+    // failure here, or a legacy key that already exists under the ramp, stops
+    // startup rather than letting the ramp count from zero beside its history.
+    let default_ramp = config.default_ramp();
+    let adopted = backend
+        .store
+        .adopt_legacy_rows(&default_ramp.name)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("adopting pre-ramps quota state into default_ramp (D-099): {e}")
+        })?;
+    if adopted.total() > 0 {
+        info!(
+            ramp = %default_ramp.name,
+            quota_usage = adopted.quota_usage,
+            quota_reservation = adopted.quota_reservation,
+            route_state = adopted.route_state,
+            recipient_event = adopted.recipient_event,
+            "adopted pre-ramps state into the default ramp (D-099)"
+        );
+    }
+    for route in adopted
+        .routes
+        .iter()
+        .filter(|r| default_ramp.route(r).is_none())
+    {
+        warn!(
+            ramp = %default_ramp.name,
+            route = %route,
+            "adopted state for a route the default ramp does not configure; it is kept, \
+             and unused unless the route is added back (D-099)"
+        );
+    }
+
     // §7.5: an unreachable database is not a startup failure — it means `451` on
     // every message while the listener stays up. Report it and carry on.
     if backend.store.is_available().await {

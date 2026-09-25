@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::quota::store::{Expired, QuotaError, ReserveRequest, Reset, Usage, UsageKey};
 
-/// Create the `(route, domain_group, day_index)` row if absent and **lock it**,
+/// Create the `(ramp, route, domain_group, day_index)` row if absent and **lock it**,
 /// returning what it says.
 ///
 /// `ON CONFLICT DO UPDATE` rather than `DO NOTHING`: the former takes a row lock
@@ -29,6 +29,7 @@ use crate::quota::store::{Expired, QuotaError, ReserveRequest, Reset, Usage, Usa
 /// update: a config edit plus a restart must not raise today's ceiling.
 pub async fn lock_usage(
     tx: &mut Transaction<'_, Postgres>,
+    ramp: &str,
     route: &str,
     domain_group: &str,
     day_index: i64,
@@ -36,9 +37,9 @@ pub async fn lock_usage(
 ) -> Result<Usage, QuotaError> {
     let row = sqlx::query(
         r#"
-        INSERT INTO quota_usage (route, domain_group, day_index, allowance)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (route, domain_group, day_index)
+        INSERT INTO quota_usage (ramp, route, domain_group, day_index, allowance)
+        VALUES ($5, $1, $2, $3, $4)
+        ON CONFLICT (ramp, route, domain_group, day_index)
         DO UPDATE SET updated_at = now()
         RETURNING allowance, allowance_override, committed, reserved
         "#,
@@ -47,6 +48,7 @@ pub async fn lock_usage(
     .bind(domain_group)
     .bind(day_index)
     .bind(allowance)
+    .bind(ramp)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -61,6 +63,7 @@ pub async fn lock_usage(
 /// Read a row without locking it. Absent means untouched today.
 pub async fn read_usage(
     pool: &PgPool,
+    ramp: &str,
     route: &str,
     domain_group: &str,
     day_index: i64,
@@ -69,12 +72,13 @@ pub async fn read_usage(
         r#"
         SELECT allowance, allowance_override, committed, reserved
         FROM quota_usage
-        WHERE route = $1 AND domain_group = $2 AND day_index = $3
+        WHERE ramp = $4 AND route = $1 AND domain_group = $2 AND day_index = $3
         "#,
     )
     .bind(route)
     .bind(domain_group)
     .bind(day_index)
+    .bind(ramp)
     .fetch_optional(pool)
     .await?;
 
@@ -97,6 +101,7 @@ pub async fn read_usage(
 /// defeat the prepared-statement cache for no benefit.
 pub async fn read_usage_many(
     pool: &PgPool,
+    ramp: &str,
     keys: &[UsageKey],
 ) -> Result<HashMap<(String, String), Usage>, QuotaError> {
     if keys.is_empty() {
@@ -116,11 +121,13 @@ pub async fn read_usage_many(
           ON q.route = k.route
          AND q.domain_group = k.domain_group
          AND q.day_index = k.day_index
+        WHERE q.ramp = $4
         "#,
     )
     .bind(&routes)
     .bind(&groups)
     .bind(&days)
+    .bind(ramp)
     .fetch_all(pool)
     .await?;
 
@@ -153,6 +160,7 @@ pub async fn read_usage_many(
 /// write.
 pub async fn reset_counters(
     pool: &PgPool,
+    ramp: &str,
     route: &str,
     domain_group: &str,
     day_index: i64,
@@ -162,13 +170,14 @@ pub async fn reset_counters(
     let Some(before) = sqlx::query(
         r#"
         SELECT committed, reserved FROM quota_usage
-        WHERE route = $1 AND domain_group = $2 AND day_index = $3
+        WHERE ramp = $4 AND route = $1 AND domain_group = $2 AND day_index = $3
         FOR UPDATE
         "#,
     )
     .bind(route)
     .bind(domain_group)
     .bind(day_index)
+    .bind(ramp)
     .fetch_optional(&mut *tx)
     .await?
     else {
@@ -181,18 +190,20 @@ pub async fn reset_counters(
         SET committed = 0,
             reserved = COALESCE((
                 SELECT SUM(r.count)::BIGINT FROM quota_reservation r
-                WHERE r.route = q.route
+                WHERE r.ramp = q.ramp
+                  AND r.route = q.route
                   AND r.domain_group = q.domain_group
                   AND r.day_index = q.day_index
             ), 0),
             updated_at = now()
-        WHERE q.route = $1 AND q.domain_group = $2 AND q.day_index = $3
+        WHERE q.ramp = $4 AND q.route = $1 AND q.domain_group = $2 AND q.day_index = $3
         RETURNING q.reserved
         "#,
     )
     .bind(route)
     .bind(domain_group)
     .bind(day_index)
+    .bind(ramp)
     .fetch_one(&mut *tx)
     .await?;
 
@@ -218,21 +229,22 @@ pub async fn insert_reservation(
         r#"
         UPDATE quota_usage
         SET reserved = reserved + $4, updated_at = now()
-        WHERE route = $1 AND domain_group = $2 AND day_index = $3
+        WHERE ramp = $5 AND route = $1 AND domain_group = $2 AND day_index = $3
         "#,
     )
     .bind(route)
     .bind(domain_group)
     .bind(day_index)
     .bind(count)
+    .bind(&req.ramp)
     .execute(&mut **tx)
     .await?;
 
     sqlx::query(
         r#"
         INSERT INTO quota_reservation
-            (id, route, domain_group, day_index, count, correlation_id, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (id, route, domain_group, day_index, count, correlation_id, expires_at, ramp)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         "#,
     )
     .bind(id)
@@ -242,6 +254,7 @@ pub async fn insert_reservation(
     .bind(count)
     .bind(&req.correlation_id)
     .bind(req.expires_at)
+    .bind(&req.ramp)
     .execute(&mut **tx)
     .await?;
 
@@ -271,6 +284,7 @@ pub async fn take_reservation(
 /// would take it from some *other* message's live reservation.
 pub async fn commit_usage(
     tx: &mut Transaction<'_, Postgres>,
+    ramp: &str,
     route: &str,
     domain_group: &str,
     day_index: i64,
@@ -283,7 +297,7 @@ pub async fn commit_usage(
         SET reserved = GREATEST(reserved - $4, 0),
             committed = committed + $4,
             updated_at = now()
-        WHERE route = $1 AND domain_group = $2 AND day_index = $3
+        WHERE ramp = $5 AND route = $1 AND domain_group = $2 AND day_index = $3
         "#
     } else {
         // The message *was* delivered, so the ramp must reflect it even though
@@ -293,7 +307,7 @@ pub async fn commit_usage(
         r#"
         UPDATE quota_usage
         SET committed = committed + $4, updated_at = now()
-        WHERE route = $1 AND domain_group = $2 AND day_index = $3
+        WHERE ramp = $5 AND route = $1 AND domain_group = $2 AND day_index = $3
         "#
     };
 
@@ -302,6 +316,7 @@ pub async fn commit_usage(
         .bind(domain_group)
         .bind(day_index)
         .bind(count)
+        .bind(ramp)
         .execute(&mut **tx)
         .await?;
 
@@ -311,6 +326,7 @@ pub async fn commit_usage(
 /// §7.4 phase 3, the failure path: give the headroom back.
 pub async fn release_usage(
     tx: &mut Transaction<'_, Postgres>,
+    ramp: &str,
     route: &str,
     domain_group: &str,
     day_index: i64,
@@ -320,13 +336,14 @@ pub async fn release_usage(
         r#"
         UPDATE quota_usage
         SET reserved = GREATEST(reserved - $4, 0), updated_at = now()
-        WHERE route = $1 AND domain_group = $2 AND day_index = $3
+        WHERE ramp = $5 AND route = $1 AND domain_group = $2 AND day_index = $3
         "#,
     )
     .bind(route)
     .bind(domain_group)
     .bind(day_index)
     .bind(count)
+    .bind(ramp)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -346,20 +363,21 @@ pub async fn sweep_expired(pool: &PgPool) -> Result<Vec<Expired>, QuotaError> {
         WITH expired AS (
             DELETE FROM quota_reservation
             WHERE expires_at < now()
-            RETURNING route, domain_group, day_index, count
+            RETURNING ramp, route, domain_group, day_index, count
         ),
         totals AS (
-            SELECT route, domain_group, day_index, SUM(count)::BIGINT AS n
+            SELECT ramp, route, domain_group, day_index, SUM(count)::BIGINT AS n
             FROM expired
-            GROUP BY route, domain_group, day_index
+            GROUP BY ramp, route, domain_group, day_index
         )
         UPDATE quota_usage q
         SET reserved = GREATEST(q.reserved - t.n, 0), updated_at = now()
         FROM totals t
-        WHERE q.route = t.route
+        WHERE q.ramp = t.ramp
+          AND q.route = t.route
           AND q.domain_group = t.domain_group
           AND q.day_index = t.day_index
-        RETURNING q.route, t.n
+        RETURNING q.ramp, q.route, t.n
         "#,
     )
     .fetch_all(pool)
@@ -368,6 +386,7 @@ pub async fn sweep_expired(pool: &PgPool) -> Result<Vec<Expired>, QuotaError> {
     rows.into_iter()
         .map(|r| {
             Ok(Expired {
+                ramp: r.try_get("ramp")?,
                 route: r.try_get("route")?,
                 count: r.try_get::<i64, _>("n")?,
             })
@@ -390,17 +409,18 @@ pub async fn release_by_ids(pool: &PgPool, ids: &[Uuid]) -> Result<u64, QuotaErr
         WITH taken AS (
             DELETE FROM quota_reservation
             WHERE id = ANY($1)
-            RETURNING route, domain_group, day_index, count
+            RETURNING ramp, route, domain_group, day_index, count
         ),
         totals AS (
-            SELECT route, domain_group, day_index, SUM(count)::BIGINT AS n
+            SELECT ramp, route, domain_group, day_index, SUM(count)::BIGINT AS n
             FROM taken
-            GROUP BY route, domain_group, day_index
+            GROUP BY ramp, route, domain_group, day_index
         )
         UPDATE quota_usage q
         SET reserved = GREATEST(q.reserved - t.n, 0), updated_at = now()
         FROM totals t
-        WHERE q.route = t.route
+        WHERE q.ramp = t.ramp
+          AND q.route = t.route
           AND q.domain_group = t.domain_group
           AND q.day_index = t.day_index
         RETURNING q.route

@@ -100,6 +100,7 @@ async fn two_instances(
 
 fn request(route: &str, allowance: Option<i64>, count: i64) -> ReserveRequest {
     ReserveRequest {
+        ramp: "main".into(),
         route: route.into(),
         domain_group: "catchall".into(),
         day_index: 0,
@@ -161,14 +162,22 @@ async fn n_reservations_split_across_two_pools_never_overshoot(
         "exactly N-1 must be granted across the two instances"
     );
 
-    let usage = a.store.usage("warming", "catchall", 0).await.unwrap();
+    let usage = a
+        .store
+        .usage("main", "warming", "catchall", 0)
+        .await
+        .unwrap();
     assert_eq!(usage.committed, N - 1, "and no overshoot in the row");
     assert_eq!(usage.reserved, 0, "with nothing left outstanding");
 
     // And the two instances agree about it, which is the other half of "one
     // instance owns its quota state" being unnecessary: there is no per-instance
     // view to diverge.
-    let seen_by_b = b.store.usage("warming", "catchall", 0).await.unwrap();
+    let seen_by_b = b
+        .store
+        .usage("main", "warming", "catchall", 0)
+        .await
+        .unwrap();
     assert_eq!(seen_by_b.committed, usage.committed);
 }
 
@@ -207,9 +216,10 @@ async fn one_instances_open_reservation_blocks_the_others(
     // Allowance 2, one committed. One slot left, and two instances about to want it.
 
     let mut tx = a.pool.begin().await.expect("begin");
-    let usage = simmer::models::quota::lock_usage(&mut tx, "warming", "catchall", 0, Some(2))
-        .await
-        .expect("lock the existing row");
+    let usage =
+        simmer::models::quota::lock_usage(&mut tx, "main", "warming", "catchall", 0, Some(2))
+            .await
+            .expect("lock the existing row");
     assert!(usage.has_headroom_for(1), "one slot left");
     simmer::models::quota::insert_reservation(
         &mut tx,
@@ -328,7 +338,7 @@ async fn events(pool: &PgPool, route: &str, address: &str) -> i64 {
         .expect("salt");
     let key = Keyer::new(salt).key_for(address, FrequencyMode::ToAddress, &[]);
     PgQuotaStore::new(pool.clone())
-        .recipient_event_count(route, &key, Utc::now() - Duration::hours(24))
+        .recipient_event_count("main", route, &key, Utc::now() - Duration::hours(24))
         .await
         .expect("count")
 }
@@ -340,7 +350,7 @@ async fn seed_one_event(pool: &PgPool, route: &str, address: &str) {
         .expect("salt");
     let key = Keyer::new(salt).key_for(address, FrequencyMode::ToAddress, &[]);
     let mut tx = pool.begin().await.expect("begin");
-    simmer::models::recipient_event::record(&mut tx, route, &[key], Utc::now())
+    simmer::models::recipient_event::record(&mut tx, "main", route, &[key], Utc::now())
         .await
         .expect("record");
     tx.commit().await.expect("commit");

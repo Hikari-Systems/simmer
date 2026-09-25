@@ -424,6 +424,7 @@ pub async fn reserve_relay_commit(
         // §9.1 gauges, from the row we just moved.
         if let Ok(usage) = store
             .usage(
+                &selected.reservation.ramp,
                 &selected.reservation.route,
                 &selected.reservation.domain_group,
                 selected.reservation.day_index,

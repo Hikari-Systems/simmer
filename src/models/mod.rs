@@ -6,6 +6,7 @@
 //! [`crate::quota::postgres`], behind §11's storage trait.
 
 pub mod instance_config;
+pub mod legacy;
 pub mod quota;
 pub mod recipient_event;
 pub mod route_state;

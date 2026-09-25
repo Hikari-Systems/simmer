@@ -152,7 +152,7 @@ pub async fn walk_and_reserve<'a>(
     evaluation: &mut Vec<Step>,
 ) -> Result<Walk<'a>, QuotaError> {
     let now = Utc::now();
-    let states = store.route_states().await?;
+    let states = store.route_states(&ramp.name).await?;
 
     // §3.2: "Quota is decremented per message, by the recipient count, not per
     // recipient" — one reservation of this magnitude (O-7). D-047 makes that
@@ -221,7 +221,9 @@ pub async fn walk_and_reserve<'a>(
                 let since = frequency::window_start(constraint, now);
                 let mut over = false;
                 for key in keys.iter().filter(|_| !is_pinned) {
-                    let seen = store.recipient_event_count(name, key, since).await?;
+                    let seen = store
+                        .recipient_event_count(&ramp.name, name, key, since)
+                        .await?;
                     if seen >= i64::from(constraint.threshold) {
                         // No recipient in the log line, and no recipient label on
                         // the metric: §7.3 hashes precisely so that the container
@@ -264,7 +266,7 @@ pub async fn walk_and_reserve<'a>(
             // first — without the lock, since nothing here writes. A listed
             // share, and every route with no ramp at all, still read nothing.
             let usage = if partial::needs_usage(route, state) {
-                Some(store.usage(name, &group, day_index).await?)
+                Some(store.usage(&ramp.name, name, &group, day_index).await?)
             } else {
                 None
             };
@@ -275,6 +277,7 @@ pub async fn walk_and_reserve<'a>(
                 let recipient = recipients.first().map(String::as_str).unwrap_or_default();
                 if !partial::offered(
                     keyer,
+                    &ramp.name,
                     name,
                     recipient,
                     day_index,
@@ -289,6 +292,7 @@ pub async fn walk_and_reserve<'a>(
 
         // (c) + (d) together, under one row lock.
         let request = ReserveRequest {
+            ramp: ramp.name.clone(),
             route: name.clone(),
             domain_group: group.clone(),
             day_index,
@@ -403,7 +407,7 @@ pub async fn dry_walk(
     recipient: &str,
     now: chrono::DateTime<Utc>,
 ) -> Result<Vec<Step>, QuotaError> {
-    let states = store.route_states().await?;
+    let states = store.route_states(&ramp.name).await?;
     let group = groups.group_name(ramp, recipient).await;
 
     let mut evaluation = Vec::new();
@@ -431,7 +435,9 @@ pub async fn dry_walk(
             let keyer = frequency.keyer(store.as_ref()).await?;
             let key = keyer.key_for(recipient, constraint.mode, dot_insensitive_domains);
             let since = frequency::window_start(constraint, now);
-            if store.recipient_event_count(name, &key, since).await?
+            if store
+                .recipient_event_count(&ramp.name, name, &key, since)
+                .await?
                 >= i64::from(constraint.threshold)
             {
                 evaluation.push(step(name, Err(SkipReason::Frequency)));
@@ -450,7 +456,7 @@ pub async fn dry_walk(
         // against this row. `walk_and_reserve` reads it only when the ramp needs
         // it and then takes the lock; the dry run needs it regardless, since it
         // reports headroom below without reserving anything.
-        let usage = store.usage(name, &group, day_index).await?;
+        let usage = store.usage(&ramp.name, name, &group, day_index).await?;
 
         // D-091 and D-097, in `walk_and_reserve`'s position. The hash and the
         // arithmetic are the real walk's, so this is its answer and not an
@@ -462,6 +468,7 @@ pub async fn dry_walk(
                 let keyer = frequency.keyer(store.as_ref()).await?;
                 if !partial::offered(
                     keyer,
+                    &ramp.name,
                     name,
                     recipient,
                     day_index,
@@ -535,7 +542,7 @@ pub async fn any_eligible(
     recipient: &str,
 ) -> Result<bool, QuotaError> {
     let now = Utc::now();
-    let states = store.route_states().await?;
+    let states = store.route_states(&ramp.name).await?;
     let group = groups.group_name(ramp, recipient).await;
 
     for name in chain {
@@ -552,7 +559,7 @@ pub async fn any_eligible(
             Allowance::NotStarted => continue,
             Allowance::Unlimited => return Ok(true),
             Allowance::Limited(a) => {
-                let usage = store.usage(name, &group, day_index).await?;
+                let usage = store.usage(&ramp.name, name, &group, day_index).await?;
                 // A row that does not exist yet reads as all-zero, so a fresh
                 // day is eligible without a write.
                 let effective = usage.effective_allowance().unwrap_or(a);

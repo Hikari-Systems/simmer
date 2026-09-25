@@ -21,7 +21,7 @@ pub use mssql::MssqlQuotaStore;
 pub use postgres::PgQuotaStore;
 pub use registry::ReservationRegistry;
 pub use store::{
-    QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset, Usage, UsageKey,
+    Adoption, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset, Usage, UsageKey,
 };
 
 /// §7.4: "Reservations carry an expiry (default: downstream timeout budget +

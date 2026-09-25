@@ -114,7 +114,10 @@ async fn a_delivered_message_increments_committed(pool: PgPool) {
         .await;
     assert_eq!(r.code, 250, "{r:?}");
 
-    let usage = store.usage("warming", "catchall", today()).await.unwrap();
+    let usage = store
+        .usage("main", "warming", "catchall", today())
+        .await
+        .unwrap();
     assert_eq!(usage.committed, 1);
     assert_eq!(usage.reserved, 0, "the reservation was resolved");
     assert_eq!(usage.allowance, Some(2), "written from the schedule");
@@ -144,7 +147,10 @@ async fn a_failed_send_leaves_committed_unchanged(pool: PgPool) {
         .await;
     assert_eq!(r.code, 451, "{r:?}");
 
-    let usage = store.usage("warming", "catchall", today()).await.unwrap();
+    let usage = store
+        .usage("main", "warming", "catchall", today())
+        .await
+        .unwrap();
     assert_eq!(
         usage.committed, 0,
         "a failed send must not consume allowance"
@@ -176,7 +182,10 @@ async fn a_downstream_connect_failure_also_leaves_committed_unchanged(pool: PgPo
         "a downstream failure must not fall through to the next route"
     );
 
-    let usage = store.usage("warming", "catchall", today()).await.unwrap();
+    let usage = store
+        .usage("main", "warming", "catchall", today())
+        .await
+        .unwrap();
     assert_eq!(usage.committed, 0);
     assert_eq!(usage.reserved, 0);
 }
@@ -213,7 +222,10 @@ async fn traffic_falls_through_to_overflow_when_the_ramp_is_spent(pool: PgPool) 
     assert_eq!(warm.messages().len(), 2, "the ramp is not exceeded");
     assert_eq!(over.messages().len(), 1, "and the overflow carried it");
 
-    let warming = store.usage("warming", "catchall", today()).await.unwrap();
+    let warming = store
+        .usage("main", "warming", "catchall", today())
+        .await
+        .unwrap();
     assert_eq!(
         warming.committed, 2,
         "exactly the day's allowance, no overshoot"
@@ -222,7 +234,7 @@ async fn traffic_falls_through_to_overflow_when_the_ramp_is_spent(pool: PgPool) 
     // O-2 / D-024: the overflow route accounts too, which is what makes "how
     // much spilled today" answerable.
     let overflow = store
-        .usage("overflow", "catchall", overflow_today())
+        .usage("main", "overflow", "catchall", overflow_today())
         .await
         .unwrap();
     assert_eq!(overflow.committed, 1);
@@ -255,7 +267,10 @@ async fn a_failed_send_does_not_consume_the_ramp_it_reserved(pool: PgPool) {
         assert_eq!(r.code, 451, "{r:?}");
     }
 
-    let usage = store.usage("warming", "catchall", today()).await.unwrap();
+    let usage = store
+        .usage("main", "warming", "catchall", today())
+        .await
+        .unwrap();
     assert_eq!(usage.committed, 0);
     assert_eq!(usage.reserved, 0, "three failures, three releases");
     assert!(over.last().is_none(), "§3.3: no failover, on every attempt");
@@ -304,7 +319,10 @@ async fn concurrent_sessions_never_overshoot_the_ramp(pool: PgPool) {
     );
     assert_eq!(over.messages().len(), 1, "and one spilled");
 
-    let usage = store.usage("warming", "catchall", today()).await.unwrap();
+    let usage = store
+        .usage("main", "warming", "catchall", today())
+        .await
+        .unwrap();
     assert_eq!(usage.committed as usize, N - 1, "no overshoot in the row");
     assert_eq!(usage.reserved, 0);
 }

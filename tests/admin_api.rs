@@ -428,6 +428,7 @@ async fn a_reservation_shows_up_as_reserved_and_reduces_headroom(pool: PgPool) {
 
     store(&state)
         .reserve(&ReserveRequest {
+            ramp: "main".into(),
             route: "warming".into(),
             domain_group: "catchall".into(),
             day_index: day,
@@ -460,6 +461,7 @@ async fn the_read_api_reports_the_row_when_the_schedule_has_moved_under_it(pool:
     // A row created under a ceiling of 1...
     store(&state)
         .reserve(&ReserveRequest {
+            ramp: "main".into(),
             route: "warming".into(),
             domain_group: "catchall".into(),
             day_index: day,
@@ -731,6 +733,7 @@ async fn an_override_takes_effect_on_the_next_reservation(pool: PgPool) {
     for i in 0..3 {
         let taken = store(&state)
             .reserve(&ReserveRequest {
+                ramp: "main".into(),
                 route: "warming".into(),
                 domain_group: "google".into(),
                 day_index: day,
@@ -891,6 +894,7 @@ async fn a_reset_zeroes_committed_and_keeps_live_reservations(pool: PgPool) {
     // One committed message...
     let first = store(&state)
         .reserve(&ReserveRequest {
+            ramp: "main".into(),
             route: "warming".into(),
             domain_group: "catchall".into(),
             day_index: day,
@@ -910,6 +914,7 @@ async fn a_reset_zeroes_committed_and_keeps_live_reservations(pool: PgPool) {
     // ...and one still in flight.
     store(&state)
         .reserve(&ReserveRequest {
+            ramp: "main".into(),
             route: "warming".into(),
             domain_group: "catchall".into(),
             day_index: day,
@@ -939,7 +944,7 @@ async fn a_reset_zeroes_committed_and_keeps_live_reservations(pool: PgPool) {
     );
 
     let usage = store(&state)
-        .usage("warming", "catchall", day)
+        .usage("main", "warming", "catchall", day)
         .await
         .expect("usage");
     assert_eq!(usage.committed, 0);
@@ -1295,6 +1300,7 @@ async fn dry_run_agrees_with_the_real_walk_on_an_exhausted_quota(pool: PgPool) {
 
     let taken = store(&state)
         .reserve(&ReserveRequest {
+            ramp: "main".into(),
             route: "warming".into(),
             domain_group: "google".into(),
             day_index: day,
@@ -1365,6 +1371,7 @@ async fn dry_run_agrees_with_the_real_walk_on_a_frequency_skip(pool: PgPool) {
     let day = today(&state.engine.config, "warming");
     let taken = store(&state)
         .reserve(&ReserveRequest {
+            ramp: "main".into(),
             route: "warming".into(),
             domain_group: "google".into(),
             day_index: day,
@@ -1419,6 +1426,7 @@ async fn no_endpoint_exposes_a_recipient(pool: PgPool) {
     );
     let taken = store(&state)
         .reserve(&ReserveRequest {
+            ramp: "main".into(),
             route: "warming".into(),
             domain_group: "google".into(),
             day_index: day,
@@ -1472,6 +1480,7 @@ async fn a_dry_run_echoes_only_what_the_caller_supplied(pool: PgPool) {
     );
     let taken = store(&state)
         .reserve(&ReserveRequest {
+            ramp: "main".into(),
             route: "warming".into(),
             domain_group: "google".into(),
             day_index: day,
@@ -1573,6 +1582,7 @@ async fn spend_google(state: &AdminState) {
     let day = today(&state.engine.config, "warming");
     let simmer::quota::Reserved::Taken(r) = store(state)
         .reserve(&ReserveRequest {
+            ramp: "main".into(),
             route: "warming".into(),
             domain_group: "google".into(),
             day_index: day,
@@ -1740,7 +1750,10 @@ async fn the_quota_view_reports_replies_past_the_cap_truthfully(pool: PgPool) {
     // compare_pinned_walks leaves the real walk's reservation outstanding, so
     // the two replies show as reserved: in flight, past the cap.
     let day = today(&state.engine.config, "warming");
-    let u = store(&state).usage("warming", "google", day).await.unwrap();
+    let u = store(&state)
+        .usage("main", "warming", "google", day)
+        .await
+        .unwrap();
     assert_eq!((u.committed, u.reserved), (1, 2));
 
     let warming = route_of(&get(&state, "/routes", Some(TOKEN)).await.json(), "warming");

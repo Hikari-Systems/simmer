@@ -22,6 +22,7 @@ use crate::quota::store::QuotaError;
 /// route rather than a corrupted ramp.
 pub async fn count_since(
     pool: &PgPool,
+    ramp: &str,
     route: &str,
     key: &Key,
     since: DateTime<Utc>,
@@ -30,12 +31,13 @@ pub async fn count_since(
         r#"
         SELECT count(*) AS n
         FROM recipient_event
-        WHERE recipient_hash = $1 AND route = $2 AND sent_at >= $3
+        WHERE recipient_hash = $1 AND ramp = $4 AND route = $2 AND sent_at >= $3
         "#,
     )
     .bind(key.as_bytes())
     .bind(route)
     .bind(since)
+    .bind(ramp)
     .fetch_one(pool)
     .await?;
 
@@ -49,6 +51,7 @@ pub async fn count_since(
 /// window whose entire purpose is "how often has this person heard from us".
 pub async fn record(
     tx: &mut Transaction<'_, Postgres>,
+    ramp: &str,
     route: &str,
     keys: &[Key],
     sent_at: DateTime<Utc>,
@@ -56,13 +59,14 @@ pub async fn record(
     for key in keys {
         sqlx::query(
             r#"
-            INSERT INTO recipient_event (recipient_hash, route, sent_at)
-            VALUES ($1, $2, $3)
+            INSERT INTO recipient_event (recipient_hash, ramp, route, sent_at)
+            VALUES ($1, $4, $2, $3)
             "#,
         )
         .bind(key.as_bytes())
         .bind(route)
         .bind(sent_at)
+        .bind(ramp)
         .execute(&mut **tx)
         .await?;
     }

@@ -1309,9 +1309,11 @@ fn check_storage(_cfg: &Config, _v: &mut ViolationList) {}
 
 #[cfg(feature = "mssql")]
 fn check_storage(cfg: &Config, v: &mut ViolationList) {
-    // The key columns are NVARCHAR(200): SQL Server caps a clustered key at 900
-    // bytes, and (route, domain_group, day_index) must fit. Postgres has no such
-    // limit, so the rule is this build's alone.
+    // The key columns are NVARCHAR(128): SQL Server caps a clustered key at 900
+    // bytes, and (ramp, route, domain_group, day_index) must fit (D-099; it was
+    // 200 before the ramp joined the key). A ramp name is already capped at 64
+    // for both builds. Postgres has no such limit, so the rule is this build's
+    // alone.
     const MAX: usize = crate::db::mssql::MAX_NAME_CHARS;
     for ramp in cfg.ramps.iter() {
         for (i, r) in ramp.routes.iter().enumerate() {

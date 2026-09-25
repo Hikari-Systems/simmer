@@ -91,6 +91,7 @@ fn frequency() -> simmer::frequency::Frequency {
 
 fn request(route: &str, allowance: Option<i64>, count: i64) -> ReserveRequest {
     ReserveRequest {
+        ramp: "main".into(),
         route: route.into(),
         domain_group: "catchall".into(),
         day_index: 0,
@@ -118,13 +119,13 @@ async fn reserving_then_committing_moves_the_count(pool: PgPool) {
     let store = store(pool);
     let r = taken(&store, &request("warming", Some(3), 1)).await;
 
-    let mid = store.usage("warming", "catchall", 0).await.unwrap();
+    let mid = store.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!(mid.reserved, 1, "reserve holds the slot");
     assert_eq!(mid.committed, 0, "but does not spend it");
 
     store.commit(&r, &[]).await.expect("commit");
 
-    let after = store.usage("warming", "catchall", 0).await.unwrap();
+    let after = store.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!(after.reserved, 0);
     assert_eq!(after.committed, 1);
 }
@@ -137,7 +138,7 @@ async fn reserving_then_releasing_gives_the_slot_back(pool: PgPool) {
     let r = taken(&store, &request("warming", Some(3), 1)).await;
     store.release(&r).await.expect("release");
 
-    let after = store.usage("warming", "catchall", 0).await.unwrap();
+    let after = store.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!(after.reserved, 0);
     assert_eq!(
         after.committed, 0,
@@ -170,7 +171,7 @@ async fn the_allowance_is_exhausted_exactly_and_not_one_more(pool: PgPool) {
         store.commit(&r, &[]).await.unwrap();
         assert_eq!(
             store
-                .usage("warming", "catchall", 0)
+                .usage("main", "warming", "catchall", 0)
                 .await
                 .unwrap()
                 .committed,
@@ -195,7 +196,7 @@ async fn a_multi_recipient_reservation_takes_its_whole_magnitude(pool: PgPool) {
     let r = taken(&store, &request("warming", Some(3), 3)).await;
     assert_eq!(
         store
-            .usage("warming", "catchall", 0)
+            .usage("main", "warming", "catchall", 0)
             .await
             .unwrap()
             .reserved,
@@ -214,7 +215,7 @@ async fn a_multi_recipient_reservation_takes_its_whole_magnitude(pool: PgPool) {
     store.commit(&r, &[]).await.unwrap();
     assert_eq!(
         store
-            .usage("warming", "catchall", 0)
+            .usage("main", "warming", "catchall", 0)
             .await
             .unwrap()
             .committed,
@@ -234,7 +235,7 @@ async fn a_request_larger_than_the_whole_allowance_never_fits(pool: PgPool) {
     ));
     assert_eq!(
         store
-            .usage("warming", "catchall", 0)
+            .usage("main", "warming", "catchall", 0)
             .await
             .unwrap()
             .reserved,
@@ -257,7 +258,10 @@ async fn an_overflow_route_never_runs_out_but_still_counts(pool: PgPool) {
         store.commit(&r, &[]).await.unwrap();
     }
 
-    let usage = store.usage("overflow", "catchall", 0).await.unwrap();
+    let usage = store
+        .usage("main", "overflow", "catchall", 0)
+        .await
+        .unwrap();
     assert_eq!(usage.allowance, None, "no ceiling");
     assert_eq!(usage.committed, 50, "but a full count");
     assert!(usage.has_headroom_for(1_000_000));
@@ -281,7 +285,7 @@ async fn a_later_config_change_does_not_raise_todays_ceiling(pool: PgPool) {
         store.commit(&r, &[]).await.unwrap();
     }
 
-    let usage = store.usage("warming", "catchall", 0).await.unwrap();
+    let usage = store.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!(
         usage.allowance,
         Some(3),
@@ -320,7 +324,7 @@ async fn tomorrow_picks_up_the_new_ceiling(pool: PgPool) {
 
     assert_eq!(
         store
-            .usage("warming", "catchall", 1)
+            .usage("main", "warming", "catchall", 1)
             .await
             .unwrap()
             .allowance,
@@ -341,7 +345,7 @@ async fn each_day_index_is_an_independent_bucket(pool: PgPool) {
     for day in 0..3 {
         assert_eq!(
             store
-                .usage("warming", "catchall", day)
+                .usage("main", "warming", "catchall", day)
                 .await
                 .unwrap()
                 .committed,
@@ -398,6 +402,7 @@ async fn an_allowance_override_raises_todays_ceiling_for_one_group(pool: PgPool)
 
     simmer::models::route_state::set_allowance_override(
         &pool,
+        "main",
         "warming",
         "catchall",
         0,
@@ -417,7 +422,7 @@ async fn an_allowance_override_raises_todays_ceiling_for_one_group(pool: PgPool)
 
     // The scheduled value is still visible alongside it, so the mutation is
     // auditable rather than destructive.
-    let usage = store.usage("warming", "catchall", 0).await.unwrap();
+    let usage = store.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!(usage.allowance, Some(3));
     assert_eq!(usage.allowance_override, Some(10));
     assert_eq!(usage.effective_allowance(), Some(10));
@@ -429,6 +434,7 @@ async fn an_override_expires_with_the_day_it_was_set_for(pool: PgPool) {
     let store = store(pool.clone());
     simmer::models::route_state::set_allowance_override(
         &pool,
+        "main",
         "warming",
         "catchall",
         0,
@@ -442,7 +448,7 @@ async fn an_override_expires_with_the_day_it_was_set_for(pool: PgPool) {
     tomorrow.day_index = 1;
     taken(&store, &tomorrow).await;
 
-    let usage = store.usage("warming", "catchall", 1).await.unwrap();
+    let usage = store.usage("main", "warming", "catchall", 1).await.unwrap();
     assert_eq!(
         usage.allowance_override, None,
         "yesterday's override is gone"
@@ -460,6 +466,7 @@ async fn an_override_can_lower_a_ceiling_below_what_is_already_committed(pool: P
 
     simmer::models::route_state::set_allowance_override(
         &pool,
+        "main",
         "warming",
         "catchall",
         0,
@@ -492,7 +499,7 @@ async fn the_sweeper_releases_an_expired_reservation(pool: PgPool) {
 
     assert_eq!(
         store
-            .usage("warming", "catchall", 0)
+            .usage("main", "warming", "catchall", 0)
             .await
             .unwrap()
             .reserved,
@@ -504,7 +511,7 @@ async fn the_sweeper_releases_an_expired_reservation(pool: PgPool) {
     assert_eq!(expired[0].route, "warming");
     assert_eq!(expired[0].count, 2);
 
-    let after = store.usage("warming", "catchall", 0).await.unwrap();
+    let after = store.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!(after.reserved, 0, "the headroom comes back");
     assert_eq!(after.committed, 0, "and nothing was spent");
 }
@@ -517,7 +524,7 @@ async fn the_sweeper_leaves_live_reservations_alone(pool: PgPool) {
     assert!(store.sweep_expired().await.unwrap().is_empty());
     assert_eq!(
         store
-            .usage("warming", "catchall", 0)
+            .usage("main", "warming", "catchall", 0)
             .await
             .unwrap()
             .reserved,
@@ -543,7 +550,7 @@ async fn committing_after_the_sweeper_still_counts_the_delivery(pool: PgPool) {
     store.sweep_expired().await.unwrap();
     store.commit(&r, &[]).await.expect("commit after sweep");
 
-    let usage = store.usage("warming", "catchall", 0).await.unwrap();
+    let usage = store.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!(usage.committed, 1, "the delivery is counted");
     assert_eq!(
         usage.reserved, 1,
@@ -553,7 +560,7 @@ async fn committing_after_the_sweeper_still_counts_the_delivery(pool: PgPool) {
     store.commit(&other, &[]).await.unwrap();
     assert_eq!(
         store
-            .usage("warming", "catchall", 0)
+            .usage("main", "warming", "catchall", 0)
             .await
             .unwrap()
             .reserved,
@@ -574,7 +581,7 @@ async fn releasing_after_the_sweeper_is_a_no_op(pool: PgPool) {
 
     assert_eq!(
         store
-            .usage("warming", "catchall", 0)
+            .usage("main", "warming", "catchall", 0)
             .await
             .unwrap()
             .reserved,
@@ -622,7 +629,7 @@ async fn n_concurrent_reservations_against_n_minus_one_slots_never_overshoot(poo
 
     assert_eq!(delivered, N - 1, "exactly N-1 must be granted");
 
-    let usage = store.usage("warming", "catchall", 0).await.unwrap();
+    let usage = store.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!(usage.committed, N - 1, "and no overshoot in the row");
     assert_eq!(usage.reserved, 0, "with nothing left outstanding");
 }
@@ -647,7 +654,7 @@ async fn concurrent_reservations_that_all_fail_leave_committed_at_zero(pool: PgP
         h.await.expect("task");
     }
 
-    let usage = store.usage("warming", "catchall", 0).await.unwrap();
+    let usage = store.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!(usage.committed, 0);
     assert_eq!(usage.reserved, 0, "every reservation was resolved");
 }
@@ -669,13 +676,13 @@ async fn shutdown_releases_only_this_processs_reservations(pool: PgPool) {
         .expect("release");
     assert_eq!(released, 1);
 
-    let usage = store.usage("warming", "catchall", 0).await.unwrap();
+    let usage = store.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!(usage.reserved, 1, "the other reservation survives");
 
     store.commit(&someone_elses, &[]).await.unwrap();
     assert_eq!(
         store
-            .usage("warming", "catchall", 0)
+            .usage("main", "warming", "catchall", 0)
             .await
             .unwrap()
             .committed,
@@ -765,7 +772,7 @@ async fn a_paused_route_is_skipped(pool: PgPool) {
     // §3.2 step 3a.
     let cfg = config();
     let store = store(pool.clone());
-    simmer::models::route_state::set_paused(&pool, "warming", true)
+    simmer::models::route_state::set_paused(&pool, "main", "warming", true)
         .await
         .expect("pause");
 
@@ -774,7 +781,7 @@ async fn a_paused_route_is_skipped(pool: PgPool) {
     assert_eq!(trace, "warming=paused,overflow=selected");
 
     // Resuming brings it straight back — no restart, and no cache to expire.
-    simmer::models::route_state::set_paused(&pool, "warming", false)
+    simmer::models::route_state::set_paused(&pool, "main", "warming", false)
         .await
         .unwrap();
     let (route, _) = walk(&cfg, &store, "bob@example.com").await;
@@ -807,7 +814,7 @@ async fn a_graduated_route_jumps_to_its_final_allowance(pool: PgPool) {
             .expect("valid");
 
     let store = store(pool.clone());
-    simmer::models::route_state::set_graduated(&pool, "warming", true)
+    simmer::models::route_state::set_graduated(&pool, "main", "warming", true)
         .await
         .expect("graduate");
 
@@ -880,7 +887,7 @@ async fn the_walk_leaves_no_reservation_behind_when_it_falls_through(pool: PgPoo
 
     assert_eq!(
         store
-            .usage("warming", "catchall", 0)
+            .usage("main", "warming", "catchall", 0)
             .await
             .unwrap()
             .reserved,
@@ -913,7 +920,7 @@ async fn the_early_check_sees_an_exhausted_chain_without_reserving(pool: PgPool)
     // ...and asking did not consume anything.
     assert_eq!(
         store
-            .usage("warming", "catchall", 0)
+            .usage("main", "warming", "catchall", 0)
             .await
             .unwrap()
             .reserved,

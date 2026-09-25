@@ -43,8 +43,8 @@ use tiberius::Row;
 use uuid::Uuid;
 
 use super::store::{
-    Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset, RouteState,
-    Usage, UsageKey,
+    Adoption, Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset,
+    RouteState, Usage, UsageKey,
 };
 use crate::db::mssql::{self, Pool};
 
@@ -102,20 +102,20 @@ fn missing(what: &str) -> QuotaError {
 const LOCK_USAGE: &str = "\
     UPDATE dbo.quota_usage WITH (UPDLOCK, SERIALIZABLE) \
        SET updated_at = SYSUTCDATETIME() \
-     WHERE route = @P1 AND domain_group = @P2 AND day_index = @P3; \
+     WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3; \
     IF @@ROWCOUNT = 0 \
-        INSERT INTO dbo.quota_usage (route, domain_group, day_index, allowance) \
-        VALUES (@P1, @P2, @P3, @P4); \
+        INSERT INTO dbo.quota_usage (ramp, route, domain_group, day_index, allowance) \
+        VALUES (@P5, @P1, @P2, @P3, @P4); \
     SELECT allowance, allowance_override, committed, reserved \
       FROM dbo.quota_usage \
-     WHERE route = @P1 AND domain_group = @P2 AND day_index = @P3;";
+     WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3;";
 
 /// `GREATEST(reserved - n, 0)`, for SQL Server before 2022.
 const RELEASE_USAGE: &str = "\
     UPDATE dbo.quota_usage \
        SET reserved = CASE WHEN reserved - @P4 < 0 THEN 0 ELSE reserved - @P4 END, \
            updated_at = SYSUTCDATETIME() \
-     WHERE route = @P1 AND domain_group = @P2 AND day_index = @P3;";
+     WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3;";
 
 /// Delete one reservation, reporting whether it was still there.
 const TAKE_RESERVATION: &str = "\
@@ -146,6 +146,7 @@ impl QuotaStore for MssqlQuotaStore {
                     &req.domain_group,
                     &req.day_index,
                     &req.allowance,
+                    &req.ramp,
                 ],
             )
             .await?
@@ -169,10 +170,11 @@ impl QuotaStore for MssqlQuotaStore {
             .execute(
                 "UPDATE dbo.quota_usage \
                     SET reserved = reserved + @P4, updated_at = SYSUTCDATETIME() \
-                  WHERE route = @P1 AND domain_group = @P2 AND day_index = @P3; \
+                  WHERE ramp = @P8 AND route = @P1 AND domain_group = @P2 AND day_index = @P3; \
                  INSERT INTO dbo.quota_reservation \
-                     (id, route, domain_group, day_index, [count], correlation_id, expires_at) \
-                 VALUES (@P5, @P1, @P2, @P3, @P4, @P6, @P7);",
+                     (id, ramp, route, domain_group, day_index, [count], correlation_id, \
+                      expires_at) \
+                 VALUES (@P5, @P8, @P1, @P2, @P3, @P4, @P6, @P7);",
                 &[
                     &req.route,
                     &req.domain_group,
@@ -181,6 +183,7 @@ impl QuotaStore for MssqlQuotaStore {
                     &id,
                     &req.correlation_id,
                     &req.expires_at.naive_utc(),
+                    &req.ramp,
                 ],
             )
             .await?;
@@ -193,6 +196,7 @@ impl QuotaStore for MssqlQuotaStore {
         conn.broken = false;
         Ok(Reserved::Taken(Reservation {
             id,
+            ramp: req.ramp.clone(),
             route: req.route.clone(),
             domain_group: req.domain_group.clone(),
             day_index: req.day_index,
@@ -225,6 +229,7 @@ impl QuotaStore for MssqlQuotaStore {
         if !still_reserved {
             // See `PgQuotaStore::commit`: delivered, so it counts.
             tracing::warn!(
+                ramp = %reservation.ramp,
                 route = %reservation.route,
                 reservation = %reservation.id,
                 "reservation expired before the downstream replied; committing anyway. \
@@ -238,11 +243,11 @@ impl QuotaStore for MssqlQuotaStore {
                 SET reserved = CASE WHEN reserved - @P4 < 0 THEN 0 ELSE reserved - @P4 END, \
                     committed = committed + @P4, \
                     updated_at = SYSUTCDATETIME() \
-              WHERE route = @P1 AND domain_group = @P2 AND day_index = @P3;"
+              WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3;"
         } else {
             "UPDATE dbo.quota_usage \
                 SET committed = committed + @P4, updated_at = SYSUTCDATETIME() \
-              WHERE route = @P1 AND domain_group = @P2 AND day_index = @P3;"
+              WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3;"
         };
         client
             .execute(
@@ -252,6 +257,7 @@ impl QuotaStore for MssqlQuotaStore {
                     &reservation.domain_group,
                     &reservation.day_index,
                     &reservation.count,
+                    &reservation.ramp,
                 ],
             )
             .await?;
@@ -261,9 +267,14 @@ impl QuotaStore for MssqlQuotaStore {
         for key in recipient_keys {
             client
                 .execute(
-                    "INSERT INTO dbo.recipient_event (recipient_hash, route, sent_at) \
-                     VALUES (@P1, @P2, @P3);",
-                    &[&key.as_bytes(), &reservation.route, &sent_at],
+                    "INSERT INTO dbo.recipient_event (recipient_hash, ramp, route, sent_at) \
+                     VALUES (@P1, @P4, @P2, @P3);",
+                    &[
+                        &key.as_bytes(),
+                        &reservation.route,
+                        &sent_at,
+                        &reservation.ramp,
+                    ],
                 )
                 .await?;
         }
@@ -305,6 +316,7 @@ impl QuotaStore for MssqlQuotaStore {
                         &reservation.domain_group,
                         &reservation.day_index,
                         &reservation.count,
+                        &reservation.ramp,
                     ],
                 )
                 .await?;
@@ -321,6 +333,7 @@ impl QuotaStore for MssqlQuotaStore {
 
     async fn usage(
         &self,
+        ramp: &str,
         route: &str,
         domain_group: &str,
         day_index: i64,
@@ -332,8 +345,9 @@ impl QuotaStore for MssqlQuotaStore {
             .query(
                 "SELECT allowance, allowance_override, committed, reserved \
                    FROM dbo.quota_usage \
-                  WHERE route = @P1 AND domain_group = @P2 AND day_index = @P3;",
-                &[&route, &domain_group, &day_index],
+                  WHERE ramp = @P4 AND route = @P1 AND domain_group = @P2 \
+                    AND day_index = @P3;",
+                &[&route, &domain_group, &day_index, &ramp],
             )
             .await?
             .into_row()
@@ -345,6 +359,7 @@ impl QuotaStore for MssqlQuotaStore {
 
     async fn usage_many(
         &self,
+        ramp: &str,
         keys: &[UsageKey],
     ) -> Result<HashMap<(String, String), Usage>, QuotaError> {
         if keys.is_empty() {
@@ -368,13 +383,14 @@ impl QuotaStore for MssqlQuotaStore {
                         q.committed, q.reserved \
                    FROM dbo.quota_usage q \
                    JOIN OPENJSON(@P1) WITH ( \
-                            route        NVARCHAR(200) '$.r', \
-                            domain_group NVARCHAR(200) '$.g', \
+                            route        NVARCHAR(128) '$.r', \
+                            domain_group NVARCHAR(128) '$.g', \
                             day_index    BIGINT        '$.d') k \
                      ON q.route = k.route COLLATE Latin1_General_100_BIN2 \
                     AND q.domain_group = k.domain_group COLLATE Latin1_General_100_BIN2 \
-                    AND q.day_index = k.day_index;",
-                &[&json],
+                    AND q.day_index = k.day_index \
+                  WHERE q.ramp = @P2;",
+                &[&json, &ramp],
             )
             .await?
             .into_first_result()
@@ -388,16 +404,23 @@ impl QuotaStore for MssqlQuotaStore {
         Ok(out)
     }
 
-    async fn set_paused(&self, route: &str, paused: bool) -> Result<(), QuotaError> {
-        self.upsert_route_state("paused", route, paused).await
+    async fn set_paused(&self, ramp: &str, route: &str, paused: bool) -> Result<(), QuotaError> {
+        self.upsert_route_state("paused", ramp, route, paused).await
     }
 
-    async fn set_graduated(&self, route: &str, graduated: bool) -> Result<(), QuotaError> {
-        self.upsert_route_state("graduated", route, graduated).await
+    async fn set_graduated(
+        &self,
+        ramp: &str,
+        route: &str,
+        graduated: bool,
+    ) -> Result<(), QuotaError> {
+        self.upsert_route_state("graduated", ramp, route, graduated)
+            .await
     }
 
     async fn set_allowance_override(
         &self,
+        ramp: &str,
         route: &str,
         domain_group: &str,
         day_index: i64,
@@ -413,13 +436,21 @@ impl QuotaStore for MssqlQuotaStore {
                 "BEGIN TRANSACTION; \
                  UPDATE dbo.quota_usage WITH (UPDLOCK, SERIALIZABLE) \
                     SET allowance_override = @P4, updated_at = SYSUTCDATETIME() \
-                  WHERE route = @P1 AND domain_group = @P2 AND day_index = @P3; \
+                  WHERE ramp = @P6 AND route = @P1 AND domain_group = @P2 \
+                    AND day_index = @P3; \
                  IF @@ROWCOUNT = 0 \
                      INSERT INTO dbo.quota_usage \
-                         (route, domain_group, day_index, allowance, allowance_override) \
-                     VALUES (@P1, @P2, @P3, @P5, @P4); \
+                         (ramp, route, domain_group, day_index, allowance, allowance_override) \
+                     VALUES (@P6, @P1, @P2, @P3, @P5, @P4); \
                  COMMIT TRANSACTION;",
-                &[&route, &domain_group, &day_index, &allowance, &scheduled],
+                &[
+                    &route,
+                    &domain_group,
+                    &day_index,
+                    &allowance,
+                    &scheduled,
+                    &ramp,
+                ],
             )
             .await?;
         conn.broken = false;
@@ -428,6 +459,7 @@ impl QuotaStore for MssqlQuotaStore {
 
     async fn reset_counters(
         &self,
+        ramp: &str,
         route: &str,
         domain_group: &str,
         day_index: i64,
@@ -444,26 +476,30 @@ impl QuotaStore for MssqlQuotaStore {
                  DECLARE @found BIT = 0, @c BIGINT, @r BIGINT, @after BIGINT; \
                  SELECT @found = 1, @c = committed, @r = reserved \
                    FROM dbo.quota_usage WITH (UPDLOCK, ROWLOCK) \
-                  WHERE route = @P1 AND domain_group = @P2 AND day_index = @P3; \
+                  WHERE ramp = @P4 AND route = @P1 AND domain_group = @P2 \
+                    AND day_index = @P3; \
                  IF @found = 1 \
                  BEGIN \
                      UPDATE q \
                         SET committed = 0, \
                             reserved = COALESCE(( \
                                 SELECT SUM(r.[count]) FROM dbo.quota_reservation r \
-                                 WHERE r.route = q.route \
+                                 WHERE r.ramp = q.ramp \
+                                   AND r.route = q.route \
                                    AND r.domain_group = q.domain_group \
                                    AND r.day_index = q.day_index), 0), \
                             updated_at = SYSUTCDATETIME() \
                        FROM dbo.quota_usage q \
-                      WHERE q.route = @P1 AND q.domain_group = @P2 AND q.day_index = @P3; \
+                      WHERE q.ramp = @P4 AND q.route = @P1 AND q.domain_group = @P2 \
+                        AND q.day_index = @P3; \
                      SELECT @after = reserved FROM dbo.quota_usage \
-                      WHERE route = @P1 AND domain_group = @P2 AND day_index = @P3; \
+                      WHERE ramp = @P4 AND route = @P1 AND domain_group = @P2 \
+                        AND day_index = @P3; \
                  END; \
                  COMMIT TRANSACTION; \
                  SELECT @found AS found, @c AS committed_before, @r AS reserved_before, \
                         @after AS reserved_after;",
-                &[&route, &domain_group, &day_index],
+                &[&route, &domain_group, &day_index, &ramp],
             )
             .await?
             .into_row()
@@ -484,12 +520,15 @@ impl QuotaStore for MssqlQuotaStore {
         Ok(out)
     }
 
-    async fn route_states(&self) -> Result<HashMap<String, RouteState>, QuotaError> {
+    async fn route_states(&self, ramp: &str) -> Result<HashMap<String, RouteState>, QuotaError> {
         let mut conn = mssql::get(&self.pool).await?;
         conn.broken = true;
         let rows = conn
             .client
-            .simple_query("SELECT route, paused, graduated FROM dbo.route_state")
+            .query(
+                "SELECT route, paused, graduated FROM dbo.route_state WHERE ramp = @P1;",
+                &[&ramp],
+            )
             .await?
             .into_first_result()
             .await?;
@@ -520,29 +559,33 @@ impl QuotaStore for MssqlQuotaStore {
             .simple_query(
                 "BEGIN TRANSACTION; \
                  DECLARE @expired TABLE ( \
-                     route        NVARCHAR(200) COLLATE Latin1_General_100_BIN2, \
-                     domain_group NVARCHAR(200) COLLATE Latin1_General_100_BIN2, \
+                     ramp         NVARCHAR(128) COLLATE Latin1_General_100_BIN2, \
+                     route        NVARCHAR(128) COLLATE Latin1_General_100_BIN2, \
+                     domain_group NVARCHAR(128) COLLATE Latin1_General_100_BIN2, \
                      day_index    BIGINT, \
                      n            BIGINT); \
                  DECLARE @done TABLE ( \
-                     route NVARCHAR(200) COLLATE Latin1_General_100_BIN2, \
+                     ramp  NVARCHAR(128) COLLATE Latin1_General_100_BIN2, \
+                     route NVARCHAR(128) COLLATE Latin1_General_100_BIN2, \
                      n     BIGINT); \
                  DELETE FROM dbo.quota_reservation \
-                 OUTPUT deleted.route, deleted.domain_group, deleted.day_index, deleted.[count] \
+                 OUTPUT deleted.ramp, deleted.route, deleted.domain_group, deleted.day_index, \
+                        deleted.[count] \
                    INTO @expired \
                   WHERE expires_at < SYSUTCDATETIME(); \
                  UPDATE q \
                     SET reserved = CASE WHEN q.reserved - t.n < 0 THEN 0 ELSE q.reserved - t.n END, \
                         updated_at = SYSUTCDATETIME() \
-                 OUTPUT inserted.route, t.n INTO @done \
+                 OUTPUT inserted.ramp, inserted.route, t.n INTO @done \
                    FROM dbo.quota_usage q \
-                   JOIN (SELECT route, domain_group, day_index, SUM(n) AS n \
-                           FROM @expired GROUP BY route, domain_group, day_index) t \
-                     ON q.route = t.route \
+                   JOIN (SELECT ramp, route, domain_group, day_index, SUM(n) AS n \
+                           FROM @expired GROUP BY ramp, route, domain_group, day_index) t \
+                     ON q.ramp = t.ramp \
+                    AND q.route = t.route \
                     AND q.domain_group = t.domain_group \
                     AND q.day_index = t.day_index; \
                  COMMIT TRANSACTION; \
-                 SELECT route, n FROM @done;",
+                 SELECT ramp, route, n FROM @done;",
             )
             .await?
             .into_first_result()
@@ -551,6 +594,7 @@ impl QuotaStore for MssqlQuotaStore {
             .iter()
             .map(|r| {
                 Ok(Expired {
+                    ramp: text(r, "ramp")?,
                     route: text(r, "route")?,
                     count: int(r, "n")?,
                 })
@@ -562,6 +606,7 @@ impl QuotaStore for MssqlQuotaStore {
 
     async fn recipient_event_count(
         &self,
+        ramp: &str,
         route: &str,
         key: &crate::frequency::Key,
         since: DateTime<Utc>,
@@ -572,8 +617,9 @@ impl QuotaStore for MssqlQuotaStore {
             .client
             .query(
                 "SELECT COUNT_BIG(*) AS n FROM dbo.recipient_event \
-                  WHERE recipient_hash = @P1 AND route = @P2 AND sent_at >= @P3;",
-                &[&key.as_bytes(), &route, &since.naive_utc()],
+                  WHERE recipient_hash = @P1 AND ramp = @P4 AND route = @P2 \
+                    AND sent_at >= @P3;",
+                &[&key.as_bytes(), &route, &since.naive_utc(), &ramp],
             )
             .await?
             .into_row()
@@ -642,6 +688,96 @@ impl QuotaStore for MssqlQuotaStore {
         Ok(n.max(0) as u64)
     }
 
+    async fn adopt_legacy_rows(&self, ramp: &str) -> Result<Adoption, QuotaError> {
+        let mut conn = mssql::get(&self.pool).await?;
+        conn.broken = true;
+        // The transaction-owned application lock serialises replicas starting
+        // together, as `pg_advisory_xact_lock` does for Postgres. A clash is
+        // reported rather than thrown, so the error can name the key; the
+        // transaction then commits having changed nothing.
+        let sets = conn
+            .client
+            .query(
+                "BEGIN TRANSACTION; \
+                 DECLARE @lock INT, @clash NVARCHAR(600), \
+                         @qu BIGINT = 0, @qr BIGINT = 0, @rs BIGINT = 0, @re BIGINT = 0; \
+                 DECLARE @routes TABLE (route NVARCHAR(128) COLLATE Latin1_General_100_BIN2); \
+                 EXEC @lock = sp_getapplock @Resource = N'simmer_adopt_legacy_rows', \
+                      @LockMode = N'Exclusive', @LockOwner = N'Transaction', \
+                      @LockTimeout = 60000; \
+                 IF @lock < 0 \
+                     THROW 50100, N'D-099: could not take the adoption lock', 1; \
+                 SELECT TOP 1 @clash = N'quota_usage (' + l.route + N', ' + l.domain_group \
+                        + N', day ' + CAST(l.day_index AS NVARCHAR(20)) + N')' \
+                   FROM dbo.quota_usage l \
+                   JOIN dbo.quota_usage t \
+                     ON t.ramp = @P1 AND t.route = l.route \
+                    AND t.domain_group = l.domain_group AND t.day_index = l.day_index \
+                  WHERE l.ramp = N''; \
+                 IF @clash IS NULL \
+                     SELECT TOP 1 @clash = N'route_state ' + l.route \
+                       FROM dbo.route_state l \
+                       JOIN dbo.route_state t ON t.ramp = @P1 AND t.route = l.route \
+                      WHERE l.ramp = N''; \
+                 IF @clash IS NULL \
+                 BEGIN \
+                     INSERT INTO @routes (route) \
+                         SELECT route FROM dbo.quota_usage WHERE ramp = N'' \
+                         UNION SELECT route FROM dbo.quota_reservation WHERE ramp = N'' \
+                         UNION SELECT route FROM dbo.route_state WHERE ramp = N'' \
+                         UNION SELECT route FROM dbo.recipient_event WHERE ramp = N''; \
+                     UPDATE dbo.quota_usage SET ramp = @P1 WHERE ramp = N''; \
+                     SET @qu = @@ROWCOUNT; \
+                     UPDATE dbo.quota_reservation SET ramp = @P1 WHERE ramp = N''; \
+                     SET @qr = @@ROWCOUNT; \
+                     UPDATE dbo.route_state SET ramp = @P1 WHERE ramp = N''; \
+                     SET @rs = @@ROWCOUNT; \
+                     UPDATE dbo.recipient_event SET ramp = @P1 WHERE ramp = N''; \
+                     SET @re = @@ROWCOUNT; \
+                 END; \
+                 COMMIT TRANSACTION; \
+                 SELECT @clash AS clash, @qu AS qu, @qr AS qr, @rs AS rs, @re AS re; \
+                 SELECT route FROM @routes ORDER BY route;",
+                &[&ramp],
+            )
+            .await?
+            .into_results()
+            .await?;
+
+        let has = |set: &Vec<Row>, col: &str| {
+            set.first()
+                .is_some_and(|r| r.columns().iter().any(|c| c.name() == col))
+        };
+        let summary = sets
+            .iter()
+            .find(|set| has(set, "qu"))
+            .and_then(|set| set.first())
+            .ok_or_else(|| missing("adopting legacy rows"))?;
+        if let Some(clash) = summary.try_get::<&str, _>("clash")? {
+            let err = QuotaError::LegacyConflict(format!(
+                "{clash} exists both before ramps and under ramp '{ramp}'"
+            ));
+            conn.broken = false;
+            return Err(err);
+        }
+        let routes = sets
+            .iter()
+            .find(|set| has(set, "route"))
+            .map(|set| set.iter().map(|r| text(r, "route")).collect())
+            .transpose()?
+            .unwrap_or_default();
+        let count = |col| int(summary, col).map(|n| n.max(0) as u64);
+        let out = Adoption {
+            quota_usage: count("qu")?,
+            quota_reservation: count("qr")?,
+            route_state: count("rs")?,
+            recipient_event: count("re")?,
+            routes,
+        };
+        conn.broken = false;
+        Ok(out)
+    }
+
     async fn is_available(&self) -> bool {
         mssql::is_reachable(&self.pool).await
     }
@@ -653,6 +789,7 @@ impl MssqlQuotaStore {
     async fn upsert_route_state(
         &self,
         column: &'static str,
+        ramp: &str,
         route: &str,
         value: bool,
     ) -> Result<(), QuotaError> {
@@ -661,14 +798,14 @@ impl MssqlQuotaStore {
             "BEGIN TRANSACTION; \
              UPDATE dbo.route_state WITH (UPDLOCK, SERIALIZABLE) \
                 SET {column} = @P2, updated_at = SYSUTCDATETIME() \
-              WHERE route = @P1; \
+              WHERE ramp = @P3 AND route = @P1; \
              IF @@ROWCOUNT = 0 \
-                 INSERT INTO dbo.route_state (route, {column}) VALUES (@P1, @P2); \
+                 INSERT INTO dbo.route_state (ramp, route, {column}) VALUES (@P3, @P1, @P2); \
              COMMIT TRANSACTION;"
         );
         let mut conn = mssql::get(&self.pool).await?;
         conn.broken = true;
-        conn.client.execute(sql, &[&route, &value]).await?;
+        conn.client.execute(sql, &[&route, &value, &ramp]).await?;
         conn.broken = false;
         Ok(())
     }

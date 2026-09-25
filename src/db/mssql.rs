@@ -32,7 +32,7 @@ pub type Pool = bb8::Pool<Manager>;
 
 /// The width of every text key column in `migrations-mssql/`. §4.2 refuses a
 /// route or domain group name longer than this under this build.
-pub const MAX_NAME_CHARS: usize = 200;
+pub const MAX_NAME_CHARS: usize = 128;
 pub type PooledConn<'a> = bb8::PooledConnection<'a, Manager>;
 
 /// One pooled session.
@@ -235,6 +235,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         20260810000000,
         "recipient event",
         include_str!("../../migrations-mssql/20260810000000_recipient_event.sql"),
+    ),
+    (
+        20260925000000,
+        "ramp",
+        include_str!("../../migrations-mssql/20260925000000_ramp.sql"),
     ),
 ];
 

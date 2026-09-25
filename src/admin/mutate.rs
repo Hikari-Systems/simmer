@@ -124,13 +124,15 @@ async fn set_paused(
     paused: bool,
 ) -> Result<Json<MutationResponse>, ApiError> {
     let action = if paused { "pause" } else { "resume" };
-    known_route(state.config().default_ramp(), &name, action)?;
+    // §3.4 (D-099): the default ramp until the control plane takes a ramp.
+    let ramp = state.config().default_ramp();
+    known_route(ramp, &name, action)?;
 
     // Read before writing, so the audit line can say what it replaced. Racy in
     // principle against a second operator; an audit line's "previous" always is.
     let previous = state
         .store()
-        .route_states()
+        .route_states(&ramp.name)
         .await?
         .get(&name)
         .copied()
@@ -139,7 +141,7 @@ async fn set_paused(
 
     state
         .store()
-        .set_paused(&name, paused)
+        .set_paused(&ramp.name, &name, paused)
         .await
         .inspect_err(|_| {
             metrics::admin_mutation(action, "failed");
@@ -193,7 +195,8 @@ pub async fn graduate(
     actor: Actor,
     MaybeJson(body): MaybeJson<GraduateBody>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    let route = known_route(state.config().default_ramp(), &name, "graduate")?;
+    let ramp = state.config().default_ramp();
+    let route = known_route(ramp, &name, "graduate")?;
 
     if route.overflow {
         // §3.1: an overflow route carries no warm-up schedule, so there is no
@@ -208,7 +211,7 @@ pub async fn graduate(
 
     let previous = state
         .store()
-        .route_states()
+        .route_states(&ramp.name)
         .await?
         .get(&name)
         .copied()
@@ -217,7 +220,7 @@ pub async fn graduate(
 
     state
         .store()
-        .set_graduated(&name, body.graduated)
+        .set_graduated(&ramp.name, &name, body.graduated)
         .await
         .inspect_err(|_| metrics::admin_mutation("graduate", "failed"))?;
 
@@ -282,14 +285,10 @@ pub async fn allowance(
     actor: Actor,
     Json(body): Json<AllowanceBody>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    let route = known_route(state.config().default_ramp(), &name, "allowance")?;
+    let ramp = state.config().default_ramp();
+    let route = known_route(ramp, &name, "allowance")?;
 
-    if state
-        .config()
-        .default_ramp()
-        .domain_group(&body.domain_group)
-        .is_none()
-    {
+    if ramp.domain_group(&body.domain_group).is_none() {
         metrics::admin_mutation("allowance", "rejected");
         return Err(ApiError::not_found("domain group", &body.domain_group));
     }
@@ -306,19 +305,20 @@ pub async fn allowance(
 
     let now = Utc::now();
     let day_index = quota::day::for_route(route, now);
-    let states = state.store().route_states().await?;
+    let states = state.store().route_states(&ramp.name).await?;
     let route_state = states.get(&name).copied().unwrap_or_default();
     let scheduled = quota::allowance_for(route, &body.domain_group, day_index, route_state);
 
     let previous = state
         .store()
-        .usage(&name, &body.domain_group, day_index)
+        .usage(&ramp.name, &name, &body.domain_group, day_index)
         .await?
         .allowance_override;
 
     state
         .store()
         .set_allowance_override(
+            &ramp.name,
             &name,
             &body.domain_group,
             day_index,
@@ -383,14 +383,10 @@ pub async fn reset(
     actor: Actor,
     Json(body): Json<ResetBody>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    let route = known_route(state.config().default_ramp(), &body.route, "reset")?;
+    let ramp = state.config().default_ramp();
+    let route = known_route(ramp, &body.route, "reset")?;
 
-    if state
-        .config()
-        .default_ramp()
-        .domain_group(&body.domain_group)
-        .is_none()
-    {
+    if ramp.domain_group(&body.domain_group).is_none() {
         metrics::admin_mutation("reset", "rejected");
         return Err(ApiError::not_found("domain group", &body.domain_group));
     }
@@ -408,7 +404,7 @@ pub async fn reset(
     let day_index = quota::day::for_route(route, Utc::now());
     let outcome = state
         .store()
-        .reset_counters(&body.route, &body.domain_group, day_index)
+        .reset_counters(&ramp.name, &body.route, &body.domain_group, day_index)
         .await
         .inspect_err(|_| metrics::admin_mutation("reset", "failed"))?;
 
@@ -487,10 +483,10 @@ pub async fn exhaustion_warnings(state: &AdminState) -> Result<Vec<String>, Quot
     // chains. The default ramp until phase 3 scopes mutations by path.
     let ramp = state.config().default_ramp();
     let now = Utc::now();
-    let states = state.store().route_states().await?;
+    let states = state.store().route_states(&ramp.name).await?;
     let usage = state
         .store()
-        .usage_many(&super::keys_for(ramp, now))
+        .usage_many(&ramp.name, &super::keys_for(ramp, now))
         .await?;
 
     let mut out = Vec::new();

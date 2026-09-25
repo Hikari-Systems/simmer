@@ -845,6 +845,7 @@ impl GrantAllQuota {
 impl QuotaStore for GrantAllQuota {
     async fn reserve(&self, req: &ReserveRequest) -> Result<Reserved, QuotaError> {
         Ok(Reserved::Taken(Reservation {
+            ramp: req.ramp.clone(),
             id: uuid::Uuid::new_v4(),
             route: req.route.clone(),
             domain_group: req.domain_group.clone(),
@@ -878,7 +879,15 @@ impl QuotaStore for GrantAllQuota {
         Ok(())
     }
 
-    async fn usage(&self, route: &str, group: &str, day: i64) -> Result<Usage, QuotaError> {
+    // One ramp per fake: every test that uses it configures only the default one,
+    // so the ramp argument is accepted and not keyed on.
+    async fn usage(
+        &self,
+        _ramp: &str,
+        route: &str,
+        group: &str,
+        day: i64,
+    ) -> Result<Usage, QuotaError> {
         Ok(self
             .usage
             .lock()
@@ -890,6 +899,7 @@ impl QuotaStore for GrantAllQuota {
 
     async fn usage_many(
         &self,
+        _ramp: &str,
         keys: &[simmer::quota::UsageKey],
     ) -> Result<std::collections::HashMap<(String, String), Usage>, QuotaError> {
         let rows = self.usage.lock().expect("not poisoned");
@@ -902,7 +912,7 @@ impl QuotaStore for GrantAllQuota {
             .collect())
     }
 
-    async fn set_paused(&self, route: &str, paused: bool) -> Result<(), QuotaError> {
+    async fn set_paused(&self, _ramp: &str, route: &str, paused: bool) -> Result<(), QuotaError> {
         let mut rows = self.paused.lock().expect("not poisoned");
         rows.retain(|r| r != route);
         if paused {
@@ -911,7 +921,12 @@ impl QuotaStore for GrantAllQuota {
         Ok(())
     }
 
-    async fn set_graduated(&self, route: &str, graduated: bool) -> Result<(), QuotaError> {
+    async fn set_graduated(
+        &self,
+        _ramp: &str,
+        route: &str,
+        graduated: bool,
+    ) -> Result<(), QuotaError> {
         let mut rows = self.graduated.lock().expect("not poisoned");
         rows.retain(|r| r != route);
         if graduated {
@@ -922,6 +937,7 @@ impl QuotaStore for GrantAllQuota {
 
     async fn set_allowance_override(
         &self,
+        _ramp: &str,
         route: &str,
         group: &str,
         day: i64,
@@ -941,6 +957,7 @@ impl QuotaStore for GrantAllQuota {
 
     async fn reset_counters(
         &self,
+        _ramp: &str,
         route: &str,
         group: &str,
         day: i64,
@@ -964,6 +981,7 @@ impl QuotaStore for GrantAllQuota {
 
     async fn route_states(
         &self,
+        _ramp: &str,
     ) -> Result<std::collections::HashMap<String, RouteState>, QuotaError> {
         let mut out: std::collections::HashMap<String, RouteState> =
             std::collections::HashMap::new();
@@ -982,6 +1000,7 @@ impl QuotaStore for GrantAllQuota {
 
     async fn recipient_event_count(
         &self,
+        _ramp: &str,
         route: &str,
         _key: &Key,
         _since: chrono::DateTime<chrono::Utc>,
@@ -999,6 +1018,10 @@ impl QuotaStore for GrantAllQuota {
         // Fixed rather than generated: a test that asserts on a key needs the
         // same key twice.
         Ok(b"a fixed salt for the in-memory store".to_vec())
+    }
+
+    async fn adopt_legacy_rows(&self, _ramp: &str) -> Result<simmer::quota::Adoption, QuotaError> {
+        Ok(simmer::quota::Adoption::default())
     }
 
     async fn sweep_recipient_events(

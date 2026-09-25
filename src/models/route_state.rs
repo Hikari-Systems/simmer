@@ -14,8 +14,9 @@ use crate::quota::store::{QuotaError, RouteState};
 ///
 /// An absent row reads as the default — not paused, not graduated — so nothing
 /// has to write a row for a route that has never been touched by an operator.
-pub async fn all(pool: &PgPool) -> Result<HashMap<String, RouteState>, QuotaError> {
-    let rows = sqlx::query("SELECT route, paused, graduated FROM route_state")
+pub async fn all(pool: &PgPool, ramp: &str) -> Result<HashMap<String, RouteState>, QuotaError> {
+    let rows = sqlx::query("SELECT route, paused, graduated FROM route_state WHERE ramp = $1")
+        .bind(ramp)
         .fetch_all(pool)
         .await?;
 
@@ -34,15 +35,21 @@ pub async fn all(pool: &PgPool) -> Result<HashMap<String, RouteState>, QuotaErro
 
 /// §9.3 `POST /routes/{name}/pause` and `/resume`. The endpoint is phase 7; the
 /// write lives here so the chain walk can be tested against a paused route now.
-pub async fn set_paused(pool: &PgPool, route: &str, paused: bool) -> Result<(), QuotaError> {
+pub async fn set_paused(
+    pool: &PgPool,
+    ramp: &str,
+    route: &str,
+    paused: bool,
+) -> Result<(), QuotaError> {
     sqlx::query(
         r#"
-        INSERT INTO route_state (route, paused) VALUES ($1, $2)
-        ON CONFLICT (route) DO UPDATE SET paused = $2, updated_at = now()
+        INSERT INTO route_state (ramp, route, paused) VALUES ($3, $1, $2)
+        ON CONFLICT (ramp, route) DO UPDATE SET paused = $2, updated_at = now()
         "#,
     )
     .bind(route)
     .bind(paused)
+    .bind(ramp)
     .execute(pool)
     .await?;
     Ok(())
@@ -50,15 +57,21 @@ pub async fn set_paused(pool: &PgPool, route: &str, paused: bool) -> Result<(), 
 
 /// §9.3 `POST /routes/{name}/graduate` — pin the route to its final schedule
 /// value. §7.2 is explicit that routes never do this on their own.
-pub async fn set_graduated(pool: &PgPool, route: &str, graduated: bool) -> Result<(), QuotaError> {
+pub async fn set_graduated(
+    pool: &PgPool,
+    ramp: &str,
+    route: &str,
+    graduated: bool,
+) -> Result<(), QuotaError> {
     sqlx::query(
         r#"
-        INSERT INTO route_state (route, graduated) VALUES ($1, $2)
-        ON CONFLICT (route) DO UPDATE SET graduated = $2, updated_at = now()
+        INSERT INTO route_state (ramp, route, graduated) VALUES ($3, $1, $2)
+        ON CONFLICT (ramp, route) DO UPDATE SET graduated = $2, updated_at = now()
         "#,
     )
     .bind(route)
     .bind(graduated)
+    .bind(ramp)
     .execute(pool)
     .await?;
     Ok(())
@@ -69,6 +82,7 @@ pub async fn set_graduated(pool: &PgPool, route: &str, graduated: bool) -> Resul
 /// column on the row for one `day_index`, and tomorrow is a different row.
 pub async fn set_allowance_override(
     pool: &PgPool,
+    ramp: &str,
     route: &str,
     domain_group: &str,
     day_index: i64,
@@ -77,9 +91,10 @@ pub async fn set_allowance_override(
 ) -> Result<(), QuotaError> {
     sqlx::query(
         r#"
-        INSERT INTO quota_usage (route, domain_group, day_index, allowance, allowance_override)
-        VALUES ($1, $2, $3, $5, $4)
-        ON CONFLICT (route, domain_group, day_index)
+        INSERT INTO quota_usage
+            (ramp, route, domain_group, day_index, allowance, allowance_override)
+        VALUES ($6, $1, $2, $3, $5, $4)
+        ON CONFLICT (ramp, route, domain_group, day_index)
         DO UPDATE SET allowance_override = $4, updated_at = now()
         "#,
     )
@@ -88,6 +103,7 @@ pub async fn set_allowance_override(
     .bind(day_index)
     .bind(allowance)
     .bind(scheduled)
+    .bind(ramp)
     .execute(pool)
     .await?;
     Ok(())

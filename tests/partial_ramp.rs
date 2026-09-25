@@ -132,7 +132,7 @@ async fn walk(
 
 async fn warming_reserved(store: &Arc<dyn QuotaStore>, cfg: &simmer::config::Config) -> i64 {
     store
-        .usage("warming", "catchall", day_index(cfg))
+        .usage("main", "warming", "catchall", day_index(cfg))
         .await
         .expect("usage")
         .reserved
@@ -150,7 +150,7 @@ async fn a_message_outside_the_share_steers_and_one_inside_reserves(pool: PgPool
     for r in recipients(60) {
         let before = warming_reserved(&store, &cfg).await;
         let (selected, evaluation) = walk(&cfg, &store, None, &r).await;
-        let expected = partial::offered(&keyer, "warming", &r, day, 0.4, &[]);
+        let expected = partial::offered(&keyer, "main", "warming", &r, day, 0.4, &[]);
 
         if expected {
             offered += 1;
@@ -213,7 +213,7 @@ async fn a_graduated_route_is_offered_everything(pool: PgPool) {
     let cfg = config(0, &[0.01]);
     let store = store(pool);
     store
-        .set_graduated("warming", true)
+        .set_graduated("main", "warming", true)
         .await
         .expect("graduate");
     for r in recipients(40) {
@@ -231,7 +231,7 @@ async fn a_pinned_reply_is_exempt(pool: PgPool) {
 
     let gated = recipients(100)
         .into_iter()
-        .find(|r| !partial::offered(&keyer, "warming", r, day, 0.2, &[]))
+        .find(|r| !partial::offered(&keyer, "main", "warming", r, day, 0.2, &[]))
         .expect("at 20%, some recipient is outside the share");
 
     let (unpinned, _) = walk(&cfg, &store, None, &gated).await;
@@ -340,6 +340,7 @@ async fn fill(store: &Arc<dyn QuotaStore>, cfg: &simmer::config::Config, group: 
     use simmer::quota::store::{ReserveRequest, Reserved};
     let taken = store
         .reserve(&ReserveRequest {
+            ramp: "main".into(),
             route: "warming".to_string(),
             domain_group: group.to_string(),
             day_index: day_index(cfg),
@@ -497,7 +498,10 @@ async fn the_auto_share_is_computed_per_domain_group(pool: PgPool) {
     let share_of = |group: &'static str| {
         let store = store.clone();
         async move {
-            let usage = store.usage("warming", group, day).await.expect("usage");
+            let usage = store
+                .usage("main", "warming", group, day)
+                .await
+                .expect("usage");
             partial::share_for_group(
                 route,
                 day,
@@ -524,7 +528,7 @@ async fn a_graduated_route_is_offered_everything_under_auto(pool: PgPool) {
     let store = store(pool);
     fill(&store, &cfg, "catchall", 190).await;
     store
-        .set_graduated("warming", true)
+        .set_graduated("main", "warming", true)
         .await
         .expect("graduate");
 

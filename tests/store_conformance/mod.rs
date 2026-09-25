@@ -18,7 +18,7 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use simmer::config::FrequencyMode;
 use simmer::frequency::Keyer;
-use simmer::quota::{QuotaStore, Reservation, ReserveRequest, Reserved, UsageKey};
+use simmer::quota::{QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, UsageKey};
 use uuid::Uuid;
 
 /// A new store on a new pool, over the test's one database.
@@ -61,6 +61,15 @@ macro_rules! conformance_suite {
         $harness!(an_undelivered_message_records_no_event);
         $harness!(the_event_sweeper_evicts_by_cutoff);
         $harness!(the_store_reports_itself_available);
+        $harness!(two_ramps_keep_separate_counters);
+        $harness!(two_ramps_keep_separate_route_state);
+        $harness!(two_ramps_keep_separate_events);
+        $harness!(the_sweeper_releases_into_the_right_ramp);
+        $harness!(a_reset_recomputes_from_its_own_ramps_reservations);
+        $harness!(adoption_moves_every_legacy_row_into_the_ramp);
+        $harness!(adoption_is_idempotent);
+        $harness!(adoption_refuses_a_quota_key_that_exists_under_the_ramp);
+        $harness!(adoption_refuses_a_route_state_that_exists_under_the_ramp);
     };
 }
 
@@ -74,6 +83,7 @@ fn request(route: &str, allowance: Option<i64>, count: i64) -> ReserveRequest {
 
 fn at(route: &str, group: &str, day: i64, allowance: Option<i64>, count: i64) -> ReserveRequest {
     ReserveRequest {
+        ramp: "main".into(),
         route: route.into(),
         domain_group: group.into(),
         day_index: day,
@@ -85,8 +95,19 @@ fn at(route: &str, group: &str, day: i64, allowance: Option<i64>, count: i64) ->
     }
 }
 
+/// `req`, in another ramp. `""` is the pre-ramps ramp the migration fills
+/// existing rows with (D-099), which is how the adoption tests write the rows a
+/// v0.8 instance left behind without any backend-specific SQL.
+fn in_ramp(ramp: &str, req: ReserveRequest) -> ReserveRequest {
+    ReserveRequest {
+        ramp: ramp.into(),
+        ..req
+    }
+}
+
 fn over_cap(req: ReserveRequest) -> ReserveRequest {
     ReserveRequest {
+        ramp: "main".into(),
         over_cap: true,
         ..req
     }
@@ -94,6 +115,7 @@ fn over_cap(req: ReserveRequest) -> ReserveRequest {
 
 fn expired(route: &str, allowance: Option<i64>) -> ReserveRequest {
     ReserveRequest {
+        ramp: "main".into(),
         expires_at: Utc::now() - Duration::minutes(1),
         ..request(route, allowance, 1)
     }
@@ -124,11 +146,11 @@ async fn keyer(store: &Arc<dyn QuotaStore>) -> Keyer {
 pub async fn reserve_then_commit_moves_the_count(stores: Stores<'_>) {
     let s = stores();
     let r = taken(&s, &request("warming", Some(10), 1)).await;
-    let mid = s.usage("warming", "catchall", 0).await.unwrap();
+    let mid = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((mid.reserved, mid.committed), (1, 0));
 
     s.commit(&r, &[]).await.unwrap();
-    let after = s.usage("warming", "catchall", 0).await.unwrap();
+    let after = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((after.reserved, after.committed), (0, 1));
     assert_eq!(after.allowance, Some(10));
 }
@@ -139,7 +161,7 @@ pub async fn reserve_then_release_gives_the_slot_back(stores: Stores<'_>) {
     refused(&s, &request("warming", Some(1), 1)).await;
     s.release(&r).await.unwrap();
 
-    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.reserved, u.committed), (0, 0));
     taken(&s, &request("warming", Some(1), 1)).await;
 }
@@ -151,7 +173,7 @@ pub async fn the_allowance_is_exhausted_exactly(stores: Stores<'_>) {
         s.commit(&r, &[]).await.unwrap();
     }
     refused(&s, &request("warming", Some(3), 1)).await;
-    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.committed, u.reserved), (3, 0));
 }
 
@@ -169,7 +191,7 @@ pub async fn an_overflow_row_never_runs_out_but_counts(stores: Stores<'_>) {
         let r = taken(&s, &request("overflow", None, 1)).await;
         s.commit(&r, &[]).await.unwrap();
     }
-    let u = s.usage("overflow", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "overflow", "catchall", 0).await.unwrap();
     assert_eq!(u.allowance, None);
     assert_eq!(u.committed, 25);
 }
@@ -181,7 +203,10 @@ pub async fn the_first_allowance_written_is_authoritative(stores: Stores<'_>) {
     s.commit(&r, &[]).await.unwrap();
     refused(&s, &request("warming", Some(100), 1)).await;
     assert_eq!(
-        s.usage("warming", "catchall", 0).await.unwrap().allowance,
+        s.usage("main", "warming", "catchall", 0)
+            .await
+            .unwrap()
+            .allowance,
         Some(1)
     );
 }
@@ -198,7 +223,7 @@ pub async fn an_over_cap_reservation_is_taken_and_counted(stores: Stores<'_>) {
     let r = taken(&s, &over_cap(request("warming", Some(1), 1))).await;
     s.commit(&r, &[]).await.unwrap();
 
-    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.committed, u.reserved), (2, 0), "counted past the cap");
     assert_eq!(u.allowance, Some(1), "and the ceiling is untouched");
     refused(&s, &request("warming", Some(1), 1)).await;
@@ -210,7 +235,7 @@ pub async fn an_over_cap_reservation_is_taken_and_counted(stores: Stores<'_>) {
 pub async fn an_over_cap_reservation_on_a_fresh_row_writes_the_allowance(stores: Stores<'_>) {
     let s = stores();
     taken(&s, &over_cap(request("warming", Some(0), 1))).await;
-    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!(u.allowance, Some(0));
     assert_eq!(u.reserved, 1);
     refused(&s, &request("warming", Some(0), 1)).await;
@@ -222,7 +247,7 @@ pub async fn releasing_an_over_cap_reservation_gives_nothing_extra_back(stores: 
     s.commit(&r, &[]).await.unwrap();
     let r = taken(&s, &over_cap(request("warming", Some(1), 1))).await;
     s.release(&r).await.unwrap();
-    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.committed, u.reserved), (1, 0));
     refused(&s, &request("warming", Some(1), 1)).await;
 }
@@ -256,7 +281,7 @@ pub async fn concurrent_over_cap_reservations_are_all_counted(stores: Stores<'_>
         h.await.expect("task");
     }
 
-    let u = b.usage("warming", "catchall", 0).await.unwrap();
+    let u = b.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.committed, u.reserved), (1 + N as i64, 0));
     assert_eq!(u.allowance, Some(1));
     refused(&a, &request("warming", Some(1), 1)).await;
@@ -280,8 +305,8 @@ pub async fn route_names_are_case_sensitive(stores: Stores<'_>) {
     let s = stores();
     taken(&s, &request("warming", Some(1), 1)).await;
     taken(&s, &request("Warming", Some(1), 1)).await;
-    s.set_paused("Warming", true).await.unwrap();
-    let states = s.route_states().await.unwrap();
+    s.set_paused("main", "Warming", true).await.unwrap();
+    let states = s.route_states("main").await.unwrap();
     assert!(states["Warming"].paused);
     assert!(!states.get("warming").map(|st| st.paused).unwrap_or(false));
 }
@@ -292,19 +317,19 @@ pub async fn an_override_raises_the_ceiling_and_can_be_cleared(stores: Stores<'_
     s.commit(&r, &[]).await.unwrap();
     refused(&s, &request("warming", Some(1), 1)).await;
 
-    s.set_allowance_override("warming", "catchall", 0, Some(3), Some(1))
+    s.set_allowance_override("main", "warming", "catchall", 0, Some(3), Some(1))
         .await
         .unwrap();
-    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.allowance, u.allowance_override), (Some(1), Some(3)));
     taken(&s, &request("warming", Some(1), 1)).await;
     taken(&s, &request("warming", Some(1), 1)).await;
     refused(&s, &request("warming", Some(1), 1)).await;
 
-    s.set_allowance_override("warming", "catchall", 0, None, Some(1))
+    s.set_allowance_override("main", "warming", "catchall", 0, None, Some(1))
         .await
         .unwrap();
-    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.allowance, u.allowance_override), (Some(1), None));
 }
 
@@ -312,14 +337,14 @@ pub async fn an_override_on_a_fresh_row_keeps_the_schedule_behind_it(stores: Sto
     // D-025: clearing an override on a row the override created leaves the
     // schedule's number, not a null (which would read as unlimited).
     let s = stores();
-    s.set_allowance_override("warming", "google", 4, Some(0), Some(20))
+    s.set_allowance_override("main", "warming", "google", 4, Some(0), Some(20))
         .await
         .unwrap();
     refused(&s, &at("warming", "google", 4, Some(20), 1)).await;
-    s.set_allowance_override("warming", "google", 4, None, Some(20))
+    s.set_allowance_override("main", "warming", "google", 4, None, Some(20))
         .await
         .unwrap();
-    let u = s.usage("warming", "google", 4).await.unwrap();
+    let u = s.usage("main", "warming", "google", 4).await.unwrap();
     assert_eq!((u.allowance, u.allowance_override), (Some(20), None));
 }
 
@@ -336,7 +361,13 @@ pub async fn the_sweeper_releases_only_expired_reservations(stores: Stores<'_>) 
     let swept = s.sweep_expired().await.unwrap();
     assert_eq!(swept.len(), 1, "one row touched: {swept:?}");
     assert_eq!((swept[0].route.as_str(), swept[0].count), ("warming", 2));
-    assert_eq!(s.usage("warming", "catchall", 0).await.unwrap().reserved, 1);
+    assert_eq!(
+        s.usage("main", "warming", "catchall", 0)
+            .await
+            .unwrap()
+            .reserved,
+        1
+    );
     assert!(s.sweep_expired().await.unwrap().is_empty(), "idempotent");
 }
 
@@ -345,7 +376,7 @@ pub async fn committing_after_the_sweeper_still_counts(stores: Stores<'_>) {
     let r = taken(&s, &expired("warming", Some(5))).await;
     s.sweep_expired().await.unwrap();
     s.commit(&r, &[]).await.unwrap();
-    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.committed, u.reserved), (1, 0));
 }
 
@@ -356,9 +387,21 @@ pub async fn releasing_after_the_sweeper_is_a_no_op(stores: Stores<'_>) {
     s.sweep_expired().await.unwrap();
     s.release(&gone).await.unwrap();
     // Decrementing again would have taken `live`'s headroom.
-    assert_eq!(s.usage("warming", "catchall", 0).await.unwrap().reserved, 1);
+    assert_eq!(
+        s.usage("main", "warming", "catchall", 0)
+            .await
+            .unwrap()
+            .reserved,
+        1
+    );
     s.release(&live).await.unwrap();
-    assert_eq!(s.usage("warming", "catchall", 0).await.unwrap().reserved, 0);
+    assert_eq!(
+        s.usage("main", "warming", "catchall", 0)
+            .await
+            .unwrap()
+            .reserved,
+        0
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +417,7 @@ pub async fn reset_zeroes_committed_and_keeps_live_reservations(stores: Stores<'
     taken(&s, &request("warming", Some(5), 2)).await;
 
     let reset = s
-        .reset_counters("warming", "catchall", 0)
+        .reset_counters("main", "warming", "catchall", 0)
         .await
         .unwrap()
         .expect("row exists");
@@ -386,14 +429,14 @@ pub async fn reset_zeroes_committed_and_keeps_live_reservations(stores: Stores<'
         ),
         (2, 2, 2)
     );
-    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.committed, u.reserved, u.allowance), (0, 2, Some(5)));
 }
 
 pub async fn resetting_a_missing_row_is_none(stores: Stores<'_>) {
     let s = stores();
     assert!(s
-        .reset_counters("nowhere", "catchall", 0)
+        .reset_counters("main", "nowhere", "catchall", 0)
         .await
         .unwrap()
         .is_none());
@@ -401,13 +444,13 @@ pub async fn resetting_a_missing_row_is_none(stores: Stores<'_>) {
 
 pub async fn route_state_round_trips(stores: Stores<'_>) {
     let s = stores();
-    assert!(s.route_states().await.unwrap().is_empty());
-    s.set_paused("a", true).await.unwrap();
-    s.set_graduated("b", true).await.unwrap();
-    s.set_graduated("a", true).await.unwrap();
-    s.set_paused("a", false).await.unwrap();
+    assert!(s.route_states("main").await.unwrap().is_empty());
+    s.set_paused("main", "a", true).await.unwrap();
+    s.set_graduated("main", "b", true).await.unwrap();
+    s.set_graduated("main", "a", true).await.unwrap();
+    s.set_paused("main", "a", false).await.unwrap();
 
-    let st = s.route_states().await.unwrap();
+    let st = s.route_states("main").await.unwrap();
     assert_eq!((st["a"].paused, st["a"].graduated), (false, true));
     assert_eq!((st["b"].paused, st["b"].graduated), (false, true));
     assert_eq!(st.len(), 2);
@@ -425,13 +468,16 @@ pub async fn usage_many_reads_only_the_rows_asked_for(stores: Stores<'_>) {
         day_index: d,
     };
     let got = s
-        .usage_many(&[key("google", 2), key("yahoo", 2), key("microsoft", 2)])
+        .usage_many(
+            "main",
+            &[key("google", 2), key("yahoo", 2), key("microsoft", 2)],
+        )
         .await
         .unwrap();
     assert_eq!(got.len(), 2, "{got:?}");
     assert_eq!(got[&("warming".into(), "google".into())].reserved, 1);
     assert_eq!(got[&("warming".into(), "yahoo".into())].reserved, 3);
-    assert!(s.usage_many(&[]).await.unwrap().is_empty());
+    assert!(s.usage_many("main", &[]).await.unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -465,7 +511,7 @@ pub async fn n_concurrent_reservations_never_overshoot(stores: Stores<'_>) {
     let s = stores();
     let granted = race(&[Arc::clone(&s)], N, N as i64 - 1).await;
     assert_eq!(granted, N as i64 - 1);
-    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.committed, u.reserved), (N as i64 - 1, 0));
 }
 
@@ -476,7 +522,7 @@ pub async fn two_independent_pools_never_overshoot(stores: Stores<'_>) {
     let (a, b) = (stores(), stores());
     let granted = race(&[a, Arc::clone(&b)], N, 10).await;
     assert_eq!(granted, 10);
-    let u = b.usage("warming", "catchall", 0).await.unwrap();
+    let u = b.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.committed, u.reserved), (10, 0));
 }
 
@@ -519,7 +565,10 @@ pub async fn concurrent_first_reservations_create_one_row(stores: Stores<'_>) {
             );
         }
         assert_eq!(
-            a.usage("fresh", "google", day).await.unwrap().reserved,
+            a.usage("main", "fresh", "google", day)
+                .await
+                .unwrap()
+                .reserved,
             N as i64
         );
     }
@@ -536,7 +585,7 @@ async fn warm(stores: &[Arc<dyn QuotaStore>], n: usize) {
         let gate = Arc::clone(&gate);
         handles.push(tokio::spawn(async move {
             // Hold a connection until all n are open, so each task gets its own.
-            let _ = s.route_states().await;
+            let _ = s.route_states("main").await;
             gate.wait().await;
         }));
     }
@@ -560,7 +609,7 @@ pub async fn concurrent_failures_leave_nothing_committed(stores: Stores<'_>) {
     for h in handles {
         h.await.expect("task");
     }
-    let u = s.usage("warming", "catchall", 0).await.unwrap();
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
     assert_eq!((u.committed, u.reserved), (0, 0));
 }
 
@@ -623,12 +672,12 @@ pub async fn concurrent_admin_upserts_on_fresh_keys_do_not_collide(stores: Store
                 gate.wait().await;
                 let route = format!("r{round}");
                 if i % 3 == 0 {
-                    s.set_allowance_override(&route, "google", round, Some(5), Some(1))
+                    s.set_allowance_override("main", &route, "google", round, Some(5), Some(1))
                         .await
                 } else if i % 3 == 1 {
-                    s.set_paused(&route, true).await
+                    s.set_paused("main", &route, true).await
                 } else {
-                    s.set_graduated(&route, true).await
+                    s.set_graduated("main", &route, true).await
                 }
             }));
         }
@@ -637,7 +686,7 @@ pub async fn concurrent_admin_upserts_on_fresh_keys_do_not_collide(stores: Store
             assert!(got.is_ok(), "round {round}: {got:?}");
         }
     }
-    let st = a.route_states().await.unwrap();
+    let st = a.route_states("main").await.unwrap();
     assert_eq!(st.len(), 10);
     assert!(st.values().all(|s| s.paused && s.graduated));
 }
@@ -657,26 +706,26 @@ pub async fn events_are_counted_per_route_inside_the_window(stores: Stores<'_>) 
 
     let hour_ago = Utc::now() - Duration::hours(1);
     assert_eq!(
-        s.recipient_event_count("warming", &jane, hour_ago)
+        s.recipient_event_count("main", "warming", &jane, hour_ago)
             .await
             .unwrap(),
         2
     );
     assert_eq!(
-        s.recipient_event_count("other", &jane, hour_ago)
+        s.recipient_event_count("main", "other", &jane, hour_ago)
             .await
             .unwrap(),
         1
     );
     assert_eq!(
-        s.recipient_event_count("warming", &bob, hour_ago)
+        s.recipient_event_count("main", "warming", &bob, hour_ago)
             .await
             .unwrap(),
         0
     );
     let later = Utc::now() + Duration::seconds(5);
     assert_eq!(
-        s.recipient_event_count("warming", &jane, later)
+        s.recipient_event_count("main", "warming", &jane, later)
             .await
             .unwrap(),
         0
@@ -692,7 +741,7 @@ pub async fn an_undelivered_message_records_no_event(stores: Stores<'_>) {
     s.release(&r).await.unwrap();
     let since = Utc::now() - Duration::hours(1);
     assert_eq!(
-        s.recipient_event_count("warming", &jane, since)
+        s.recipient_event_count("main", "warming", &jane, since)
             .await
             .unwrap(),
         0
@@ -722,7 +771,7 @@ pub async fn the_event_sweeper_evicts_by_cutoff(stores: Stores<'_>) {
     );
     let since = Utc::now() - Duration::hours(1);
     assert_eq!(
-        s.recipient_event_count("warming", &jane, since)
+        s.recipient_event_count("main", "warming", &jane, since)
             .await
             .unwrap(),
         0
@@ -731,4 +780,215 @@ pub async fn the_event_sweeper_evicts_by_cutoff(stores: Stores<'_>) {
 
 pub async fn the_store_reports_itself_available(stores: Stores<'_>) {
     assert!(stores().is_available().await);
+}
+
+// ---------------------------------------------------------------------------
+// D-099 — ramps share nothing
+// ---------------------------------------------------------------------------
+
+pub async fn two_ramps_keep_separate_counters(stores: Stores<'_>) {
+    let s = stores();
+    // One route name, one group, one day, in two ramps: two rows.
+    let a = request("warming", Some(1), 1);
+    taken(&s, &a).await;
+    refused(&s, &a).await;
+    let b = taken(&s, &in_ramp("brand-b", request("warming", Some(1), 1))).await;
+    s.commit(&b, &[]).await.unwrap();
+
+    let main = s.usage("main", "warming", "catchall", 0).await.unwrap();
+    let other = s.usage("brand-b", "warming", "catchall", 0).await.unwrap();
+    assert_eq!((main.reserved, main.committed), (1, 0));
+    assert_eq!((other.reserved, other.committed), (0, 1));
+
+    let keys = [UsageKey {
+        route: "warming".into(),
+        domain_group: "catchall".into(),
+        day_index: 0,
+    }];
+    let many = s.usage_many("brand-b", &keys).await.unwrap();
+    assert_eq!(many.len(), 1);
+    assert_eq!(
+        many[&("warming".to_string(), "catchall".to_string())].committed,
+        1,
+        "usage_many reads the ramp it was asked about"
+    );
+    assert!(s.usage_many("nobody", &keys).await.unwrap().is_empty());
+}
+
+pub async fn two_ramps_keep_separate_route_state(stores: Stores<'_>) {
+    let s = stores();
+    s.set_paused("main", "warming", true).await.unwrap();
+    s.set_graduated("brand-b", "warming", true).await.unwrap();
+
+    let main = s.route_states("main").await.unwrap();
+    let other = s.route_states("brand-b").await.unwrap();
+    assert_eq!(
+        (main["warming"].paused, main["warming"].graduated),
+        (true, false)
+    );
+    assert_eq!(
+        (other["warming"].paused, other["warming"].graduated),
+        (false, true)
+    );
+}
+
+pub async fn two_ramps_keep_separate_events(stores: Stores<'_>) {
+    let s = stores();
+    let k = keyer(&s).await;
+    let jane = k.key_for("jane@example.com", FrequencyMode::ToAddress, &[]);
+
+    let r = taken(&s, &request("warming", Some(9), 1)).await;
+    s.commit(&r, std::slice::from_ref(&jane)).await.unwrap();
+
+    let hour_ago = Utc::now() - Duration::hours(1);
+    assert_eq!(
+        s.recipient_event_count("main", "warming", &jane, hour_ago)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        s.recipient_event_count("brand-b", "warming", &jane, hour_ago)
+            .await
+            .unwrap(),
+        0,
+        "§7.3's window is per ramp"
+    );
+}
+
+pub async fn the_sweeper_releases_into_the_right_ramp(stores: Stores<'_>) {
+    // The bug D-099's fence exists for: a sweep joining on (route, group, day)
+    // alone would release one ramp's expired count from both ramps' rows.
+    let s = stores();
+    taken(&s, &expired("warming", Some(5))).await;
+    taken(&s, &in_ramp("brand-b", request("warming", Some(5), 1))).await;
+
+    let swept = s.sweep_expired().await.unwrap();
+    assert_eq!(swept.len(), 1, "{swept:?}");
+    assert_eq!(
+        (
+            swept[0].ramp.as_str(),
+            swept[0].route.as_str(),
+            swept[0].count
+        ),
+        ("main", "warming", 1)
+    );
+    let usage = |ramp: &'static str| {
+        let s = s.clone();
+        async move { s.usage(ramp, "warming", "catchall", 0).await.unwrap() }
+    };
+    assert_eq!(usage("main").await.reserved, 0);
+    assert_eq!(usage("brand-b").await.reserved, 1, "untouched");
+}
+
+pub async fn a_reset_recomputes_from_its_own_ramps_reservations(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(&s, &request("warming", Some(5), 1)).await;
+    s.commit(&r, &[]).await.unwrap();
+    taken(&s, &in_ramp("brand-b", request("warming", Some(5), 2))).await;
+
+    let reset = s
+        .reset_counters("main", "warming", "catchall", 0)
+        .await
+        .unwrap()
+        .expect("a row to reset");
+    assert_eq!(reset.committed_before, 1);
+    assert_eq!(
+        reset.reserved_after, 0,
+        "brand-b's live reservation is not main's"
+    );
+    let other = s.usage("brand-b", "warming", "catchall", 0).await.unwrap();
+    assert_eq!(other.reserved, 2, "and brand-b's row is untouched");
+}
+
+// ---------------------------------------------------------------------------
+// D-099 — adopting pre-ramps state
+// ---------------------------------------------------------------------------
+
+pub async fn adoption_moves_every_legacy_row_into_the_ramp(stores: Stores<'_>) {
+    let s = stores();
+    let k = keyer(&s).await;
+    let jane = k.key_for("jane@example.com", FrequencyMode::ToAddress, &[]);
+
+    // What a v0.8 instance leaves behind, after the migration's '' fill.
+    let done = taken(&s, &in_ramp("", request("warming", Some(9), 1))).await;
+    s.commit(&done, std::slice::from_ref(&jane)).await.unwrap();
+    taken(&s, &in_ramp("", request("warming", Some(9), 1))).await; // in flight
+    s.set_paused("", "warming", true).await.unwrap();
+    s.set_graduated("", "retired", true).await.unwrap();
+
+    let adopted = s.adopt_legacy_rows("main").await.unwrap();
+    assert_eq!(adopted.quota_usage, 1);
+    assert_eq!(adopted.quota_reservation, 1);
+    assert_eq!(adopted.route_state, 2);
+    assert_eq!(adopted.recipient_event, 1);
+    assert_eq!(adopted.routes, vec!["retired", "warming"]);
+
+    let usage = s.usage("main", "warming", "catchall", 0).await.unwrap();
+    assert_eq!((usage.committed, usage.reserved), (1, 1));
+    assert!(s.route_states("main").await.unwrap()["warming"].paused);
+    assert!(s.route_states("").await.unwrap().is_empty());
+    let hour_ago = Utc::now() - Duration::hours(1);
+    assert_eq!(
+        s.recipient_event_count("main", "warming", &jane, hour_ago)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+pub async fn adoption_is_idempotent(stores: Stores<'_>) {
+    let s = stores();
+    taken(&s, &in_ramp("", request("warming", Some(9), 1))).await;
+    // One reservation is two rows: the usage row and the reservation itself.
+    assert_eq!(s.adopt_legacy_rows("main").await.unwrap().total(), 2);
+
+    let again = s.adopt_legacy_rows("main").await.unwrap();
+    assert_eq!(again.total(), 0);
+    assert!(again.routes.is_empty());
+    // A second instance starting later finds nothing to do either.
+    let replica = stores();
+    assert_eq!(replica.adopt_legacy_rows("main").await.unwrap().total(), 0);
+}
+
+pub async fn adoption_refuses_a_quota_key_that_exists_under_the_ramp(stores: Stores<'_>) {
+    let s = stores();
+    taken(&s, &in_ramp("", request("warming", Some(9), 1))).await;
+    taken(&s, &request("warming", Some(9), 1)).await;
+
+    let err = s.adopt_legacy_rows("main").await.unwrap_err();
+    assert!(
+        matches!(err, QuotaError::LegacyConflict(ref m) if m.contains("warming")),
+        "{err}"
+    );
+    // Nothing moved: both rows are where they were.
+    assert_eq!(
+        s.usage("", "warming", "catchall", 0)
+            .await
+            .unwrap()
+            .reserved,
+        1
+    );
+    assert_eq!(
+        s.usage("main", "warming", "catchall", 0)
+            .await
+            .unwrap()
+            .reserved,
+        1
+    );
+    // A different ramp has no clash.
+    assert_eq!(s.adopt_legacy_rows("brand-b").await.unwrap().quota_usage, 1);
+}
+
+pub async fn adoption_refuses_a_route_state_that_exists_under_the_ramp(stores: Stores<'_>) {
+    let s = stores();
+    s.set_paused("", "warming", true).await.unwrap();
+    s.set_graduated("main", "warming", true).await.unwrap();
+
+    let err = s.adopt_legacy_rows("main").await.unwrap_err();
+    assert!(
+        matches!(err, QuotaError::LegacyConflict(ref m) if m.contains("route_state")),
+        "{err}"
+    );
+    assert!(s.route_states("").await.unwrap()["warming"].paused);
 }

@@ -32,6 +32,34 @@ put to the spec's author and recorded rather than assumed:
 
 ---
 
+## 0. Named ramps (D-099) — in progress on `feat/named-ramps`
+
+D-099 is built in five phases. Until **selection** lands, §4.2 refuses a
+configuration with more than one ramp, so a half-built build cannot mix two
+ramps' state.
+
+| Phase | What | Status |
+|---|---|---|
+| 1. Config | Routing moves under `ramps.<name>`; required `default_ramp`; top-level keys that moved are named; every reader goes through `default_ramp()` | **done** |
+| 2. Storage | `ramp` joins every key in both backends (migration `20260925000000_ramp`, `''` fill, default dropped as the v0.8 fence); SQL Server key names 200 → 128; `adopt_legacy_rows` at startup; the partial-ramp hash gains the ramp | **done** |
+| 3. Control plane | `/ramps/{ramp}/…` admin paths, `410` on the old ones, `ramp` on every route-labelled metric, `simmer_ramp_*` counters, dry run's ramp selection | not started |
+| 4. Selection | Listener `ramp` affinity and `header_overrides_affinity`, `X-Simmer-Ramp` with `grants.ramps`, header stripping, the §5.4 early decision, the capture's listener field; lifts the one-ramp limit | not started |
+| 5. Acceptance | Two ramps end to end on the acceptance stack; release notes for 0.9.0 | not started |
+
+**Storage, verified:** the conformance suite on both backends, including nine new
+tests (two ramps sharing a route name keep separate counters, route state and
+§7.3 events; the sweeper and a reset stay in their own ramp; adoption moves every
+legacy row, is idempotent, and refuses a clashing `quota_usage` or `route_state`
+key). Upgrade tests on both backends start from a v0.8 schema holding rows, apply
+the new migration, and check that the rows are kept under `''`, are adopted with
+their counts intact, and that a v0.8 write then fails. On SQL Server, a stored
+129-character name rolls the migration back whole. Full suites: Postgres 1278
+passed, SQL Server 1119 passed.
+**Not verified:** a startup against a real v0.8 database through the binary.
+Phase 5's stack run covers it.
+
+---
+
 ## 1. Where the build has got to
 
 `SPEC.md` §13 lists ten phases. **Nine are done and one is void**, so the original
@@ -487,16 +515,20 @@ now, with `src/db/`, `src/capture/`, `src/link_proxy/` and the soak tier.
 
 ```
 instance_config(key, value, …)                        phase 1
-quota_usage(route, domain_group, day_index,           phase 3
+quota_usage(ramp, route, domain_group, day_index,     phase 3; ramp D-099
             allowance, allowance_override,
-            committed, reserved, …)                   PK on the first three
-quota_reservation(id, route, domain_group,            phase 3
+            committed, reserved, …)                   PK on the first four
+quota_reservation(id, ramp, route, domain_group,      phase 3; ramp D-099
                   day_index, count,
                   correlation_id, expires_at, …)      indexed on expires_at
-route_state(route, paused, graduated, …)              phase 3
-recipient_event(recipient_hash, route, sent_at)       phase 6 (D-048)
+route_state(ramp, route, paused, graduated, …)        phase 3; PK (ramp, route)
+recipient_event(recipient_hash, ramp, route, sent_at) phase 6 (D-048); ramp D-099
                                                       no PK; two indexes
 ```
+
+`ramp` has no default (D-099): the migration filled existing rows with `''`
+and dropped it, so a v0.8 binary cannot write to this schema.
+`adopt_legacy_rows` moves the `''` rows into `default_ramp` at startup.
 
 Two things about `quota_usage` that are not obvious:
 

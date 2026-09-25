@@ -310,7 +310,10 @@ mod over_the_cap {
         assert_eq!(send(&simmer, &reply_to(&id)).await.code, 250);
         assert_eq!(warm.messages().len(), 2, "past the cap, on its own route");
 
-        let usage = store.usage("warming", "catchall", today()).await.unwrap();
+        let usage = store
+            .usage("main", "warming", "catchall", today())
+            .await
+            .unwrap();
         assert_eq!(usage.allowance, Some(1), "the ceiling is unchanged");
         assert_eq!(usage.committed, 2, "and the reply is counted against it");
         assert_eq!(usage.reserved, 0);
@@ -325,7 +328,10 @@ mod over_the_cap {
     }
 
     async fn warming_usage(store: &Arc<dyn QuotaStore>) -> (Option<i64>, i64, i64) {
-        let u = store.usage("warming", "catchall", today()).await.unwrap();
+        let u = store
+            .usage("main", "warming", "catchall", today())
+            .await
+            .unwrap();
         (u.allowance, u.committed, u.reserved)
     }
 
@@ -596,7 +602,7 @@ mod over_the_cap {
             };
             store.commit(&s.reservation, &[]).await.unwrap();
         }
-        store.set_paused("second", true).await.unwrap();
+        store.set_paused("main", "second", true).await.unwrap();
 
         let pin = simmer::routing::thread::Pin::Route("second".into());
         let order =
