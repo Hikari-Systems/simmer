@@ -4407,8 +4407,21 @@ literal match or a config without `mx`), and validation tests in
 `tests/config_validation.rs`. Full suites: Postgres 1254 passed, SQL Server 1095
 passed. Checked by hand once against live DNS: `anthropic.com` resolved to
 `google` via `mx:aspmx.l.google.com`, and `nhs.net` and `hikari-systems.com`
-resolved to `microsoft`. **Not run:** the §12.3 acceptance suite (it cannot run
-from the jail), and a dry run against a deployed instance.
+resolved to `microsoft`.
+
+**On a local stack** (the shipped `simmer.yaml`, real DNS): `POST /dryrun` gave
+`gmail.com` → `google` (`literal`), `anthropic.com` → `google`
+(`mx:aspmx.l.google.com`), `nhs.net` and `hikari-systems.com` → `microsoft`
+(`mx:…mail.protection.outlook.com`), and `yahoo.co.jp` and `example.com` →
+`catchall` (`fallback`). With `warming-newbrand`'s `google` allowance set to 0,
+both the gmail.com and the anthropic.com recipient went to
+`overflow-established`, while `nhs.net` stayed on the warming route. That is ramp
+#2's gap, closed. The acceptance stack, driven from inside its network (the jail
+cannot reach its traps), gave the day-0 result over real SMTP: 5 in
+`trap-warming` and the 6th in `trap-overflow`.
+
+**Not run:** `cargo test --test acceptance` itself, which cannot run from the
+jail, and a dry run against a deployed instance.
 
 ## Still open — to settle at the start of the phase that needs them
 
