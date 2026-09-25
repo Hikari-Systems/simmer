@@ -4545,8 +4545,10 @@ the SQL Server build's standing in §11–§13 (beyond the key width, recorded
 here) nor the capture's standing in §2.2. Both remain divergences, and both
 remain due before the *next* amendment.
 
-**Tested:** phase by phase. `docs/STATE.md` §0 tracks the phases (config,
-storage, control plane, selection, acceptance) and what each verified.
+**Tested:** phase by phase, all five done. `docs/STATE.md` §0 records what each
+verified, including an upgrade rehearsal through the real images: a
+pre-ramps binary's state adopted, two ramps routed by affinity and header, and
+the old binary refusing the migrated schema.
 
 **Found while building storage.** `usage_many` takes the ramp as its own
 argument and leaves it out of `UsageKey`. Every read view is of one ramp, so
