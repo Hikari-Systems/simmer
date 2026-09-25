@@ -235,10 +235,11 @@ pub struct Rewriters(HashMap<String, RouteRewrite>);
 
 impl Rewriters {
     pub fn compile(cfg: &Config) -> Result<Rewriters, Vec<(String, CompileError)>> {
-        let mut out = HashMap::with_capacity(cfg.routes.len());
+        let mut out = HashMap::new();
         let mut errors = Vec::new();
 
-        for route in &cfg.routes {
+        // Keyed by route name: sound only while §4.2 allows one ramp (D-099).
+        for route in cfg.all_routes() {
             match RouteRewrite::compile(&route.identity) {
                 Ok(r) => {
                     out.insert(route.name.clone(), r);

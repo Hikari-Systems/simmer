@@ -529,6 +529,12 @@ pub fn without_received(raw: &[u8]) -> String {
 
 /// Build a config for a downstream at `addr`. `overrides` are appended verbatim,
 /// so a test can change any leaf without restating the whole document.
+///
+/// The one ramp (D-099) is written compactly — `main` at one space, its keys at
+/// two, their sequences at the same two — so every route's contents sit where
+/// they sat before ramps existed. An override that continues the route's
+/// `identity` keeps working unchanged, and one that sets a ramp-level key
+/// (`strict_senders`, `thread_affinity`) is written at two spaces.
 pub fn config_for(addr: SocketAddr, overrides: &str) -> String {
     format!(
         r#"
@@ -551,14 +557,17 @@ admin:
   listen: "127.0.0.1:0"
   auth_token: "t"
 logging: {{ level: warn, format: text }}
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - {{ name: catchall, domains: ["*"] }}
-senders:
+  senders:
   - match: "oldbrand.com"
     match_on: envelope
     chain: [only]
-default_chain: [only]
-routes:
+  default_chain: [only]
+  routes:
   - name: only
     overflow: true
     downstream:

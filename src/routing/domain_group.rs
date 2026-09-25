@@ -14,7 +14,7 @@
 //! Three properties the rest of Simmer relies on, kept deliberately:
 //!
 //! - **A literal match never touches DNS.** gmail.com resolves exactly as it
-//!   did before D-100, and a config with no `mx` lists does no lookups at all.
+//!   did before D-100, and a ramp with no `mx` lists does no lookups at all.
 //! - **DNS never defers mail.** A lookup that fails or times out lands in the
 //!   catch-all, as the recipient would have before D-100. It is counted
 //!   (`simmer_mx_lookups_total{result="error"|"timeout"}`) rather than retried
@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::config::{Config, DomainGroup};
+use crate::config::{DomainGroup, Ramp};
 use crate::preflight::resolver::MxResolver;
 
 /// How long one MX lookup may hold a message up. A lookup that has not
@@ -100,7 +100,7 @@ struct Cached {
 
 impl Grouper {
     /// No resolver: literal matching and the catch-all, exactly §3.2 step 2 as
-    /// it was before D-100. A config with `mx` lists resolves every domain it
+    /// it was before D-100. A ramp with `mx` lists resolves every domain it
     /// does not list literally to the catch-all, as `MxUnavailable`.
     pub fn literal() -> Self {
         Self {
@@ -122,17 +122,17 @@ impl Grouper {
         self
     }
 
-    /// The group `recipient` belongs to, and why.
+    /// The group `recipient` belongs to in `ramp`, and why.
     ///
     /// `None` only for a configuration with no catch-all, which §4.2 refuses.
-    pub async fn resolve<'a>(&self, cfg: &'a Config, recipient: &str) -> Option<Resolved<'a>> {
-        if let Some(group) = literal(cfg, recipient) {
+    pub async fn resolve<'a>(&self, ramp: &'a Ramp, recipient: &str) -> Option<Resolved<'a>> {
+        if let Some(group) = literal(ramp, recipient) {
             return Some(Resolved {
                 group,
                 basis: Basis::Literal,
             });
         }
-        let catchall = cfg.catchall_group()?;
+        let catchall = ramp.catchall_group()?;
         let fallback = |basis| {
             Some(Resolved {
                 group: catchall,
@@ -143,7 +143,7 @@ impl Grouper {
         let Some(domain) = domain_of(recipient) else {
             return fallback(Basis::CatchAll);
         };
-        if !cfg.domain_groups.iter().any(|g| !g.mx.is_empty()) {
+        if !ramp.domain_groups.iter().any(|g| !g.mx.is_empty()) {
             return fallback(Basis::CatchAll);
         }
         // An address literal (`bob@[192.0.2.1]`) has no MX to look up.
@@ -156,7 +156,7 @@ impl Grouper {
 
         // Configuration order decides, as it does for literal domains; §4.2
         // already refuses a suffix listed in two groups.
-        for group in &cfg.domain_groups {
+        for group in &ramp.domain_groups {
             if let Some(host) = hosts.iter().find(|h| group.matches_mx_host(h)) {
                 return Some(Resolved {
                     group,
@@ -169,8 +169,8 @@ impl Grouper {
 
     /// The group's name, for the walk: [`resolve`](Self::resolve) with the
     /// catch-all's conventional name as the last resort.
-    pub async fn group_name(&self, cfg: &Config, recipient: &str) -> String {
-        self.resolve(cfg, recipient)
+    pub async fn group_name(&self, ramp: &Ramp, recipient: &str) -> String {
+        self.resolve(ramp, recipient)
             .await
             .map(|r| r.group.name.clone())
             .unwrap_or_else(|| "catchall".to_string())
@@ -247,9 +247,9 @@ impl Grouper {
 
 /// §3.2 step 2's literal match: the group whose `domains` list contains the
 /// recipient's domain, if any. No DNS, and no catch-all.
-pub fn literal<'a>(cfg: &'a Config, recipient: &str) -> Option<&'a DomainGroup> {
+pub fn literal<'a>(ramp: &'a Ramp, recipient: &str) -> Option<&'a DomainGroup> {
     let d = domain_of(recipient)?;
-    cfg.domain_groups.iter().find(|group| {
+    ramp.domain_groups.iter().find(|group| {
         group
             .domains
             .iter()
@@ -271,6 +271,7 @@ fn domain_of(address: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     const CFG: &str = r#"
 server:
@@ -285,14 +286,17 @@ server:
   auth: { allow_insecure_auth: true }
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
 admin: { listen: "127.0.0.1:8080", auth_token: "t" }
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: google, domains: ["gmail.com", "googlemail.com"] }
   - { name: microsoft, domains: ["outlook.com", "hotmail.co.uk", "live.com"] }
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [overflow] }
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: overflow
     overflow: true
     downstream:
@@ -307,10 +311,11 @@ routes:
     }
 
     /// Pre-D-100 behaviour: literal, else the catch-all — what `Grouper::literal`
-    /// gives for a config with no `mx` lists, checked separately below.
+    /// gives for a ramp with no `mx` lists, checked separately below.
     fn group_of(cfg: &Config, recipient: &str) -> String {
-        literal(cfg, recipient)
-            .or_else(|| cfg.catchall_group())
+        let ramp = cfg.default_ramp();
+        literal(ramp, recipient)
+            .or_else(|| ramp.catchall_group())
             .expect("catch-all always exists")
             .name
             .clone()
@@ -428,7 +433,7 @@ routes:
 
     async fn mx_group_of(grouper: &Grouper, cfg: &Config, recipient: &str) -> (String, Basis) {
         let r = grouper
-            .resolve(cfg, recipient)
+            .resolve(cfg.default_ramp(), recipient)
             .await
             .expect("catch-all always exists");
         (r.group.name.clone(), r.basis)
@@ -550,7 +555,7 @@ routes:
     }
 
     #[tokio::test]
-    async fn a_config_without_mx_lists_never_looks_anything_up() {
+    async fn a_ramp_without_mx_lists_never_looks_anything_up() {
         let cfg = config();
         let fake = Arc::new(workspace_and_m365());
         let g = Grouper::new(fake.clone());
@@ -574,7 +579,11 @@ routes:
             "@gmail.com",
             r#""a@b"@gmail.com"#,
         ] {
-            assert_eq!(g.group_name(&cfg, r).await, group_of(&cfg, r), "{r}");
+            assert_eq!(
+                g.group_name(cfg.default_ramp(), r).await,
+                group_of(&cfg, r),
+                "{r}"
+            );
         }
     }
 }

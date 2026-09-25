@@ -48,6 +48,7 @@ use simmer::config::Config;
 fn cap() -> usize {
     let cfg = config();
     let schedule = &cfg
+        .default_ramp()
         .route("warming-newbrand")
         .expect("the warming route")
         .warmup
@@ -260,6 +261,7 @@ fn the_tier_config_is_valid_and_still_carries_an_auto_share() {
     // an auto share would make every test above pass while measuring D-091.
     let cfg = config();
     let schedule = &cfg
+        .default_ramp()
         .route("warming-newbrand")
         .expect("the warming route")
         .warmup

@@ -40,13 +40,16 @@ server:
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
 admin: { listen: "127.0.0.1:0", auth_token: "t" }
 logging: { level: warn, format: text }
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: google, domains: ["gmail.com"] }
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: "127.0.0.1"
@@ -692,8 +695,9 @@ async fn walk(
     let mut evaluation = Vec::new();
     let chain = vec!["warming".to_string(), "overflow".to_string()];
     let result = chain::walk_and_reserve(
-        cfg,
+        cfg.default_ramp(),
         &simmer::routing::domain_group::Grouper::literal(),
+        &cfg.dot_insensitive_domains,
         store,
         &frequency(),
         &simmer::preflight::Registry::new(),
@@ -783,7 +787,11 @@ async fn a_route_whose_warm_up_has_not_started_is_skipped(pool: PgPool) {
     // arrives."
     let mut cfg = config();
     let future = Utc::now() + Duration::days(3);
-    cfg.routes[0].warmup.as_mut().unwrap().started = future;
+    cfg.default_ramp_mut().routes[0]
+        .warmup
+        .as_mut()
+        .unwrap()
+        .started = future;
 
     let store = store(pool);
     let (route, trace) = walk(&cfg, &store, "bob@example.com").await;
@@ -820,8 +828,9 @@ async fn an_exhausted_chain_with_no_overflow_selects_nothing(pool: PgPool) {
     let chain = vec!["warming".to_string()];
     for _ in 0..3 {
         let r = chain::walk_and_reserve(
-            &cfg,
+            cfg.default_ramp(),
             &simmer::routing::domain_group::Grouper::literal(),
+            &cfg.dot_insensitive_domains,
             &store,
             &frequency(),
             &simmer::preflight::Registry::new(),
@@ -840,8 +849,9 @@ async fn an_exhausted_chain_with_no_overflow_selects_nothing(pool: PgPool) {
     }
 
     let r = chain::walk_and_reserve(
-        &cfg,
+        cfg.default_ramp(),
         &simmer::routing::domain_group::Grouper::literal(),
+        &cfg.dot_insensitive_domains,
         &store,
         &frequency(),
         &simmer::preflight::Registry::new(),
@@ -892,7 +902,7 @@ async fn the_early_check_sees_an_exhausted_chain_without_reserving(pool: PgPool)
     let chain = vec!["warming".to_string()];
 
     assert!(chain::any_eligible(
-        &cfg,
+        cfg.default_ramp(),
         &simmer::routing::domain_group::Grouper::literal(),
         &store,
         &chain,
@@ -913,8 +923,9 @@ async fn the_early_check_sees_an_exhausted_chain_without_reserving(pool: PgPool)
     for _ in 0..3 {
         let mut ev = Vec::new();
         if let Walk::Selected(s) = chain::walk_and_reserve(
-            &cfg,
+            cfg.default_ramp(),
             &simmer::routing::domain_group::Grouper::literal(),
+            &cfg.dot_insensitive_domains,
             &store,
             &frequency(),
             &simmer::preflight::Registry::new(),
@@ -932,7 +943,7 @@ async fn the_early_check_sees_an_exhausted_chain_without_reserving(pool: PgPool)
     }
 
     assert!(!chain::any_eligible(
-        &cfg,
+        cfg.default_ramp(),
         &simmer::routing::domain_group::Grouper::literal(),
         &store,
         &chain,
@@ -951,8 +962,9 @@ async fn the_early_check_always_passes_a_chain_ending_in_overflow(pool: PgPool) 
     for _ in 0..10 {
         let mut ev = Vec::new();
         if let Walk::Selected(s) = chain::walk_and_reserve(
-            &cfg,
+            cfg.default_ramp(),
             &simmer::routing::domain_group::Grouper::literal(),
+            &cfg.dot_insensitive_domains,
             &store,
             &frequency(),
             &simmer::preflight::Registry::new(),
@@ -971,7 +983,7 @@ async fn the_early_check_always_passes_a_chain_ending_in_overflow(pool: PgPool) 
 
     assert!(
         chain::any_eligible(
-            &cfg,
+            cfg.default_ramp(),
             &simmer::routing::domain_group::Grouper::literal(),
             &store,
             &chain,

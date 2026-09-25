@@ -1398,7 +1398,8 @@ impl Ceilings {
         let cfg = compose::configs::load(STRESS_CONFIG);
         let pool = |name: &str| {
             count(
-                cfg.route(name)
+                cfg.default_ramp()
+                    .route(name)
                     .unwrap_or_else(|| panic!("no route {name}"))
                     .downstream
                     .pool

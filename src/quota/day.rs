@@ -268,12 +268,15 @@ database:
   url: "postgres://u:p@localhost/simmer"
   connect_timeout: 5s
 admin: { listen: "127.0.0.1:8080", auth_token: "t" }
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: w.example
@@ -297,7 +300,7 @@ routes:
     #[test]
     fn a_warming_route_measures_from_its_configured_start() {
         let cfg = config();
-        let route = cfg.route("warming").expect("route");
+        let route = cfg.default_ramp().route("warming").expect("route");
         assert_eq!(origin(route), utc("2026-08-01T09:00:00Z"));
         assert_eq!(for_route(route, utc("2026-08-03T10:00:00Z")), 2);
     }
@@ -308,7 +311,7 @@ routes:
         // own. The epoch gives it one formula and a UTC-midnight bucket, which
         // is what makes "how much spilled to overflow today" answerable.
         let cfg = config();
-        let route = cfg.route("overflow").expect("route");
+        let route = cfg.default_ramp().route("overflow").expect("route");
         assert_eq!(origin(route), Utc.timestamp_opt(0, 0).unwrap());
 
         let a = for_route(route, utc("2026-08-03T00:00:00Z"));
@@ -321,7 +324,7 @@ routes:
     #[test]
     fn an_overflow_routes_next_boundary_is_the_next_utc_midnight() {
         let cfg = config();
-        let route = cfg.route("overflow").expect("route");
+        let route = cfg.default_ramp().route("overflow").expect("route");
         assert_eq!(
             next_boundary(route, utc("2026-08-03T14:23:11Z")),
             utc("2026-08-04T00:00:00Z")
@@ -331,7 +334,7 @@ routes:
     #[test]
     fn a_warming_routes_next_boundary_is_its_own_anniversary() {
         let cfg = config();
-        let route = cfg.route("warming").expect("route");
+        let route = cfg.default_ramp().route("warming").expect("route");
         assert_eq!(
             next_boundary(route, utc("2026-08-03T14:23:11Z")),
             utc("2026-08-04T09:00:00Z")

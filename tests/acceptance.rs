@@ -476,6 +476,7 @@ fn return_paths(trap: Trap) -> Vec<String> {
 fn warming_schedule() -> Vec<i64> {
     let cfg = load_acceptance_config();
     let route = cfg
+        .default_ramp()
         .routes
         .iter()
         .find(|r| r.name == "warming-newbrand")
@@ -554,7 +555,12 @@ fn the_acceptance_config_and_the_shipped_config_stay_in_step() {
     let acceptance = load_acceptance_config();
 
     let shipped_names = ["warming-newbrand", "overflow-established"];
-    let acceptance_names: Vec<&str> = acceptance.routes.iter().map(|r| r.name.as_str()).collect();
+    let acceptance_names: Vec<&str> = acceptance
+        .default_ramp()
+        .routes
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
     assert_eq!(
         acceptance_names, shipped_names,
         "the acceptance config's routes no longer match the shipped config's"
@@ -562,7 +568,7 @@ fn the_acceptance_config_and_the_shipped_config_stay_in_step() {
 
     // The three ways the acceptance config is *allowed* to differ, asserted so
     // that a fourth has to be deliberate.
-    let warming = &acceptance.routes[0];
+    let warming = &acceptance.default_ramp().routes[0];
     assert_eq!(warming.downstream.host, "trap-warming");
     assert!(
         warming

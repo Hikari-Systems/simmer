@@ -37,7 +37,7 @@ use serde_json::json;
 use super::auth::Actor;
 use super::error::ApiError;
 use super::AdminState;
-use crate::config::Config;
+use crate::config::Ramp;
 use crate::metrics;
 use crate::quota::store::RouteState;
 use crate::quota::{self, Allowance, QuotaError};
@@ -124,7 +124,7 @@ async fn set_paused(
     paused: bool,
 ) -> Result<Json<MutationResponse>, ApiError> {
     let action = if paused { "pause" } else { "resume" };
-    known_route(state.config(), &name, action)?;
+    known_route(state.config().default_ramp(), &name, action)?;
 
     // Read before writing, so the audit line can say what it replaced. Racy in
     // principle against a second operator; an audit line's "previous" always is.
@@ -193,7 +193,7 @@ pub async fn graduate(
     actor: Actor,
     MaybeJson(body): MaybeJson<GraduateBody>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    let route = known_route(state.config(), &name, "graduate")?;
+    let route = known_route(state.config().default_ramp(), &name, "graduate")?;
 
     if route.overflow {
         // §3.1: an overflow route carries no warm-up schedule, so there is no
@@ -282,9 +282,14 @@ pub async fn allowance(
     actor: Actor,
     Json(body): Json<AllowanceBody>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    let route = known_route(state.config(), &name, "allowance")?;
+    let route = known_route(state.config().default_ramp(), &name, "allowance")?;
 
-    if state.config().domain_group(&body.domain_group).is_none() {
+    if state
+        .config()
+        .default_ramp()
+        .domain_group(&body.domain_group)
+        .is_none()
+    {
         metrics::admin_mutation("allowance", "rejected");
         return Err(ApiError::not_found("domain group", &body.domain_group));
     }
@@ -378,9 +383,14 @@ pub async fn reset(
     actor: Actor,
     Json(body): Json<ResetBody>,
 ) -> Result<Json<MutationResponse>, ApiError> {
-    let route = known_route(state.config(), &body.route, "reset")?;
+    let route = known_route(state.config().default_ramp(), &body.route, "reset")?;
 
-    if state.config().domain_group(&body.domain_group).is_none() {
+    if state
+        .config()
+        .default_ramp()
+        .domain_group(&body.domain_group)
+        .is_none()
+    {
         metrics::admin_mutation("reset", "rejected");
         return Err(ApiError::not_found("domain group", &body.domain_group));
     }
@@ -473,19 +483,23 @@ pub async fn reset(
 ///
 /// Empty is both the ordinary case and the cheap case.
 pub async fn exhaustion_warnings(state: &AdminState) -> Result<Vec<String>, QuotaError> {
-    let cfg = state.config();
+    // D-057 within one ramp (D-099): a ramp's routes can only empty its own
+    // chains. The default ramp until phase 3 scopes mutations by path.
+    let ramp = state.config().default_ramp();
     let now = Utc::now();
     let states = state.store().route_states().await?;
-    let usage = state.store().usage_many(&super::keys_for(cfg, now)).await?;
+    let usage = state
+        .store()
+        .usage_many(&super::keys_for(ramp, now))
+        .await?;
 
     let mut out = Vec::new();
 
-    for chain in cfg.chains() {
-        for group in &cfg.domain_groups {
+    for chain in ramp.chains() {
+        for group in &ramp.domain_groups {
             let any_eligible = chain.routes.iter().any(|name| {
-                cfg.route(name).is_some_and(|route| {
+                ramp.route(name).is_some_and(|route| {
                     eligible(
-                        cfg,
                         route,
                         &group.name,
                         states.get(name).copied().unwrap_or_default(),
@@ -516,7 +530,6 @@ pub async fn exhaustion_warnings(state: &AdminState) -> Result<Vec<String>, Quot
 /// The same three questions `chain::walk_and_reserve` asks, minus §7.3's, which
 /// needs a recipient.
 fn eligible(
-    _cfg: &Config,
     route: &crate::config::Route,
     group: &str,
     state: RouteState,
@@ -547,11 +560,11 @@ fn eligible(
 // ---------------------------------------------------------------------------
 
 fn known_route<'a>(
-    cfg: &'a Config,
+    ramp: &'a Ramp,
     name: &str,
     action: &'static str,
 ) -> Result<&'a crate::config::Route, ApiError> {
-    cfg.route(name).ok_or_else(|| {
+    ramp.route(name).ok_or_else(|| {
         metrics::admin_mutation(action, "rejected");
         ApiError::not_found("route", name)
     })

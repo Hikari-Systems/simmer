@@ -262,7 +262,7 @@ fn refresh_runtime_gauges(state: &AdminState) {
 /// Unlike the quota gauges this needs no storage, so it cannot fail and is not
 /// inside the fallible path above.
 fn refresh_pool_gauges(state: &AdminState) {
-    for route in &state.config().routes {
+    for route in &state.config().default_ramp().routes {
         let Some(stats) = state.engine.pools.stats(&route.name) else {
             continue;
         };
@@ -273,13 +273,15 @@ fn refresh_pool_gauges(state: &AdminState) {
 
 async fn refresh_quota_gauges(state: &AdminState) -> Result<(), quota::QuotaError> {
     let cfg = state.config();
+    // §3.4 (D-099): per ramp from phase 3; the default ramp until then.
+    let ramp = cfg.default_ramp();
     let now = Utc::now();
     let states = state.store().route_states().await?;
-    let usage = state.store().usage_many(&keys_for(cfg, now)).await?;
+    let usage = state.store().usage_many(&keys_for(ramp, now)).await?;
 
-    for route in &cfg.routes {
+    for route in &ramp.routes {
         let projected = view::project_route(
-            cfg,
+            ramp,
             route,
             states.get(&route.name).copied().unwrap_or_default(),
             &usage,
@@ -337,11 +339,11 @@ async fn refresh_quota_gauges(state: &AdminState) -> Result<(), quota::QuotaErro
 ///
 /// The day index is per route: a warming route's day begins on its own
 /// `warmup.started` anniversary, an overflow route's on UTC midnight (D-024).
-fn keys_for(cfg: &crate::config::Config, now: chrono::DateTime<Utc>) -> Vec<UsageKey> {
-    let mut keys = Vec::with_capacity(cfg.routes.len() * cfg.domain_groups.len());
-    for route in &cfg.routes {
+fn keys_for(ramp: &crate::config::Ramp, now: chrono::DateTime<Utc>) -> Vec<UsageKey> {
+    let mut keys = Vec::with_capacity(ramp.routes.len() * ramp.domain_groups.len());
+    for route in &ramp.routes {
         let day_index = quota::day::for_route(route, now);
-        for group in &cfg.domain_groups {
+        for group in &ramp.domain_groups {
             keys.push(UsageKey {
                 route: route.name.clone(),
                 domain_group: group.name.clone(),
@@ -358,12 +360,14 @@ async fn routes(
     _actor: Actor,
 ) -> Result<Json<view::RoutesView>, ApiError> {
     let cfg = state.config();
+    // §3.4 (D-099): per ramp from phase 3; the default ramp until then.
+    let ramp = cfg.default_ramp();
     let now = Utc::now();
     let states = state.store().route_states().await?;
-    let usage = state.store().usage_many(&keys_for(cfg, now)).await?;
+    let usage = state.store().usage_many(&keys_for(ramp, now)).await?;
 
     Ok(Json(view::project_routes(
-        cfg,
+        ramp,
         &states,
         &usage,
         &state.engine.preflight,
@@ -379,14 +383,16 @@ async fn route_by_name(
     _actor: Actor,
 ) -> Result<Json<view::RouteView>, ApiError> {
     let cfg = state.config();
-    let route = cfg
+    // §3.4 (D-099): per ramp from phase 3; the default ramp until then.
+    let ramp = cfg.default_ramp();
+    let route = ramp
         .route(&name)
         .ok_or_else(|| ApiError::not_found("route", &name))?;
 
     let now = Utc::now();
     let states = state.store().route_states().await?;
     let day_index = quota::day::for_route(route, now);
-    let keys: Vec<UsageKey> = cfg
+    let keys: Vec<UsageKey> = ramp
         .domain_groups
         .iter()
         .map(|g| UsageKey {
@@ -398,7 +404,7 @@ async fn route_by_name(
     let usage = state.store().usage_many(&keys).await?;
 
     Ok(Json(view::project_route(
-        cfg,
+        ramp,
         route,
         states.get(&name).copied().unwrap_or_default(),
         &usage,
@@ -425,23 +431,25 @@ async fn quota_detail(
     _actor: Actor,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let cfg = state.config();
+    // §3.4 (D-099): per ramp from phase 3; the default ramp until then.
+    let ramp = cfg.default_ramp();
 
     if let Some(route) = &q.route {
-        if cfg.route(route).is_none() {
+        if ramp.route(route).is_none() {
             return Err(ApiError::not_found("route", route));
         }
     }
     if let Some(group) = &q.group {
-        if !cfg.domain_groups.iter().any(|g| &g.name == group) {
+        if !ramp.domain_groups.iter().any(|g| &g.name == group) {
             return Err(ApiError::not_found("domain group", group));
         }
     }
 
     let now = Utc::now();
     let states = state.store().route_states().await?;
-    let usage = state.store().usage_many(&keys_for(cfg, now)).await?;
+    let usage = state.store().usage_many(&keys_for(ramp, now)).await?;
     let projected = view::project_routes(
-        cfg,
+        ramp,
         &states,
         &usage,
         &state.engine.preflight,
@@ -509,13 +517,16 @@ server:
   auth: { allow_insecure_auth: true }
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
 admin: { listen: "127.0.0.1:8080", auth_token: "0123456789abcdef" }
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: google, domains: ["gmail.com"] }
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: w.example
@@ -538,7 +549,7 @@ routes:
     fn the_read_key_set_is_every_route_times_every_group() {
         let cfg = config(CFG);
         let now: chrono::DateTime<Utc> = "2026-08-03T15:00:00Z".parse().unwrap();
-        let keys = keys_for(&cfg, now);
+        let keys = keys_for(cfg.default_ramp(), now);
         assert_eq!(keys.len(), 4);
     }
 
@@ -551,7 +562,7 @@ routes:
         // the wrong row.
         let cfg = config(CFG);
         let now: chrono::DateTime<Utc> = "2026-08-03T15:00:00Z".parse().unwrap();
-        let keys = keys_for(&cfg, now);
+        let keys = keys_for(cfg.default_ramp(), now);
 
         let warming = keys.iter().find(|k| k.route == "warming").unwrap();
         let overflow = keys.iter().find(|k| k.route == "overflow").unwrap();

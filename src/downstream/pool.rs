@@ -64,9 +64,9 @@ pub struct Pool {
 
 impl Pool {
     pub fn build(cfg: &Config) -> Pool {
+        // Keyed by route name: sound only while §4.2 allows one ramp (D-099).
         let routes = cfg
-            .routes
-            .iter()
+            .all_routes()
             .map(|r| (r.name.clone(), Arc::new(RoutePool::new(r))))
             .collect();
         Pool {
@@ -414,12 +414,15 @@ server:
 database: {{ url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }}
 admin: {{ listen: "127.0.0.1:0", auth_token: "t" }}
 logging: {{ level: warn, format: text }}
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - {{ name: catchall, domains: ["*"] }}
-senders:
+  senders:
   - {{ match: "oldbrand.com", match_on: envelope, chain: [only] }}
-default_chain: [only]
-routes:
+  default_chain: [only]
+  routes:
   - name: only
     overflow: true
     downstream:
@@ -434,7 +437,12 @@ routes:
     }
 
     fn route(pool: &str) -> Route {
-        config(pool).routes.into_iter().next().expect("one route")
+        config(pool)
+            .default_ramp()
+            .routes
+            .first()
+            .cloned()
+            .expect("one route")
     }
 
     #[test]
@@ -458,7 +466,7 @@ routes:
         };
         assert!(pool.stats("only").is_none(), "nothing seeded yet");
 
-        let r = cfg.routes.first().expect("one route");
+        let r = cfg.default_ramp().routes.first().expect("one route");
         let first = pool.for_route(r);
         let second = pool.for_route(r);
         assert!(

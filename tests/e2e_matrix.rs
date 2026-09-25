@@ -519,7 +519,12 @@ fn the_matrix_config_is_valid_and_routes_each_server_by_sender() {
     // build and a stack that will not come up.
     let cfg = compose::configs::load(MATRIX_CONFIG);
 
-    let routes: Vec<&str> = cfg.routes.iter().map(|r| r.name.as_str()).collect();
+    let routes: Vec<&str> = cfg
+        .default_ramp()
+        .routes
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
     assert_eq!(
         routes,
         [
@@ -543,7 +548,7 @@ fn the_matrix_config_is_valid_and_routes_each_server_by_sender() {
         ("jane@ratelimit.matrix.test", "postfix-ratelimit"),
     ] {
         let senders = simmer::routing::sender_match::Senders::new(Some(sender), None);
-        match simmer::routing::sender_match::match_sender(&cfg, &senders) {
+        match simmer::routing::sender_match::match_sender(cfg.default_ramp(), &senders) {
             simmer::routing::sender_match::Match::Rule { rule, .. } => {
                 assert_eq!(rule.chain, [route], "{sender}")
             }
@@ -554,19 +559,19 @@ fn the_matrix_config_is_valid_and_routes_each_server_by_sender() {
     }
     // tests/e2e_flows.rs's sender: the one warming route, then the baseline.
     let flows = simmer::routing::sender_match::Senders::new(Some("jane@flows.matrix.test"), None);
-    match simmer::routing::sender_match::match_sender(&cfg, &flows) {
+    match simmer::routing::sender_match::match_sender(cfg.default_ramp(), &flows) {
         simmer::routing::sender_match::Match::Rule { rule, .. } => {
             assert_eq!(rule.chain, ["warming-flows", "mailpit-direct"])
         }
         simmer::routing::sender_match::Match::Unmatched => panic!("flows matched no rule"),
     }
     assert_eq!(
-        cfg.default_chain.as_deref(),
+        cfg.default_ramp().default_chain.as_deref(),
         Some(&["mailpit-direct".to_string()][..])
     );
 
     // The TLS route verifies: that is the point of it.
-    let tls = cfg.route("postfix-tls-auth").expect("route");
+    let tls = cfg.default_ramp().route("postfix-tls-auth").expect("route");
     assert_eq!(tls.downstream.tls, simmer::config::TlsMode::RequiredVerify);
     assert!(tls.downstream.auth.is_some());
 }

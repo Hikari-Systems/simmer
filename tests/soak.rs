@@ -217,7 +217,10 @@ fn assert_soak_config_sound(path: &str) {
     // The warming route has to survive the whole run: 24 h at 10 msg/s is ~864k
     // messages, and a route that quietly exhausted its allowance after an hour
     // would leave the soak measuring overflow for the other twenty-three.
-    let warming = cfg.route("warming-newbrand").expect("a warming route");
+    let warming = cfg
+        .default_ramp()
+        .route("warming-newbrand")
+        .expect("a warming route");
     let schedule = &warming
         .warmup
         .as_ref()
@@ -236,7 +239,7 @@ fn assert_soak_config_sound(path: &str) {
 
     // V4 (F2). Every one of these is a way for the variant to stop cancelling
     // relays while still looking as if it runs.
-    let cancel = cfg.route(V4_ROUTE).expect("V4's route");
+    let cancel = cfg.default_ramp().route(V4_ROUTE).expect("V4's route");
     assert!(
         cancel
             .warmup
@@ -250,6 +253,7 @@ fn assert_soak_config_sound(path: &str) {
     );
     let domain = V4_SENDER.split_once('@').expect("an address").1;
     let rule = cfg
+        .default_ramp()
         .senders
         .iter()
         .find(|r| r.pattern == domain)
@@ -295,7 +299,7 @@ fn assert_soak_config_sound(path: &str) {
     // Not declared in `unstable_headers`: §6.6's probe pins volatile variables,
     // so the header is stable, and declaring it would draw the stale-declaration
     // WARN instead.
-    for route in &cfg.routes {
+    for route in &cfg.default_ramp().routes {
         assert!(
             route
                 .identity

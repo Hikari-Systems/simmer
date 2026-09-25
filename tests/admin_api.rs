@@ -63,13 +63,16 @@ admin:
   tokens:
     - { name: oncall, token: "0123456789abcdef-oncall" }
 logging: { level: warn, format: text }
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: google, domains: ["gmail.com"] }
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: "127.0.0.1"
@@ -144,7 +147,7 @@ fn store(state: &AdminState) -> Arc<dyn QuotaStore> {
 }
 
 fn today(cfg: &Config, route: &str) -> i64 {
-    quota::day::for_route(cfg.route(route).expect("route"), Utc::now())
+    quota::day::for_route(cfg.default_ramp().route(route).expect("route"), Utc::now())
 }
 
 // ---------------------------------------------------------------------------
@@ -588,8 +591,9 @@ async fn a_paused_route_is_skipped_by_the_real_chain_walk(pool: PgPool) {
 
     let mut evaluation = Vec::new();
     let walk = simmer::routing::chain::walk_and_reserve(
-        &state.engine.config,
+        state.engine.config.default_ramp(),
         &state.engine.groups,
+        &state.engine.config.dot_insensitive_domains,
         &store(&state),
         &state.engine.frequency,
         &state.engine.preflight,
@@ -1157,7 +1161,7 @@ async fn an_exhausted_chain_reports_the_reply_the_client_would_get(pool: PgPool)
 async fn a_sender_policy_refusal_is_an_answer_rather_than_an_http_error(pool: PgPool) {
     // The request was well formed; this is what would happen to it. Reporting it
     // as a 4xx would make a script treat a correct answer as its own bug.
-    let state = state_from(pool, config("strict_senders: true\n"));
+    let state = state_from(pool, config("  strict_senders: true\n"));
 
     let response = post(
         &state,
@@ -1228,8 +1232,9 @@ async fn compare_pinned_walks(
         simmer::routing::thread::order(&["warming".to_string(), "overflow".to_string()], &pin);
 
     let dry = simmer::routing::chain::dry_walk(
-        cfg,
+        cfg.default_ramp(),
         &state.engine.groups,
+        &cfg.dot_insensitive_domains,
         &store(state),
         &state.engine.frequency,
         &state.engine.preflight,
@@ -1243,8 +1248,9 @@ async fn compare_pinned_walks(
 
     let mut evaluation = Vec::new();
     simmer::routing::chain::walk_and_reserve(
-        cfg,
+        cfg.default_ramp(),
         &state.engine.groups,
+        &cfg.dot_insensitive_domains,
         &store(state),
         &state.engine.frequency,
         &state.engine.preflight,
@@ -1550,10 +1556,15 @@ fn affinity_state(pool: PgPool) -> AdminState {
             "    identity: { envelope_from: \"bounce@established.com\" }\n",
             "    identity:\n      envelope_from: \"bounce@established.com\"\n      set_headers: { Message-ID: \"<{{uuid}}@established.com>\" }\n",
         )
-        + "thread_affinity: true\n";
+        + "  thread_affinity: true\n";
     let cfg = simmer::config::from_str(&yaml, "test").expect("fixture is valid");
-    assert!(cfg.thread_affinity);
-    assert!(cfg.route("warming").unwrap().recipient_frequency.is_some());
+    assert!(cfg.default_ramp().thread_affinity);
+    assert!(cfg
+        .default_ramp()
+        .route("warming")
+        .unwrap()
+        .recipient_frequency
+        .is_some());
     state_from(pool, cfg)
 }
 
@@ -1603,8 +1614,9 @@ async fn dry_run_agrees_with_the_real_walk_on_a_pinned_route_over_its_frequency(
     // One delivered message to bob puts him at warming's threshold of 1.
     let mut ev = Vec::new();
     let simmer::routing::chain::Walk::Selected(s) = simmer::routing::chain::walk_and_reserve(
-        &state.engine.config,
+        state.engine.config.default_ramp(),
         &state.engine.groups,
+        &state.engine.config.dot_insensitive_domains,
         &store(&state),
         &state.engine.frequency,
         &state.engine.preflight,

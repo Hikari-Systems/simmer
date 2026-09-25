@@ -66,12 +66,15 @@ server:
 database: {{ url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }}
 admin: {{ listen: "127.0.0.1:0", auth_token: "t" }}
 logging: {{ level: warn, format: text }}
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - {{ name: catchall, domains: ["*"] }}
-senders:
+  senders:
   - {{ match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }}
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: "127.0.0.1"
@@ -141,8 +144,9 @@ async fn walk(
     let mut evaluation = Vec::new();
     let chain: Vec<String> = chain.iter().map(|s| s.to_string()).collect();
     let walked = chain::walk_and_reserve(
-        cfg,
+        cfg.default_ramp(),
         &simmer::routing::domain_group::Grouper::literal(),
+        &cfg.dot_insensitive_domains,
         store,
         &Frequency::new(),
         registry,
@@ -212,7 +216,7 @@ async fn a_missing_dkim_selector_is_the_failure_6_5_is_about() {
 #[tokio::test]
 async fn dmarc_is_not_checked_unless_required() {
     let mut cfg = config(false);
-    for route in &mut cfg.routes {
+    for route in &mut cfg.default_ramp_mut().routes {
         if let Some(p) = route.preflight.as_mut() {
             p.require_dmarc = false;
         }
@@ -269,7 +273,8 @@ async fn a_resolver_failure_is_a_failed_check_and_says_so() {
 #[tokio::test]
 async fn a_route_with_no_constant_domain_is_never_planned() {
     let mut cfg = config(true);
-    cfg.routes[0].identity.envelope_from = "bounce@{{original.envelope_from.domain}}".to_string();
+    cfg.default_ramp_mut().routes[0].identity.envelope_from =
+        "bounce@{{original.envelope_from.domain}}".to_string();
 
     assert!(
         preflight::plan(&cfg).is_empty(),
@@ -384,8 +389,8 @@ async fn the_route_view_reports_the_checks_and_whether_they_block() {
     let registry = registry_after(&cfg, &dns_without_dkim()).await;
 
     let view = simmer::admin::view::project_route(
-        &cfg,
-        &cfg.routes[0],
+        cfg.default_ramp(),
+        &cfg.default_ramp().routes[0],
         Default::default(),
         &simmer::admin::view::UsageByRoute::new(),
         &registry,
@@ -410,8 +415,8 @@ async fn a_route_that_was_never_checked_reports_null_rather_than_a_pass() {
     let cfg = config(true);
 
     let view = simmer::admin::view::project_route(
-        &cfg,
-        &cfg.routes[1], // overflow: no preflight block at all
+        cfg.default_ramp(),
+        &cfg.default_ramp().routes[1], // overflow: no preflight block at all
         Default::default(),
         &simmer::admin::view::UsageByRoute::new(),
         &registry_after(&cfg, &healthy_dns()).await,
@@ -434,7 +439,7 @@ async fn no_read_endpoint_leaks_a_recipient_through_the_preflight_block() {
     let registry = registry_after(&cfg, &dns_without_dkim()).await;
 
     let view = simmer::admin::view::project_routes(
-        &cfg,
+        cfg.default_ramp(),
         &Default::default(),
         &simmer::admin::view::UsageByRoute::new(),
         &registry,

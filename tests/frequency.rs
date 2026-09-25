@@ -52,12 +52,15 @@ database:
 admin: {{ listen: "127.0.0.1:0", auth_token: "t" }}
 logging: {{ level: warn, format: text }}
 dot_insensitive_domains: ["gmail.com"]
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - {{ name: catchall, domains: ["*"] }}
-senders:
+  senders:
   - {{ match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }}
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: "127.0.0.1"
@@ -343,8 +346,9 @@ async fn walk(
     let mut evaluation = Vec::new();
     let chain = vec!["warming".to_string(), "overflow".to_string()];
     let walked = chain::walk_and_reserve(
-        cfg,
+        cfg.default_ramp(),
         &simmer::routing::domain_group::Grouper::literal(),
+        &cfg.dot_insensitive_domains,
         store,
         &Frequency::new(),
         &simmer::preflight::Registry::new(),

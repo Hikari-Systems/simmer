@@ -648,11 +648,11 @@ impl Session {
         // reservation. The authoritative check is the reservation itself, taken
         // immediately before the downstream conversation, so a reservation never
         // spans the DATA transfer.
-        if crate::routing::sender_match::can_decide_at_rcpt(cfg) {
+        if crate::routing::sender_match::can_decide_at_rcpt(cfg.default_ramp()) {
             let senders = Senders::new(tx.mail_from.as_deref(), None);
             let engine = self.engine.clone();
             if let Err(e) = relay::check_early(&engine, &senders, &to).await {
-                let r = e.to_reply(&engine.config);
+                let r = e.to_reply(engine.config.default_ramp());
                 tracing::info!(
                     correlation_id = %self.correlation_id,
                     reason = ?e,

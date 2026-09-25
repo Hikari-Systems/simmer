@@ -46,12 +46,15 @@ database:
   fail_closed: true
 admin: {{ listen: "127.0.0.1:0", auth_token: "t" }}
 logging: {{ level: warn, format: text }}
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - {{ name: catchall, domains: ["*"] }}
-senders:
+  senders:
   - {{ match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }}
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: "127.0.0.1"
@@ -87,7 +90,10 @@ async fn keyer(store: &Arc<dyn QuotaStore>) -> Keyer {
 }
 
 fn day_index(cfg: &simmer::config::Config) -> i64 {
-    simmer::quota::day::for_route(cfg.route("warming").expect("route"), Utc::now())
+    simmer::quota::day::for_route(
+        cfg.default_ramp().route("warming").expect("route"),
+        Utc::now(),
+    )
 }
 
 fn recipients(n: usize) -> Vec<String> {
@@ -103,8 +109,9 @@ async fn walk(
     let mut evaluation = Vec::new();
     let chain = vec!["warming".to_string(), "overflow".to_string()];
     let walked = chain::walk_and_reserve(
-        cfg,
+        cfg.default_ramp(),
         &simmer::routing::domain_group::Grouper::literal(),
+        &cfg.dot_insensitive_domains,
         store,
         &Frequency::new(),
         &simmer::preflight::Registry::new(),
@@ -244,8 +251,9 @@ async fn dry_run_gives_the_real_walks_answer(pool: PgPool) {
 
     for r in recipients(40) {
         let dry = chain::dry_walk(
-            &cfg,
+            cfg.default_ramp(),
             &simmer::routing::domain_group::Grouper::literal(),
+            &cfg.dot_insensitive_domains,
             &store,
             &Frequency::new(),
             &simmer::preflight::Registry::new(),
@@ -289,13 +297,16 @@ database:
   fail_closed: true
 admin: {{ listen: "127.0.0.1:0", auth_token: "t" }}
 logging: {{ level: warn, format: text }}
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - {{ name: google, domains: ["gmail.com"] }}
   - {{ name: catchall, domains: ["*"] }}
-senders:
+  senders:
   - {{ match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }}
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: "127.0.0.1"
@@ -358,8 +369,9 @@ async fn offered_count(
     let mut offered = 0;
     for r in recipients(n) {
         let dry = chain::dry_walk(
-            cfg,
+            cfg.default_ramp(),
             &simmer::routing::domain_group::Grouper::literal(),
+            &cfg.dot_insensitive_domains,
             store,
             &Frequency::new(),
             &simmer::preflight::Registry::new(),
@@ -477,7 +489,7 @@ async fn the_auto_share_is_computed_per_domain_group(pool: PgPool) {
     );
     let store = store(pool);
     let day = day_index(&cfg);
-    let route = cfg.route("warming").expect("route");
+    let route = cfg.default_ramp().route("warming").expect("route");
     let state = simmer::quota::store::RouteState::default();
 
     fill(&store, &cfg, "catchall", 150).await;
@@ -555,8 +567,9 @@ async fn dry_run_gives_the_real_walks_answer_under_auto(pool: PgPool) {
     // clock as the walk, so its answer is the walk's — not a probability.
     for r in recipients(40) {
         let dry = chain::dry_walk(
-            &cfg,
+            cfg.default_ramp(),
             &simmer::routing::domain_group::Grouper::literal(),
+            &cfg.dot_insensitive_domains,
             &store,
             &Frequency::new(),
             &simmer::preflight::Registry::new(),

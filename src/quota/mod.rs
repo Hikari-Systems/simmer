@@ -129,13 +129,16 @@ server:
   auth: { allow_insecure_auth: true }
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
 admin: { listen: "127.0.0.1:8080", auth_token: "t" }
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: google, domains: ["gmail.com"] }
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: w.example
@@ -169,7 +172,7 @@ routes:
     #[test]
     fn walks_the_default_schedule() {
         let cfg = config();
-        let r = cfg.route("warming").unwrap();
+        let r = cfg.default_ramp().route("warming").unwrap();
         assert_eq!(
             allowance_for(r, "catchall", 0, plain()),
             Allowance::Limited(50)
@@ -187,7 +190,7 @@ routes:
     #[test]
     fn a_domain_group_override_replaces_the_default_series() {
         let cfg = config();
-        let r = cfg.route("warming").unwrap();
+        let r = cfg.default_ramp().route("warming").unwrap();
         assert_eq!(
             allowance_for(r, "google", 0, plain()),
             Allowance::Limited(20)
@@ -203,7 +206,7 @@ routes:
         // §7.2: "When day_index exceeds the array bounds, the final value
         // repeats indefinitely. Routes do not auto-graduate to uncapped."
         let cfg = config();
-        let r = cfg.route("warming").unwrap();
+        let r = cfg.default_ramp().route("warming").unwrap();
         assert_eq!(
             allowance_for(r, "catchall", 3, plain()),
             Allowance::Limited(200)
@@ -229,7 +232,7 @@ routes:
         // The distinction matters for the §9.1 skip reason: "not started" and
         // "out of quota" are different operational conditions.
         let cfg = config();
-        let r = cfg.route("warming").unwrap();
+        let r = cfg.default_ramp().route("warming").unwrap();
         assert_eq!(
             allowance_for(r, "catchall", -1, plain()),
             Allowance::NotStarted
@@ -243,7 +246,7 @@ routes:
     #[test]
     fn an_overflow_route_is_unlimited_at_every_day_index() {
         let cfg = config();
-        let r = cfg.route("overflow").unwrap();
+        let r = cfg.default_ramp().route("overflow").unwrap();
         for day in [-5, 0, 1, 10_000] {
             assert_eq!(
                 allowance_for(r, "catchall", day, plain()),
@@ -255,7 +258,7 @@ routes:
     #[test]
     fn graduating_pins_a_route_to_its_final_value_immediately() {
         let cfg = config();
-        let r = cfg.route("warming").unwrap();
+        let r = cfg.default_ramp().route("warming").unwrap();
         let graduated = RouteState {
             paused: false,
             graduated: true,
@@ -275,7 +278,7 @@ routes:
         // Graduation changes the ceiling, not the clock. A route whose start is
         // still in the future has no business sending.
         let cfg = config();
-        let r = cfg.route("warming").unwrap();
+        let r = cfg.default_ramp().route("warming").unwrap();
         let graduated = RouteState {
             paused: false,
             graduated: true,
@@ -296,7 +299,7 @@ routes:
     #[test]
     fn the_reservation_expiry_covers_the_whole_downstream_budget() {
         let cfg = config();
-        let r = cfg.route("warming").unwrap();
+        let r = cfg.default_ramp().route("warming").unwrap();
         // 10 + 30*8 + 120 + 60 = 430s for one recipient.
         assert_eq!(reservation_expiry(r, 1), Duration::from_secs(430));
         // ...and grows with the recipient count, because each RCPT TO is
@@ -309,7 +312,7 @@ routes:
         // The property that matters: the sweeper must never release a
         // reservation for a send that is still legitimately in flight.
         let cfg = config();
-        let r = cfg.route("warming").unwrap();
+        let r = cfg.default_ramp().route("warming").unwrap();
         for recipients in [1, 5, 100] {
             let budget = Duration::from_secs(10)
                 + Duration::from_secs(30) * (7 + recipients)

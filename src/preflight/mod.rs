@@ -169,8 +169,8 @@ pub struct Plan {
 /// identity domain is not a constant — [`warnings`] is what tells the operator
 /// about the second case.
 pub fn plan(cfg: &Config) -> Vec<Plan> {
-    cfg.routes
-        .iter()
+    // Keyed by route name: sound only while §4.2 allows one ramp (D-099).
+    cfg.all_routes()
         .filter(|r| r.preflight_enabled())
         .filter_map(|route| {
             let domain = literal_domain(&route.identity.envelope_from)?;
@@ -577,12 +577,15 @@ server:
 database: {{ url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }}
 admin: {{ listen: "127.0.0.1:0", auth_token: "t" }}
 logging: {{ level: warn, format: text }}
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - {{ name: catchall, domains: ["*"] }}
-senders:
+  senders:
   - {{ match: "oldbrand.com", match_on: envelope, chain: [overflow] }}
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: overflow
     overflow: true
     downstream:
@@ -595,7 +598,7 @@ routes:
 {strict_clause}"#
         );
         let cfg = crate::config::from_str(&yaml, "test").expect("fixture is valid");
-        cfg.routes.into_iter().next().unwrap()
+        cfg.default_ramp().routes.first().cloned().unwrap()
     }
 
     #[test]

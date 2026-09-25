@@ -889,7 +889,7 @@ async fn strict_senders_rejects_an_unmatched_sender_at_rcpt_to() {
     let down = FakeDownstream::start(Script::default()).await;
     let cfg = config_for(down.addr, "").replace(
         "default_chain: [only]",
-        "default_chain: [only]\nstrict_senders: true",
+        "default_chain: [only]\n  strict_senders: true",
     );
     let simmer = Simmer::start(&cfg).await;
 

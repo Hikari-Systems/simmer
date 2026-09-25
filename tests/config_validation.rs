@@ -36,16 +36,19 @@ admin:
   listen: "127.0.0.1:8080"
   auth_token: "tok"
 logging: { level: info, format: json }
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: google, domains: ["gmail.com"] }
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - match: "oldbrand.com"
     match_on: from_header
     chain: [warming, overflow]
-default_chain: [overflow]
-strict_senders: false
-routes:
+  default_chain: [overflow]
+  strict_senders: false
+  routes:
   - name: warming
     downstream:
       host: "smtp.postal.internal"
@@ -211,7 +214,7 @@ fn accepts_mx_suffixes_and_defaults_them_to_none() {
         "  - { name: google, domains: [\"gmail.com\"], mx: [\"google.com\", \"googlemail.com\"] }\n  - { name: catchall, domains: [\"*\"] }\n",
     ))
     .expect("valid");
-    let groups = &cfg.domain_groups;
+    let groups = &cfg.default_ramp().domain_groups;
     assert_eq!(groups[0].mx, ["google.com", "googlemail.com"]);
     assert!(groups[1].mx.is_empty());
 }
@@ -592,7 +595,11 @@ fn the_literal_domain_rule_is_about_the_domain_and_not_the_local_part() {
     );
     let cfg = load(&yaml).expect("a constant domain is all §4.2 asks for");
     assert_eq!(
-        cfg.route("warming").unwrap().identity.envelope_from,
+        cfg.default_ramp()
+            .route("warming")
+            .unwrap()
+            .identity
+            .envelope_from,
         "bounce+{{uuid}}@newbrand.com"
     );
 }
@@ -886,7 +893,7 @@ fn names_the_key_a_bad_template_came_from() {
 
 #[test]
 fn rejects_a_missing_default_chain_when_senders_are_not_strict() {
-    let yaml = BASE.replace("default_chain: [overflow]\n", "");
+    let yaml = BASE.replace("  default_chain: [overflow]\n", "");
     rejected_for(&yaml, "default_chain");
 }
 
@@ -899,7 +906,7 @@ fn rejects_a_default_chain_not_ending_in_an_overflow_route() {
 #[test]
 fn accepts_a_missing_default_chain_when_senders_are_strict() {
     let yaml = BASE
-        .replace("default_chain: [overflow]\n", "")
+        .replace("  default_chain: [overflow]\n", "")
         .replace("strict_senders: false", "strict_senders: true");
     load(&yaml).expect("strict_senders makes default_chain unnecessary");
 }
@@ -1432,7 +1439,7 @@ fn with_affinity(warming_id: &str, overflow_id: &str) -> String {
             "        From: \"News <news@mail.established.com>\"\n",
             &format!("        From: \"News <news@mail.established.com>\"\n        Message-ID: \"{overflow_id}\"\n"),
         );
-    yaml.push_str("thread_affinity: true\n");
+    yaml.push_str("  thread_affinity: true\n");
     yaml
 }
 
@@ -1448,7 +1455,7 @@ fn thread_affinity_accepts_routes_with_distinct_literal_message_id_domains() {
 #[test]
 fn thread_affinity_requires_every_route_to_set_a_message_id() {
     let mut yaml = BASE.to_string();
-    yaml.push_str("thread_affinity: true\n");
+    yaml.push_str("  thread_affinity: true\n");
     match load(&yaml) {
         Err(LoadError::Invalid(v)) => {
             // §4.2: all of them, not the first.
@@ -1460,10 +1467,11 @@ fn thread_affinity_requires_every_route_to_set_a_message_id() {
                 v.mentions("routes.overflow.identity.set_headers.Message-ID"),
                 "{v}"
             );
-            let overflow =
-                v.0.iter()
-                    .filter(|x| x.path == "routes.overflow.identity.set_headers.Message-ID")
-                    .count();
+            let overflow = v
+                .0
+                .iter()
+                .filter(|x| x.path == "ramps.main.routes.overflow.identity.set_headers.Message-ID")
+                .count();
             assert_eq!(
                 overflow, 1,
                 "reported once, though two chains contain it: {v}"
@@ -1512,6 +1520,7 @@ fn with_share(share: &str) -> String {
 fn accepts_a_share_list_followed_by_another_route() {
     let cfg = load(&with_share("[0.1, 0.25, 0.5]")).expect("valid");
     let schedule = &cfg
+        .default_ramp()
         .route("warming")
         .unwrap()
         .warmup
@@ -1535,6 +1544,7 @@ fn accepts_a_share_list_followed_by_another_route() {
 
     let ones = load(&with_share("[1.0, 0.5]")).expect("a share of 1 is valid");
     let schedule = &ones
+        .default_ramp()
         .route("warming")
         .unwrap()
         .warmup
@@ -1547,6 +1557,7 @@ fn accepts_a_share_list_followed_by_another_route() {
     // And absent, or empty, is no partial ramp at all.
     assert!(!load(BASE)
         .unwrap()
+        .default_ramp()
         .route("warming")
         .unwrap()
         .warmup
@@ -1624,6 +1635,7 @@ fn with_auto_share(params: &str) -> String {
 fn accepts_an_auto_share_at_its_defaults() {
     let cfg = load(&with_auto_share("")).expect("valid");
     let schedule = &cfg
+        .default_ramp()
         .route("warming")
         .unwrap()
         .warmup
@@ -1654,6 +1666,7 @@ fn accepts_an_auto_share_with_every_parameter_set() {
     );
     let cfg = load(&yaml).expect("valid");
     let auto = cfg
+        .default_ramp()
         .route("warming")
         .unwrap()
         .warmup
@@ -1864,4 +1877,199 @@ fn an_unset_metrics_key_warns_and_an_explicit_one_does_not() {
             "{value}: {explicit:?}"
         );
     }
+}
+
+// -- §3.4 / §4.2: ramps (D-099) ------------------------------------------
+
+/// The seven keys D-099 moved under `ramps.<name>`.
+const RAMP_KEYS: [&str; 7] = [
+    "domain_groups",
+    "senders",
+    "default_chain",
+    "strict_senders",
+    "thread_affinity",
+    "exhausted_chain_reply",
+    "routes",
+];
+
+/// [`BASE`] as a pre-D-099 document: the routing block back at the top level.
+fn pre_ramps(extra: &str) -> String {
+    let mut yaml = BASE.replace("default_ramp: main\nramps:\n main:\n", "");
+    for key in RAMP_KEYS {
+        yaml = yaml.replace(&format!("\n  {key}:"), &format!("\n{key}:"));
+    }
+    yaml + extra
+}
+
+#[test]
+fn a_pre_ramps_config_is_refused_with_a_pointer_for_every_moved_key() {
+    let yaml = pre_ramps("thread_affinity: false\nexhausted_chain_reply: \"451\"\n");
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            // All seven, from one failed start (§4.2), each saying where it went.
+            for key in RAMP_KEYS {
+                let hit = v.0.iter().find(|x| x.path == key);
+                let hit = hit.unwrap_or_else(|| panic!("no violation for '{key}':\n{v}"));
+                assert!(hit.message.contains("ramps"), "{hit}");
+                assert!(hit.message.contains("default_ramp"), "{hit}");
+                assert!(hit.message.contains("D-099"), "{hit}");
+            }
+        }
+        other => panic!("expected the moved keys to be named, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_single_moved_key_is_named_on_its_own() {
+    // An operator who has migrated all but one key is told which one.
+    rejected_for(&format!("{BASE}strict_senders: true\n"), "strict_senders");
+}
+
+#[test]
+fn default_ramp_is_required() {
+    let yaml = BASE.replace("default_ramp: main\n", "");
+    match load(&yaml) {
+        Err(LoadError::Parse { source, .. }) => {
+            assert!(source.to_string().contains("default_ramp"), "{source}")
+        }
+        other => panic!("expected a missing-field error, got {other:?}"),
+    }
+}
+
+#[test]
+fn default_ramp_must_name_a_declared_ramp() {
+    let yaml = BASE.replace("default_ramp: main\n", "default_ramp: mian\n");
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            let hit =
+                v.0.iter()
+                    .find(|x| x.path == "default_ramp")
+                    .expect("named");
+            // Says what it named and what exists, so the typo is obvious.
+            assert!(
+                hit.message.contains("'mian'") && hit.message.contains("main"),
+                "{hit}"
+            );
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn ramps_must_not_be_empty() {
+    let empty = "default_ramp: main\nramps: {}\n";
+    let head = &BASE[..BASE.find("default_ramp: main").expect("fixture")];
+    rejected_for(&format!("{head}{empty}"), "at least one ramp");
+}
+
+#[test]
+fn a_ramp_name_must_be_short_and_url_safe() {
+    for bad in ["-leading", "has space", "slash/ed", "ünicode"] {
+        let yaml = BASE
+            .replace(
+                "default_ramp: main\n",
+                &format!("default_ramp: \"{bad}\"\n"),
+            )
+            .replace("\n main:\n", &format!("\n \"{bad}\":\n"));
+        rejected_for(&yaml, "a ramp name must start with a letter or digit");
+    }
+
+    let long = "r".repeat(65);
+    let yaml = BASE
+        .replace("default_ramp: main\n", &format!("default_ramp: {long}\n"))
+        .replace("\n main:\n", &format!("\n {long}:\n"));
+    rejected_for(&yaml, "at most 64 characters");
+
+    for good in ["a", "transactional", "brand-2.eu_west", "0"] {
+        let yaml = BASE
+            .replace(
+                "default_ramp: main\n",
+                &format!("default_ramp: \"{good}\"\n"),
+            )
+            .replace("\n main:\n", &format!("\n \"{good}\":\n"));
+        let cfg = load(&yaml).unwrap_or_else(|e| panic!("'{good}' should be valid: {e}"));
+        assert_eq!(cfg.default_ramp().name, good);
+    }
+}
+
+#[test]
+fn a_ramp_declared_twice_is_refused() {
+    // The YAML layer refuses a repeated mapping key before validation runs, so a
+    // second `main:` cannot silently replace the first.
+    let tail = &BASE[BASE.find("\n main:\n").expect("fixture")..];
+    let yaml = format!("{BASE}{tail}");
+    match load(&yaml) {
+        Err(LoadError::Parse { source, .. }) => {
+            assert!(source.to_string().contains("duplicate"), "{source}")
+        }
+        other => panic!("expected a duplicate-key error, got {other:?}"),
+    }
+}
+
+#[test]
+fn more_than_one_ramp_is_refused_until_state_is_keyed_by_ramp() {
+    // D-099's phasing: the scaffolding rule that goes when storage, pools and
+    // metrics carry the ramp.
+    let second =
+        &BASE[BASE.find("\n main:\n").expect("fixture")..].replace("\n main:\n", "\n other:\n");
+    rejected_for(&format!("{BASE}{second}"), "exactly one");
+}
+
+#[test]
+fn a_violation_inside_a_ramp_names_the_ramp() {
+    let yaml = BASE.replace("chain: [warming, overflow]", "chain: [warming, nonesuch]");
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            let hit =
+                v.0.iter()
+                    .find(|x| x.message.contains("nonesuch"))
+                    .expect("reported");
+            assert!(hit.path.starts_with("ramps.main.senders[0]"), "{hit}");
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn ramp_level_and_per_ramp_violations_are_reported_together() {
+    // §4.2's "all, not the first", across the new boundary: a bad default_ramp
+    // does not hide what is wrong inside the ramp.
+    let yaml = BASE
+        .replace("default_ramp: main\n", "default_ramp: nonesuch\n")
+        .replace("default_chain: [overflow]", "default_chain: [warming]");
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            assert!(v.0.iter().any(|x| x.path == "default_ramp"), "{v}");
+            assert!(
+                v.0.iter().any(|x| x.path == "ramps.main.default_chain"),
+                "{v}"
+            );
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_ramp_not_called_main_is_the_one_routed_in() {
+    let yaml = BASE
+        .replace("default_ramp: main\n", "default_ramp: transactional\n")
+        .replace("\n main:\n", "\n transactional:\n");
+    let cfg = load(&yaml).expect("valid");
+    assert_eq!(cfg.ramps.len(), 1);
+    assert_eq!(cfg.default_ramp().name, "transactional");
+    assert!(cfg.ramp("transactional").is_some());
+    assert!(cfg.ramp("main").is_none());
+    assert_eq!(cfg.default_ramp().routes.len(), 2);
+}
+
+#[test]
+fn warnings_inside_a_ramp_name_the_ramp() {
+    // strict_senders: false is warned about (§14.2), now under its ramp.
+    let warnings = config::validate::warnings(&load(BASE).expect("valid"));
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.path == "ramps.main.strict_senders"),
+        "{warnings:?}"
+    );
 }

@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use crate::config::Config;
+use crate::config::{Config, Ramp};
 use crate::downstream::{self, TlsConfigs};
 use crate::frequency::Frequency;
 use crate::metrics;
@@ -93,12 +93,12 @@ pub enum SelectError {
 }
 
 impl SelectError {
-    pub fn to_reply(&self, cfg: &Config) -> Reply {
+    pub fn to_reply(&self, ramp: &Ramp) -> Reply {
         match self {
             SelectError::StrictSenderRejected { .. } => reply::sender_not_configured(),
             SelectError::MalformedFromHeader => reply::malformed_from_header(),
             SelectError::ChainExhausted => reply::no_eligible_route(matches!(
-                cfg.exhausted_chain_reply,
+                ramp.exhausted_chain_reply,
                 crate::config::ExhaustedChainReply::Permanent
             )),
             // §7.5's own wording. Temporary, necessarily: the recipient is fine,
@@ -113,14 +113,14 @@ impl SelectError {
 /// Pure and synchronous. Splitting it out from the chain walk is what lets the
 /// §5.4 early check and the final-dot path share exactly one implementation of
 /// the sender policy.
-pub fn resolve_chain<'a>(cfg: &'a Config, senders: &Senders) -> Result<&'a [String], SelectError> {
+pub fn resolve_chain<'a>(ramp: &'a Ramp, senders: &Senders) -> Result<&'a [String], SelectError> {
     // §5.4: a rule that tests the From: header needs one to exist.
     //
     // The check is "does *any* rule need it", not "does the rule that would have
     // matched need it" — a rule cannot be known to match until the header it
     // tests has been parsed, so the narrower reading is unimplementable
     // (D-028).
-    let needs_from_header = cfg
+    let needs_from_header = ramp
         .senders
         .iter()
         .any(|r| !matches!(r.match_on, crate::config::MatchOn::Envelope));
@@ -139,7 +139,7 @@ pub fn resolve_chain<'a>(cfg: &'a Config, senders: &Senders) -> Result<&'a [Stri
         metrics::sender_mismatch();
     }
 
-    match sender_match::match_sender(cfg, senders) {
+    match sender_match::match_sender(ramp, senders) {
         sender_match::Match::Rule { rule, .. } => Ok(&rule.chain),
         sender_match::Match::Unmatched => {
             let domain = senders
@@ -149,7 +149,7 @@ pub fn resolve_chain<'a>(cfg: &'a Config, senders: &Senders) -> Result<&'a [Stri
                 .and_then(|a| a.rsplit_once('@').map(|(_, d)| d.to_ascii_lowercase()))
                 .unwrap_or_default();
 
-            if cfg.strict_senders {
+            if ramp.strict_senders {
                 return Err(SelectError::StrictSenderRejected { domain });
             }
 
@@ -163,7 +163,7 @@ pub fn resolve_chain<'a>(cfg: &'a Config, senders: &Senders) -> Result<&'a [Stri
             metrics::unmatched_sender(&domain);
 
             // O-6: walk it normally, like any other chain.
-            Ok(cfg
+            Ok(ramp
                 .default_chain
                 .as_deref()
                 // §4.2 guarantees this exists whenever strict_senders is false.
@@ -181,17 +181,10 @@ pub async fn check_early(
     senders: &Senders,
     recipient: &str,
 ) -> Result<(), SelectError> {
-    let chain = resolve_chain(&engine.config, senders)?;
+    let ramp = engine.config.default_ramp();
+    let chain = resolve_chain(ramp, senders)?;
 
-    match chain::any_eligible(
-        &engine.config,
-        &engine.groups,
-        &engine.quota,
-        chain,
-        recipient,
-    )
-    .await
-    {
+    match chain::any_eligible(ramp, &engine.groups, &engine.quota, chain, recipient).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(SelectError::ChainExhausted),
         Err(e) => Err(quota_failure(&engine.config, e, "early eligibility check")),
@@ -229,12 +222,15 @@ pub async fn reserve_relay_commit(
     correlation_id: &str,
 ) -> Reply {
     let cfg = &engine.config;
+    // §5.8 (D-099). Until selection lands every message is routed in the
+    // default ramp, which §4.2 currently requires to be the only one.
+    let ramp = cfg.default_ramp();
 
-    let chain = match resolve_chain(cfg, senders) {
+    let chain = match resolve_chain(ramp, senders) {
         Ok(c) => c,
         Err(e) => {
             tracing::info!(correlation_id, reason = ?e, "no route selected");
-            return e.to_reply(cfg);
+            return e.to_reply(ramp);
         }
     };
 
@@ -245,14 +241,15 @@ pub async fn reserve_relay_commit(
     // day's cap — counted, under the row lock, but not refused. Pause, strict
     // preflight and a future start still apply: they say the route cannot
     // send, not that it has sent enough.
-    let pin = thread::pin_for_message(cfg, chain, message.body);
+    let pin = thread::pin_for_message(ramp, chain, message.body);
     let walk_order = thread::order(chain, &pin);
 
     // -- §7.4 phase 1 -------------------------------------------------
     let mut evaluation = Vec::new();
     let selected = match chain::walk_and_reserve(
-        cfg,
+        ramp,
         &engine.groups,
+        &cfg.dot_insensitive_domains,
         &engine.quota,
         &engine.frequency,
         &engine.preflight,
@@ -279,11 +276,11 @@ pub async fn reserve_relay_commit(
                 thread_pin = pin.as_log(),
                 "no eligible route in chain"
             );
-            return SelectError::ChainExhausted.to_reply(cfg);
+            return SelectError::ChainExhausted.to_reply(ramp);
         }
         Err(e) => {
             let err = quota_failure(cfg, e, "reservation");
-            return err.to_reply(cfg);
+            return err.to_reply(ramp);
         }
     };
 
@@ -509,12 +506,15 @@ server:
   auth: { allow_insecure_auth: true }
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
 admin: { listen: "127.0.0.1:8080", auth_token: "t" }
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: warm.example
@@ -535,8 +535,9 @@ routes:
 
     fn config(extra: &[(&str, &str)]) -> Config {
         let mut yaml = CFG.to_string();
+        // Ramp-level keys: two spaces, inside the fixture's one ramp (D-099).
         for (k, v) in extra {
-            yaml.push_str(&format!("{k}: {v}\n"));
+            yaml.push_str(&format!("  {k}: {v}\n"));
         }
         crate::config::from_str(&yaml, "test").expect("fixture is valid")
     }
@@ -544,14 +545,22 @@ routes:
     #[test]
     fn a_matched_sender_yields_its_own_chain() {
         let cfg = config(&[]);
-        let chain = resolve_chain(&cfg, &Senders::new(Some("a@oldbrand.com"), None)).unwrap();
+        let chain = resolve_chain(
+            cfg.default_ramp(),
+            &Senders::new(Some("a@oldbrand.com"), None),
+        )
+        .unwrap();
         assert_eq!(chain, ["warming".to_string(), "overflow".to_string()]);
     }
 
     #[test]
     fn an_unmatched_sender_falls_to_the_default_chain() {
         let cfg = config(&[]);
-        let chain = resolve_chain(&cfg, &Senders::new(Some("a@elsewhere.com"), None)).unwrap();
+        let chain = resolve_chain(
+            cfg.default_ramp(),
+            &Senders::new(Some("a@elsewhere.com"), None),
+        )
+        .unwrap();
         assert_eq!(chain, ["overflow".to_string()]);
     }
 
@@ -559,7 +568,11 @@ routes:
     fn strict_senders_rejects_an_unmatched_sender() {
         let cfg = config(&[("strict_senders", "true")]);
         assert_eq!(
-            resolve_chain(&cfg, &Senders::new(Some("a@elsewhere.com"), None)).err(),
+            resolve_chain(
+                cfg.default_ramp(),
+                &Senders::new(Some("a@elsewhere.com"), None)
+            )
+            .err(),
             Some(SelectError::StrictSenderRejected {
                 domain: "elsewhere.com".into()
             })
@@ -574,19 +587,29 @@ routes:
         let err = SelectError::StrictSenderRejected {
             domain: "x.com".into(),
         };
-        assert_eq!(err.to_reply(&cfg).code, 550);
+        assert_eq!(err.to_reply(cfg.default_ramp()).code, 550);
     }
 
     #[test]
     fn chain_exhaustion_defaults_to_451_not_550() {
         let cfg = config(&[]);
-        assert_eq!(SelectError::ChainExhausted.to_reply(&cfg).code, 451);
+        assert_eq!(
+            SelectError::ChainExhausted
+                .to_reply(cfg.default_ramp())
+                .code,
+            451
+        );
     }
 
     #[test]
     fn chain_exhaustion_honours_an_explicit_550_policy() {
         let cfg = config(&[("exhausted_chain_reply", "\"550\"")]);
-        assert_eq!(SelectError::ChainExhausted.to_reply(&cfg).code, 550);
+        assert_eq!(
+            SelectError::ChainExhausted
+                .to_reply(cfg.default_ramp())
+                .code,
+            550
+        );
     }
 
     #[test]
@@ -594,7 +617,7 @@ routes:
         // §7.5's reply, and §14.1's reasoning: Simmer's database being down says
         // nothing permanent about the recipient.
         let cfg = config(&[]);
-        let r = SelectError::QuotaUnavailable.to_reply(&cfg);
+        let r = SelectError::QuotaUnavailable.to_reply(cfg.default_ramp());
         assert_eq!(r.code, 451);
         assert!(r.to_wire().contains("4.3.0"));
     }
@@ -602,12 +625,20 @@ routes:
     #[test]
     fn a_missing_from_header_is_only_fatal_when_a_rule_needs_it() {
         let cfg = config(&[]);
-        assert!(resolve_chain(&cfg, &Senders::new(Some("a@oldbrand.com"), None)).is_ok());
+        assert!(resolve_chain(
+            cfg.default_ramp(),
+            &Senders::new(Some("a@oldbrand.com"), None)
+        )
+        .is_ok());
 
         let mut cfg = config(&[]);
-        cfg.senders[0].match_on = crate::config::MatchOn::FromHeader;
+        cfg.default_ramp_mut().senders[0].match_on = crate::config::MatchOn::FromHeader;
         assert_eq!(
-            resolve_chain(&cfg, &Senders::new(Some("a@oldbrand.com"), None)).err(),
+            resolve_chain(
+                cfg.default_ramp(),
+                &Senders::new(Some("a@oldbrand.com"), None)
+            )
+            .err(),
             Some(SelectError::MalformedFromHeader)
         );
     }
@@ -615,7 +646,7 @@ routes:
     #[test]
     fn a_null_envelope_sender_still_routes() {
         let cfg = config(&[]);
-        let chain = resolve_chain(&cfg, &Senders::new(None, None)).unwrap();
+        let chain = resolve_chain(cfg.default_ramp(), &Senders::new(None, None)).unwrap();
         assert_eq!(chain, ["overflow".to_string()]);
     }
 }

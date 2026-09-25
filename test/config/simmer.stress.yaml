@@ -57,60 +57,67 @@ logging:
   level: info
   format: json
 
-domain_groups:
-  - name: catchall
-    domains: ["*"]
+# §3.4 (D-099): each ramp is a complete, isolated routing profile. Everything
+# below lives inside one; a second ramp would repeat the whole block under its
+# own name, sharing nothing with this one. `default_ramp` is the ramp a message
+# is routed in when neither its listener nor an X-Simmer-Ramp header names one.
+default_ramp: main
+ramps:
+  main:
+    domain_groups:
+      - name: catchall
+        domains: ["*"]
 
-senders:
-  - match: "oldbrand.com"
-    match_on: envelope
-    chain: [warming-newbrand, overflow-established]
+    senders:
+      - match: "oldbrand.com"
+        match_on: envelope
+        chain: [warming-newbrand, overflow-established]
 
-default_chain: [overflow-established]
-strict_senders: false
+    default_chain: [overflow-established]
+    strict_senders: false
 
-routes:
-  # The warming route, with an allowance no scenario reaches unless it sets an
-  # override: steering mid-run is a scenario's choice (S6), not an accident of
-  # the schedule.
-  - name: warming-newbrand
-    downstream:
-      host: "sink"
-      port: 2525
-      tls: off
-      pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
-      timeouts:
-        connect: 5s
-        command: 10s
-        data: 60s
-    identity:
-      envelope_from: "bounce@newbrand.com"
-      set_headers:
-        X-Simmer-Route: "{{route.name}}"
-      body_rewrites:
-        - pattern: 'https://oldbrand\.com/'
-          replacement: "https://newbrand.com/"
-    preflight:
-      enabled: false
-    warmup:
-      started: "${SIMMER_WARMUP_STARTED}"
-      schedule:
-        default: [1000000]
+    routes:
+      # The warming route, with an allowance no scenario reaches unless it sets an
+      # override: steering mid-run is a scenario's choice (S6), not an accident of
+      # the schedule.
+      - name: warming-newbrand
+        downstream:
+          host: "sink"
+          port: 2525
+          tls: off
+          pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+          timeouts:
+            connect: 5s
+            command: 10s
+            data: 60s
+        identity:
+          envelope_from: "bounce@newbrand.com"
+          set_headers:
+            X-Simmer-Route: "{{route.name}}"
+          body_rewrites:
+            - pattern: 'https://oldbrand\.com/'
+              replacement: "https://newbrand.com/"
+        preflight:
+          enabled: false
+        warmup:
+          started: "${SIMMER_WARMUP_STARTED}"
+          schedule:
+            default: [1000000]
 
-  - name: overflow-established
-    overflow: true
-    downstream:
-      host: "sink"
-      port: 2526
-      tls: off
-      pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
-      timeouts:
-        connect: 5s
-        command: 10s
-        data: 60s
-    identity:
-      envelope_from: "bounce@mail.established.com"
-      set_headers:
-        X-Simmer-Route: "{{route.name}}"
-    preflight:
-      enabled: false
+      - name: overflow-established
+        overflow: true
+        downstream:
+          host: "sink"
+          port: 2526
+          tls: off
+          pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
+          timeouts:
+            connect: 5s
+            command: 10s
+            data: 60s
+        identity:
+          envelope_from: "bounce@mail.established.com"
+          set_headers:
+            X-Simmer-Route: "{{route.name}}"
+        preflight:
+          enabled: false

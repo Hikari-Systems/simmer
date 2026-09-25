@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::config::{Config, DomainGroup, RecipientFrequency, Route, ShareSchedule, TlsMode};
+use crate::config::{DomainGroup, Ramp, RecipientFrequency, Route, ShareSchedule, TlsMode};
 use crate::quota::store::{RouteState, Usage};
 use crate::quota::{self, Allowance};
 
@@ -230,7 +230,7 @@ pub type UsageByRoute = HashMap<(String, String), Usage>;
 /// Project one route. `usage` is keyed `(route, domain_group)` so one query can
 /// feed every route.
 pub fn project_route(
-    cfg: &Config,
+    ramp: &Ramp,
     route: &Route,
     state: RouteState,
     usage: &UsageByRoute,
@@ -249,7 +249,7 @@ pub fn project_route(
         RouteStatus::Active
     };
 
-    let groups = cfg
+    let groups = ramp
         .domain_groups
         .iter()
         .map(|group| {
@@ -357,7 +357,7 @@ pub fn project_group(
 
 /// §9.2 `GET /routes`, for every route in configuration order.
 pub fn project_routes(
-    cfg: &Config,
+    ramp: &Ramp,
     states: &HashMap<String, RouteState>,
     usage: &UsageByRoute,
     preflight: &crate::preflight::Registry,
@@ -366,12 +366,12 @@ pub fn project_routes(
 ) -> RoutesView {
     RoutesView {
         generated_at: now,
-        routes: cfg
+        routes: ramp
             .routes
             .iter()
             .map(|route| {
                 let state = states.get(&route.name).copied().unwrap_or_default();
-                project_route(cfg, route, state, usage, preflight, pools, now)
+                project_route(ramp, route, state, usage, preflight, pools, now)
             })
             .collect(),
     }
@@ -409,6 +409,7 @@ fn tls_name(mode: TlsMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     const CFG: &str = r#"
 server:
@@ -423,13 +424,16 @@ server:
   auth: { allow_insecure_auth: true }
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
 admin: { listen: "127.0.0.1:8080", auth_token: "0123456789abcdef" }
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: google, domains: ["gmail.com"] }
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: w.example
@@ -472,8 +476,8 @@ routes:
 
     fn view(cfg: &Config, route: &str, state: RouteState, usage: &UsageByRoute) -> RouteView {
         project_route(
-            cfg,
-            cfg.route(route).unwrap(),
+            cfg.default_ramp(),
+            cfg.default_ramp().route(route).unwrap(),
             state,
             usage,
             &crate::preflight::Registry::new(),
@@ -641,8 +645,8 @@ routes:
         let cfg = config();
         let earlier: DateTime<Utc> = "2026-07-30T00:00:00Z".parse().unwrap();
         let v = project_route(
-            &cfg,
-            cfg.route("warming").unwrap(),
+            cfg.default_ramp(),
+            cfg.default_ramp().route("warming").unwrap(),
             RouteState::default(),
             &UsageByRoute::new(),
             &crate::preflight::Registry::new(),
@@ -660,8 +664,8 @@ routes:
         let cfg = config();
         let earlier: DateTime<Utc> = "2026-07-30T00:00:00Z".parse().unwrap();
         let v = project_route(
-            &cfg,
-            cfg.route("warming").unwrap(),
+            cfg.default_ramp(),
+            cfg.default_ramp().route("warming").unwrap(),
             RouteState {
                 paused: true,
                 graduated: false,
@@ -685,8 +689,8 @@ routes:
         // google, whose series ends at 40 after two entries.
         let earlier: DateTime<Utc> = "2026-08-01T10:00:00Z".parse().unwrap();
         let v = project_route(
-            &cfg,
-            cfg.route("warming").unwrap(),
+            cfg.default_ramp(),
+            cfg.default_ramp().route("warming").unwrap(),
             state,
             &UsageByRoute::new(),
             &crate::preflight::Registry::new(),
@@ -799,7 +803,7 @@ routes:
         );
 
         let json = serde_json::to_string(&project_routes(
-            &cfg,
+            cfg.default_ramp(),
             &states,
             &usage,
             &crate::preflight::Registry::new(),
@@ -873,7 +877,7 @@ routes:
         // usually asking "what does the chain do next".
         let cfg = config();
         let v = project_routes(
-            &cfg,
+            cfg.default_ramp(),
             &HashMap::new(),
             &UsageByRoute::new(),
             &crate::preflight::Registry::new(),
@@ -888,7 +892,7 @@ routes:
     fn a_route_with_no_state_row_reads_as_the_default() {
         let cfg = config();
         let v = project_routes(
-            &cfg,
+            cfg.default_ramp(),
             &HashMap::new(),
             &UsageByRoute::new(),
             &crate::preflight::Registry::new(),

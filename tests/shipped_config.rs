@@ -60,10 +60,10 @@ fn the_shipped_config_loads_and_validates() {
     );
 
     // §4.1 shape.
-    assert_eq!(cfg.domain_groups.len(), 4);
-    assert_eq!(cfg.routes.len(), 2);
-    assert_eq!(cfg.senders.len(), 4);
-    assert!(cfg.catchall_group().is_some());
+    assert_eq!(cfg.default_ramp().domain_groups.len(), 4);
+    assert_eq!(cfg.default_ramp().routes.len(), 2);
+    assert_eq!(cfg.default_ramp().senders.len(), 4);
+    assert!(cfg.default_ramp().catchall_group().is_some());
 
     // D-047 — one recipient per transaction, so §5.5's ceiling has nothing left
     // to limit and the shipped file says so rather than warning at every start.
@@ -72,7 +72,7 @@ fn the_shipped_config_loads_and_validates() {
     assert!(cfg.database.fail_closed);
     // §10.3 default.
     assert_eq!(
-        cfg.exhausted_chain_reply,
+        cfg.default_ramp().exhausted_chain_reply,
         config::ExhaustedChainReply::Temporary
     );
 }
@@ -82,7 +82,10 @@ fn every_field_of_the_spec_example_survives_the_round_trip() {
     let _env = env_guard();
     let cfg = load_shipped();
 
-    let warming = cfg.route("warming-newbrand").expect("warming route");
+    let warming = cfg
+        .default_ramp()
+        .route("warming-newbrand")
+        .expect("warming route");
     assert!(!warming.overflow);
     assert_eq!(warming.downstream.port, 587);
     assert_eq!(warming.downstream.tls, config::TlsMode::RequiredVerify);
@@ -133,7 +136,10 @@ fn every_field_of_the_spec_example_survives_the_round_trip() {
     assert_eq!(freq.mode, config::FrequencyMode::ToAddress);
 
     // The overflow route carries no warm-up and is never quota-limited (§3.1).
-    let overflow = cfg.route("overflow-established").expect("overflow route");
+    let overflow = cfg
+        .default_ramp()
+        .route("overflow-established")
+        .expect("overflow route");
     assert!(overflow.overflow);
     assert!(overflow.warmup.is_none());
 }
@@ -145,6 +151,7 @@ fn the_schedule_repeats_its_final_value_rather_than_uncapping() {
     // indefinitely. Routes do not auto-graduate to uncapped."
     let cfg = load_shipped();
     let schedule = &cfg
+        .default_ramp()
         .route("warming-newbrand")
         .expect("warming route")
         .warmup
@@ -218,11 +225,14 @@ fn the_shipped_config_is_ready_for_thread_affinity() {
     set_all_vars();
     let text = std::fs::read_to_string("simmer.yaml").expect("read");
     assert!(
-        text.contains("\nthread_affinity: false\n"),
+        text.contains("\n    thread_affinity: false"),
         "documented and off"
     );
-    let on = text.replace("\nthread_affinity: false\n", "\nthread_affinity: true\n");
+    let on = text.replace(
+        "\n    thread_affinity: false",
+        "\n    thread_affinity: true",
+    );
     let cfg = config::from_str(&on, "simmer.yaml")
         .unwrap_or_else(|e| panic!("simmer.yaml is not valid with thread_affinity on:\n{e}"));
-    assert!(cfg.thread_affinity);
+    assert!(cfg.default_ramp().thread_affinity);
 }

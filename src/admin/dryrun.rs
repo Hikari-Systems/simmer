@@ -207,6 +207,8 @@ pub async fn dryrun(
     Json(request): Json<DryRunRequest>,
 ) -> Result<Json<DryRunResponse>, ApiError> {
     let cfg = state.config();
+    // §5.8 (D-099): the default ramp until selection is implemented.
+    let ramp = cfg.default_ramp();
     let now = Utc::now();
 
     if request.recipients.is_empty() {
@@ -231,7 +233,7 @@ pub async fn dryrun(
     // formed and this is what would happen to it — so it is a `200` describing
     // the refusal, not an HTTP error. There is simply no chain to walk, so no
     // recipient is evaluated.
-    let chain = match relay::resolve_chain(cfg, &senders) {
+    let chain = match relay::resolve_chain(ramp, &senders) {
         Ok(chain) => chain,
         Err(e) => {
             return Ok(Json(DryRunResponse {
@@ -244,14 +246,14 @@ pub async fn dryrun(
                 refused: Some(Refused {
                     reason: refusal_reason(&e),
                     explanation: refusal_explanation(&e),
-                    would_reply: e.to_reply(cfg).to_wire().trim_end().to_string(),
+                    would_reply: e.to_reply(ramp).to_wire().trim_end().to_string(),
                 }),
                 recipients: Vec::new(),
             }));
         }
     };
 
-    let (matched_rule, chain_source) = match sender_match::match_sender(cfg, &senders) {
+    let (matched_rule, chain_source) = match sender_match::match_sender(ramp, &senders) {
         sender_match::Match::Rule { rule, index } => (
             Some(MatchedRule {
                 index,
@@ -268,7 +270,7 @@ pub async fn dryrun(
     // the same message, so a dry run cannot read threading headers differently.
     // The pin depends on the headers and the chain, never on the recipient.
     let pin = crate::routing::thread::pin_for_message(
-        cfg,
+        ramp,
         chain,
         &synthesise(&request, &request.recipients[0]),
     );
@@ -355,18 +357,20 @@ async fn evaluate_one(
     now: chrono::DateTime<Utc>,
 ) -> Result<RecipientOutcome, ApiError> {
     let cfg = state.config();
+    let ramp = cfg.default_ramp();
 
     // The walk resolves the group again; the second answer comes from the
     // cache this one just filled, so the two cannot disagree in practice.
-    let (domain_group, domain_group_basis) = match state.engine.groups.resolve(cfg, recipient).await
-    {
-        Some(r) => (r.group.name.clone(), r.basis.describe()),
-        None => ("catchall".to_string(), "fallback".to_string()),
-    };
+    let (domain_group, domain_group_basis) =
+        match state.engine.groups.resolve(ramp, recipient).await {
+            Some(r) => (r.group.name.clone(), r.basis.describe()),
+            None => ("catchall".to_string(), "fallback".to_string()),
+        };
 
     let evaluation = chain::dry_walk(
-        cfg,
+        ramp,
         &state.engine.groups,
+        &cfg.dot_insensitive_domains,
         state.store(),
         &state.engine.frequency,
         &state.engine.preflight,
@@ -385,7 +389,7 @@ async fn evaluate_one(
     let would_reply = match &selected {
         Some(_) => "250 2.0.0 accepted (if the downstream accepts it)".to_string(),
         None => relay::SelectError::ChainExhausted
-            .to_reply(cfg)
+            .to_reply(ramp)
             .to_wire()
             .trim_end()
             .to_string(),

@@ -76,96 +76,103 @@ logging:
   level: info
   format: json
 
-domain_groups:
-  - name: catchall
-    domains: ["*"]
+# §3.4 (D-099): each ramp is a complete, isolated routing profile. Everything
+# below lives inside one; a second ramp would repeat the whole block under its
+# own name, sharing nothing with this one. `default_ramp` is the ramp a message
+# is routed in when neither its listener nor an X-Simmer-Ramp header names one.
+default_ramp: main
+ramps:
+  main:
+    domain_groups:
+      - name: catchall
+        domains: ["*"]
 
-senders:
-  - match: "oldbrand.com"
-    match_on: envelope
-    chain: [warming-newbrand, overflow-established]
+    senders:
+      - match: "oldbrand.com"
+        match_on: envelope
+        chain: [warming-newbrand, overflow-established]
 
-default_chain: [overflow-established]
-strict_senders: false
+    default_chain: [overflow-established]
+    strict_senders: false
 
-routes:
-  - name: warming-newbrand
-    downstream:
-      host: "trap-warming"
-      port: 1025
-      # Phase 10 gives the traps a certificate and moves this to
-      # `required_verify` (`ACCEPTANCE.md` §5). Until then the suite proves the
-      # ramp and the rewrite, not the TLS modes.
-      tls: off
-      pool:
-        max_connections: 4
-        idle_ttl: 60s
-        max_messages_per_connection: 100
-      timeouts:
-        connect: 10s
-        command: 30s
-        data: 120s
-      smtputf8: false
-    identity:
-      # Absolute assignment (§1.1 constraint 1). See the note in `simmer.yaml`
-      # about why this is not the sub-addressed form SPEC.md §4.1 shows.
-      envelope_from: "bounce@newbrand.com"
-      set_headers:
-        From: "{{original.from.display_name}} <sales@newbrand.com>"
-        Reply-To: "{{original.from.address}}"
-        Message-ID: "<{{uuid}}@newbrand.com>"
-        List-Unsubscribe: "<mailto:unsub@newbrand.com>, <https://newbrand.com/u/{{uuid}}>"
-        List-Unsubscribe-Post: "List-Unsubscribe=One-Click"
-        X-Simmer-Route: "{{route.name}}"
-      unstable_headers: ["Reply-To"]
-      remove_headers: ["Return-Path", "X-Mailer"]
-      # §6.4, and `ACCEPTANCE.md` §4.3's last row. The loadgen's body carries
-      # this link; the suite reads it back off a real mail server.
-      body_rewrites:
-        - pattern: 'https://oldbrand\.com/'
-          replacement: "https://newbrand.com/"
-    preflight:
-      # §6.7 is phase 8. Off rather than left at its default, so the suite is not
-      # asserting against a feature that does not exist yet.
-      enabled: false
-    warmup:
-      # The harness sets this to `now - (day × 24h) - 1h`, so at day 0 the route
-      # is one hour into its ramp day: `elapsed` is 1/24, and the fill window
-      # below has almost all of itself left to run.
-      started: "${SIMMER_WARMUP_STARTED}"
-      schedule:
-        default: [40]
-        share:
-          mode: auto
-          # Half, at most, ever. The one hard promise about the peak, and what
-          # makes the throttle visible from the first message instead of only
-          # once the route has run ahead of pace.
-          ceiling: 0.5
-          # Low, so that "the controller alone would stall here" is a state the
-          # tail release can be seen to rescue rather than one the floor hides.
-          floor: 0.02
-          gain: 4.0
-          fill_by: 0.6
-          # The last tenth of 40 is four messages. Enough to tell a release from
-          # a coincidence, few enough that the burst it allows is small.
-          tail: { below: 0.1, ceiling: 1.0 }
+    routes:
+      - name: warming-newbrand
+        downstream:
+          host: "trap-warming"
+          port: 1025
+          # Phase 10 gives the traps a certificate and moves this to
+          # `required_verify` (`ACCEPTANCE.md` §5). Until then the suite proves the
+          # ramp and the rewrite, not the TLS modes.
+          tls: off
+          pool:
+            max_connections: 4
+            idle_ttl: 60s
+            max_messages_per_connection: 100
+          timeouts:
+            connect: 10s
+            command: 30s
+            data: 120s
+          smtputf8: false
+        identity:
+          # Absolute assignment (§1.1 constraint 1). See the note in `simmer.yaml`
+          # about why this is not the sub-addressed form SPEC.md §4.1 shows.
+          envelope_from: "bounce@newbrand.com"
+          set_headers:
+            From: "{{original.from.display_name}} <sales@newbrand.com>"
+            Reply-To: "{{original.from.address}}"
+            Message-ID: "<{{uuid}}@newbrand.com>"
+            List-Unsubscribe: "<mailto:unsub@newbrand.com>, <https://newbrand.com/u/{{uuid}}>"
+            List-Unsubscribe-Post: "List-Unsubscribe=One-Click"
+            X-Simmer-Route: "{{route.name}}"
+          unstable_headers: ["Reply-To"]
+          remove_headers: ["Return-Path", "X-Mailer"]
+          # §6.4, and `ACCEPTANCE.md` §4.3's last row. The loadgen's body carries
+          # this link; the suite reads it back off a real mail server.
+          body_rewrites:
+            - pattern: 'https://oldbrand\.com/'
+              replacement: "https://newbrand.com/"
+        preflight:
+          # §6.7 is phase 8. Off rather than left at its default, so the suite is not
+          # asserting against a feature that does not exist yet.
+          enabled: false
+        warmup:
+          # The harness sets this to `now - (day × 24h) - 1h`, so at day 0 the route
+          # is one hour into its ramp day: `elapsed` is 1/24, and the fill window
+          # below has almost all of itself left to run.
+          started: "${SIMMER_WARMUP_STARTED}"
+          schedule:
+            default: [40]
+            share:
+              mode: auto
+              # Half, at most, ever. The one hard promise about the peak, and what
+              # makes the throttle visible from the first message instead of only
+              # once the route has run ahead of pace.
+              ceiling: 0.5
+              # Low, so that "the controller alone would stall here" is a state the
+              # tail release can be seen to rescue rather than one the floor hides.
+              floor: 0.02
+              gain: 4.0
+              fill_by: 0.6
+              # The last tenth of 40 is four messages. Enough to tell a release from
+              # a coincidence, few enough that the burst it allows is small.
+              tail: { below: 0.1, ceiling: 1.0 }
 
-  - name: overflow-established
-    overflow: true
-    downstream:
-      host: "trap-overflow"
-      port: 1025
-      tls: off
-      pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
-      smtputf8: false
-    identity:
-      envelope_from: "bounce@mail.established.com"
-      set_headers:
-        From: "{{original.from.display_name}} <news@mail.established.com>"
-        Reply-To: "{{original.from.address}}"
-        Message-ID: "<{{uuid}}@mail.established.com>"
-        X-Simmer-Route: "{{route.name}}"
-      unstable_headers: ["Reply-To"]
-      remove_headers: ["Return-Path", "X-Mailer"]
-    preflight:
-      enabled: false
+      - name: overflow-established
+        overflow: true
+        downstream:
+          host: "trap-overflow"
+          port: 1025
+          tls: off
+          pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
+          smtputf8: false
+        identity:
+          envelope_from: "bounce@mail.established.com"
+          set_headers:
+            From: "{{original.from.display_name}} <news@mail.established.com>"
+            Reply-To: "{{original.from.address}}"
+            Message-ID: "<{{uuid}}@mail.established.com>"
+            X-Simmer-Route: "{{route.name}}"
+          unstable_headers: ["Reply-To"]
+          remove_headers: ["Return-Path", "X-Mailer"]
+        preflight:
+          enabled: false

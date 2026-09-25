@@ -103,14 +103,22 @@ async fn run() -> anyhow::Result<()> {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         config = %path,
-        routes = config.routes.len(),
-        senders = config.senders.len(),
-        domain_groups = config.domain_groups.len(),
+        ramps = config.ramps.len(),
+        default_ramp = %config.default_ramp,
         listeners = config.server.listeners.len(),
         admin = %config.admin.listen,
-        strict_senders = config.strict_senders,
         "starting simmer"
     );
+    for ramp in config.ramps.iter() {
+        info!(
+            ramp = %ramp.name,
+            routes = ramp.routes.len(),
+            senders = ramp.senders.len(),
+            domain_groups = ramp.domain_groups.len(),
+            strict_senders = ramp.strict_senders,
+            "ramp"
+        );
+    }
 
     // Non-fatal conditions worth a human's attention: migration-only headers
     // (§6.6), a future warm-up start (§7.2), recipient templates that force
@@ -207,7 +215,10 @@ async fn run() -> anyhow::Result<()> {
     // resolver that cannot be built is a WARN, not a refusal: every domain not
     // listed literally then lands in the catch-all, which is what it did before
     // D-100.
-    let wants_mx = config.domain_groups.iter().any(|g| !g.mx.is_empty());
+    let wants_mx = config
+        .ramps
+        .iter()
+        .any(|r| r.domain_groups.iter().any(|g| !g.mx.is_empty()));
     let groups = if wants_mx {
         match simmer::preflight::resolver::Hickory::from_system() {
             Ok(r) => {

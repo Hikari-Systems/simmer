@@ -65,122 +65,129 @@ logging:
   level: info
   format: json
 
-domain_groups:
-  - name: catchall
-    domains: ["*"]
+# §3.4 (D-099): each ramp is a complete, isolated routing profile. Everything
+# below lives inside one; a second ramp would repeat the whole block under its
+# own name, sharing nothing with this one. `default_ramp` is the ramp a message
+# is routed in when neither its listener nor an X-Simmer-Ramp header names one.
+default_ramp: main
+ramps:
+  main:
+    domain_groups:
+      - name: catchall
+        domains: ["*"]
 
-senders:
-  - { match: "plain.matrix.test", match_on: envelope, chain: [postfix-plain] }
-  - { match: "tls.matrix.test", match_on: envelope, chain: [postfix-tls-auth] }
-  - { match: "login.matrix.test", match_on: envelope, chain: [postfix-login-only] }
-  - { match: "strict.matrix.test", match_on: envelope, chain: [postfix-strict] }
-  - { match: "ratelimit.matrix.test", match_on: envelope, chain: [postfix-ratelimit] }
-  - { match: "flows.matrix.test", match_on: envelope, chain: [warming-flows, mailpit-direct] }
+    senders:
+      - { match: "plain.matrix.test", match_on: envelope, chain: [postfix-plain] }
+      - { match: "tls.matrix.test", match_on: envelope, chain: [postfix-tls-auth] }
+      - { match: "login.matrix.test", match_on: envelope, chain: [postfix-login-only] }
+      - { match: "strict.matrix.test", match_on: envelope, chain: [postfix-strict] }
+      - { match: "ratelimit.matrix.test", match_on: envelope, chain: [postfix-ratelimit] }
+      - { match: "flows.matrix.test", match_on: envelope, chain: [warming-flows, mailpit-direct] }
 
-default_chain: [mailpit-direct]
-strict_senders: false
+    default_chain: [mailpit-direct]
+    strict_senders: false
 
-routes:
-  - name: mailpit-direct
-    overflow: true
-    downstream:
-      host: "trap-matrix"
-      port: 1025
-      tls: off
-      pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
-    identity:
-      envelope_from: "bounce@mailpit-direct.out.test"
-      set_headers:
-        X-Simmer-Route: "{{route.name}}"
+    routes:
+      - name: mailpit-direct
+        overflow: true
+        downstream:
+          host: "trap-matrix"
+          port: 1025
+          tls: off
+          pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@mailpit-direct.out.test"
+          set_headers:
+            X-Simmer-Route: "{{route.name}}"
 
-  - name: postfix-plain
-    overflow: true
-    downstream:
-      host: "postfix-plain"
-      port: 25
-      tls: off
-      pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
-    identity:
-      envelope_from: "bounce@postfix-plain.out.test"
-      set_headers:
-        X-Simmer-Route: "{{route.name}}"
+      - name: postfix-plain
+        overflow: true
+        downstream:
+          host: "postfix-plain"
+          port: 25
+          tls: off
+          pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@postfix-plain.out.test"
+          set_headers:
+            X-Simmer-Route: "{{route.name}}"
 
-  - name: postfix-tls-auth
-    overflow: true
-    downstream:
-      host: "postfix-tls-auth"
-      port: 25
-      # Verified against the per-run test CA, which reaches `app` only through
-      # the OS trust store (test/compose/acceptance.yml's test-trust mount).
-      tls: required_verify
-      auth: { username: "matrix", password: "matrix-password" }
-      pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
-    identity:
-      envelope_from: "bounce@postfix-tls-auth.out.test"
-      set_headers:
-        X-Simmer-Route: "{{route.name}}"
+      - name: postfix-tls-auth
+        overflow: true
+        downstream:
+          host: "postfix-tls-auth"
+          port: 25
+          # Verified against the per-run test CA, which reaches `app` only through
+          # the OS trust store (test/compose/acceptance.yml's test-trust mount).
+          tls: required_verify
+          auth: { username: "matrix", password: "matrix-password" }
+          pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@postfix-tls-auth.out.test"
+          set_headers:
+            X-Simmer-Route: "{{route.name}}"
 
-  - name: postfix-login-only
-    overflow: true
-    downstream:
-      host: "postfix-login-only"
-      port: 25
-      tls: off
-      auth: { username: "matrix", password: "matrix-password" }
-      pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
-    identity:
-      envelope_from: "bounce@postfix-login-only.out.test"
-      set_headers:
-        X-Simmer-Route: "{{route.name}}"
+      - name: postfix-login-only
+        overflow: true
+        downstream:
+          host: "postfix-login-only"
+          port: 25
+          tls: off
+          auth: { username: "matrix", password: "matrix-password" }
+          pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@postfix-login-only.out.test"
+          set_headers:
+            X-Simmer-Route: "{{route.name}}"
 
-  - name: postfix-strict
-    overflow: true
-    downstream:
-      host: "postfix-strict"
-      port: 25
-      tls: off
-      pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
-    identity:
-      envelope_from: "bounce@postfix-strict.out.test"
-      set_headers:
-        X-Simmer-Route: "{{route.name}}"
+      - name: postfix-strict
+        overflow: true
+        downstream:
+          host: "postfix-strict"
+          port: 25
+          tls: off
+          pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@postfix-strict.out.test"
+          set_headers:
+            X-Simmer-Route: "{{route.name}}"
 
-  # The one warming route: tests/e2e_flows.rs's. A body rewrite, a recipient
-  # frequency limit tight enough to steer within a test, and an allowance large
-  # enough that quota never does unless a test overrides it. Delivers into the
-  # matrix trap directly, so what a test reads is Simmer's output unmodified.
-  - name: warming-flows
-    downstream:
-      host: "trap-matrix"
-      port: 1025
-      tls: off
-      pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
-    identity:
-      envelope_from: "bounce@warming-flows.out.test"
-      set_headers:
-        X-Simmer-Route: "{{route.name}}"
-      body_rewrites:
-        - pattern: 'https://oldbrand\.com/'
-          replacement: "https://newbrand.com/"
-    preflight:
-      enabled: false
-    recipient_frequency:
-      mode: to_address
-      window: { unit: daily, count: 1 }
-      threshold: 2
-    warmup:
-      started: "${SIMMER_WARMUP_STARTED}"
-      schedule:
-        default: [1000]
+      # The one warming route: tests/e2e_flows.rs's. A body rewrite, a recipient
+      # frequency limit tight enough to steer within a test, and an allowance large
+      # enough that quota never does unless a test overrides it. Delivers into the
+      # matrix trap directly, so what a test reads is Simmer's output unmodified.
+      - name: warming-flows
+        downstream:
+          host: "trap-matrix"
+          port: 1025
+          tls: off
+          pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@warming-flows.out.test"
+          set_headers:
+            X-Simmer-Route: "{{route.name}}"
+          body_rewrites:
+            - pattern: 'https://oldbrand\.com/'
+              replacement: "https://newbrand.com/"
+        preflight:
+          enabled: false
+        recipient_frequency:
+          mode: to_address
+          window: { unit: daily, count: 1 }
+          threshold: 2
+        warmup:
+          started: "${SIMMER_WARMUP_STARTED}"
+          schedule:
+            default: [1000]
 
-  - name: postfix-ratelimit
-    overflow: true
-    downstream:
-      host: "postfix-ratelimit"
-      port: 25
-      tls: off
-      pool: { max_connections: 2, idle_ttl: 60s, max_messages_per_connection: 100 }
-    identity:
-      envelope_from: "bounce@postfix-ratelimit.out.test"
-      set_headers:
-        X-Simmer-Route: "{{route.name}}"
+      - name: postfix-ratelimit
+        overflow: true
+        downstream:
+          host: "postfix-ratelimit"
+          port: 25
+          tls: off
+          pool: { max_connections: 2, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@postfix-ratelimit.out.test"
+          set_headers:
+            X-Simmer-Route: "{{route.name}}"

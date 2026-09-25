@@ -180,211 +180,218 @@ logging:
 # Use it when a gap would invalidate the run, and know that a full disk then
 # stops mail.
 
-# §3.1: the second axis of the quota key. `domains` is matched literally
-# first. A domain no group lists is then grouped by who receives its mail
-# (D-100): its lowest-preference MX host is matched against each group's `mx`
-# suffixes, so a Google Workspace company domain (MX aspmx.l.google.com)
-# counts against `google` and a Microsoft 365 tenant against `microsoft`.
-# Omit `mx` everywhere and no DNS lookups happen at all.
-domain_groups:
-  - name: google
-    domains: ["gmail.com", "googlemail.com"]
-    mx: ["google.com", "googlemail.com"]
-  - name: microsoft
-    domains: ["outlook.com", "hotmail.com", "hotmail.co.uk", "live.com", "msn.com"]
-    mx: ["mail.protection.outlook.com", "olc.protection.outlook.com"]
-  - name: yahoo
-    domains: ["yahoo.com", "yahoo.co.uk", "ymail.com", "aol.com"]
-    mx: ["yahoodns.net"]
-  - name: catchall
-    domains: ["*"]                   # exactly one group must contain "*"
+# §3.4 (D-099): each ramp is a complete, isolated routing profile. Everything
+# below lives inside one; a second ramp would repeat the whole block under its
+# own name, sharing nothing with this one. `default_ramp` is the ramp a message
+# is routed in when neither its listener nor an X-Simmer-Ramp header names one.
+default_ramp: main
+ramps:
+  main:
+    # §3.1: the second axis of the quota key. `domains` is matched literally
+    # first. A domain no group lists is then grouped by who receives its mail
+    # (D-100): its lowest-preference MX host is matched against each group's `mx`
+    # suffixes, so a Google Workspace company domain (MX aspmx.l.google.com)
+    # counts against `google` and a Microsoft 365 tenant against `microsoft`.
+    # Omit `mx` everywhere and no DNS lookups happen at all.
+    domain_groups:
+      - name: google
+        domains: ["gmail.com", "googlemail.com"]
+        mx: ["google.com", "googlemail.com"]
+      - name: microsoft
+        domains: ["outlook.com", "hotmail.com", "hotmail.co.uk", "live.com", "msn.com"]
+        mx: ["mail.protection.outlook.com", "olc.protection.outlook.com"]
+      - name: yahoo
+        domains: ["yahoo.com", "yahoo.co.uk", "ymail.com", "aol.com"]
+        mx: ["yahoodns.net"]
+      - name: catchall
+        domains: ["*"]                   # exactly one group must contain "*"
 
-# §5.4: evaluated in configuration order, first match wins. Full-address rules
-# go above domain rules where both could match — there is no specificity
-# ranking, so position in this list is the only precedence there is.
-#
-# Both arrangements of §1.1 are covered deliberately: the app may still be
-# sending as oldbrand.com, or may already have been cut over to newbrand.com.
-# Neither is privileged.
-senders:
-  - match: "marketing@newbrand.com"  # full address — must precede the domain rule
-    match_on: from_header
-    chain: [warming-newbrand, overflow-established]
-  - match: "oldbrand.com"            # exact domain
-    match_on: from_header
-    chain: [warming-newbrand, overflow-established]
-  - match: "*.oldbrand.com"          # strict subdomains; NOT oldbrand.com itself
-    match_on: from_header
-    chain: [warming-newbrand, overflow-established]
-  - match: "newbrand.com"            # the app-updated arrangement
-    match_on: from_header
-    chain: [warming-newbrand, overflow-established]
+    # §5.4: evaluated in configuration order, first match wins. Full-address rules
+    # go above domain rules where both could match — there is no specificity
+    # ranking, so position in this list is the only precedence there is.
+    #
+    # Both arrangements of §1.1 are covered deliberately: the app may still be
+    # sending as oldbrand.com, or may already have been cut over to newbrand.com.
+    # Neither is privileged.
+    senders:
+      - match: "marketing@newbrand.com"  # full address — must precede the domain rule
+        match_on: from_header
+        chain: [warming-newbrand, overflow-established]
+      - match: "oldbrand.com"            # exact domain
+        match_on: from_header
+        chain: [warming-newbrand, overflow-established]
+      - match: "*.oldbrand.com"          # strict subdomains; NOT oldbrand.com itself
+        match_on: from_header
+        chain: [warming-newbrand, overflow-established]
+      - match: "newbrand.com"            # the app-updated arrangement
+        match_on: from_header
+        chain: [warming-newbrand, overflow-established]
 
-# §3.2 step 1. An unmatched sender goes here rather than being rejected, because
-# invisibility is the point — but that means a typo in a rule above sends
-# unwarmed traffic at full volume via the established identity. Alert on
-# simmer_unmatched_sender_total, or set strict_senders: true (§14.2).
-default_chain: [overflow-established]
-strict_senders: false
+    # §3.2 step 1. An unmatched sender goes here rather than being rejected, because
+    # invisibility is the point — but that means a typo in a rule above sends
+    # unwarmed traffic at full volume via the established identity. Alert on
+    # simmer_unmatched_sender_total, or set strict_senders: true (§14.2).
+    default_chain: [overflow-established]
+    strict_senders: false
 
-# §3.2 step 2a (D-090): a reply the application sends into a thread Simmer
-# started leaves via the route that started it — past that route's day cap if
-# the cap is already met, and counted. Needs every route's Message-ID to carry a
-# literal domain of its own, which the routes below do.
-thread_affinity: false
+    # §3.2 step 2a (D-090): a reply the application sends into a thread Simmer
+    # started leaves via the route that started it — past that route's day cap if
+    # the cap is already met, and counted. Needs every route's Message-ID to carry a
+    # literal domain of its own, which the routes below do.
+    thread_affinity: false
 
-# §10.3. 451 by default: Simmer must not emit a reply that causes a client to
-# record permanent state about a recipient, because Simmer is temporary and that
-# state is not (§14.1).
-exhausted_chain_reply: "451"
+    # §10.3. 451 by default: Simmer must not emit a reply that causes a client to
+    # record permanent state about a recipient, because Simmer is temporary and that
+    # state is not (§14.1).
+    exhausted_chain_reply: "451"
 
-routes:
-  - name: warming-newbrand
-    downstream:
-      host: "smtp.postal.internal"
-      port: 587
-      tls: required_verify           # off | opportunistic | required | required_verify
-      auth:
-        username: "${POSTAL_USER}"
-        password: "${POSTAL_PASS}"
-      pool:
-        max_connections: 4
-        idle_ttl: 60s
-        max_messages_per_connection: 100
-      timeouts:
-        connect: 10s
-        command: 30s
-        data: 120s
-      # Does this provider implement RFC 6531? EHLO advertises SMTPUTF8 only
-      # when EVERY reachable route says true, because the ramp decides which
-      # route a message takes long after EHLO. Left false so the capability is
-      # never claimed by accident — a UTF-8 address is then refused at MAIL FROM
-      # rather than discovered mid-relay. See DECISIONS.md D-018.
-      smtputf8: false
-      # Postal advertises no 8BITMIME but accepts 8-bit bodies. Without this,
-      # every message whose body really is 8-bit (UTF-8 text sent as `8bit`,
-      # which modern mailers do) is refused 451 4.3.5 on every retry. A 7-bit
-      # body is fine either way. See DECISIONS.md D-074.
-      assume_8bitmime: true
-    identity:
-      # §1.1 constraint 1: absolute assignment, never a relative transformation.
-      #
-      # SPEC.md §4.1's example used to write this as
-      # `bounce+{{original.envelope_from.local}}@newbrand.com`, which is a
-      # relative transformation and fails §6.6 — the sub-address is prepended to
-      # a value this same field overwrites, so applying it to already-migrated
-      # traffic gives `bounce+bounce+jane@newbrand.com`, and once more again.
-      # The §4.2 stability check rejects it at startup. The spec's author has
-      # since confirmed the example was wrong and it is corrected there; see
-      # DECISIONS.md D-036.
-      #
-      # Two separate rules govern this field. §6.6 owns the LOCAL part and rejects
-      # relative transformations like the one above. §4.2's D-069 rule owns the
-      # DOMAIN, which must be a literal: `bounce@{{original.envelope_from.domain}}`
-      # is perfectly stable and still refused, because a route whose domain varies
-      # per message warms nothing while its quota row reads like a healthy ramp.
-      #
-      # Per-sender VERP cannot be expressed absolutely from a field the route
-      # rewrites. It *can* be expressed from one the route leaves alone —
-      # `bounce+{{recipient.local}}@newbrand.com` is stable, and since D-047 there
-      # is exactly one recipient per transaction, so it no longer forces a split.
-      envelope_from: "bounce@newbrand.com"
-      set_headers:
-        From: "{{original.from.display_name}} <sales@newbrand.com>"
-        Reply-To: "{{original.from.address}}"
-        Message-ID: "<{{uuid}}@newbrand.com>"
-        List-Unsubscribe: "<mailto:unsub@newbrand.com>, <https://newbrand.com/u/{{uuid}}>"
-        List-Unsubscribe-Post: "List-Unsubscribe=One-Click"
-        X-Simmer-Route: "{{route.name}}"
-        X-Simmer-Correlation-Id: "{{correlation_id}}"
-      # §6.6: Reply-To reads From:, which this same pass overwrites, so its value
-      # changes at the moment the application is reconfigured. That is
-      # migration-only by design — it keeps replies reaching the original mailbox
-      # while the sending identity is in flux — and must be declared.
-      unstable_headers: ["Reply-To"]
-      remove_headers: ["Return-Path", "X-Mailer"]
-      body_rewrites:
-        - pattern: 'https://oldbrand\.com/'
-          replacement: "https://newbrand.com/"
-    # §6.7. Catches the failure in §6.5: if the downstream signs with
-    # d=sendgrid.net rather than d=newbrand.com, the route ramps flawlessly for
-    # weeks and builds no domain reputation at all, and nothing in the mail flow
-    # would reveal it.
-    preflight:
-      enabled: true
-      spf_include: "spf.postal.internal"
-      dkim_selector: "s1"
-      require_dmarc: true
-    warmup:
-      started: "2026-08-01T09:00:00Z" # RFC 3339 instant; day_index is elapsed
-                                      # duration from here, not calendar days
-      schedule:
-        default: [50, 100, 200, 400, 800, 1500, 3000, 5000]
-        overrides:
-          google:    [20, 50, 100, 250, 500, 1000, 2000, 4000]
-          microsoft: [20, 50, 100, 250, 500, 1000, 2000, 4000]
-        # D-091 — offer this route only a share of its traffic for its first
-        # days, so the cap is reached later and its volume spreads across the
-        # day rather than being spent in a burst after each day boundary. One
-        # value per day index, for every group; past the end, every message is
-        # offered (the last value does NOT repeat, unlike a cap). A message not
-        # offered goes to overflow-established, as recipient_frequency steers.
-        # A keyed hash picks which, so dry run gives the real answer. Pinned
-        # thread-affinity replies are exempt.
-        #
-        # share: [0.1, 0.25, 0.5]
-        #
-        # D-097 — or let the share compute itself, per domain group, from how
-        # full the day's cap is and how far through the ramp day it is. Ahead of
-        # pace it collapses; behind, or out of window, it opens to `ceiling`.
-        # Every parameter below is optional and shown at its default, so
-        # `share: {mode: auto}` on its own is the whole thing.
-        #
-        # `fill_by` is under 1 deliberately: simmer never delays a message, so
-        # it cannot smooth a bursty sender — only take a fraction of each burst.
-        # Pacing to the day boundary would lose the cap whenever the traffic is
-        # front-loaded, so aim earlier and hit it early instead of not at all.
-        #
-        # `tail` is what makes the ramp finish. A floor cannot: at 0.05 the last
-        # 40 messages of an 800 cap need some 800 offered messages to arrive.
-        # Under `below` of the cap the throttle comes off. `below: 0` disables.
-        #
-        # `ceiling` is the only hard promise about the peak a provider sees.
-        # It defaults to 1, which promises nothing. Set it if you care.
-        #
-        # share:
-        #   mode: auto
-        #   floor:   0.05
-        #   ceiling: 1.0
-        #   gain:    4.0
-        #   fill_by: 0.6
-        #   tail: { below: 0.1, ceiling: 1.0 }
-    # §7.3: a steering rule, not a suppression rule. Over threshold makes this
-    # route ineligible so the message falls through; nothing is ever dropped.
-    recipient_frequency:
-      mode: to_address               # to_address | to_domain
-      window: { unit: daily, count: 1 }
-      threshold: 3
+    routes:
+      - name: warming-newbrand
+        downstream:
+          host: "smtp.postal.internal"
+          port: 587
+          tls: required_verify           # off | opportunistic | required | required_verify
+          auth:
+            username: "${POSTAL_USER}"
+            password: "${POSTAL_PASS}"
+          pool:
+            max_connections: 4
+            idle_ttl: 60s
+            max_messages_per_connection: 100
+          timeouts:
+            connect: 10s
+            command: 30s
+            data: 120s
+          # Does this provider implement RFC 6531? EHLO advertises SMTPUTF8 only
+          # when EVERY reachable route says true, because the ramp decides which
+          # route a message takes long after EHLO. Left false so the capability is
+          # never claimed by accident — a UTF-8 address is then refused at MAIL FROM
+          # rather than discovered mid-relay. See DECISIONS.md D-018.
+          smtputf8: false
+          # Postal advertises no 8BITMIME but accepts 8-bit bodies. Without this,
+          # every message whose body really is 8-bit (UTF-8 text sent as `8bit`,
+          # which modern mailers do) is refused 451 4.3.5 on every retry. A 7-bit
+          # body is fine either way. See DECISIONS.md D-074.
+          assume_8bitmime: true
+        identity:
+          # §1.1 constraint 1: absolute assignment, never a relative transformation.
+          #
+          # SPEC.md §4.1's example used to write this as
+          # `bounce+{{original.envelope_from.local}}@newbrand.com`, which is a
+          # relative transformation and fails §6.6 — the sub-address is prepended to
+          # a value this same field overwrites, so applying it to already-migrated
+          # traffic gives `bounce+bounce+jane@newbrand.com`, and once more again.
+          # The §4.2 stability check rejects it at startup. The spec's author has
+          # since confirmed the example was wrong and it is corrected there; see
+          # DECISIONS.md D-036.
+          #
+          # Two separate rules govern this field. §6.6 owns the LOCAL part and rejects
+          # relative transformations like the one above. §4.2's D-069 rule owns the
+          # DOMAIN, which must be a literal: `bounce@{{original.envelope_from.domain}}`
+          # is perfectly stable and still refused, because a route whose domain varies
+          # per message warms nothing while its quota row reads like a healthy ramp.
+          #
+          # Per-sender VERP cannot be expressed absolutely from a field the route
+          # rewrites. It *can* be expressed from one the route leaves alone —
+          # `bounce+{{recipient.local}}@newbrand.com` is stable, and since D-047 there
+          # is exactly one recipient per transaction, so it no longer forces a split.
+          envelope_from: "bounce@newbrand.com"
+          set_headers:
+            From: "{{original.from.display_name}} <sales@newbrand.com>"
+            Reply-To: "{{original.from.address}}"
+            Message-ID: "<{{uuid}}@newbrand.com>"
+            List-Unsubscribe: "<mailto:unsub@newbrand.com>, <https://newbrand.com/u/{{uuid}}>"
+            List-Unsubscribe-Post: "List-Unsubscribe=One-Click"
+            X-Simmer-Route: "{{route.name}}"
+            X-Simmer-Correlation-Id: "{{correlation_id}}"
+          # §6.6: Reply-To reads From:, which this same pass overwrites, so its value
+          # changes at the moment the application is reconfigured. That is
+          # migration-only by design — it keeps replies reaching the original mailbox
+          # while the sending identity is in flux — and must be declared.
+          unstable_headers: ["Reply-To"]
+          remove_headers: ["Return-Path", "X-Mailer"]
+          body_rewrites:
+            - pattern: 'https://oldbrand\.com/'
+              replacement: "https://newbrand.com/"
+        # §6.7. Catches the failure in §6.5: if the downstream signs with
+        # d=sendgrid.net rather than d=newbrand.com, the route ramps flawlessly for
+        # weeks and builds no domain reputation at all, and nothing in the mail flow
+        # would reveal it.
+        preflight:
+          enabled: true
+          spf_include: "spf.postal.internal"
+          dkim_selector: "s1"
+          require_dmarc: true
+        warmup:
+          started: "2026-08-01T09:00:00Z" # RFC 3339 instant; day_index is elapsed
+                                          # duration from here, not calendar days
+          schedule:
+            default: [50, 100, 200, 400, 800, 1500, 3000, 5000]
+            overrides:
+              google:    [20, 50, 100, 250, 500, 1000, 2000, 4000]
+              microsoft: [20, 50, 100, 250, 500, 1000, 2000, 4000]
+            # D-091 — offer this route only a share of its traffic for its first
+            # days, so the cap is reached later and its volume spreads across the
+            # day rather than being spent in a burst after each day boundary. One
+            # value per day index, for every group; past the end, every message is
+            # offered (the last value does NOT repeat, unlike a cap). A message not
+            # offered goes to overflow-established, as recipient_frequency steers.
+            # A keyed hash picks which, so dry run gives the real answer. Pinned
+            # thread-affinity replies are exempt.
+            #
+            # share: [0.1, 0.25, 0.5]
+            #
+            # D-097 — or let the share compute itself, per domain group, from how
+            # full the day's cap is and how far through the ramp day it is. Ahead of
+            # pace it collapses; behind, or out of window, it opens to `ceiling`.
+            # Every parameter below is optional and shown at its default, so
+            # `share: {mode: auto}` on its own is the whole thing.
+            #
+            # `fill_by` is under 1 deliberately: simmer never delays a message, so
+            # it cannot smooth a bursty sender — only take a fraction of each burst.
+            # Pacing to the day boundary would lose the cap whenever the traffic is
+            # front-loaded, so aim earlier and hit it early instead of not at all.
+            #
+            # `tail` is what makes the ramp finish. A floor cannot: at 0.05 the last
+            # 40 messages of an 800 cap need some 800 offered messages to arrive.
+            # Under `below` of the cap the throttle comes off. `below: 0` disables.
+            #
+            # `ceiling` is the only hard promise about the peak a provider sees.
+            # It defaults to 1, which promises nothing. Set it if you care.
+            #
+            # share:
+            #   mode: auto
+            #   floor:   0.05
+            #   ceiling: 1.0
+            #   gain:    4.0
+            #   fill_by: 0.6
+            #   tail: { below: 0.1, ceiling: 1.0 }
+        # §7.3: a steering rule, not a suppression rule. Over threshold makes this
+        # route ineligible so the message falls through; nothing is ever dropped.
+        recipient_frequency:
+          mode: to_address               # to_address | to_domain
+          window: { unit: daily, count: 1 }
+          threshold: 3
 
-  - name: overflow-established
-    overflow: true                   # no warm-up, never quota-limited, must be last
-    downstream:
-      host: "smtp.sendgrid.net"
-      port: 587
-      tls: required_verify
-      auth:
-        username: "apikey"
-        password: "${SENDGRID_KEY}"
-      pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
-      smtputf8: false           # see the warming route above and D-018
-    identity:
-      # §14.4: rewriting From: to an established domain spends that domain's
-      # reputation on new-brand traffic. A dedicated subdomain contains the blast
-      # radius.
-      envelope_from: "bounce@mail.established.com"
-      set_headers:
-        From: "{{original.from.display_name}} <news@mail.established.com>"
-        Reply-To: "{{original.from.address}}"
-        Message-ID: "<{{uuid}}@mail.established.com>"
-        X-Simmer-Route: "{{route.name}}"
-      unstable_headers: ["Reply-To"]
+      - name: overflow-established
+        overflow: true                   # no warm-up, never quota-limited, must be last
+        downstream:
+          host: "smtp.sendgrid.net"
+          port: 587
+          tls: required_verify
+          auth:
+            username: "apikey"
+            password: "${SENDGRID_KEY}"
+          pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
+          smtputf8: false           # see the warming route above and D-018
+        identity:
+          # §14.4: rewriting From: to an established domain spends that domain's
+          # reputation on new-brand traffic. A dedicated subdomain contains the blast
+          # radius.
+          envelope_from: "bounce@mail.established.com"
+          set_headers:
+            From: "{{original.from.display_name}} <news@mail.established.com>"
+            Reply-To: "{{original.from.address}}"
+            Message-ID: "<{{uuid}}@mail.established.com>"
+            X-Simmer-Route: "{{route.name}}"
+          unstable_headers: ["Reply-To"]

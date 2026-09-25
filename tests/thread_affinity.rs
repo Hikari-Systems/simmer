@@ -42,12 +42,15 @@ database:
   fail_closed: true
 admin: {{ listen: "127.0.0.1:0", auth_token: "t" }}
 logging: {{ level: warn, format: text }}
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - {{ name: catchall, domains: ["*"] }}
-senders:
+  senders:
   - {{ match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }}
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: "127.0.0.1"
@@ -80,7 +83,7 @@ routes:
     )
 }
 
-const ON: &str = "thread_affinity: true";
+const ON: &str = "  thread_affinity: true";
 
 /// The first message of a conversation.
 fn first(n: u32) -> String {
@@ -408,8 +411,9 @@ mod over_the_cap {
         for n in 0..4 {
             let mut ev = Vec::new();
             let walk = simmer::routing::chain::walk_and_reserve(
-                &cfg,
+                cfg.default_ramp(),
                 &simmer::routing::domain_group::Grouper::literal(),
+                &cfg.dot_insensitive_domains,
                 &store,
                 &frequency,
                 &preflight,
@@ -468,8 +472,9 @@ mod over_the_cap {
             async move {
                 let mut ev = Vec::new();
                 let walk = simmer::routing::chain::walk_and_reserve(
-                    &cfg,
+                    cfg.default_ramp(),
                     &simmer::routing::domain_group::Grouper::literal(),
+                    &cfg.dot_insensitive_domains,
                     &store,
                     &frequency,
                     &preflight,
@@ -572,8 +577,9 @@ mod over_the_cap {
             let mut ev = Vec::new();
             let simmer::routing::chain::Walk::Selected(s) =
                 simmer::routing::chain::walk_and_reserve(
-                    &cfg,
+                    cfg.default_ramp(),
                     &simmer::routing::domain_group::Grouper::literal(),
+                    &cfg.dot_insensitive_domains,
                     &store,
                     &frequency,
                     &preflight,
@@ -597,8 +603,9 @@ mod over_the_cap {
             simmer::routing::thread::order(&["warming".to_string(), "second".to_string()], &pin);
         let mut ev = Vec::new();
         let walk = simmer::routing::chain::walk_and_reserve(
-            &cfg,
+            cfg.default_ramp(),
             &simmer::routing::domain_group::Grouper::literal(),
+            &cfg.dot_insensitive_domains,
             &store,
             &frequency,
             &preflight,

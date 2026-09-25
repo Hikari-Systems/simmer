@@ -29,7 +29,7 @@ use chrono::Utc;
 
 use super::domain_group::Grouper;
 use super::partial;
-use crate::config::{Config, Route};
+use crate::config::{Ramp, Route};
 use crate::frequency::{self, Frequency};
 use crate::metrics;
 use crate::quota::{
@@ -139,8 +139,9 @@ pub enum Walk<'a> {
 /// name and buy nothing.
 #[allow(clippy::too_many_arguments)]
 pub async fn walk_and_reserve<'a>(
-    cfg: &'a Config,
+    ramp: &'a Ramp,
     groups: &Grouper,
+    dot_insensitive_domains: &[String],
     store: &Arc<dyn QuotaStore>,
     frequency: &Frequency,
     preflight: &crate::preflight::Registry,
@@ -163,15 +164,15 @@ pub async fn walk_and_reserve<'a>(
     // §3.2 step 2. One recipient per transaction (D-047), so there is one domain
     // group and no question of a transaction spanning two.
     let group = match recipients.first() {
-        Some(r) => groups.group_name(cfg, r).await,
-        None => cfg
+        Some(r) => groups.group_name(ramp, r).await,
+        None => ramp
             .catchall_group()
             .map(|g| g.name.clone())
             .unwrap_or_else(|| "catchall".to_string()),
     };
 
     for name in chain {
-        let Some(route) = cfg.route(name) else {
+        let Some(route) = ramp.route(name) else {
             record(evaluation, name, Err(SkipReason::Unknown));
             continue;
         };
@@ -210,7 +211,7 @@ pub async fn walk_and_reserve<'a>(
                 let keyer = frequency.keyer(store.as_ref()).await?;
                 let keys: Vec<_> = recipients
                     .iter()
-                    .map(|r| keyer.key_for(r, constraint.mode, &cfg.dot_insensitive_domains))
+                    .map(|r| keyer.key_for(r, constraint.mode, dot_insensitive_domains))
                     .collect();
 
                 // D-090: a reply the recipient prompted by replying is not the
@@ -278,7 +279,7 @@ pub async fn walk_and_reserve<'a>(
                     recipient,
                     day_index,
                     share,
-                    &cfg.dot_insensitive_domains,
+                    dot_insensitive_domains,
                 ) {
                     record(evaluation, name, Err(SkipReason::PartialRamp));
                     continue;
@@ -391,8 +392,9 @@ pub async fn walk_and_reserve<'a>(
 /// `walk_and_reserve`'s argument list, for the same reason (D-090 added `pinned`).
 #[allow(clippy::too_many_arguments)]
 pub async fn dry_walk(
-    cfg: &Config,
+    ramp: &Ramp,
     groups: &Grouper,
+    dot_insensitive_domains: &[String],
     store: &Arc<dyn QuotaStore>,
     frequency: &Frequency,
     preflight: &crate::preflight::Registry,
@@ -402,12 +404,12 @@ pub async fn dry_walk(
     now: chrono::DateTime<Utc>,
 ) -> Result<Vec<Step>, QuotaError> {
     let states = store.route_states().await?;
-    let group = groups.group_name(cfg, recipient).await;
+    let group = groups.group_name(ramp, recipient).await;
 
     let mut evaluation = Vec::new();
 
     for name in chain {
-        let Some(route) = cfg.route(name) else {
+        let Some(route) = ramp.route(name) else {
             evaluation.push(step(name, Err(SkipReason::Unknown)));
             continue;
         };
@@ -427,7 +429,7 @@ pub async fn dry_walk(
 
         if let Some(constraint) = route.recipient_frequency.as_ref().filter(|_| !is_pinned) {
             let keyer = frequency.keyer(store.as_ref()).await?;
-            let key = keyer.key_for(recipient, constraint.mode, &cfg.dot_insensitive_domains);
+            let key = keyer.key_for(recipient, constraint.mode, dot_insensitive_domains);
             let since = frequency::window_start(constraint, now);
             if store.recipient_event_count(name, &key, since).await?
                 >= i64::from(constraint.threshold)
@@ -464,7 +466,7 @@ pub async fn dry_walk(
                     recipient,
                     day_index,
                     share,
-                    &cfg.dot_insensitive_domains,
+                    dot_insensitive_domains,
                 ) {
                     evaluation.push(step(name, Err(SkipReason::PartialRamp)));
                     continue;
@@ -526,7 +528,7 @@ fn step(route: &str, outcome: Result<(), SkipReason>) -> Step {
 /// partial ramp: a route turned away by it always has a later link (§4.2), so
 /// counting it eligible can only err in the harmless direction.
 pub async fn any_eligible(
-    cfg: &Config,
+    ramp: &Ramp,
     groups: &Grouper,
     store: &Arc<dyn QuotaStore>,
     chain: &[String],
@@ -534,10 +536,10 @@ pub async fn any_eligible(
 ) -> Result<bool, QuotaError> {
     let now = Utc::now();
     let states = store.route_states().await?;
-    let group = groups.group_name(cfg, recipient).await;
+    let group = groups.group_name(ramp, recipient).await;
 
     for name in chain {
-        let Some(route) = cfg.route(name) else {
+        let Some(route) = ramp.route(name) else {
             continue;
         };
         let state = states.get(name).copied().unwrap_or_default();

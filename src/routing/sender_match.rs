@@ -18,7 +18,7 @@
 //! precedence is the single easiest thing here to get subtly wrong, and it is
 //! cheap to pin.
 
-use crate::config::{Config, MatchOn, SenderRule};
+use crate::config::{MatchOn, Ramp, SenderRule};
 
 /// One parsed `match` pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +136,7 @@ impl Senders {
 /// The outcome of §3.2 step 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Match<'a> {
-    /// Index into `config.senders`, plus the rule itself.
+    /// Index into the ramp's `senders`, plus the rule itself.
     Rule { index: usize, rule: &'a SenderRule },
     /// No rule matched. §3.2 step 1: use the default chain, or reject when
     /// `strict_senders`.
@@ -144,8 +144,8 @@ pub enum Match<'a> {
 }
 
 /// First matching rule in configuration order wins (§5.4).
-pub fn match_sender<'a>(cfg: &'a Config, senders: &Senders) -> Match<'a> {
-    for (index, rule) in cfg.senders.iter().enumerate() {
+pub fn match_sender<'a>(ramp: &'a Ramp, senders: &Senders) -> Match<'a> {
+    for (index, rule) in ramp.senders.iter().enumerate() {
         let pattern = Pattern::parse(&rule.pattern);
         let matched = senders
             .candidates(rule.match_on)
@@ -172,9 +172,9 @@ pub fn match_sender<'a>(cfg: &'a Config, senders: &Senders) -> Match<'a> {
 /// headers, which have not arrived at `RCPT TO`. Deciding early would refuse
 /// exactly the reply the pin exists to let through, whenever the chain's
 /// ordinary walk is spent.
-pub fn can_decide_at_rcpt(cfg: &Config) -> bool {
-    !cfg.thread_affinity
-        && cfg
+pub fn can_decide_at_rcpt(ramp: &Ramp) -> bool {
+    !ramp.thread_affinity
+        && ramp
             .senders
             .iter()
             .all(|r| matches!(r.match_on, MatchOn::Envelope))
@@ -183,6 +183,7 @@ pub fn can_decide_at_rcpt(cfg: &Config) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     // -- Pattern classification ------------------------------------------
 
@@ -330,11 +331,14 @@ database:
 admin:
   listen: "127.0.0.1:8080"
   auth_token: "t"
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: catchall, domains: ["*"] }
-senders: []
-default_chain: [overflow]
-routes:
+  senders: []
+  default_chain: [overflow]
+  routes:
   - name: overflow
     overflow: true
     downstream:
@@ -345,7 +349,7 @@ routes:
       envelope_from: "b@example.com"
 "#;
         let mut cfg: Config = serde_yaml_ng::from_str(yaml).expect("fixture parses");
-        cfg.senders = rules
+        cfg.default_ramp_mut().senders = rules
             .iter()
             .map(|(pattern, match_on, chain)| SenderRule {
                 pattern: (*pattern).to_string(),
@@ -372,7 +376,10 @@ routes:
             ("newbrand.com", MatchOn::Envelope, "by-domain"),
             ("marketing@newbrand.com", MatchOn::Envelope, "by-address"),
         ]);
-        let m = match_sender(&cfg, &Senders::new(Some("marketing@newbrand.com"), None));
+        let m = match_sender(
+            cfg.default_ramp(),
+            &Senders::new(Some("marketing@newbrand.com"), None),
+        );
         assert_eq!(matched_chain(&m), Some("by-domain"));
     }
 
@@ -382,18 +389,27 @@ routes:
             ("marketing@newbrand.com", MatchOn::Envelope, "by-address"),
             ("newbrand.com", MatchOn::Envelope, "by-domain"),
         ]);
-        let m = match_sender(&cfg, &Senders::new(Some("marketing@newbrand.com"), None));
+        let m = match_sender(
+            cfg.default_ramp(),
+            &Senders::new(Some("marketing@newbrand.com"), None),
+        );
         assert_eq!(matched_chain(&m), Some("by-address"));
 
         // ...and a different local part still falls to the domain rule.
-        let m = match_sender(&cfg, &Senders::new(Some("sales@newbrand.com"), None));
+        let m = match_sender(
+            cfg.default_ramp(),
+            &Senders::new(Some("sales@newbrand.com"), None),
+        );
         assert_eq!(matched_chain(&m), Some("by-domain"));
     }
 
     #[test]
     fn unmatched_when_no_rule_applies() {
         let cfg = config_with(&[("oldbrand.com", MatchOn::Envelope, "c")]);
-        let m = match_sender(&cfg, &Senders::new(Some("x@elsewhere.com"), None));
+        let m = match_sender(
+            cfg.default_ramp(),
+            &Senders::new(Some("x@elsewhere.com"), None),
+        );
         assert_eq!(m, Match::Unmatched);
     }
 
@@ -403,7 +419,7 @@ routes:
     fn match_on_envelope_ignores_the_from_header() {
         let cfg = config_with(&[("oldbrand.com", MatchOn::Envelope, "c")]);
         let m = match_sender(
-            &cfg,
+            cfg.default_ramp(),
             &Senders::new(Some("x@other.com"), Some("y@oldbrand.com")),
         );
         assert_eq!(m, Match::Unmatched);
@@ -413,7 +429,7 @@ routes:
     fn match_on_from_header_ignores_the_envelope() {
         let cfg = config_with(&[("oldbrand.com", MatchOn::FromHeader, "c")]);
         let m = match_sender(
-            &cfg,
+            cfg.default_ramp(),
             &Senders::new(Some("x@oldbrand.com"), Some("y@other.com")),
         );
         assert_eq!(m, Match::Unmatched);
@@ -424,20 +440,23 @@ routes:
         let cfg = config_with(&[("oldbrand.com", MatchOn::Either, "c")]);
         assert!(matches!(
             match_sender(
-                &cfg,
+                cfg.default_ramp(),
                 &Senders::new(Some("x@oldbrand.com"), Some("y@other.com"))
             ),
             Match::Rule { .. }
         ));
         assert!(matches!(
             match_sender(
-                &cfg,
+                cfg.default_ramp(),
                 &Senders::new(Some("x@other.com"), Some("y@oldbrand.com"))
             ),
             Match::Rule { .. }
         ));
         assert_eq!(
-            match_sender(&cfg, &Senders::new(Some("x@a.com"), Some("y@b.com"))),
+            match_sender(
+                cfg.default_ramp(),
+                &Senders::new(Some("x@a.com"), Some("y@b.com"))
+            ),
             Match::Unmatched
         );
     }
@@ -447,7 +466,10 @@ routes:
         // MAIL FROM:<> is legal; it must not panic or match a domain rule.
         let cfg = config_with(&[("oldbrand.com", MatchOn::Envelope, "c")]);
         assert_eq!(
-            match_sender(&cfg, &Senders::new(None, Some("y@oldbrand.com"))),
+            match_sender(
+                cfg.default_ramp(),
+                &Senders::new(None, Some("y@oldbrand.com"))
+            ),
             Match::Unmatched
         );
     }
@@ -464,19 +486,23 @@ routes:
 
     #[test]
     fn early_decision_only_when_every_rule_is_envelope_only() {
-        assert!(can_decide_at_rcpt(&config_with(&[
-            ("a.com", MatchOn::Envelope, "c"),
-            ("b.com", MatchOn::Envelope, "c"),
-        ])));
-        assert!(!can_decide_at_rcpt(&config_with(&[
-            ("a.com", MatchOn::Envelope, "c"),
-            ("b.com", MatchOn::FromHeader, "c"),
-        ])));
-        assert!(!can_decide_at_rcpt(&config_with(&[(
-            "a.com",
-            MatchOn::Either,
-            "c"
-        )])));
+        assert!(can_decide_at_rcpt(
+            config_with(&[
+                ("a.com", MatchOn::Envelope, "c"),
+                ("b.com", MatchOn::Envelope, "c"),
+            ])
+            .default_ramp()
+        ));
+        assert!(!can_decide_at_rcpt(
+            config_with(&[
+                ("a.com", MatchOn::Envelope, "c"),
+                ("b.com", MatchOn::FromHeader, "c"),
+            ])
+            .default_ramp()
+        ));
+        assert!(!can_decide_at_rcpt(
+            config_with(&[("a.com", MatchOn::Either, "c")]).default_ramp()
+        ));
     }
 
     #[test]
@@ -489,7 +515,7 @@ routes:
             ("newbrand.com", MatchOn::FromHeader, "warming"),
         ]);
 
-        let hits = |addr: &str| match_sender(&cfg, &Senders::new(None, Some(addr)));
+        let hits = |addr: &str| match_sender(cfg.default_ramp(), &Senders::new(None, Some(addr)));
 
         // Both the old brand and its subdomains are covered, and the app-updated
         // arrangement (§1.1) sending as newbrand.com matches too.

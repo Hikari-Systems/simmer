@@ -49,13 +49,16 @@ server:
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
 admin: { listen: "127.0.0.1:0", auth_token: "0123456789abcdef-default", metrics: true }
 logging: { level: warn, format: text }
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: google, domains: ["gmail.com"] }
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: "127.0.0.1"
@@ -236,7 +239,10 @@ async fn a_reservation_moves_the_gauges_without_a_relay(pool: PgPool) {
     let _serialised = exclusive().await;
     let state = state(pool.clone());
     let cfg = Arc::clone(&state.engine.config);
-    let day = quota::day::for_route(cfg.route("warming").unwrap(), chrono::Utc::now());
+    let day = quota::day::for_route(
+        cfg.default_ramp().route("warming").unwrap(),
+        chrono::Utc::now(),
+    );
 
     let taken = state
         .engine

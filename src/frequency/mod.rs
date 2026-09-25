@@ -243,8 +243,7 @@ pub fn window_start(constraint: &RecipientFrequency, now: DateTime<Utc>) -> Date
 /// row the count needed.
 pub fn retention(cfg: &Config) -> Option<Duration> {
     let longest = cfg
-        .routes
-        .iter()
+        .all_routes()
         .filter_map(|r| r.recipient_frequency.as_ref())
         .map(|f| f.window.as_duration())
         .max()?;
@@ -255,7 +254,7 @@ pub fn retention(cfg: &Config) -> Option<Duration> {
 /// Does any route declare a constraint? If not, nothing writes `recipient_event`
 /// and the sweeper is not started at all.
 pub fn any_configured(cfg: &Config) -> bool {
-    cfg.routes.iter().any(|r| r.recipient_frequency.is_some())
+    cfg.all_routes().any(|r| r.recipient_frequency.is_some())
 }
 
 #[cfg(test)]
@@ -569,12 +568,15 @@ server:
   auth: { allow_insecure_auth: true }
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
 admin: { listen: "127.0.0.1:8080", auth_token: "t" }
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  domain_groups:
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: w.example

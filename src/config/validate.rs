@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use super::{AutoShare, Config, Identity, IngressAuth, Route, ShareSchedule};
+use super::{AutoShare, Config, Identity, IngressAuth, Ramp, Route, ShareSchedule};
 use crate::rewrite::{stability, RouteRewrite};
 
 /// The identity fields of §6.6. A stability violation in one of these is fatal
@@ -115,7 +115,21 @@ impl fmt::Display for Warning {
 /// Removing an entry from this table is safe once nobody is upgrading across it;
 /// the `deny_unknown_fields` refusal remains either way.
 pub fn removed_keys(tree: &serde_yaml_ng::Value) -> ViolationList {
-    const REMOVED: [(&[&str], &str); 3] = [
+    /// D-099: the whole routing block moved, unchanged, under `ramps.<name>`.
+    const MOVED_TO_RAMPS: &str =
+        "moved under ramps (D-099): every routing key — domain_groups, senders, \
+         default_chain, strict_senders, thread_affinity, exhausted_chain_reply and routes — \
+         now belongs to a named ramp. Indent the existing block under `ramps: { main: ... }` \
+         and add `default_ramp: main` at the top level; nothing inside it changes. See \
+         DECISIONS.md D-099 and SPEC.md §3.4";
+    const REMOVED: [(&[&str], &str); 10] = [
+        (&["domain_groups"], MOVED_TO_RAMPS),
+        (&["senders"], MOVED_TO_RAMPS),
+        (&["default_chain"], MOVED_TO_RAMPS),
+        (&["strict_senders"], MOVED_TO_RAMPS),
+        (&["thread_affinity"], MOVED_TO_RAMPS),
+        (&["exhausted_chain_reply"], MOVED_TO_RAMPS),
+        (&["routes"], MOVED_TO_RAMPS),
         (
             &["server", "single_recipient_only"],
             "removed: a transaction may carry exactly one recipient and a second \
@@ -159,12 +173,7 @@ pub fn validate(cfg: &Config) -> ViolationList {
     check_auth(cfg, &mut v);
     check_admin_tokens(cfg, &mut v);
     check_admin_metrics(cfg, &mut v);
-    check_domain_groups(cfg, &mut v);
-    check_route_uniqueness(cfg, &mut v);
-    check_routes(cfg, &mut v);
-    check_chains(cfg, &mut v);
-    check_default_chain(cfg, &mut v);
-    check_thread_affinity(cfg, &mut v);
+    check_ramps(cfg, &mut v);
     check_link_proxy(cfg, &mut v);
     check_capture(cfg, &mut v);
     check_storage(cfg, &mut v);
@@ -300,6 +309,24 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
         }
     }
 
+    // Everything else is about one ramp's routing, and is reported under it.
+    for ramp in cfg.ramps.iter() {
+        for w in ramp_warnings(ramp) {
+            out.push(Warning {
+                path: format!("ramps.{}.{}", ramp.name, w.path),
+                message: w.message,
+            });
+        }
+    }
+
+    out
+}
+
+/// The per-ramp half of [`warnings`]: the pre-D-099 routing warnings, with
+/// paths relative to the ramp.
+fn ramp_warnings(ramp: &Ramp) -> Vec<Warning> {
+    let mut out = Vec::new();
+
     // §7.3 is a *steering* rule: over threshold means "try the next link". A
     // constraint on the last link of a chain has no next link to steer to, so it
     // stops steering and starts refusing — the message gets §10.3's `451` instead
@@ -307,11 +334,11 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
     // how "never mail this person more than twice a day, full stop" is spelled),
     // but it is much more often a mistake, and it is invisible until the day a
     // recipient reaches the threshold.
-    for chain in cfg.chains() {
+    for chain in ramp.chains() {
         let Some(last) = chain.routes.last() else {
             continue;
         };
-        if cfg
+        if ramp
             .route(last)
             .is_some_and(|r| r.recipient_frequency.is_some())
         {
@@ -329,11 +356,11 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
     // link the rule stops steering and starts refusing, so a DNS problem answers
     // 451 rather than routing around itself. That is the one outcome §6.7's
     // non-blocking default exists to avoid, and it is invisible in the config.
-    for chain in cfg.chains() {
+    for chain in ramp.chains() {
         let Some(last) = chain.routes.last() else {
             continue;
         };
-        if cfg
+        if ramp
             .route(last)
             .is_some_and(|r| r.preflight.as_ref().is_some_and(|p| p.enabled && p.strict))
         {
@@ -347,7 +374,7 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
         }
     }
 
-    for route in &cfg.routes {
+    for route in &ramp.routes {
         // §6.7 — the route whose identity domain is not a constant, so there is
         // no single domain to check on a timer (D-064).
         //
@@ -441,7 +468,7 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
     // violation: §6.2's own idiom is naming a header in two lists, and the
     // order makes each case well defined. But the operator wrote a rule
     // expecting it to fire, and it will not.
-    for route in &cfg.routes {
+    for route in &ramp.routes {
         let identity = &route.identity;
         for (i, rule) in identity.header_rewrites.iter().enumerate() {
             let path = format!("routes.{}.identity.header_rewrites[{i}]", route.name);
@@ -476,7 +503,7 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
 
     // §14.2: an unmatched sender goes to the overflow route at full volume. If
     // that is not what the operator wants, strict_senders exists.
-    if !cfg.strict_senders {
+    if !ramp.strict_senders {
         out.push(Warning {
             path: "strict_senders".to_string(),
             message: "is false, so an unmatched sender routes to the default chain's overflow \
@@ -1038,14 +1065,99 @@ fn check_admin_tokens(cfg: &Config, v: &mut ViolationList) {
     }
 }
 
-fn check_domain_groups(cfg: &Config, v: &mut ViolationList) {
-    if cfg.domain_groups.is_empty() {
+/// The longest ramp name §4.2 accepts (D-099). It appears in log lines, metric
+/// labels and admin paths, so it is kept short and URL-safe.
+pub const MAX_RAMP_NAME_CHARS: usize = 64;
+
+/// §3.4's shape, then every per-ramp rule once per ramp.
+///
+/// The per-ramp checks are the pre-D-099 top-level checks, unchanged: each
+/// writes paths relative to its ramp, and they are prefixed `ramps.<name>.`
+/// here, so a violation always says which ramp it is in.
+fn check_ramps(cfg: &Config, v: &mut ViolationList) {
+    if cfg.ramps.is_empty() {
+        v.push("ramps", "must declare at least one ramp");
+    } else if cfg.ramp(&cfg.default_ramp).is_none() {
+        v.push(
+            "default_ramp",
+            format!(
+                "names ramp '{}', which is not declared in ramps (declared: {})",
+                cfg.default_ramp,
+                cfg.ramps
+                    .iter()
+                    .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    }
+
+    // D-099's phasing: until quota state, pools and metrics are keyed by ramp
+    // as well as route, a second ramp would share rows with the first wherever
+    // their route names coincide. The rule is scaffolding and goes when they are.
+    if cfg.ramps.len() > 1 {
+        v.push(
+            "ramps",
+            format!(
+                "declares {} ramps; this build supports exactly one while multi-ramp \
+                 routing is being implemented (D-099)",
+                cfg.ramps.len()
+            ),
+        );
+    }
+
+    for ramp in cfg.ramps.iter() {
+        if let Some(problem) = ramp_name_problem(&ramp.name) {
+            v.push(format!("ramps.{}", ramp.name), problem);
+        }
+
+        let mut inner = ViolationList::default();
+        check_domain_groups(ramp, &mut inner);
+        check_route_uniqueness(ramp, &mut inner);
+        check_routes(ramp, &mut inner);
+        check_chains(ramp, &mut inner);
+        check_default_chain(ramp, &mut inner);
+        check_thread_affinity(ramp, &mut inner);
+        for violation in inner.0 {
+            v.push(
+                format!("ramps.{}.{}", ramp.name, violation.path),
+                violation.message,
+            );
+        }
+    }
+}
+
+/// §4.2 (D-099): 1–64 characters of `[A-Za-z0-9][A-Za-z0-9._-]*`.
+fn ramp_name_problem(name: &str) -> Option<String> {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Some("a ramp name must not be empty".to_string());
+    };
+    if name.chars().count() > MAX_RAMP_NAME_CHARS {
+        return Some(format!(
+            "a ramp name must be at most {MAX_RAMP_NAME_CHARS} characters"
+        ));
+    }
+    let valid = first.is_ascii_alphanumeric()
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !valid {
+        return Some(
+            "a ramp name must start with a letter or digit and contain only letters, \
+             digits, '.', '_' and '-'"
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn check_domain_groups(ramp: &Ramp, v: &mut ViolationList) {
+    if ramp.domain_groups.is_empty() {
         v.push("domain_groups", "must contain at least the catch-all group");
         return;
     }
 
     // §4.2: "No domain group contains `*`, or more than one does."
-    let catchalls: Vec<&str> = cfg
+    let catchalls: Vec<&str> = ramp
         .domain_groups
         .iter()
         .filter(|g| g.is_catchall())
@@ -1070,7 +1182,7 @@ fn check_domain_groups(cfg: &Config, v: &mut ViolationList) {
     // Group names must be unique — the quota key and the schedule overrides both
     // address groups by name.
     let mut seen_names: BTreeMap<&str, usize> = BTreeMap::new();
-    for (i, g) in cfg.domain_groups.iter().enumerate() {
+    for (i, g) in ramp.domain_groups.iter().enumerate() {
         if g.name.is_empty() {
             v.push(format!("domain_groups[{i}].name"), "must not be empty");
         }
@@ -1088,7 +1200,7 @@ fn check_domain_groups(cfg: &Config, v: &mut ViolationList) {
     // §4.2: "A domain appears in more than one group." Case-insensitive, since
     // §3.2 step 2 matches case-insensitively.
     let mut seen_domains: BTreeMap<String, &str> = BTreeMap::new();
-    for g in &cfg.domain_groups {
+    for g in &ramp.domain_groups {
         for domain in &g.domains {
             let key = domain.to_ascii_lowercase();
             match seen_domains.get(&key) {
@@ -1111,7 +1223,7 @@ fn check_domain_groups(cfg: &Config, v: &mut ViolationList) {
     // configuration order would win, and a config that relies on that is one
     // an operator will misread.
     let mut seen_mx: BTreeMap<String, &str> = BTreeMap::new();
-    for g in &cfg.domain_groups {
+    for g in &ramp.domain_groups {
         if g.is_catchall() && !g.mx.is_empty() {
             v.push(
                 format!("domain_groups.{}.mx", g.name),
@@ -1171,9 +1283,9 @@ fn mx_suffix_problem(suffix: &str) -> Option<&'static str> {
     None
 }
 
-fn check_route_uniqueness(cfg: &Config, v: &mut ViolationList) {
+fn check_route_uniqueness(ramp: &Ramp, v: &mut ViolationList) {
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-    for (i, r) in cfg.routes.iter().enumerate() {
+    for (i, r) in ramp.routes.iter().enumerate() {
         if r.name.is_empty() {
             v.push(format!("routes[{i}].name"), "must not be empty");
         }
@@ -1201,26 +1313,28 @@ fn check_storage(cfg: &Config, v: &mut ViolationList) {
     // bytes, and (route, domain_group, day_index) must fit. Postgres has no such
     // limit, so the rule is this build's alone.
     const MAX: usize = crate::db::mssql::MAX_NAME_CHARS;
-    for (i, r) in cfg.routes.iter().enumerate() {
-        if r.name.chars().count() > MAX {
-            v.push(
-                format!("routes[{i}].name"),
-                format!("is longer than {MAX} characters, the SQL Server build's limit"),
-            );
+    for ramp in cfg.ramps.iter() {
+        for (i, r) in ramp.routes.iter().enumerate() {
+            if r.name.chars().count() > MAX {
+                v.push(
+                    format!("ramps.{}.routes[{i}].name", ramp.name),
+                    format!("is longer than {MAX} characters, the SQL Server build's limit"),
+                );
+            }
         }
-    }
-    for (i, g) in cfg.domain_groups.iter().enumerate() {
-        if g.name.chars().count() > MAX {
-            v.push(
-                format!("domain_groups[{i}].name"),
-                format!("is longer than {MAX} characters, the SQL Server build's limit"),
-            );
+        for (i, g) in ramp.domain_groups.iter().enumerate() {
+            if g.name.chars().count() > MAX {
+                v.push(
+                    format!("ramps.{}.domain_groups[{i}].name", ramp.name),
+                    format!("is longer than {MAX} characters, the SQL Server build's limit"),
+                );
+            }
         }
     }
 }
 
-fn check_routes(cfg: &Config, v: &mut ViolationList) {
-    for route in &cfg.routes {
+fn check_routes(ramp: &Ramp, v: &mut ViolationList) {
+    for route in &ramp.routes {
         let at = |suffix: &str| format!("routes.{}.{suffix}", route.name);
 
         // §4.2: "An overflow route carries a warmup block, or a non-overflow
@@ -1238,7 +1352,7 @@ fn check_routes(cfg: &Config, v: &mut ViolationList) {
         }
 
         if let Some(warmup) = &route.warmup {
-            check_schedule(cfg, route, warmup, v);
+            check_schedule(ramp, route, warmup, v);
         }
 
         check_identity(&route.identity, &route.name, v);
@@ -1294,7 +1408,7 @@ fn check_routes(cfg: &Config, v: &mut ViolationList) {
     }
 }
 
-fn check_schedule(cfg: &Config, route: &Route, warmup: &super::Warmup, v: &mut ViolationList) {
+fn check_schedule(ramp: &Ramp, route: &Route, warmup: &super::Warmup, v: &mut ViolationList) {
     let at = |suffix: &str| format!("routes.{}.warmup.schedule.{suffix}", route.name);
 
     // §4.2: "A warmup.schedule array is empty, or contains a negative value."
@@ -1302,7 +1416,7 @@ fn check_schedule(cfg: &Config, route: &Route, warmup: &super::Warmup, v: &mut V
 
     for (group, series) in &warmup.schedule.overrides {
         // §4.2: "An overrides key names a nonexistent domain group."
-        if cfg.domain_group(group).is_none() {
+        if ramp.domain_group(group).is_none() {
             v.push(
                 at(&format!("overrides.{group}")),
                 format!("names domain group '{group}', which is not defined"),
@@ -1637,19 +1751,19 @@ fn stability_path(field: &str) -> String {
     }
 }
 
-fn check_chains(cfg: &Config, v: &mut ViolationList) {
-    for (i, rule) in cfg.senders.iter().enumerate() {
+fn check_chains(ramp: &Ramp, v: &mut ViolationList) {
+    for (i, rule) in ramp.senders.iter().enumerate() {
         let path = format!("senders[{i}] (match '{}')", rule.pattern);
         if rule.pattern.trim().is_empty() {
             v.push(&path, "match must not be empty");
         }
-        check_chain(cfg, &rule.chain, &path, v);
+        check_chain(ramp, &rule.chain, &path, v);
     }
 }
 
 /// §3.1: "Zero or more warming routes, followed by **at most one** overflow
 /// route. It must be last in any chain containing it."
-fn check_chain(cfg: &Config, chain: &[String], path: &str, v: &mut ViolationList) {
+fn check_chain(ramp: &Ramp, chain: &[String], path: &str, v: &mut ViolationList) {
     if chain.is_empty() {
         v.push(path, "chain must not be empty");
         return;
@@ -1659,7 +1773,7 @@ fn check_chain(cfg: &Config, chain: &[String], path: &str, v: &mut ViolationList
 
     for (i, name) in chain.iter().enumerate() {
         // §4.2: "A referenced route name does not exist."
-        let Some(route) = cfg.route(name) else {
+        let Some(route) = ramp.route(name) else {
             v.push(
                 path,
                 format!("chain[{i}] references route '{name}', which is not defined"),
@@ -1729,12 +1843,12 @@ fn check_chain(cfg: &Config, chain: &[String], path: &str, v: &mut ViolationList
 /// one chain sharing a domain make the pin pick whichever is listed first,
 /// which is right for one of them. Memory of which it was is exactly the state
 /// D-090 chose not to keep.
-fn check_thread_affinity(cfg: &Config, v: &mut ViolationList) {
-    if !cfg.thread_affinity {
+fn check_thread_affinity(ramp: &Ramp, v: &mut ViolationList) {
+    if !ramp.thread_affinity {
         return;
     }
 
-    let mut chains: Vec<(String, &[String])> = cfg
+    let mut chains: Vec<(String, &[String])> = ramp
         .senders
         .iter()
         .enumerate()
@@ -1745,7 +1859,7 @@ fn check_thread_affinity(cfg: &Config, v: &mut ViolationList) {
             )
         })
         .collect();
-    if let Some(chain) = &cfg.default_chain {
+    if let Some(chain) = &ramp.default_chain {
         chains.push(("default_chain".to_string(), chain.as_slice()));
     }
 
@@ -1754,7 +1868,7 @@ fn check_thread_affinity(cfg: &Config, v: &mut ViolationList) {
         let mut seen: Vec<(String, &str)> = Vec::new();
         for name in chain {
             // A dangling name is check_chain's to report.
-            let Some(route) = cfg.route(name) else {
+            let Some(route) = ramp.route(name) else {
                 continue;
             };
             match crate::routing::thread::route_domain(&route.identity) {
@@ -1787,20 +1901,20 @@ fn check_thread_affinity(cfg: &Config, v: &mut ViolationList) {
     }
 }
 
-fn check_default_chain(cfg: &Config, v: &mut ViolationList) {
+fn check_default_chain(ramp: &Ramp, v: &mut ViolationList) {
     // §4.2: "strict_senders: false and default_chain is absent or its final
     // route is not an overflow route."
-    if cfg.strict_senders {
+    if ramp.strict_senders {
         // A default_chain is harmless but pointless under strict_senders; still
         // validate it if present, so turning strict_senders off later does not
         // surface new errors.
-        if let Some(chain) = &cfg.default_chain {
-            check_chain(cfg, chain, "default_chain", v);
+        if let Some(chain) = &ramp.default_chain {
+            check_chain(ramp, chain, "default_chain", v);
         }
         return;
     }
 
-    let Some(chain) = &cfg.default_chain else {
+    let Some(chain) = &ramp.default_chain else {
         v.push(
             "default_chain",
             "is required when strict_senders is false: an unmatched sender has nowhere to go",
@@ -1808,9 +1922,9 @@ fn check_default_chain(cfg: &Config, v: &mut ViolationList) {
         return;
     };
 
-    check_chain(cfg, chain, "default_chain", v);
+    check_chain(ramp, chain, "default_chain", v);
 
-    match chain.last().and_then(|name| cfg.route(name)) {
+    match chain.last().and_then(|name| ramp.route(name)) {
         Some(route) if route.overflow => {}
         Some(route) => v.push(
             "default_chain",

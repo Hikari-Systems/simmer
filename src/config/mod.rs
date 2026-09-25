@@ -50,6 +50,47 @@ pub struct Config {
     #[serde(default)]
     pub capture: Option<Capture>,
 
+    /// §7.3. The spec defaults this to "the `google` group's domains", which
+    /// couples behaviour to a configuration-defined group name that may not
+    /// exist. Made explicit instead — see `DECISIONS.md` D-010.
+    ///
+    /// Global, not per ramp (D-099): it is a fact about mailbox providers, not a
+    /// routing policy, and two ramps disagreeing about it would make one wrong.
+    #[serde(default = "default_dot_insensitive_domains")]
+    pub dot_insensitive_domains: Vec<String>,
+
+    /// §5.8 (D-099) — the ramp a message is routed in when neither its listener
+    /// nor a usable `X-Simmer-Ramp` header names one. Must name an entry of
+    /// `ramps` (§4.2).
+    pub default_ramp: String,
+
+    /// §3.4 (D-099) — every routing profile, in document order.
+    pub ramps: Ramps,
+}
+
+fn default_dot_insensitive_domains() -> Vec<String> {
+    ["gmail.com", "googlemail.com"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// ramps (§3.4, D-099)
+// ---------------------------------------------------------------------------
+
+/// §3.4 — one complete, isolated routing profile: everything §3.2 consults.
+///
+/// These fields were top-level keys before D-099 and moved here unchanged.
+/// Route and domain-group names are scoped to the ramp.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ramp {
+    /// The key it was declared under in `ramps`. Filled in by [`Ramps`]'
+    /// deserialiser, never read from the document.
+    #[serde(skip)]
+    pub name: String,
+
     pub domain_groups: Vec<DomainGroup>,
     pub senders: Vec<SenderRule>,
 
@@ -66,25 +107,67 @@ pub struct Config {
     #[serde(default)]
     pub thread_affinity: bool,
 
-    /// §10.3. Not shown in the §4.1 example; placed at the top level because it
-    /// is a policy about the whole engine rather than about one route.
+    /// §10.3. Not shown in the §4.1 example; a policy about the whole ramp
+    /// rather than about one route.
     #[serde(default)]
     pub exhausted_chain_reply: ExhaustedChainReply,
-
-    /// §7.3. The spec defaults this to "the `google` group's domains", which
-    /// couples behaviour to a configuration-defined group name that may not
-    /// exist. Made explicit instead — see `DECISIONS.md` D-010.
-    #[serde(default = "default_dot_insensitive_domains")]
-    pub dot_insensitive_domains: Vec<String>,
 
     pub routes: Vec<Route>,
 }
 
-fn default_dot_insensitive_domains() -> Vec<String> {
-    ["gmail.com", "googlemail.com"]
-        .into_iter()
-        .map(String::from)
-        .collect()
+/// `ramps:` — a YAML mapping from name to [`Ramp`], kept in document order so
+/// that validation reports, `/ramps` and anything else that lists them agree
+/// with the file.
+#[derive(Debug, Clone, Default)]
+pub struct Ramps(pub Vec<Ramp>);
+
+impl Ramps {
+    pub fn iter(&self) -> std::slice::Iter<'_, Ramp> {
+        self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&Ramp> {
+        self.0.iter().find(|r| r.name == name)
+    }
+}
+
+impl<'de> Deserialize<'de> for Ramps {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Ramps;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a mapping from ramp name to its routing profile")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Ramps, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut out = Vec::new();
+                while let Some((name, mut ramp)) = map.next_entry::<String, Ramp>()? {
+                    ramp.name = name;
+                    out.push(ramp);
+                }
+                Ok(Ramps(out))
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
 }
 
 /// §10.3 — `451` by default. See §14.1: Simmer must not emit a reply that causes
@@ -1472,6 +1555,56 @@ pub struct NamedChain<'a> {
 }
 
 impl Config {
+    /// The ramp named `name`, if there is one.
+    pub fn ramp(&self, name: &str) -> Option<&Ramp> {
+        self.ramps.get(name)
+    }
+
+    /// The ramp named by `default_ramp`.
+    ///
+    /// # Panics
+    ///
+    /// If `default_ramp` names no ramp — which §4.2 refuses at startup, so a
+    /// `Config` that came through [`load`] or [`from_str`] never does.
+    pub fn default_ramp(&self) -> &Ramp {
+        self.ramp(&self.default_ramp)
+            .expect("§4.2 guarantees default_ramp names a ramp")
+    }
+
+    /// [`default_ramp`](Self::default_ramp), mutably — for tests that adjust a
+    /// loaded configuration in place.
+    ///
+    /// # Panics
+    ///
+    /// As [`default_ramp`](Self::default_ramp).
+    pub fn default_ramp_mut(&mut self) -> &mut Ramp {
+        let name = self.default_ramp.clone();
+        self.ramps
+            .0
+            .iter_mut()
+            .find(|r| r.name == name)
+            .expect("§4.2 guarantees default_ramp names a ramp")
+    }
+
+    /// Every route in every ramp, in document order.
+    ///
+    /// Route names are unique only **within** a ramp (§3.4), so anything that
+    /// keys by name alone must not be built from this once more than one ramp
+    /// can exist.
+    pub fn all_routes(&self) -> impl Iterator<Item = &Route> {
+        self.ramps.iter().flat_map(|r| r.routes.iter())
+    }
+
+    /// Whether `EHLO` may advertise `SMTPUTF8` (§5.2, D-018): only when every
+    /// route reachable in **every** ramp can carry it, since which ramp a
+    /// message lands in is not knowable at `EHLO` either. See
+    /// [`Ramp::advertise_smtputf8`].
+    pub fn advertise_smtputf8(&self) -> bool {
+        !self.ramps.is_empty() && self.ramps.iter().all(Ramp::advertise_smtputf8)
+    }
+}
+
+impl Ramp {
     pub fn route(&self, name: &str) -> Option<&Route> {
         self.routes.iter().find(|r| r.name == name)
     }
@@ -1484,7 +1617,7 @@ impl Config {
         self.domain_groups.iter().find(|g| g.is_catchall())
     }
 
-    /// Every chain in the configuration: one per sender rule, plus the default.
+    /// Every chain in the ramp: one per sender rule, plus the default.
     ///
     /// §4.2 uses it to check each chain's shape; §9.3 uses it to work out which
     /// chains a mutation has just left with nothing eligible, which is the
@@ -1511,8 +1644,8 @@ impl Config {
         out
     }
 
-    /// Every route a message could actually be sent through: the union of all
-    /// sender-rule chains and `default_chain`.
+    /// Every route a message could actually be sent through in this ramp: the
+    /// union of all sender-rule chains and `default_chain`.
     ///
     /// A route defined in `routes` but named by no chain is dead configuration
     /// (there is no hot reload, §2.2, so nothing can bring it to life), and it

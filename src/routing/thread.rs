@@ -29,7 +29,7 @@
 //! message may leave under (§3.2 step 1). An ID naming a route outside that
 //! chain pins nothing — it cannot widen the set, only order it.
 
-use crate::config::{Config, Identity};
+use crate::config::{Identity, Ramp};
 
 /// How many message IDs one message may make Simmer consider. A `References:`
 /// chain grows by one per turn of a conversation; RFC 5322 lets clients trim
@@ -124,7 +124,7 @@ impl Pin {
 }
 
 /// Find the route, in `chain`, that emitted the most recent ID in `ids`.
-pub fn pin_for(cfg: &Config, chain: &[String], ids: &[String]) -> Pin {
+pub fn pin_for(ramp: &Ramp, chain: &[String], ids: &[String]) -> Pin {
     if ids.is_empty() {
         return Pin::None;
     }
@@ -132,7 +132,7 @@ pub fn pin_for(cfg: &Config, chain: &[String], ids: &[String]) -> Pin {
     let domains: Vec<(&str, String)> = chain
         .iter()
         .filter_map(|name| {
-            let route = cfg.route(name)?;
+            let route = ramp.route(name)?;
             Some((name.as_str(), route_domain(&route.identity)?))
         })
         .collect();
@@ -151,8 +151,8 @@ pub fn pin_for(cfg: &Config, chain: &[String], ids: &[String]) -> Pin {
 /// Everything §3.2 step 2a needs from a buffered message: its threading
 /// headers, parsed, and matched against the chain. [`Pin::None`] without
 /// parsing anything when `thread_affinity` is off.
-pub fn pin_for_message(cfg: &Config, chain: &[String], raw: &[u8]) -> Pin {
-    if !cfg.thread_affinity {
+pub fn pin_for_message(ramp: &Ramp, chain: &[String], raw: &[u8]) -> Pin {
+    if !ramp.thread_affinity {
         return Pin::None;
     }
     let headers = crate::rewrite::headers::split(raw).headers;
@@ -160,7 +160,7 @@ pub fn pin_for_message(cfg: &Config, chain: &[String], raw: &[u8]) -> Pin {
         &headers.get_all("In-Reply-To"),
         &headers.get_all("References"),
     );
-    pin_for(cfg, chain, &ids)
+    pin_for(ramp, chain, &ids)
 }
 
 /// The chain in the order §3.2 step 3 should walk it: the pinned route first,
@@ -277,6 +277,7 @@ fn strip_comments(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -295,14 +296,17 @@ server:
   auth: { allow_insecure_auth: true }
 database: { url: "postgres://u:p@localhost/simmer", connect_timeout: 5s }
 admin: { listen: "127.0.0.1:8080", auth_token: "t" }
-thread_affinity: true
-domain_groups:
+default_ramp: main
+ramps:
+ main:
+  thread_affinity: true
+  domain_groups:
   - { name: catchall, domains: ["*"] }
-senders:
+  senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
   - { match: "other.com", match_on: envelope, chain: [elsewhere] }
-default_chain: [overflow]
-routes:
+  default_chain: [overflow]
+  routes:
   - name: warming
     downstream:
       host: warm.example
@@ -408,7 +412,7 @@ routes:
     fn route_domain_is_the_literal_after_the_last_at() {
         let cfg = cfg();
         assert_eq!(
-            route_domain(&cfg.route("warming").unwrap().identity).as_deref(),
+            route_domain(&cfg.default_ramp().route("warming").unwrap().identity).as_deref(),
             Some("newbrand.com"),
             "lowercased"
         );
@@ -416,7 +420,12 @@ routes:
 
     #[test]
     fn route_domain_refuses_a_templated_or_absent_domain() {
-        let mut identity = cfg().route("warming").unwrap().identity.clone();
+        let mut identity = cfg()
+            .default_ramp()
+            .route("warming")
+            .unwrap()
+            .identity
+            .clone();
         identity.set_headers.0 = vec![(
             "Message-ID".into(),
             "<{{uuid}}@{{original.from.domain}}>".into(),
@@ -432,7 +441,12 @@ routes:
 
     #[test]
     fn route_domain_accepts_a_template_without_angle_brackets() {
-        let mut identity = cfg().route("warming").unwrap().identity.clone();
+        let mut identity = cfg()
+            .default_ramp()
+            .route("warming")
+            .unwrap()
+            .identity
+            .clone();
         identity.set_headers.0 = vec![("message-id".into(), "{{uuid}}@newbrand.com".into())];
         assert_eq!(route_domain(&identity).as_deref(), Some("newbrand.com"));
     }
@@ -441,7 +455,7 @@ routes:
 
     #[test]
     fn no_ids_is_no_pin() {
-        assert_eq!(pin_for(&cfg(), &chain(), &[]), Pin::None);
+        assert_eq!(pin_for(cfg().default_ramp(), &chain(), &[]), Pin::None);
     }
 
     #[test]
@@ -451,7 +465,7 @@ routes:
             &s(&["<3f2a@mail.established.com> <CAx9@mail.gmail.com>"]),
         );
         assert_eq!(
-            pin_for(&cfg(), &chain(), &ids),
+            pin_for(cfg().default_ramp(), &chain(), &ids),
             Pin::Route("overflow".into())
         );
     }
@@ -460,7 +474,7 @@ routes:
     fn domains_match_case_insensitively_and_ignore_a_trailing_dot() {
         let ids = s(&["<3f2a@NEWBRAND.COM.>"]);
         assert_eq!(
-            pin_for(&cfg(), &chain(), &ids),
+            pin_for(cfg().default_ramp(), &chain(), &ids),
             Pin::Route("warming".into())
         );
     }
@@ -474,7 +488,7 @@ routes:
             &s(&["<1@newbrand.com> <r1@gmail.com> <2@mail.established.com> <r2@gmail.com>"]),
         );
         assert_eq!(
-            pin_for(&cfg(), &chain(), &ids),
+            pin_for(cfg().default_ramp(), &chain(), &ids),
             Pin::Route("overflow".into())
         );
     }
@@ -484,27 +498,39 @@ routes:
         // `elsewhere` exists and its domain matches, but the sender rule did not
         // give this message that chain.
         let ids = s(&["<1@elsewhere.com>"]);
-        assert_eq!(pin_for(&cfg(), &chain(), &ids), Pin::Unmatched);
+        assert_eq!(
+            pin_for(cfg().default_ramp(), &chain(), &ids),
+            Pin::Unmatched
+        );
     }
 
     #[test]
     fn ids_from_other_domains_are_unmatched() {
         let ids = s(&["<CAx9@mail.gmail.com>"]);
-        assert_eq!(pin_for(&cfg(), &chain(), &ids), Pin::Unmatched);
+        assert_eq!(
+            pin_for(cfg().default_ramp(), &chain(), &ids),
+            Pin::Unmatched
+        );
     }
 
     #[test]
     fn a_subdomain_is_not_the_domain() {
         let ids = s(&["<1@x.newbrand.com>", "<2@established.com>"]);
-        assert_eq!(pin_for(&cfg(), &chain(), &ids), Pin::Unmatched);
+        assert_eq!(
+            pin_for(cfg().default_ramp(), &chain(), &ids),
+            Pin::Unmatched
+        );
     }
 
     #[test]
     fn nothing_is_parsed_when_affinity_is_off() {
         let mut cfg = cfg();
-        cfg.thread_affinity = false;
+        cfg.default_ramp_mut().thread_affinity = false;
         let raw = b"From: a@oldbrand.com\r\nReferences: <1@newbrand.com>\r\n\r\nhi\r\n";
-        assert_eq!(pin_for_message(&cfg, &chain(), raw), Pin::None);
+        assert_eq!(
+            pin_for_message(cfg.default_ramp(), &chain(), raw),
+            Pin::None
+        );
     }
 
     #[test]
@@ -515,7 +541,7 @@ routes:
             \r\n\
             References: <body@mail.established.com>\r\n";
         assert_eq!(
-            pin_for_message(&cfg(), &chain(), raw),
+            pin_for_message(cfg().default_ramp(), &chain(), raw),
             Pin::Route("warming".into()),
             "folded header read; the body is not headers"
         );
