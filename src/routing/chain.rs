@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
+use super::domain_group::Grouper;
 use super::partial;
 use crate::config::{Config, Route};
 use crate::frequency::{self, Frequency};
@@ -139,6 +140,7 @@ pub enum Walk<'a> {
 #[allow(clippy::too_many_arguments)]
 pub async fn walk_and_reserve<'a>(
     cfg: &'a Config,
+    groups: &Grouper,
     store: &Arc<dyn QuotaStore>,
     frequency: &Frequency,
     preflight: &crate::preflight::Registry,
@@ -160,12 +162,13 @@ pub async fn walk_and_reserve<'a>(
 
     // §3.2 step 2. One recipient per transaction (D-047), so there is one domain
     // group and no question of a transaction spanning two.
-    let group = recipients
-        .first()
-        .and_then(|r| super::domain_group::resolve(cfg, r))
-        .or_else(|| cfg.catchall_group())
-        .map(|g| g.name.clone())
-        .unwrap_or_else(|| "catchall".to_string());
+    let group = match recipients.first() {
+        Some(r) => groups.group_name(cfg, r).await,
+        None => cfg
+            .catchall_group()
+            .map(|g| g.name.clone())
+            .unwrap_or_else(|| "catchall".to_string()),
+    };
 
     for name in chain {
         let Some(route) = cfg.route(name) else {
@@ -389,6 +392,7 @@ pub async fn walk_and_reserve<'a>(
 #[allow(clippy::too_many_arguments)]
 pub async fn dry_walk(
     cfg: &Config,
+    groups: &Grouper,
     store: &Arc<dyn QuotaStore>,
     frequency: &Frequency,
     preflight: &crate::preflight::Registry,
@@ -398,10 +402,7 @@ pub async fn dry_walk(
     now: chrono::DateTime<Utc>,
 ) -> Result<Vec<Step>, QuotaError> {
     let states = store.route_states().await?;
-    let group = super::domain_group::resolve(cfg, recipient)
-        .or_else(|| cfg.catchall_group())
-        .map(|g| g.name.clone())
-        .unwrap_or_else(|| "catchall".to_string());
+    let group = groups.group_name(cfg, recipient).await;
 
     let mut evaluation = Vec::new();
 
@@ -526,15 +527,14 @@ fn step(route: &str, outcome: Result<(), SkipReason>) -> Step {
 /// counting it eligible can only err in the harmless direction.
 pub async fn any_eligible(
     cfg: &Config,
+    groups: &Grouper,
     store: &Arc<dyn QuotaStore>,
     chain: &[String],
     recipient: &str,
 ) -> Result<bool, QuotaError> {
     let now = Utc::now();
     let states = store.route_states().await?;
-    let group = super::domain_group::resolve(cfg, recipient)
-        .map(|g| g.name.clone())
-        .unwrap_or_else(|| "catchall".to_string());
+    let group = groups.group_name(cfg, recipient).await;
 
     for name in chain {
         let Some(route) = cfg.route(name) else {

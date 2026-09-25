@@ -284,6 +284,11 @@ fn describe() {
     );
     describe_gauge!("simmer_db_pool_max", "database.max_connections");
     describe_counter!(
+        "simmer_mx_lookups_total",
+        "D-100 MX lookups for domain grouping, by result: ok, cached, error or timeout. \
+         error and timeout put the recipient in the catch-all group"
+    );
+    describe_counter!(
         "simmer_link_proxy_requests_total",
         "D-083 link proxy requests by status class and origin: upstream (the upstream's \
          own response) or proxy (502, 504, 413, 501 or 508 answered by Simmer itself)"
@@ -524,6 +529,12 @@ pub fn thread_affinity(route: &str, outcome: &'static str) {
         "outcome" => outcome,
     )
     .increment(1);
+}
+
+/// D-100 — one MX lookup for §3.2 step 2, or one answered from the cache.
+/// `result` is a fixed set; the domain is deliberately not a label.
+pub fn mx_lookup(result: &'static str) {
+    counter!("simmer_mx_lookups_total", "result" => result).increment(1);
 }
 
 /// §9.1 `simmer_downstream_latency_seconds{route}` — a histogram in phase 7.

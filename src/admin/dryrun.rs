@@ -147,6 +147,10 @@ pub struct MatchedRule {
 pub struct RecipientOutcome {
     pub recipient: String,
     pub domain_group: String,
+    /// Why the recipient is in that group (D-100): `literal`, `mx:<host>` for
+    /// the lowest-preference MX host that matched a group's suffix, `fallback`,
+    /// or `fallback:mx-unavailable` when the MX lookup failed or timed out.
+    pub domain_group_basis: String,
     /// One entry per route consulted, in walk order — chain order, with a
     /// thread-affinity pin moved to the front (D-090). The walk stops at the
     /// first eligible route, so the links after it are absent — they would not
@@ -352,13 +356,17 @@ async fn evaluate_one(
 ) -> Result<RecipientOutcome, ApiError> {
     let cfg = state.config();
 
-    let domain_group = crate::routing::domain_group::resolve(cfg, recipient)
-        .or_else(|| cfg.catchall_group())
-        .map(|g| g.name.clone())
-        .unwrap_or_else(|| "catchall".to_string());
+    // The walk resolves the group again; the second answer comes from the
+    // cache this one just filled, so the two cannot disagree in practice.
+    let (domain_group, domain_group_basis) = match state.engine.groups.resolve(cfg, recipient).await
+    {
+        Some(r) => (r.group.name.clone(), r.basis.describe()),
+        None => ("catchall".to_string(), "fallback".to_string()),
+    };
 
     let evaluation = chain::dry_walk(
         cfg,
+        &state.engine.groups,
         state.store(),
         &state.engine.frequency,
         &state.engine.preflight,
@@ -392,6 +400,7 @@ async fn evaluate_one(
     Ok(RecipientOutcome {
         recipient: recipient.to_string(),
         domain_group,
+        domain_group_basis,
         evaluation: evaluation.iter().map(step_view).collect(),
         selected,
         would_reply,

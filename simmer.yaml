@@ -180,16 +180,22 @@ logging:
 # Use it when a gap would invalidate the run, and know that a full disk then
 # stops mail.
 
-# §3.1: the second axis of the quota key. Literal domains only — no MX-based or
-# heuristic grouping (§14.3), so Google Workspace custom domains land in the
-# catch-all rather than being tracked against Google.
+# §3.1: the second axis of the quota key. `domains` is matched literally
+# first. A domain no group lists is then grouped by who receives its mail
+# (D-100): its lowest-preference MX host is matched against each group's `mx`
+# suffixes, so a Google Workspace company domain (MX aspmx.l.google.com)
+# counts against `google` and a Microsoft 365 tenant against `microsoft`.
+# Omit `mx` everywhere and no DNS lookups happen at all.
 domain_groups:
   - name: google
     domains: ["gmail.com", "googlemail.com"]
+    mx: ["google.com", "googlemail.com"]
   - name: microsoft
     domains: ["outlook.com", "hotmail.com", "hotmail.co.uk", "live.com", "msn.com"]
+    mx: ["mail.protection.outlook.com", "olc.protection.outlook.com"]
   - name: yahoo
     domains: ["yahoo.com", "yahoo.co.uk", "ymail.com", "aol.com"]
+    mx: ["yahoodns.net"]
   - name: catchall
     domains: ["*"]                   # exactly one group must contain "*"
 

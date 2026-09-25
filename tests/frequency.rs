@@ -344,6 +344,7 @@ async fn walk(
     let chain = vec!["warming".to_string(), "overflow".to_string()];
     let walked = chain::walk_and_reserve(
         cfg,
+        &simmer::routing::domain_group::Grouper::literal(),
         store,
         &Frequency::new(),
         &simmer::preflight::Registry::new(),

@@ -63,6 +63,9 @@ pub struct Engine {
     /// Shared and read-mostly: the walk consults it per message and only a
     /// `strict` route can be eliminated by it.
     pub preflight: Arc<crate::preflight::Registry>,
+    /// §3.2 step 2 with D-100's MX step, and its cache. Shared so the early
+    /// check, the walk and the dry run agree about a domain.
+    pub groups: Arc<crate::routing::domain_group::Grouper>,
     /// D-085 — the optional debugging capture. `None` is the whole of "off":
     /// no directory, no task, no metric, and an `Option<Capture>` one word wide,
     /// so cloning the engine per session costs nothing when it is absent.
@@ -180,7 +183,15 @@ pub async fn check_early(
 ) -> Result<(), SelectError> {
     let chain = resolve_chain(&engine.config, senders)?;
 
-    match chain::any_eligible(&engine.config, &engine.quota, chain, recipient).await {
+    match chain::any_eligible(
+        &engine.config,
+        &engine.groups,
+        &engine.quota,
+        chain,
+        recipient,
+    )
+    .await
+    {
         Ok(true) => Ok(()),
         Ok(false) => Err(SelectError::ChainExhausted),
         Err(e) => Err(quota_failure(&engine.config, e, "early eligibility check")),
@@ -241,6 +252,7 @@ pub async fn reserve_relay_commit(
     let mut evaluation = Vec::new();
     let selected = match chain::walk_and_reserve(
         cfg,
+        &engine.groups,
         &engine.quota,
         &engine.frequency,
         &engine.preflight,

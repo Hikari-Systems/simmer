@@ -335,6 +335,40 @@ index.
 Overflow routes are never capped, but they *are* counted — "how much is spilling
 to overflow" is the number that tells you whether the ramp is set too low.
 
+### Domain groups by MX
+
+A group's `domains` are matched literally. That is right for `gmail.com`, but it
+misses company domains whose mail is hosted by Google Workspace or Microsoft 365.
+Those used to land in the catch-all, so holding `google` at 0 did not stop them.
+Giving a group `mx` suffixes adds a second step (§3.2 step 2, D-100): a domain no
+group lists is looked up in DNS and joins the first group whose suffix matches its
+lowest-preference MX host.
+
+```yaml
+domain_groups:
+  - name: google
+    domains: ["gmail.com", "googlemail.com"]
+    mx: ["google.com", "googlemail.com"]          # aspmx.l.google.com, smtp.google.com
+  - name: microsoft
+    domains: ["outlook.com", "hotmail.com", "live.com"]
+    mx: ["mail.protection.outlook.com", "olc.protection.outlook.com"]
+  - name: yahoo
+    domains: ["yahoo.com", "aol.com"]
+    mx: ["yahoodns.net"]
+  - name: catchall
+    domains: ["*"]
+```
+
+- A literal match never touches DNS. With no `mx` anywhere, nothing is looked up.
+- Only the lowest-preference MX hosts count. A domain behind Proofpoint with Google
+  as its backup MX is judged by Proofpoint, so it is not counted as `google`.
+- A failed lookup, or one that takes over 2 s, puts the recipient in the catch-all.
+  It never defers mail. `simmer_mx_lookups_total{result}` (`ok`, `cached`, `error`,
+  `timeout`) counts lookups.
+- Answers are cached for their TTL, clamped to 5 min–24 h.
+- `POST /dryrun` reports each recipient's `domain_group_basis`: `literal`,
+  `mx:<host>`, `fallback` or `fallback:mx-unavailable`.
+
 ### Partial ramp
 
 Without it, a warming route takes **every** eligible message from the day
@@ -900,6 +934,7 @@ platform root store the §8.2 `required_verify` mode needs.
 ```
 src/config/     the §4.1 schema, ${ENV_VAR} interpolation, §4.2 validation
 src/routing/    sender matching (§5.4), domain groups (§3.2.2), the chain walk
+  domain_group.rs §3.2 step 2: literal domains, then MX host suffixes, cached (D-100)
   thread.rs       §3.2 step 2a's thread affinity: IDs in, a pinned route out (D-090)
   partial.rs      §3.2 step 3c′'s partial ramp: a keyed hash picks the share (D-091)
 src/smtp/       §5 ingress: listeners, state machine, AUTH, DATA buffer, replies

@@ -42,6 +42,32 @@ pub trait TxtResolver: Send + Sync {
     async fn txt(&self, name: &str) -> Result<Vec<String>, ResolveError>;
 }
 
+/// One MX record: its preference and its exchange host, lowercased and without
+/// the trailing root dot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mx {
+    pub preference: u16,
+    pub exchange: String,
+}
+
+/// The MX records at a name, and how long the answer may be kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MxAnswer {
+    pub records: Vec<Mx>,
+    /// The smallest TTL among the records; 0 when there are none, and the
+    /// caller picks its own negative-cache lifetime.
+    pub ttl_secs: u32,
+}
+
+/// The MX leg of §3.2 step 2 (D-100), behind a trait for the same reason
+/// `TxtResolver` is.
+#[async_trait]
+pub trait MxResolver: Send + Sync {
+    /// Every MX record at `domain`. An empty answer is "resolved, no MX" (and
+    /// NXDOMAIN reads the same way); `Err` is "we could not find out".
+    async fn mx(&self, domain: &str) -> Result<MxAnswer, ResolveError>;
+}
+
 // ---------------------------------------------------------------------------
 // The real one
 // ---------------------------------------------------------------------------
@@ -93,6 +119,48 @@ impl TxtResolver for Hickory {
     }
 }
 
+#[async_trait]
+impl MxResolver for Hickory {
+    async fn mx(&self, domain: &str) -> Result<MxAnswer, ResolveError> {
+        use hickory_resolver::proto::rr::{RData, RecordType};
+
+        // Fully qualified, so a resolv.conf `search` list cannot turn
+        // `example.com` into `example.com.corp.internal`.
+        let fqdn = format!("{}.", domain.trim_end_matches('.'));
+        let lookup = match self.inner.lookup(fqdn.as_str(), RecordType::MX).await {
+            Ok(l) => l,
+            Err(e) if e.is_no_records_found() => {
+                return Ok(MxAnswer {
+                    records: Vec::new(),
+                    ttl_secs: 0,
+                })
+            }
+            Err(e) => return Err(ResolveError(e.to_string())),
+        };
+
+        let mut ttl_secs = u32::MAX;
+        let mut records = Vec::new();
+        for record in lookup.answers() {
+            if let RData::MX(mx) = &record.data {
+                ttl_secs = ttl_secs.min(record.ttl);
+                records.push(Mx {
+                    preference: mx.preference,
+                    exchange: normalise_host(&mx.exchange.to_ascii()),
+                });
+            }
+        }
+        if records.is_empty() {
+            ttl_secs = 0;
+        }
+        Ok(MxAnswer { records, ttl_secs })
+    }
+}
+
+/// Lowercase, no trailing root dot: the form MX suffixes are compared in.
+pub fn normalise_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
 // ---------------------------------------------------------------------------
 // The test one
 // ---------------------------------------------------------------------------
@@ -105,6 +173,9 @@ impl TxtResolver for Hickory {
 #[derive(Default)]
 pub struct Fake {
     answers: std::collections::HashMap<String, Result<Vec<String>, ResolveError>>,
+    mx_answers: std::collections::HashMap<String, Result<MxAnswer, ResolveError>>,
+    /// How many MX lookups reached the fake — what a cache test counts.
+    mx_lookups: std::sync::atomic::AtomicUsize,
 }
 
 impl Fake {
@@ -125,6 +196,47 @@ impl Fake {
         self.answers
             .insert(name.to_string(), Err(ResolveError(error.to_string())));
         self
+    }
+
+    /// MX records at `domain`, as `(preference, exchange)`, with a one-hour TTL.
+    pub fn with_mx(mut self, domain: &str, records: &[(u16, &str)]) -> Self {
+        self.mx_answers.insert(
+            domain.to_string(),
+            Ok(MxAnswer {
+                records: records
+                    .iter()
+                    .map(|(preference, host)| Mx {
+                        preference: *preference,
+                        exchange: normalise_host(host),
+                    })
+                    .collect(),
+                ttl_secs: if records.is_empty() { 0 } else { 3600 },
+            }),
+        );
+        self
+    }
+
+    /// A domain whose MX lookup fails, as opposed to one with no MX records.
+    pub fn failing_mx(mut self, domain: &str, error: &str) -> Self {
+        self.mx_answers
+            .insert(domain.to_string(), Err(ResolveError(error.to_string())));
+        self
+    }
+
+    pub fn mx_lookups(&self) -> usize {
+        self.mx_lookups.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl MxResolver for Fake {
+    async fn mx(&self, domain: &str) -> Result<MxAnswer, ResolveError> {
+        self.mx_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.mx_answers.get(domain).cloned().unwrap_or(Ok(MxAnswer {
+            records: Vec::new(),
+            ttl_secs: 0,
+        }))
     }
 }
 

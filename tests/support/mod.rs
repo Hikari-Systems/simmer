@@ -479,6 +479,7 @@ impl Simmer {
             rewriters: Arc::new(rewriters),
             frequency: Arc::new(Frequency::new()),
             preflight,
+            groups: Arc::new(simmer::routing::domain_group::Grouper::literal()),
             capture: capture.clone(),
         };
 

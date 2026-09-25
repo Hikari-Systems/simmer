@@ -124,6 +124,7 @@ fn state_from(pool: PgPool, cfg: Config) -> AdminState {
                 b"test salt".to_vec(),
             )),
             preflight: Arc::new(simmer::preflight::Registry::new()),
+            groups: Arc::new(simmer::routing::domain_group::Grouper::literal()),
             capture: None,
         },
         // No recorder: `metrics` allows exactly one per process and installing it
@@ -588,6 +589,7 @@ async fn a_paused_route_is_skipped_by_the_real_chain_walk(pool: PgPool) {
     let mut evaluation = Vec::new();
     let walk = simmer::routing::chain::walk_and_reserve(
         &state.engine.config,
+        &state.engine.groups,
         &store(&state),
         &state.engine.frequency,
         &state.engine.preflight,
@@ -1227,6 +1229,7 @@ async fn compare_pinned_walks(
 
     let dry = simmer::routing::chain::dry_walk(
         cfg,
+        &state.engine.groups,
         &store(state),
         &state.engine.frequency,
         &state.engine.preflight,
@@ -1241,6 +1244,7 @@ async fn compare_pinned_walks(
     let mut evaluation = Vec::new();
     simmer::routing::chain::walk_and_reserve(
         cfg,
+        &state.engine.groups,
         &store(state),
         &state.engine.frequency,
         &state.engine.preflight,
@@ -1600,6 +1604,7 @@ async fn dry_run_agrees_with_the_real_walk_on_a_pinned_route_over_its_frequency(
     let mut ev = Vec::new();
     let simmer::routing::chain::Walk::Selected(s) = simmer::routing::chain::walk_and_reserve(
         &state.engine.config,
+        &state.engine.groups,
         &store(&state),
         &state.engine.frequency,
         &state.engine.preflight,

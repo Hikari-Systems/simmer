@@ -466,6 +466,7 @@ routes:
         DomainGroup {
             name: name.to_string(),
             domains: vec![],
+            mx: vec![],
         }
     }
 

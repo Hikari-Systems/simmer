@@ -1106,6 +1106,69 @@ fn check_domain_groups(cfg: &Config, v: &mut ViolationList) {
             }
         }
     }
+
+    // D-100: MX suffixes. Same uniqueness rule as domains — first group in
+    // configuration order would win, and a config that relies on that is one
+    // an operator will misread.
+    let mut seen_mx: BTreeMap<String, &str> = BTreeMap::new();
+    for g in &cfg.domain_groups {
+        if g.is_catchall() && !g.mx.is_empty() {
+            v.push(
+                format!("domain_groups.{}.mx", g.name),
+                "the catch-all group must not list MX suffixes; it is where every \
+                 recipient no other group claims already goes",
+            );
+        }
+        for suffix in &g.mx {
+            if let Some(problem) = mx_suffix_problem(suffix) {
+                v.push(
+                    format!("domain_groups.{}.mx", g.name),
+                    format!("'{suffix}': {problem}"),
+                );
+                continue;
+            }
+            let key = suffix.to_ascii_lowercase();
+            match seen_mx.get(&key) {
+                Some(first) if *first != g.name.as_str() => v.push(
+                    format!("domain_groups.{}.mx", g.name),
+                    format!("'{suffix}' also appears in group '{first}'"),
+                ),
+                Some(_) => v.push(
+                    format!("domain_groups.{}.mx", g.name),
+                    format!("'{suffix}' is listed twice in the same group"),
+                ),
+                None => {
+                    seen_mx.insert(key, &g.name);
+                }
+            }
+        }
+    }
+}
+
+/// D-100: an MX suffix is a host name — at least two labels, no wildcard, no
+/// leading or trailing dot. A single label (`com`) would claim half the
+/// internet's mail for one group.
+fn mx_suffix_problem(suffix: &str) -> Option<&'static str> {
+    if suffix.is_empty() {
+        return Some("must not be empty");
+    }
+    if suffix.contains('*') {
+        return Some("is a suffix, not a pattern; write 'google.com', not '*.google.com'");
+    }
+    if suffix.starts_with('.') || suffix.ends_with('.') {
+        return Some("must not start or end with '.'");
+    }
+    let labels: Vec<&str> = suffix.split('.').collect();
+    if labels.len() < 2 {
+        return Some("must have at least two labels, e.g. 'google.com'");
+    }
+    let label_ok = |l: &&str| {
+        !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    if !labels.iter().all(label_ok) {
+        return Some("must be a host name: letters, digits and '-', separated by '.'");
+    }
+    None
 }
 
 fn check_route_uniqueness(cfg: &Config, v: &mut ViolationList) {

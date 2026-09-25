@@ -142,6 +142,7 @@ async fn walk(
     let chain: Vec<String> = chain.iter().map(|s| s.to_string()).collect();
     let walked = chain::walk_and_reserve(
         cfg,
+        &simmer::routing::domain_group::Grouper::literal(),
         store,
         &Frequency::new(),
         registry,

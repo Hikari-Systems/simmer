@@ -552,13 +552,31 @@ pub enum LogFormat {
 pub struct DomainGroup {
     pub name: String,
     /// Literal recipient domains. Exactly one group must contain `*` (§3.1, §4.2).
-    /// No MX-based or heuristic grouping — see §14.3.
     pub domains: Vec<String>,
+    /// MX host suffixes (D-100). A recipient domain no group lists literally
+    /// joins the first group, in configuration order, one of whose suffixes
+    /// matches its lowest-preference MX host on a label boundary —
+    /// `google.com` matches `aspmx.l.google.com`, not `notgoogle.com`. Empty,
+    /// the default, is §3.2 step 2 exactly as it was: no DNS at all.
+    #[serde(default)]
+    pub mx: Vec<String>,
 }
 
 impl DomainGroup {
     pub fn is_catchall(&self) -> bool {
         self.domains.iter().any(|d| d == "*")
+    }
+
+    /// Whether `host` (lowercase, no trailing dot) is one of this group's MX
+    /// suffixes or a subdomain of one.
+    pub fn matches_mx_host(&self, host: &str) -> bool {
+        self.mx.iter().any(|suffix| {
+            let suffix = suffix.as_str();
+            host.len() >= suffix.len()
+                && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+                && (host.len() == suffix.len()
+                    || host.as_bytes()[host.len() - suffix.len() - 1] == b'.')
+        })
     }
 }
 

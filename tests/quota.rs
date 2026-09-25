@@ -693,6 +693,7 @@ async fn walk(
     let chain = vec!["warming".to_string(), "overflow".to_string()];
     let result = chain::walk_and_reserve(
         cfg,
+        &simmer::routing::domain_group::Grouper::literal(),
         store,
         &frequency(),
         &simmer::preflight::Registry::new(),
@@ -820,6 +821,7 @@ async fn an_exhausted_chain_with_no_overflow_selects_nothing(pool: PgPool) {
     for _ in 0..3 {
         let r = chain::walk_and_reserve(
             &cfg,
+            &simmer::routing::domain_group::Grouper::literal(),
             &store,
             &frequency(),
             &simmer::preflight::Registry::new(),
@@ -839,6 +841,7 @@ async fn an_exhausted_chain_with_no_overflow_selects_nothing(pool: PgPool) {
 
     let r = chain::walk_and_reserve(
         &cfg,
+        &simmer::routing::domain_group::Grouper::literal(),
         &store,
         &frequency(),
         &simmer::preflight::Registry::new(),
@@ -888,9 +891,15 @@ async fn the_early_check_sees_an_exhausted_chain_without_reserving(pool: PgPool)
     let store = store(pool);
     let chain = vec!["warming".to_string()];
 
-    assert!(chain::any_eligible(&cfg, &store, &chain, "bob@example.com")
-        .await
-        .unwrap());
+    assert!(chain::any_eligible(
+        &cfg,
+        &simmer::routing::domain_group::Grouper::literal(),
+        &store,
+        &chain,
+        "bob@example.com"
+    )
+    .await
+    .unwrap());
     // ...and asking did not consume anything.
     assert_eq!(
         store
@@ -905,6 +914,7 @@ async fn the_early_check_sees_an_exhausted_chain_without_reserving(pool: PgPool)
         let mut ev = Vec::new();
         if let Walk::Selected(s) = chain::walk_and_reserve(
             &cfg,
+            &simmer::routing::domain_group::Grouper::literal(),
             &store,
             &frequency(),
             &simmer::preflight::Registry::new(),
@@ -921,11 +931,15 @@ async fn the_early_check_sees_an_exhausted_chain_without_reserving(pool: PgPool)
         }
     }
 
-    assert!(
-        !chain::any_eligible(&cfg, &store, &chain, "bob@example.com")
-            .await
-            .unwrap()
-    );
+    assert!(!chain::any_eligible(
+        &cfg,
+        &simmer::routing::domain_group::Grouper::literal(),
+        &store,
+        &chain,
+        "bob@example.com"
+    )
+    .await
+    .unwrap());
 }
 
 #[sqlx::test]
@@ -938,6 +952,7 @@ async fn the_early_check_always_passes_a_chain_ending_in_overflow(pool: PgPool) 
         let mut ev = Vec::new();
         if let Walk::Selected(s) = chain::walk_and_reserve(
             &cfg,
+            &simmer::routing::domain_group::Grouper::literal(),
             &store,
             &frequency(),
             &simmer::preflight::Registry::new(),
@@ -955,9 +970,15 @@ async fn the_early_check_always_passes_a_chain_ending_in_overflow(pool: PgPool) 
     }
 
     assert!(
-        chain::any_eligible(&cfg, &store, &chain, "bob@example.com")
-            .await
-            .unwrap(),
+        chain::any_eligible(
+            &cfg,
+            &simmer::routing::domain_group::Grouper::literal(),
+            &store,
+            &chain,
+            "bob@example.com"
+        )
+        .await
+        .unwrap(),
         "an overflow route is never exhausted, so the chain never is"
     );
 }

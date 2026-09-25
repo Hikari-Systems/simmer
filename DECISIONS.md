@@ -4326,6 +4326,90 @@ unchanged and that the concession is real, and both are now assertions rather
 than prose.
 
 
+### D-100 — Domain groups by MX host: a Workspace company domain counts against `google`
+
+> **Approved 2026-09-25 in plan review, spec amendment included:** §3.1, §3.2
+> step 2, §4.1, §4.2, §9.1, §9.4, and §14 item 3 (now resolved).
+
+**The problem.** Ramp #2 (Postal on PHL-POSTAL-01, 22–24 Sep) showed Google refusing
+on domain reputation ("5.7.1 very low reputation of the sending domain"): 545
+refusals on 23 Sep and 211 on 24 Sep. Company domains hosted on Google Workspace got
+the same refusal: 8 on 23 Sep and 6 on 24 Sep. §3.2 step 2 matched the recipient
+domain literally, so those addresses were counted in the catch-all. Holding the
+`google` group at 0 could not have stopped them, and the catch-all numbers mixed in
+Google-hosted domains that Google would refuse. §14 item 3 had named this gap: fine
+for consumer lists, not for B2B. Microsoft 365 tenants and Yahoo-hosted domains have
+the same gap.
+
+Recognising `@gmail.com` was never the problem. The literal match handles consumer
+addresses correctly, and it is unchanged.
+
+**The rule.**
+1. A literal `domains` match wins, as before, with no DNS.
+2. Otherwise, if any group lists `mx` suffixes, look up the domain's MX
+   records. Take the exchange hosts at the **lowest preference**. The first group in
+   configuration order with a suffix that matches one of those hosts on a label
+   boundary wins.
+3. Otherwise, the catch-all.
+
+**Choices, and why.**
+- **Lowest preference only.** That is the host a sender actually talks to. A domain
+  behind Proofpoint with Google as its backup MX is judged by Proofpoint when mail
+  arrives, so it stays in the catch-all (or whichever group lists the filter).
+- **Suffix match on a label boundary.** `google.com` matches `aspmx.l.google.com` and
+  `smtp.google.com` (newer Workspace tenants), but not `notgoogle.com`. The exactness
+  test in `domain_group.rs` guards the same attack for literal domains. An MX suffix
+  needs at least two labels, so `com` cannot claim half the internet.
+- **DNS never defers mail.** A failure, or no answer within 2 s, sends the recipient
+  to the catch-all, which is where it went before this change. Deferring it instead
+  would turn a DNS problem into a `451` for a deliverable recipient, which D-064
+  already declined to do for §6.7. The fallback is counted
+  (`simmer_mx_lookups_total{result="error"|"timeout"}`) and logged at WARN with the
+  domain, never the address.
+- **Grouping by MX can only tighten.** Anyone can point their domain's MX at Google,
+  but that only puts the domain under the `google` allowance. No choice of recipient
+  domain can move a Google-hosted domain *out* of it.
+- **An in-process cache.** Positive answers are kept for their TTL, clamped to
+  5 min–24 h; "no MX" and NXDOMAIN for 1 h; failures for 60 s, so an outage does not
+  add 2 s to every message. The cache holds at most 50,000 entries; when it is full,
+  expired entries go first, then all of them. A cold cache costs lookups, not
+  correctness.
+- **Instances can briefly disagree.** Two instances with different cache ages can
+  count one domain in different groups for up to a TTL, for example across a
+  Workspace migration. Each quota row stays exact under its lock (§7.4). Only the
+  domain's attribution drifts, and only for that window.
+- **Off unless asked.** With no `mx` anywhere, `Grouper` does no lookup and §3.2
+  step 2 behaves exactly as before; `the_literal_grouper_matches_the_pre_d100_rule_exactly`
+  pins that. A resolver that cannot be built at startup is a WARN, not a refusal,
+  and grouping falls back to literal-only.
+- **The walk signatures take a `&Grouper`.** `walk_and_reserve`, `dry_walk` and
+  `any_eligible` each resolve the group themselves, as before, but through the one
+  shared `Engine::groups`. The early check, the walk and the dry run therefore read
+  one cache and cannot disagree about a domain.
+
+**Dry run** reports `domain_group_basis`: `literal`, `mx:<host>`, `fallback` or
+`fallback:mx-unavailable`. An operator can see why a hospital domain was counted as
+`microsoft`.
+
+**Alternatives, rejected.**
+- *Match any MX host, not just the lowest-preference ones.* This would put filtered
+  domains in `google` because of a backup record that never receives mail.
+- *Look up at config load and list the domains.* A recipient list is not known at
+  load time.
+- *Defer on DNS failure.* See above.
+- *A hard-coded provider table.* D-037's rule is that Simmer adds nothing unasked.
+  The suffixes live in config, next to the literal domains they complement.
+
+**Tested:** unit tests in `routing/domain_group.rs` against `resolver::Fake`
+(Workspace, including `smtp.google.com`; M365; the label boundary;
+lowest-preference only; null MX; failure; timeout; the cache; no lookup for a
+literal match or a config without `mx`), and validation tests in
+`tests/config_validation.rs`. Full suites: Postgres 1254 passed, SQL Server 1095
+passed. Checked by hand once against live DNS: `anthropic.com` resolved to
+`google` via `mx:aspmx.l.google.com`, and `nhs.net` and `hikari-systems.com`
+resolved to `microsoft`. **Not run:** the §12.3 acceptance suite (it cannot run
+from the jail), and a dry run against a deployed instance.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

@@ -166,9 +166,11 @@ followed by **at most one** overflow route. Evaluated in order; the first eligib
 never quota-limited. It must be last in any chain containing it. A chain may contain at most
 one.
 
-**Domain group** — a named list of literal recipient domains, used as the second axis of the
-quota key. Entirely configuration-defined; no MX-based or heuristic grouping. A group whose
-domain list contains `*` is the catch-all and must exist.
+**Domain group** — a named list of literal recipient domains, and optionally of MX host
+suffixes, used as the second axis of the quota key. Entirely configuration-defined; no
+heuristic grouping. A group whose domain list contains `*` is the catch-all and must exist.
+*(Amended — was "a named list of literal recipient domains … no MX-based or heuristic
+grouping". See `DECISIONS.md` D-100.)*
 
 ### 3.2 Selection algorithm
 
@@ -180,7 +182,14 @@ Given an accepted message with a resolved incoming identity:
    `simmer_unmatched_sender_total{domain}`. If `strict_senders: true`, reject instead with
    `550 5.7.1 sender domain not configured`.
 2. **Resolve the recipient's domain group.** Exact, case-insensitive match of the recipient
-   domain against each group's domain list; fall back to the catch-all group.
+   domain against each group's domain list. Failing that, and only if some group lists `mx`
+   suffixes, look up the domain's MX records: the first group, in configuration order, one of
+   whose suffixes matches a **lowest-preference** exchange host on a label boundary
+   (`google.com` matches `aspmx.l.google.com`, not `notgoogle.com`). Fall back to the
+   catch-all group — including when the lookup fails or does not answer within 2 seconds,
+   which never defers the message. Answers are cached for their TTL, clamped to 5 minutes–24
+   hours; no MX for an hour; a failure for a minute. *(Amended — the MX step is added. See
+   `DECISIONS.md` D-100.)*
 
    2a. **Thread affinity**, when `thread_affinity: true`. Read the message IDs in
    `In-Reply-To:` and then `References:`, most recent first (at most 256). The first whose
@@ -289,10 +298,13 @@ link_proxy:                            # optional; absent => no listener (§5.7)
 domain_groups:
   - name: google
     domains: ["gmail.com", "googlemail.com"]
+    mx: ["google.com", "googlemail.com"]   # optional MX host suffixes (§3.2 step 2)
   - name: microsoft
     domains: ["outlook.com", "hotmail.com", "hotmail.co.uk", "live.com", "msn.com"]
+    mx: ["mail.protection.outlook.com", "olc.protection.outlook.com"]
   - name: yahoo
     domains: ["yahoo.com", "yahoo.co.uk", "ymail.com", "aol.com"]
+    mx: ["yahoodns.net"]
   - name: catchall
     domains: ["*"]                     # exactly one group must contain "*"
 
@@ -408,6 +420,9 @@ not just the first.
 - An overflow route carries a `warmup` block, or a non-overflow route omits one.
 - No domain group contains `*`, or more than one does.
 - A domain appears in more than one group.
+- An `mx` suffix appears in more than one group, is on the catch-all group, or is not a host
+  name of at least two labels (no `*`, no leading or trailing `.`). *(Added. See
+  `DECISIONS.md` D-100.)*
 - A `warmup.schedule` array is empty, or contains a negative value.
 - An `overrides` key names a nonexistent domain group.
 - `admin.metrics.idle_timeout` is shorter than one minute, whether or not `admin.metrics` is
@@ -1162,10 +1177,12 @@ At minimum:
   within its cap), `over_cap` (past its cap), `ineligible` (the pinned route was eliminated and
   the ordinary walk decided), `unmatched` (the message refers to IDs no chain route emitted;
   `route` is `-`). A message that refers to no ID counts nothing
+- `simmer_mx_lookups_total{result}` — result: `ok`, `cached`, `error`, `timeout` (§3.2 step
+  2). `error` and `timeout` each put a recipient in the catch-all
 
 *(The four `simmer_link_proxy_*` metrics are added. See `DECISIONS.md` D-083.
 `simmer_header_rewrite_skipped_total` is added; see D-089. `simmer_thread_affinity_total` is
-added; see D-090.)*
+added; see D-090. `simmer_mx_lookups_total` is added; see D-100.)*
 
 ### 9.2 Read API
 
@@ -1212,6 +1229,11 @@ not an estimate. *(Added. See `DECISIONS.md` D-091.)* Under `mode: auto` it is t
 answer **as of now**: the share is computed from the same row and the same clock the walk
 would read, and that row moves. This is the standard the headroom check beside it has always
 held to. *(Added. See `DECISIONS.md` D-097.)*
+
+Each recipient's domain group is reported with the basis it was chosen on: `literal`,
+`mx:<host>` (the exchange host that matched), `fallback`, or `fallback:mx-unavailable`. The
+lookup is the real one and fills the same cache the walk reads. *(Added. See `DECISIONS.md`
+D-100.)*
 
 This is the primary tool for validating a configuration before it carries live traffic, and
 should be treated as a first-class feature rather than a debugging afterthought.
@@ -1416,10 +1438,11 @@ call before production use.
    point, but it means a typo in a sender rule sends unwarmed traffic at full volume via the
    established identity. The `WARN` and counter must actually be alerted on, or set
    `strict_senders: true`.
-3. **§7.1 — no MX-based domain grouping.** Literal matching means Google Workspace custom
-   domains land in the catch-all rather than being tracked against Google. Acceptable for
-   consumer-heavy recipient lists; less so for B2B. The config shape permits adding MX
-   grouping later without a schema change.
+3. *(Resolved — see `DECISIONS.md` D-100.)* **§7.1 — no MX-based domain grouping.** Literal
+   matching meant Google Workspace custom domains landed in the catch-all rather than being
+   tracked against Google. Ramp #2 (22–24 Sep 2026) showed the cost: Google refused Workspace
+   company domains with the same reputation error as gmail.com, and holding `google` at 0
+   could not stop them. §3.2 step 2 now groups an unlisted domain by its MX host.
 4. **Reputation cost of overflow.** Rewriting `From:` to an established domain spends that
    domain's reputation on new-brand traffic. A dedicated subdomain (`mail.established.com`)
    contains the blast radius and is what the example configuration uses.

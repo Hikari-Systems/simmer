@@ -265,6 +265,9 @@ src/frequency/sweeper.rs §7.3's eviction. Hourly; not started if nothing needs 
 src/quota/postgres.rs    the §7.4 protocol. The row lock is what makes it correct
                          `commit` also records §7.3's events, in ONE transaction
 src/quota/day.rs         §7.2 elapsed-duration day index; NEVER calendar arithmetic
+src/routing/domain_group.rs  §3.2 step 2 — literal, then MX suffix (D-100). DNS NEVER
+                         defers: a failed or slow lookup is the catch-all. One shared
+                         `Grouper` (Engine::groups) so walk, early check and dry run agree
 src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve are ONE op
 src/routing/thread.rs    §3.2 step 2a (D-090) — thread affinity. A REORDERING plus two
                          exemptions for the pinned route only: no §7.3 threshold, and

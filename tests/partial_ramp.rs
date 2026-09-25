@@ -104,6 +104,7 @@ async fn walk(
     let chain = vec!["warming".to_string(), "overflow".to_string()];
     let walked = chain::walk_and_reserve(
         cfg,
+        &simmer::routing::domain_group::Grouper::literal(),
         store,
         &Frequency::new(),
         &simmer::preflight::Registry::new(),
@@ -244,6 +245,7 @@ async fn dry_run_gives_the_real_walks_answer(pool: PgPool) {
     for r in recipients(40) {
         let dry = chain::dry_walk(
             &cfg,
+            &simmer::routing::domain_group::Grouper::literal(),
             &store,
             &Frequency::new(),
             &simmer::preflight::Registry::new(),
@@ -357,6 +359,7 @@ async fn offered_count(
     for r in recipients(n) {
         let dry = chain::dry_walk(
             cfg,
+            &simmer::routing::domain_group::Grouper::literal(),
             store,
             &Frequency::new(),
             &simmer::preflight::Registry::new(),
@@ -553,6 +556,7 @@ async fn dry_run_gives_the_real_walks_answer_under_auto(pool: PgPool) {
     for r in recipients(40) {
         let dry = chain::dry_walk(
             &cfg,
+            &simmer::routing::domain_group::Grouper::literal(),
             &store,
             &Frequency::new(),
             &simmer::preflight::Registry::new(),

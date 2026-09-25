@@ -194,6 +194,66 @@ fn rejects_a_domain_in_more_than_one_group() {
     rejected_for(&yaml, "also appears in group");
 }
 
+// -- D-100: MX suffixes ----------------------------------------------------
+
+fn with_groups(groups: &str) -> String {
+    let yaml = BASE.replace(
+        "  - { name: google, domains: [\"gmail.com\"] }\n  - { name: catchall, domains: [\"*\"] }\n",
+        groups,
+    );
+    assert_ne!(yaml, BASE, "the fixture rewrite must have applied");
+    yaml
+}
+
+#[test]
+fn accepts_mx_suffixes_and_defaults_them_to_none() {
+    let cfg = load(&with_groups(
+        "  - { name: google, domains: [\"gmail.com\"], mx: [\"google.com\", \"googlemail.com\"] }\n  - { name: catchall, domains: [\"*\"] }\n",
+    ))
+    .expect("valid");
+    let groups = &cfg.domain_groups;
+    assert_eq!(groups[0].mx, ["google.com", "googlemail.com"]);
+    assert!(groups[1].mx.is_empty());
+}
+
+#[test]
+fn rejects_an_mx_suffix_in_more_than_one_group() {
+    rejected_for(
+        &with_groups(
+            "  - { name: google, domains: [\"gmail.com\"], mx: [\"google.com\"] }\n  - { name: other, domains: [\"x.example\"], mx: [\"Google.com\"] }\n  - { name: catchall, domains: [\"*\"] }\n",
+        ),
+        "also appears in group",
+    );
+}
+
+#[test]
+fn rejects_mx_suffixes_on_the_catch_all() {
+    rejected_for(
+        &with_groups(
+            "  - { name: google, domains: [\"gmail.com\"] }\n  - { name: catchall, domains: [\"*\"], mx: [\"google.com\"] }\n",
+        ),
+        "catch-all group must not list MX suffixes",
+    );
+}
+
+#[test]
+fn rejects_malformed_mx_suffixes() {
+    for (suffix, needle) in [
+        ("*.google.com", "is a suffix, not a pattern"),
+        (".google.com", "must not start or end with '.'"),
+        ("com", "at least two labels"),
+        ("goo gle.com", "must be a host name"),
+        ("", "must not be empty"),
+    ] {
+        rejected_for(
+            &with_groups(&format!(
+                "  - {{ name: google, domains: [\"gmail.com\"], mx: [\"{suffix}\"] }}\n  - {{ name: catchall, domains: [\"*\"] }}\n"
+            )),
+            needle,
+        );
+    }
+}
+
 // -- §4.2: schedules -----------------------------------------------------
 
 #[test]

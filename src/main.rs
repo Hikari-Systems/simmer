@@ -203,6 +203,30 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // §3.2 step 2, D-100 — MX grouping, only when some group asks for it. A
+    // resolver that cannot be built is a WARN, not a refusal: every domain not
+    // listed literally then lands in the catch-all, which is what it did before
+    // D-100.
+    let wants_mx = config.domain_groups.iter().any(|g| !g.mx.is_empty());
+    let groups = if wants_mx {
+        match simmer::preflight::resolver::Hickory::from_system() {
+            Ok(r) => {
+                info!("MX domain grouping enabled (D-100)");
+                simmer::routing::domain_group::Grouper::new(Arc::new(r))
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "DNS resolver unavailable; MX domain grouping disabled. Domains not \
+                     listed literally in a group go to the catch-all (D-100)"
+                );
+                simmer::routing::domain_group::Grouper::literal()
+            }
+        }
+    } else {
+        simmer::routing::domain_group::Grouper::literal()
+    };
+
     // §8.3 — one pool per route, built from the same `Config` the engine holds.
     // Opening nothing yet: a pool is a bound and a set of idle sockets, and there
     // is no reason to dial a downstream before a message needs one.
@@ -231,6 +255,7 @@ async fn run() -> anyhow::Result<()> {
         rewriters: Arc::new(rewriters),
         frequency,
         preflight: Arc::clone(&preflight),
+        groups: Arc::new(groups),
         capture: capture.clone(),
     };
 

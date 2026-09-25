@@ -409,6 +409,7 @@ mod over_the_cap {
             let mut ev = Vec::new();
             let walk = simmer::routing::chain::walk_and_reserve(
                 &cfg,
+                &simmer::routing::domain_group::Grouper::literal(),
                 &store,
                 &frequency,
                 &preflight,
@@ -468,6 +469,7 @@ mod over_the_cap {
                 let mut ev = Vec::new();
                 let walk = simmer::routing::chain::walk_and_reserve(
                     &cfg,
+                    &simmer::routing::domain_group::Grouper::literal(),
                     &store,
                     &frequency,
                     &preflight,
@@ -571,6 +573,7 @@ mod over_the_cap {
             let simmer::routing::chain::Walk::Selected(s) =
                 simmer::routing::chain::walk_and_reserve(
                     &cfg,
+                    &simmer::routing::domain_group::Grouper::literal(),
                     &store,
                     &frequency,
                     &preflight,
@@ -595,6 +598,7 @@ mod over_the_cap {
         let mut ev = Vec::new();
         let walk = simmer::routing::chain::walk_and_reserve(
             &cfg,
+            &simmer::routing::domain_group::Grouper::literal(),
             &store,
             &frequency,
             &preflight,
