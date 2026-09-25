@@ -68,8 +68,15 @@ pub use tokio_util_shim::CancellationToken as Shutdown;
 /// What a session needs to know about the port it arrived on (D-070).
 #[derive(Clone)]
 pub struct Policy {
+    /// The listener's configured address, as written — what the capture
+    /// records and what §9.4's dry run is asked about (D-099).
+    pub address: String,
     pub tls: IngressTls,
     pub auth: IngressAuth,
+    /// §5.8 (D-099) — the listener's port affinity, and whether a permitted
+    /// `X-Simmer-Ramp` header may override it.
+    pub ramp: Option<String>,
+    pub header_overrides_affinity: bool,
     /// Present exactly when `tls` is not `off`: §4.2 refuses a TLS listener
     /// without a certificate, so a session never has to wonder.
     pub acceptor: Option<TlsAcceptor>,
@@ -157,8 +164,11 @@ impl Listener {
                 .map_err(|e| anyhow::anyhow!("binding SMTP listener {}: {e}", l.address))?;
             let tls = l.tls_mode();
             let policy = Policy {
+                address: l.address.clone(),
                 tls,
                 auth: l.auth_mode(),
+                ramp: l.ramp.clone(),
+                header_overrides_affinity: l.header_overrides_affinity,
                 acceptor: tls
                     .can_encrypt()
                     .then(|| certificate.as_ref().map(|c| c.acceptor.clone()))

@@ -1964,3 +1964,142 @@ async fn a_dry_run_reports_the_ramp_it_used(pool: PgPool) {
     let missing = post(&state, "/dryrun", Some(TOKEN), &body(r#","ramp":"other""#)).await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND, "{}", missing.body);
 }
+
+/// Two ramps. `partner` has its own `overflow` (same name as `main`'s), the
+/// second listener is tied to it, and `cfapp` may name it in the header.
+fn two_ramp_state(pool: PgPool) -> AdminState {
+    let hash = "$argon2id$v=19$m=19456,t=2,p=1$iYj0sVhRvzAWM9kzsFBKyg$V1tnVXTGEO+BD0x9q1uccuo91w84jrz+qDKA3qElLFE";
+    let yaml = CFG
+        .replace(
+            "    - address: \"127.0.0.1:0\"\n",
+            "    - address: \"127.0.0.1:0\"\n    - address: \"127.0.0.1:2526\"\n      ramp: partner\n",
+        )
+        .replace(
+            "  auth: { allow_insecure_auth: true }",
+            &format!(
+                "  auth:\n    allow_insecure_auth: true\n    users:\n      - username: cfapp\n        \
+                 password_hash: \"{hash}\"\n        grants: {{ send_as: [oldbrand.com], ramps: [partner] }}"
+            ),
+        )
+        + r#" partner:
+  domain_groups:
+  - { name: catchall, domains: ["*"] }
+  senders: []
+  default_chain: [overflow]
+  routes:
+  - name: overflow
+    overflow: true
+    downstream:
+      host: "127.0.0.1"
+      port: 2525
+      tls: off
+      pool: { max_connections: 1, idle_ttl: 60s, max_messages_per_connection: 10 }
+      timeouts: { connect: 2s, command: 2s, data: 2s }
+    identity: { envelope_from: "bounce@partner.example" }
+"#;
+    let cfg = simmer::config::from_str(&yaml, "test").expect("two-ramp fixture is valid");
+    state_from(pool, cfg)
+}
+
+#[sqlx::test]
+async fn with_several_ramps_quota_will_not_guess(pool: PgPool) {
+    let state = two_ramp_state(pool);
+    let response = get(&state, "/quota", Some(TOKEN)).await;
+    assert_eq!(
+        response.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        response.body
+    );
+    assert!(
+        response.body.contains("ramp is required"),
+        "{}",
+        response.body
+    );
+
+    let doc = get(&state, "/quota?ramp=partner", Some(TOKEN)).await.json();
+    assert_eq!(doc["ramp"], "partner");
+}
+
+#[sqlx::test]
+async fn ramps_report_their_listeners_and_are_mutated_independently(pool: PgPool) {
+    let state = two_ramp_state(pool);
+    let partner = get(&state, "/ramps/partner", Some(TOKEN)).await.json();
+    assert_eq!(partner["default"], false);
+    assert_eq!(partner["listeners"], serde_json::json!(["127.0.0.1:2526"]));
+
+    // Pausing partner's `overflow` leaves main's `overflow` alone.
+    let r = post(
+        &state,
+        "/ramps/partner/routes/overflow/pause",
+        Some(TOKEN),
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let theirs = get(&state, "/ramps/partner/routes/overflow", Some(TOKEN))
+        .await
+        .json();
+    let ours = get(&state, "/ramps/main/routes/overflow", Some(TOKEN))
+        .await
+        .json();
+    assert_eq!(
+        (theirs["paused"].as_bool(), ours["paused"].as_bool()),
+        (Some(true), Some(false))
+    );
+}
+
+#[sqlx::test]
+async fn a_dry_run_selects_the_ramp_as_the_session_would(pool: PgPool) {
+    let state = two_ramp_state(pool);
+    let run = |extra: &'static str| {
+        let state = state.clone();
+        async move {
+            post(
+                &state,
+                "/dryrun",
+                Some(TOKEN),
+                &format!(
+                    r#"{{"envelope_from":"app@oldbrand.com","recipients":["bob@example.net"]{extra}}}"#
+                ),
+            )
+            .await
+        }
+    };
+    let pick = |doc: serde_json::Value| {
+        (
+            doc["ramp"].as_str().unwrap().to_string(),
+            doc["ramp_source"].as_str().unwrap().to_string(),
+            doc["ramp_header"].as_str().unwrap().to_string(),
+        )
+    };
+    let s = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+
+    assert_eq!(
+        pick(run(r#","listener":"127.0.0.1:2526""#).await.json()),
+        s("partner", "affinity", "absent")
+    );
+    assert_eq!(
+        pick(
+            run(r#","auth_user":"cfapp","ramp_header":"partner""#)
+                .await
+                .json()
+        ),
+        s("partner", "header", "used")
+    );
+    assert_eq!(
+        pick(run(r#","ramp_header":"partner""#).await.json()),
+        s("main", "default", "not_permitted"),
+        "unauthenticated, so the header is ignored"
+    );
+    assert_eq!(
+        run(r#","listener":"127.0.0.1:9""#).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        run(r#","ramp":"main","listener":"127.0.0.1:2526""#)
+            .await
+            .status,
+        StatusCode::BAD_REQUEST
+    );
+}

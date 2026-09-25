@@ -88,9 +88,21 @@ pub struct DryRunRequest {
     /// is almost always the headers and which patterns fired.
     #[serde(default)]
     pub include_message: bool,
-    /// §9.4 (D-099) — the ramp to route in. Absent: `default_ramp`.
+    /// §9.4 (D-099) — the ramp to route in. Or leave it out and give what
+    /// §5.8 selects from, and the same function the session calls chooses it:
     #[serde(default)]
     pub ramp: Option<String>,
+    /// … the listener's address, as written in `server.listeners`,
+    #[serde(default)]
+    pub listener: Option<String>,
+    /// … the user the session authenticated as, whose `grants.ramps` decide
+    /// whether the header may be used,
+    #[serde(default)]
+    pub auth_user: Option<String>,
+    /// … and the `X-Simmer-Ramp` value. Ignored when `message` is supplied:
+    /// its own headers are what the session would read.
+    #[serde(default)]
+    pub ramp_header: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,8 +110,12 @@ pub struct DryRunResponse {
     pub evaluated_at: chrono::DateTime<Utc>,
     /// The ramp everything below was evaluated in (D-099).
     pub ramp: String,
-    /// Which rule chose it: `given` (the request's `ramp`) or `default`.
+    /// Which rule chose it: `given` (the request's `ramp`), or §5.8's
+    /// `affinity`, `header` or `default`.
     pub ramp_source: &'static str,
+    /// What became of `X-Simmer-Ramp`: `absent`, `used`, `redundant`, or the
+    /// reason it was ignored (§5.8's table).
+    pub ramp_header: &'static str,
     /// Which sender rule matched, or `null` for the default chain.
     pub matched_rule: Option<MatchedRule>,
     /// Where the chain came from — a sender rule's path, or `default_chain`.
@@ -214,15 +230,7 @@ pub async fn dryrun(
     Json(request): Json<DryRunRequest>,
 ) -> Result<Json<DryRunResponse>, ApiError> {
     let cfg = state.config();
-    let (ramp, ramp_source) = match &request.ramp {
-        Some(name) => (
-            cfg.ramps
-                .get(name)
-                .ok_or_else(|| ApiError::not_found("ramp", name))?,
-            "given",
-        ),
-        None => (cfg.default_ramp(), "default"),
-    };
+    let (ramp, ramp_source, ramp_header) = choose_ramp(cfg, &request)?;
     let now = Utc::now();
 
     if request.recipients.is_empty() {
@@ -254,6 +262,7 @@ pub async fn dryrun(
                 evaluated_at: now,
                 ramp: ramp.name.clone(),
                 ramp_source,
+                ramp_header,
                 matched_rule: None,
                 chain_source: "none".to_string(),
                 chain: Vec::new(),
@@ -300,6 +309,7 @@ pub async fn dryrun(
     Ok(Json(DryRunResponse {
         ramp: ramp.name.clone(),
         ramp_source,
+        ramp_header,
         evaluated_at: now,
         matched_rule,
         chain_source,
@@ -418,7 +428,7 @@ async fn evaluate_one(
     // which one to apply.
     let outbound = selected
         .as_ref()
-        .map(|route| render(state, route, recipient, request, now));
+        .map(|route| render(state, &ramp.name, route, recipient, request, now));
 
     Ok(RecipientOutcome {
         recipient: recipient.to_string(),
@@ -439,6 +449,7 @@ async fn evaluate_one(
 /// look like the thing it is previewing.
 fn render(
     state: &AdminState,
+    ramp: &str,
     route_name: &str,
     recipient: &str,
     request: &DryRunRequest,
@@ -450,7 +461,7 @@ fn render(
 
     // Unreachable in practice: `Rewriters` is compiled from the same routes the
     // walk selected from.
-    let Some(rewriter) = state.engine.rewriters.get(route_name) else {
+    let Some(rewriter) = state.engine.rewriters.get(ramp, route_name) else {
         return Outbound {
             route: route_name.to_string(),
             envelope_from: None,
@@ -512,6 +523,68 @@ fn render(
 /// MIME structure. Otherwise a minimal `text/plain` message is assembled from
 /// the fields §9.4 names, because the common case is an operator with a `From:`
 /// value and a paragraph, not a raw RFC 5322 document.
+/// §9.4 (D-099): the ramp, which rule chose it, and what became of the header.
+/// `ramp` is given outright, or §5.8 selects from the rest — never both, since
+/// an answer that silently ignored half the request would mislead exactly the
+/// operator who asked.
+fn choose_ramp<'a>(
+    cfg: &'a crate::config::Config,
+    request: &DryRunRequest,
+) -> Result<(&'a crate::config::Ramp, &'static str, &'static str), ApiError> {
+    use crate::routing::ramp_select;
+
+    let selecting =
+        request.listener.is_some() || request.auth_user.is_some() || request.ramp_header.is_some();
+    if let Some(name) = &request.ramp {
+        if selecting {
+            return Err(ApiError::bad_request(
+                "give either `ramp`, or what §5.8 selects from (`listener`, `auth_user`, \
+                 `ramp_header`), not both",
+            ));
+        }
+        let ramp = cfg
+            .ramps
+            .get(name)
+            .ok_or_else(|| ApiError::not_found("ramp", name))?;
+        return Ok((ramp, "given", "absent"));
+    }
+
+    let listener = request
+        .listener
+        .as_ref()
+        .map(|address| {
+            cfg.server
+                .listeners
+                .iter()
+                .find(|l| &l.address == address)
+                .ok_or_else(|| ApiError::not_found("listener", address))
+        })
+        .transpose()?;
+    if let Some(user) = &request.auth_user {
+        if !cfg.server.auth.users.iter().any(|u| &u.username == user) {
+            return Err(ApiError::not_found("user", user));
+        }
+    }
+    let ingress = ramp_select::ingress(
+        cfg,
+        listener.and_then(|l| l.ramp.as_deref()),
+        listener.is_some_and(|l| l.header_overrides_affinity),
+        request.auth_user.as_deref(),
+    );
+    let headers = match &request.message {
+        Some(message) => crate::rewrite::headers::split(&normalise_eol(message))
+            .headers
+            .get_all(ramp_select::HEADER),
+        None => request.ramp_header.iter().cloned().collect(),
+    };
+    let selection = ramp_select::select(cfg, &ingress, &headers);
+    Ok((
+        selection.ramp,
+        selection.source.as_str(),
+        selection.header.as_str(),
+    ))
+}
+
 fn synthesise(request: &DryRunRequest, recipient: &str) -> Vec<u8> {
     if let Some(message) = &request.message {
         return normalise_eol(message);
@@ -534,6 +607,10 @@ fn synthesise(request: &DryRunRequest, recipient: &str) -> Vec<u8> {
     ));
     if let Some(v) = &request.in_reply_to {
         out.push_str(&format!("In-Reply-To: {v}\r\n"));
+    }
+    // So the rendered outbound shows it stripped (§6.5), as it would be.
+    if let Some(v) = &request.ramp_header {
+        out.push_str(&format!("{}: {v}\r\n", crate::routing::ramp_select::HEADER));
     }
     if let Some(v) = &request.references {
         out.push_str(&format!("References: {v}\r\n"));
@@ -659,6 +736,9 @@ mod tests {
             references: None,
             include_message: false,
             ramp: None,
+            listener: None,
+            auth_user: None,
+            ramp_header: None,
         }
     }
 

@@ -274,7 +274,7 @@ fn refresh_runtime_gauges(state: &AdminState) {
 /// inside the fallible path above.
 fn refresh_pool_gauges(state: &AdminState) {
     for route in state.config().all_routes() {
-        let Some(stats) = state.engine.pools.stats(&route.name) else {
+        let Some(stats) = state.engine.pools.stats(&route.ramp, &route.name) else {
             continue;
         };
         crate::metrics::pool_connections(&route.ramp, &route.name, "idle", stats.idle as f64);

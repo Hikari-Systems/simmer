@@ -33,6 +33,7 @@ use crate::metrics;
 use crate::quota::{self, QuotaStore, ReservationRegistry};
 use crate::rewrite::{self, Rewriters};
 use crate::routing::chain::{self, Walk};
+use crate::routing::ramp_select;
 use crate::routing::sender_match::{self, Senders};
 use crate::routing::thread;
 use crate::smtp::reply::{self, Reply};
@@ -178,10 +179,10 @@ pub fn resolve_chain<'a>(ramp: &'a Ramp, senders: &Senders) -> Result<&'a [Strin
 /// only then asks the store whether anything in the chain has headroom.
 pub async fn check_early(
     engine: &Engine,
+    ramp: &Ramp,
     senders: &Senders,
     recipient: &str,
 ) -> Result<(), SelectError> {
-    let ramp = engine.config.default_ramp();
     let chain = resolve_chain(ramp, senders)?;
 
     match chain::any_eligible(ramp, &engine.groups, &engine.quota, chain, recipient).await {
@@ -222,19 +223,26 @@ fn quota_failure(cfg: &Config, ramp: &Ramp, e: quota::QuotaError, during: &str) 
 /// why commit and release are not exposed separately to the session.
 pub async fn reserve_relay_commit(
     engine: &Engine,
+    selection: &ramp_select::Selection<'_>,
     senders: &Senders,
     message: Message<'_>,
     correlation_id: &str,
 ) -> Reply {
     let cfg = &engine.config;
-    // §5.8 (D-099). Until selection lands every message is routed in the
-    // default ramp, which §4.2 currently requires to be the only one.
-    let ramp = cfg.default_ramp();
+    // §5.8 (D-099): chosen by the session before this runs. Everything below
+    // is within this ramp.
+    let ramp = selection.ramp;
 
     let chain = match resolve_chain(ramp, senders) {
         Ok(c) => c,
         Err(e) => {
-            tracing::info!(correlation_id, reason = ?e, "no route selected");
+            tracing::info!(
+                correlation_id,
+                ramp = %ramp.name,
+                ramp_source = selection.source.as_str(),
+                reason = ?e,
+                "no route selected"
+            );
             return e.to_reply(ramp);
         }
     };
@@ -296,7 +304,10 @@ pub async fn reserve_relay_commit(
     // The identity is known only now, because it belongs to the route the walk
     // just picked. Everything before this point has treated the message as
     // opaque bytes.
-    let Some(rewriter) = engine.rewriters.get(&selected.route.name) else {
+    let Some(rewriter) = engine
+        .rewriters
+        .get(&selected.route.ramp, &selected.route.name)
+    else {
         // Unreachable: `Rewriters` is compiled from the same `cfg.routes` the
         // walk selected from. Answered rather than panicked because the message
         // has already been accepted from the client, and §14.1 makes the answer
@@ -348,6 +359,9 @@ pub async fn reserve_relay_commit(
 
     tracing::info!(
         correlation_id,
+        // §9.5: the ramp and which §5.8 rule chose it.
+        ramp = %ramp.name,
+        ramp_source = selection.source.as_str(),
         route = %selected.route.name,
         domain_group = %selected.domain_group,
         day_index = selected.day_index,

@@ -4556,6 +4556,24 @@ T-SQL batch is compiled whole before any of it runs. `route_state`'s primary
 key there was declared inline, so its generated name is looked up rather than
 assumed.
 
+**Found while building selection.**
+- *A header naming the ramp a locked affinity chose anyway is `redundant`, not
+  rejected.* It is neither used nor wrong, and counting it as `affinity_locked`
+  would page someone over a client that is merely explicit.
+- *Rejection reasons are judged in a fixed order:* conflicting, then malformed,
+  then unknown, then (under a locked affinity) affinity_locked, then
+  not_permitted. A locked listener never needs the rights check, since the header
+  cannot win there.
+- *The dry run takes either `ramp` or the selection inputs, not both* (`400`). An
+  answer that silently ignored half the request would mislead exactly the
+  operator who asked. A synthesised message carries `ramp_header`, so the
+  rendered outbound shows it stripped.
+- *`set_headers` naming `X-Simmer-Ramp` is a startup warning*, as §6.5 says. It
+  runs after the strip, so it would hand a Simmer instruction to the downstream.
+- *Pools, rewriters and preflight reports are keyed `(ramp, route)`,* and each
+  `Route` carries its ramp's name (filled at load), so code holding a route can
+  key and label by both without being passed the ramp separately.
+
 
 ### D-100 — Domain groups by MX host: a Workspace company domain counts against `google`
 

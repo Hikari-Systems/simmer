@@ -175,7 +175,7 @@ async fn a_healthy_domain_passes_all_three_checks() {
     let cfg = config(false);
     let registry = registry_after(&cfg, &healthy_dns()).await;
 
-    let report = registry.report("warming").expect("a report");
+    let report = registry.report("main", "warming").expect("a report");
     assert_eq!(report.domain, "newbrand.com");
     assert!(report.all_ok(), "{:?}", report.checks);
     assert_eq!(report.checks.len(), 3, "SPF, DKIM and DMARC were all asked");
@@ -186,7 +186,7 @@ async fn a_missing_dkim_selector_is_the_failure_6_5_is_about() {
     let cfg = config(false);
     let registry = registry_after(&cfg, &dns_without_dkim()).await;
 
-    let report = registry.report("warming").expect("a report");
+    let report = registry.report("main", "warming").expect("a report");
     assert!(!report.all_ok());
 
     let dkim = report
@@ -230,7 +230,7 @@ async fn dmarc_is_not_checked_unless_required() {
         );
 
     let registry = registry_after(&cfg, &dns).await;
-    let report = registry.report("warming").expect("a report");
+    let report = registry.report("main", "warming").expect("a report");
 
     assert_eq!(report.checks.len(), 2, "only SPF and DKIM were asked");
     assert!(
@@ -253,7 +253,7 @@ async fn a_resolver_failure_is_a_failed_check_and_says_so() {
 
     let report = registry_after(&cfg, &dns)
         .await
-        .report("warming")
+        .report("main", "warming")
         .expect("a report");
 
     let spf = report
@@ -358,7 +358,9 @@ async fn a_chain_with_nothing_left_is_451_and_never_550() {
     let cfg = config_without_overflow();
     let registry = Arc::new(registry_after(&cfg, &dns_without_dkim()).await);
     assert!(
-        registry.report("warming").is_some_and(|r| !r.all_ok()),
+        registry
+            .report("main", "warming")
+            .is_some_and(|r| !r.all_ok()),
         "precondition: the only route in the chain is failing preflight"
     );
 

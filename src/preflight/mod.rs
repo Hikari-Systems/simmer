@@ -223,7 +223,8 @@ impl RouteReport {
 /// `/routes`.
 #[derive(Default)]
 pub struct Registry {
-    routes: RwLock<HashMap<String, RouteReport>>,
+    /// Keyed `(ramp, route)` (D-099).
+    routes: RwLock<HashMap<(String, String), RouteReport>>,
 }
 
 impl Registry {
@@ -231,19 +232,19 @@ impl Registry {
         Self::default()
     }
 
-    pub fn report(&self, route: &str) -> Option<RouteReport> {
+    pub fn report(&self, ramp: &str, route: &str) -> Option<RouteReport> {
         self.routes
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .get(route)
+            .get(&(ramp.to_string(), route.to_string()))
             .cloned()
     }
 
-    fn put(&self, route: &str, report: RouteReport) {
+    fn put(&self, ramp: &str, route: &str, report: RouteReport) {
         self.routes
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(route.to_string(), report);
+            .insert((ramp.to_string(), route.to_string()), report);
     }
 
     /// §6.7's `strict`: does preflight make this route ineligible right now?
@@ -259,7 +260,8 @@ impl Registry {
         if !p.enabled || !p.strict {
             return false;
         }
-        self.report(&route.name).is_some_and(|r| !r.all_ok())
+        self.report(&route.ramp, &route.name)
+            .is_some_and(|r| !r.all_ok())
     }
 }
 
@@ -375,7 +377,7 @@ pub async fn check_once(plans: &[Plan], resolver: &dyn TxtResolver, registry: &R
             }
         }
 
-        registry.put(&plan.route, report);
+        registry.put(&plan.ramp, &plan.route, report);
     }
 }
 
@@ -608,7 +610,7 @@ ramps:
     fn a_non_strict_route_is_never_blocked_however_badly_it_fails() {
         let route = route_with(Some((true, false)));
         let reg = Registry::new();
-        reg.put(&route.name, report(false));
+        reg.put(&route.ramp, &route.name, report(false));
         assert!(
             !reg.blocks(&route),
             "§6.7: without strict, a failure is a WARN and a gauge and nothing else"
@@ -626,10 +628,10 @@ ramps:
              chain-wide outage"
         );
 
-        reg.put(&route.name, report(true));
+        reg.put(&route.ramp, &route.name, report(true));
         assert!(!reg.blocks(&route), "a passing report does not block");
 
-        reg.put(&route.name, report(false));
+        reg.put(&route.ramp, &route.name, report(false));
         assert!(
             reg.blocks(&route),
             "a failing report on a strict route blocks"
@@ -640,7 +642,7 @@ ramps:
     fn a_route_with_no_preflight_block_is_never_blocked() {
         let route = route_with(None);
         let reg = Registry::new();
-        reg.put(&route.name, report(false));
+        reg.put(&route.ramp, &route.name, report(false));
         assert!(!reg.blocks(&route));
     }
 
@@ -648,7 +650,7 @@ ramps:
     fn a_disabled_route_is_never_blocked() {
         let route = route_with(Some((false, true)));
         let reg = Registry::new();
-        reg.put(&route.name, report(false));
+        reg.put(&route.ramp, &route.name, report(false));
         assert!(
             !reg.blocks(&route),
             "enabled: false wins over strict: true — D-009 is that an absent or \

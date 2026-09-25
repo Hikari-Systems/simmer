@@ -864,6 +864,7 @@ mod tests {
             id: "id".into(),
             at: now(),
             peer: "127.0.0.1:1".into(),
+            listener: None,
             helo: "h".into(),
             tls: false,
             auth_user: user.map(str::to_string),

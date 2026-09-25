@@ -48,6 +48,7 @@ use crate::config::{CaptureOnError, Config, IngressAuth, IngressTls};
 use crate::downstream::stream::Stream;
 use crate::metrics;
 use crate::relay::{self, Engine};
+use crate::routing::ramp_select;
 use crate::routing::sender_match::Senders;
 
 /// RFC 5321 §4.5.3.1: 512 octets for a command line including CRLF.
@@ -648,11 +649,29 @@ impl Session {
         // reservation. The authoritative check is the reservation itself, taken
         // immediately before the downstream conversation, so a reservation never
         // spans the DATA transfer.
-        if crate::routing::sender_match::can_decide_at_rcpt(cfg.default_ramp()) {
+        //
+        // D-099 narrows it once more: only when the ramp is already fixed here,
+        // before `X-Simmer-Ramp` has arrived. Otherwise a header-selected ramp
+        // could be refused because a different ramp is exhausted.
+        let ingress = ramp_select::ingress(
+            cfg,
+            self.policy.ramp.as_deref(),
+            self.policy.header_overrides_affinity,
+            self.user.as_deref(),
+        );
+        let early = ramp_select::fixed_at_rcpt(cfg, &ingress)
+            .filter(|ramp| crate::routing::sender_match::can_decide_at_rcpt(ramp))
+            .map(|ramp| ramp.name.clone());
+        if let Some(ramp_name) = early {
             let senders = Senders::new(tx.mail_from.as_deref(), None);
             let engine = self.engine.clone();
-            if let Err(e) = relay::check_early(&engine, &senders, &to).await {
-                let r = e.to_reply(engine.config.default_ramp());
+            let ramp = engine
+                .config
+                .ramps
+                .get(&ramp_name)
+                .expect("fixed_at_rcpt returns a configured ramp");
+            if let Err(e) = relay::check_early(&engine, ramp, &senders, &to).await {
+                let r = e.to_reply(ramp);
                 tracing::info!(
                     correlation_id = %self.correlation_id,
                     reason = ?e,
@@ -779,6 +798,12 @@ impl Session {
 
         let senders = Senders::new(tx.mail_from.as_deref(), from_header.as_deref());
 
+        // §5.8 (D-099) — the ramp's header, from the same head of the buffer.
+        // Stripped from the outbound message whatever becomes of it (§6.5).
+        let ramp_header = crate::rewrite::headers::split(&head)
+            .headers
+            .get_all(ramp_select::HEADER);
+
         let bytes = match body.read_all().await {
             Ok(b) => b,
             Err(e) => {
@@ -816,6 +841,7 @@ impl Session {
                     correlation_id: &self.correlation_id,
                     at: chrono::Utc::now(),
                     peer: self.peer,
+                    listener: &self.policy.address,
                     helo: self.greeted.as_deref().unwrap_or_default(),
                     tls: self.encrypted(),
                     auth_user: self.user.as_deref(),
@@ -865,8 +891,20 @@ impl Session {
         // an accepted message over.
         let helo = self.greeted.clone().unwrap_or_default();
         let peer = self.peer.ip().to_string();
+
+        // §5.8 — chosen here, at the final dot, and nowhere else.
+        let ingress = ramp_select::ingress(
+            &engine.config,
+            self.policy.ramp.as_deref(),
+            self.policy.header_overrides_affinity,
+            self.user.as_deref(),
+        );
+        let selection = ramp_select::select(&engine.config, &ingress, &ramp_header);
+        ramp_select::record(&selection, &self.correlation_id);
+
         relay::reserve_relay_commit(
             &engine,
+            &selection,
             &senders,
             relay::Message {
                 mail_from: tx.mail_from.as_deref(),

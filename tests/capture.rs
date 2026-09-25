@@ -170,7 +170,9 @@ async fn one_message_produces_one_record_in_one_bucket() {
     let recs = records(dir.path());
     assert_eq!(recs.len(), 1);
     let r = &recs[0];
-    assert_eq!(r.v, 1);
+    assert_eq!(r.v, 2);
+    // D-099: the listener as configured, an ingress fact — not the ramp.
+    assert_eq!(r.listener.as_deref(), Some("127.0.0.1:0"));
     assert_eq!(r.mail_from.as_deref(), Some("a@oldbrand.com"));
     assert_eq!(r.rcpt_to, vec!["bob@x.test".to_string()]);
     assert!(!r.id.is_empty(), "the correlation id is the join key");

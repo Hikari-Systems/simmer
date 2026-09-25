@@ -274,6 +274,10 @@ src/quota/day.rs         §7.2 elapsed-duration day index; NEVER calendar arithm
 src/routing/domain_group.rs  §3.2 step 2 — literal, then MX suffix (D-100). DNS NEVER
                          defers: a failed or slow lookup is the catch-all. One shared
                          `Grouper` (Engine::groups) so walk, early check and dry run agree
+src/routing/ramp_select.rs  §5.8 (D-099) — which ramp. PURE: the session, the §5.4
+                         early check and the dry run all call `select`. An unusable
+                         header is IGNORED and counted, never a refusal; the header
+                         is stripped (§6.5) whatever became of it
 src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve are ONE op
 src/routing/thread.rs    §3.2 step 2a (D-090) — thread affinity. A REORDERING plus two
                          exemptions for the pinned route only: no §7.3 threshold, and

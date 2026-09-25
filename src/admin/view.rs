@@ -206,7 +206,7 @@ pub struct PreflightCheckView {
 }
 
 fn preflight_view(route: &Route, registry: &crate::preflight::Registry) -> Option<PreflightView> {
-    let report = registry.report(&route.name)?;
+    let report = registry.report(&route.ramp, &route.name)?;
     Some(PreflightView {
         domain: report.domain.clone(),
         checked_at: report.checked_at,
@@ -308,7 +308,7 @@ pub fn project_route(
             }),
         groups,
         preflight: preflight_view(route, preflight),
-        pool: pools.stats(&route.name),
+        pool: pools.stats(&route.ramp, &route.name),
     }
 }
 

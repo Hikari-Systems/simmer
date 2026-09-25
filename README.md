@@ -304,7 +304,10 @@ misconfigured application or somebody else's credentials.
 
 **The grants decide whether a message is accepted, never where it goes.** Routing
 is still `senders`, exactly as before, and the username still plays no part in it.
-Two users granted the same identity send byte-identical mail.
+Two users granted the same identity send byte-identical mail. There is one amended
+exception: `grants.ramps` decides whether a user's `X-Simmer-Ramp` header is
+honoured, and so which *ramp* the message is routed in (§5.3, D-099; see Named
+ramps). It never refuses, and within a ramp the rule above holds.
 
 **They apply only to sessions that authenticated.** A listener with `auth:
 optional` — port 25's default — accepts unauthenticated mail with any sender from
@@ -317,6 +320,61 @@ where it would land in shell history:
 ```sh
 printf '%s' "$PASSWORD" | docker run -i --rm simmer:local hash-password
 ```
+
+### Named ramps
+
+One process can warm several unrelated programmes (two brands, two ESP
+accounts, two start dates), each as its own **ramp**. A ramp is a complete
+routing profile: its own `domain_groups`, `senders`, `default_chain`, routes,
+schedules and quota. Ramps share nothing. Route and group names are scoped to
+their ramp, so two ramps can each have an `overflow` (§3.4, D-099).
+
+```yaml
+server:
+  listeners:
+    - address: "0.0.0.0:25"             # no affinity: header, else default_ramp
+    - address: "0.0.0.0:2525"
+      ramp: partner                      # port affinity
+      header_overrides_affinity: false   # default: the affinity wins
+  auth:
+    users:
+      - username: "cfapp"
+        grants:
+          send_as: ["oldbrand.com"]
+          ramps: [partner]               # may name it in X-Simmer-Ramp; default none
+default_ramp: main                       # required
+ramps:
+  main:    { domain_groups: …, senders: …, routes: … }
+  partner: { domain_groups: …, senders: …, routes: … }
+```
+
+**Which ramp a message goes to** is decided at the final dot (§5.8). The
+listener's `ramp` wins, unless it sets `header_overrides_affinity`. Then comes an
+`X-Simmer-Ramp:` header the session may name, then the listener's `ramp`, then
+`default_ramp`.
+
+- **Unauthenticated sessions cannot choose.** Only an authenticated session may
+  name a ramp, and only one in its user's `grants.ramps`.
+- **A bad header is never an error.** It is ignored, logged at `WARN` and counted
+  in `simmer_ramp_header_rejected_total{reason}`, and the message routes as if it
+  weren't there. The reasons are `unknown`, `not_permitted`, `malformed`,
+  `conflicting` and `affinity_locked`.
+- **`simmer_ramp_selected_total{ramp,source}`** says which rule decided.
+- **The header is always stripped**, used or not. It is an instruction to Simmer
+  and never reaches the downstream.
+- **`POST /dryrun`** takes `listener`, `auth_user` and `ramp_header` and answers
+  with the ramp the session would choose.
+
+**Upgrading from 0.8.** Everything that used to be top level (`domain_groups`,
+`senders`, `default_chain`, `strict_senders`, `thread_affinity`,
+`exhausted_chain_reply`, `routes`) moves under `ramps.<name>`, and
+`default_ramp` names it. An old config is refused, with a pointer for each moved
+key. Existing quota, pause and §7.3 state is adopted into `default_ramp` at the
+first start, before any listener binds. The upgrade is **stop-the-world**: stop
+every 0.8 instance, start one 0.9 instance, then the rest. A 0.8 binary cannot
+write to the migrated schema (it fails with `451` rather than miscounting), and
+there is no downgrade, so take a backup. On SQL Server, route, group and ramp
+names are now limited to 128 characters.
 
 ### The ramp
 
@@ -673,7 +731,7 @@ parser:
 
 ```console
 $ cut -c1-140 2026-09-20T14.10.jsonl
-{"at":"2026-09-20T14:13:02.418Z","rcpt_to":["bob@gmail.com"],"mail_from":"news@oldbrand.com","subject":"Your September statement","v":1,
+{"at":"2026-09-20T14:13:02.418Z","rcpt_to":["bob@gmail.com"],"mail_from":"news@oldbrand.com","subject":"Your September statement","v":2,
 ```
 
 A record is on disk within **ten buffered lines or 500 ms of quiet**, whichever

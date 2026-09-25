@@ -80,6 +80,13 @@ pub const AUTH_ARTEFACTS: [&str; 5] = [
     "ARC-Authentication-Results",
 ];
 
+/// §6.5, for a different reason (D-099): Simmer's own control input. §5.8
+/// reads it at the final dot; it is stripped unconditionally, every
+/// occurrence, whether it was used, ignored or overridden, so its absence
+/// from the output never depends on selection — and a Simmer-ism never
+/// reaches the downstream or the recipient.
+pub const CONTROL_HEADERS: [&str; 1] = [crate::routing::ramp_select::HEADER];
+
 // ---------------------------------------------------------------------------
 // compiled form
 // ---------------------------------------------------------------------------
@@ -231,18 +238,18 @@ impl RouteRewrite {
 /// is impossible after validation, and the relay treats it as a `451` rather
 /// than a panic — the message has already been accepted from the client.
 #[derive(Debug, Clone, Default)]
-pub struct Rewriters(HashMap<String, RouteRewrite>);
+pub struct Rewriters(HashMap<(String, String), RouteRewrite>);
 
 impl Rewriters {
     pub fn compile(cfg: &Config) -> Result<Rewriters, Vec<(String, CompileError)>> {
         let mut out = HashMap::new();
         let mut errors = Vec::new();
 
-        // Keyed by route name: sound only while §4.2 allows one ramp (D-099).
+        // Keyed `(ramp, route)`: a route name is unique only within its ramp.
         for route in cfg.all_routes() {
             match RouteRewrite::compile(&route.identity) {
                 Ok(r) => {
-                    out.insert(route.name.clone(), r);
+                    out.insert((route.ramp.clone(), route.name.clone()), r);
                 }
                 Err(errs) => errors.extend(errs.into_iter().map(|e| (route.name.clone(), e))),
             }
@@ -255,8 +262,8 @@ impl Rewriters {
         }
     }
 
-    pub fn get(&self, route: &str) -> Option<&RouteRewrite> {
-        self.0.get(route)
+    pub fn get(&self, ramp: &str, route: &str) -> Option<&RouteRewrite> {
+        self.0.get(&(ramp.to_string(), route.to_string()))
     }
 }
 
@@ -376,6 +383,9 @@ pub fn rewrite(route: &RouteRewrite, inbound: &Inbound<'_>) -> Rewritten {
     // -- step 4: §6.5, unconditional -----------------------------------
     for artefact in AUTH_ARTEFACTS {
         message.headers.remove(artefact);
+    }
+    for control in CONTROL_HEADERS {
+        message.headers.remove(control);
     }
 
     // -- step 5 --------------------------------------------------------
@@ -674,6 +684,22 @@ set_headers:
             assert!(!out.contains(artefact), "{artefact} survived:\n{out}");
         }
         assert!(out.contains("From: a@oldbrand.com"));
+    }
+
+    #[test]
+    fn the_ramp_header_is_stripped_every_time() {
+        // D-099: Simmer's control input, whatever §5.8 made of it, and every
+        // occurrence — including one folded or in a different case.
+        let route = compile(r#"envelope_from: "b@new.com""#);
+        let raw: &[u8] = b"X-Simmer-Ramp: partner\r\nx-simmer-ramp:\r\n  other\r\n\
+                           From: a@b\r\n\r\nX-Simmer-Ramp: in the body stays\r\n";
+        let out = text(&run(&route, raw, Some("a@b")));
+        let (head, body) = out.split_once("\r\n\r\n").expect("a header block");
+        assert!(
+            !head.to_ascii_lowercase().contains("x-simmer-ramp"),
+            "{out}"
+        );
+        assert!(body.contains("X-Simmer-Ramp: in the body stays"), "{out}");
     }
 
     #[test]

@@ -717,3 +717,35 @@ async fn f7_unmatched_sender_series_are_bounded() {
     })
     .await;
 }
+
+#[sqlx::test]
+async fn ramp_selection_is_counted_and_a_rejected_value_never_becomes_a_label(pool: PgPool) {
+    let _serialised = exclusive().await;
+    let state = state(pool);
+    simmer::metrics::ramp_selected("main", "header");
+    simmer::metrics::ramp_header_rejected("unknown");
+
+    let (_, body) = scrape(&state).await;
+    assert_eq!(
+        value(
+            &body,
+            "simmer_ramp_selected_total",
+            &[("ramp", "main"), ("source", "header")]
+        ),
+        "1"
+    );
+    assert_eq!(
+        value(
+            &body,
+            "simmer_ramp_header_rejected_total",
+            &[("reason", "unknown")]
+        ),
+        "1",
+        "reason is the only label: the value is the client's, and D-093's lesson is \
+         that a client-chosen label grows without bound"
+    );
+    assert!(
+        body.contains("# HELP simmer_ramp_header_rejected_total"),
+        "{body}"
+    );
+}

@@ -43,7 +43,7 @@ ramps' state.
 | 1. Config | Routing moves under `ramps.<name>`; required `default_ramp`; top-level keys that moved are named; every reader goes through `default_ramp()` | **done** |
 | 2. Storage | `ramp` joins every key in both backends (migration `20260925000000_ramp`, `''` fill, default dropped as the v0.8 fence); SQL Server key names 200 → 128; `adopt_legacy_rows` at startup; the partial-ramp hash gains the ramp | **done** |
 | 3. Control plane | `GET /ramps[/{ramp}]`; every route path under `/ramps/{ramp}`; `410 Gone` (behind the token) on the pre-ramp paths, naming the replacement; `/quota?ramp=` required once there are several; `POST /quota/reset` requires `ramp`; every mutation response and audit line names its ramp; `ramp` is the first label on every route-labelled metric and on `simmer_unmatched_sender_total`; gauges refreshed for every ramp; dry run takes `ramp` and reports `ramp`/`ramp_source`. Also the config surface for phase 4: listener `ramp` and `header_overrides_affinity`, and `grants.ramps`, with their §4.2 rules | **done** |
-| 4. Selection | Choosing the ramp by listener affinity or `X-Simmer-Ramp` (per `grants.ramps`); `simmer_ramp_selected_total` and `simmer_ramp_header_rejected_total`; stripping the header; the §5.4 early decision; the capture's listener field; per-route maps (pools, rewriters, preflight) keyed by `(ramp, route)`; lifting the one-ramp limit | not started |
+| 4. Selection | `routing::ramp_select`: §5.8's four rules, rights from `grants.ramps`, the five rejection reasons; the session selects at the final dot and passes the ramp to the relay; the §5.4 early refusal only when the ramp is fixed at `RCPT TO`; `X-Simmer-Ramp` stripped (§6.5) with a startup warning if `set_headers` restores it; `simmer_ramp_selected_total` and `simmer_ramp_header_rejected_total`; pools, rewriters and preflight keyed `(ramp, route)`; dry run selects from `listener`/`auth_user`/`ramp_header`; capture record v2 with `listener` (v1 still read); the one-ramp limit lifted | **done** |
 | 5. Acceptance | Two ramps end to end on the acceptance stack; release notes for 0.9.0 | not started |
 
 **Storage, verified:** the conformance suite on both backends, including nine new
@@ -64,8 +64,25 @@ Phase 5's stack run covers it.
 reporting its ramp, and a reset refused without one. The metrics tests assert
 the `ramp` label, and validation tests cover the three new config keys. Full
 suites: Postgres 1288 passed, SQL Server 1123 passed.
-**Not verified yet:** `/quota` refusing to guess between several ramps. That
-needs two ramps, which §4.2 refuses until phase 4 lifts the limit.
+`/quota` refusing to guess between several ramps is verified in phase 4, once
+two ramps were allowed.
+
+**Selection, verified:** 13 unit tests on `select` and `fixed_at_rcpt`. Eight
+end-to-end tests over real SMTP (`tests/named_ramps.rs`), with two ramps sharing
+a route name, cover:
+- the default ramp, affinity, a permitted header, and the header never reaching
+  the downstream;
+- ignored headers: not permitted, unauthenticated, unknown and conflicting;
+- a locked affinity, and the override;
+- the reservation taken in the selected ramp;
+- D-071's pinned exception, where different `grants.ramps` route the same bytes
+  differently.
+
+A Postgres test shows the early refusal applies to a session that can name
+nothing and not to one that could name `partner`. There are admin tests for
+`/quota` with two ramps, per-ramp pause, a listener's affinity in `/ramps`, and
+dry-run selection. There are metrics tests for both counters, and capture tests
+for v2 and reading v1. Full suites: Postgres 1317 passed, SQL Server 1147 passed.
 
 ---
 

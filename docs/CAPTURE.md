@@ -142,9 +142,10 @@ One JSON object per line. Wrapped here; one line on disk.
  "rcpt_to":["alice@example.com"],
  "mail_from":"news@oldbrand.com",
  "subject":"Your September statement",
- "v":1,
+ "v":2,
  "id":"7b2f4a6c-1d9e-4b21-9f0a-3c5e8d1a2b44",
  "peer":"10.0.3.17:52344",
+ "listener":"0.0.0.0:587",
  "helo":"app-7.internal",
  "tls":true,
  "auth_user":"marketing",
@@ -174,8 +175,9 @@ declaration order in `Record`, and there is a test on the bytes.
 | `rcpt_to` | a list because that is the wire form, though D-047 pins it at one. |
 | `mail_from` | the envelope sender. `""` is the null sender `<>`; `null` means none was given. |
 | `subject` | RFC 2047-decoded, unfolded, and cut to 200 characters with a `…`. **`""` when there is none — never `null`**, so the row of four stays uniform. A label for a human: it is not byte-faithful and nothing reads it back. |
-| `v` | schema version. A reader refuses one it does not know rather than guessing. |
+| `v` | schema version, 2 since named ramps (D-099). A reader refuses one it does not know rather than guessing; it still reads 1, which is the same shape without `listener`. |
 | `id` | the session's `correlation_id` — the **join key to the log stream**, which is where the reply lives. |
+| `listener` | the listener the message arrived on, as written in `server.listeners`. An ingress fact: **not** the ramp it was routed in, which is derived state. `null` in a version-1 record. |
 | `params` | not cosmetic — a replay that does not re-present `SMTPUTF8` and `BODY=8BITMIME` is not replaying the same transaction. |
 | `size`, `sha256` | over the raw body, present **even when the body is not**, so an omitted record still names its message. |
 | `body_b64` | standard base64, no line breaks. Absent exactly when `body_omitted`. |
@@ -187,8 +189,8 @@ has left.
 
 ### What is deliberately not there
 
-**No `reply`, no `code`, no `route`, no `domain_group`, no `attempts`, no
-`state`.** The record is built before the route walk and before the downstream
+**No `reply`, no `code`, no `ramp`, no `route`, no `domain_group`, no
+`attempts`, no `state`.** The record is built before the route walk and before the downstream
 conversation, so none of them exists yet. A spool's minimum schema is "the
 message, and what we still owe it"; this has only the first half, and that is
 what keeps a capture directory from being mistaken for a queue. There is a test
@@ -196,6 +198,14 @@ asserting the emitted key set exactly.
 
 **No credential, in any form** — no password, no AUTH blob, no mechanism, no
 failed attempt. Only the username that resulted.
+
+**A replay chooses its ramp again, at its target.** The ramp is not recorded
+(D-099): it is derived from the listener, the user's `grants.ramps` and the
+`X-Simmer-Ramp` header. That header is still in `body_b64`, because the capture
+precedes the rewrite that strips it. So a replay into a Simmer re-selects the
+ramp from the listener it connects to and the credentials it presents. Point
+`server replay` at the listener with the affinity you mean, and authenticate
+as a user who may name the header's ramp, or the header is ignored there too.
 
 ### What `body_b64` decodes to
 

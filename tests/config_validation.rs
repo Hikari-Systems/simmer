@@ -2063,12 +2063,25 @@ fn a_ramp_declared_twice_is_refused() {
 }
 
 #[test]
-fn more_than_one_ramp_is_refused_until_state_is_keyed_by_ramp() {
-    // D-099's phasing: the scaffolding rule that goes when storage, pools and
-    // metrics carry the ramp.
+fn two_ramps_may_reuse_route_and_group_names() {
+    // D-099: route and domain group names are scoped to their ramp, so a second
+    // ramp that is a copy of the first is valid. (The phase-1 rule refusing a
+    // second ramp went when storage, pools and metrics carried the ramp.)
     let second =
         &BASE[BASE.find("\n main:\n").expect("fixture")..].replace("\n main:\n", "\n other:\n");
-    rejected_for(&format!("{BASE}{second}"), "exactly one");
+    let cfg = load(&format!("{BASE}{second}")).expect("two ramps are valid");
+    assert_eq!(cfg.ramps.len(), 2);
+    let names = |ramp: &str| -> Vec<String> {
+        cfg.ramps
+            .get(ramp)
+            .unwrap()
+            .routes
+            .iter()
+            .map(|r| format!("{}/{}", r.ramp, r.name))
+            .collect()
+    };
+    assert_eq!(names("main"), ["main/warming", "main/overflow"]);
+    assert_eq!(names("other"), ["other/warming", "other/overflow"]);
 }
 
 #[test]

@@ -436,6 +436,24 @@ fn ramp_warnings(ramp: &Ramp) -> Vec<Warning> {
             }
         }
 
+        // §6.5 (D-099): `X-Simmer-Ramp` is stripped before `set_headers` runs,
+        // so a route can put it back. Legal, and almost certainly a mistake: it
+        // would hand a Simmer instruction to the downstream.
+        for (header, _) in route.identity.set_headers.iter() {
+            if crate::rewrite::CONTROL_HEADERS
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(header))
+            {
+                out.push(Warning {
+                    path: format!("routes.{}.identity.set_headers", route.name),
+                    message: format!(
+                        "sets '{header}', which §6.5 strips as Simmer's own control header; \
+                         setting it hands a Simmer instruction to the downstream (D-099)"
+                    ),
+                });
+            }
+        }
+
         // Everything below needs the templates parsed. A route whose templates do
         // not compile has already failed `validate()`, so there is nothing here
         // worth reporting about it.
@@ -1122,20 +1140,6 @@ fn check_ramps(cfg: &Config, v: &mut ViolationList) {
                     .map(|r| r.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            ),
-        );
-    }
-
-    // D-099's phasing: until quota state, pools and metrics are keyed by ramp
-    // as well as route, a second ramp would share rows with the first wherever
-    // their route names coincide. The rule is scaffolding and goes when they are.
-    if cfg.ramps.len() > 1 {
-        v.push(
-            "ramps",
-            format!(
-                "declares {} ramps; this build supports exactly one while multi-ramp \
-                 routing is being implemented (D-099)",
-                cfg.ramps.len()
             ),
         );
     }

@@ -284,6 +284,17 @@ fn describe() {
     );
     describe_gauge!("simmer_db_pool_max", "database.max_connections");
     describe_counter!(
+        "simmer_ramp_selected_total",
+        "D-099 messages by the ramp §5.8 chose and the rule that chose it: affinity \
+         (the listener's ramp), header (X-Simmer-Ramp) or default (default_ramp)"
+    );
+    describe_counter!(
+        "simmer_ramp_header_rejected_total",
+        "D-099 X-Simmer-Ramp headers ignored, by reason: unknown, not_permitted, \
+         malformed, conflicting or affinity_locked. Never a refusal: the message \
+         falls back to the listener's ramp or default_ramp. A typo shows here"
+    );
+    describe_counter!(
         "simmer_mx_lookups_total",
         "D-100 MX lookups for domain grouping, by result: ok, cached, error or timeout. \
          error and timeout put the recipient in the catch-all group"
@@ -534,6 +545,23 @@ pub fn thread_affinity(ramp: &str, route: &str, outcome: &'static str) {
         "outcome" => outcome,
     )
     .increment(1);
+}
+
+/// §9.1 `simmer_ramp_selected_total{ramp,source}` (D-099).
+pub fn ramp_selected(ramp: &str, source: &'static str) {
+    counter!(
+        "simmer_ramp_selected_total",
+        "ramp" => ramp.to_string(),
+        "source" => source,
+    )
+    .increment(1);
+}
+
+/// §9.1 `simmer_ramp_header_rejected_total{reason}` (D-099). No value label:
+/// the client chooses the value, and a label it chooses grows without bound
+/// (D-093's lesson).
+pub fn ramp_header_rejected(reason: &'static str) {
+    counter!("simmer_ramp_header_rejected_total", "reason" => reason).increment(1);
 }
 
 /// D-100 — one MX lookup for §3.2 step 2, or one answered from the cache.

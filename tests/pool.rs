@@ -388,7 +388,7 @@ async fn the_statistics_track_what_the_downstream_saw() {
     .await;
 
     assert_eq!(
-        simmer.pools.stats("only").expect("a pool").opened,
+        simmer.pools.stats("main", "only").expect("a pool").opened,
         0,
         "nothing is dialled before a message needs it"
     );
@@ -405,7 +405,7 @@ async fn the_statistics_track_what_the_downstream_saw() {
         );
     }
 
-    let stats = simmer.pools.stats("only").expect("a pool");
+    let stats = simmer.pools.stats("main", "only").expect("a pool");
     assert_eq!(stats.max_connections, 4);
     assert_eq!(stats.opened, 1, "one connection opened");
     assert_eq!(stats.reused, 2, "and taken back out twice");
@@ -441,7 +441,7 @@ async fn draining_closes_the_idle_connections() {
             .code,
         250
     );
-    assert_eq!(simmer.pools.stats("only").expect("a pool").idle, 1);
+    assert_eq!(simmer.pools.stats("main", "only").expect("a pool").idle, 1);
     assert_eq!(down.command_count("QUIT"), 0);
 
     simmer.pools.drain().await;
@@ -452,7 +452,7 @@ async fn draining_closes_the_idle_connections() {
         "an orderly goodbye rather than a reset the provider counts against us: {:?}",
         down.commands()
     );
-    let stats = simmer.pools.stats("only").expect("a pool");
+    let stats = simmer.pools.stats("main", "only").expect("a pool");
     assert_eq!(stats.idle, 0);
     assert_eq!(stats.active, 0);
 }

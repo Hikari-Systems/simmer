@@ -46,9 +46,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// The schema version. A reader refuses a version it does not know rather than
-/// guessing which fields still mean what they used to.
-pub const VERSION: u16 = 1;
+/// The schema version written. A reader refuses a version it does not know
+/// rather than guessing which fields still mean what they used to.
+///
+/// 2 added `listener` (D-099). A version-1 record is still read: it is the same
+/// shape without that field, which reads back as `None`.
+pub const VERSION: u16 = 2;
+
+/// The oldest version this build reads.
+pub const MIN_VERSION: u16 = 1;
 
 /// How much of a `Subject:` is kept.
 ///
@@ -107,6 +113,14 @@ pub struct Record {
     /// `ip:port`. The port is kept: it is what distinguishes two sessions from
     /// one application host in the same millisecond.
     pub peer: String,
+    /// The listener the message arrived on, as written in `server.listeners`
+    /// (D-099, version 2). An **ingress fact**, not the ramp it was routed in:
+    /// the resolved ramp is derived state, which D-085 keeps out. A replay
+    /// re-selects at its target from this and the `X-Simmer-Ramp` header still
+    /// in the body, because the capture precedes the rewrite. `None` in a
+    /// version-1 record.
+    #[serde(default)]
+    pub listener: Option<String>,
     /// The `EHLO`/`HELO` name the client gave.
     pub helo: String,
     /// Whether the session was encrypted when the message was received.
@@ -151,6 +165,7 @@ pub struct Ingress<'a> {
     pub correlation_id: &'a str,
     pub at: DateTime<Utc>,
     pub peer: std::net::SocketAddr,
+    pub listener: &'a str,
     pub helo: &'a str,
     pub tls: bool,
     pub auth_user: Option<&'a str>,
@@ -217,6 +232,7 @@ impl Record {
             id: i.correlation_id.to_string(),
             at: i.at,
             peer: i.peer.to_string(),
+            listener: Some(i.listener.to_string()),
             helo: i.helo.to_string(),
             tls: i.tls,
             auth_user: i.auth_user.map(str::to_string),
@@ -269,7 +285,7 @@ impl Record {
         }
         let probe: JustTheVersion =
             serde_json::from_slice(line).map_err(|e| ParseError::Malformed(e.to_string()))?;
-        if probe.v != VERSION {
+        if !(MIN_VERSION..=VERSION).contains(&probe.v) {
             return Err(ParseError::Version(probe.v));
         }
         serde_json::from_slice(line).map_err(|e| ParseError::Malformed(e.to_string()))
@@ -290,7 +306,7 @@ impl std::fmt::Display for ParseError {
         match self {
             Self::Version(v) => write!(
                 f,
-                "schema version {v}, but this build understands {VERSION}"
+                "schema version {v}, but this build understands {MIN_VERSION} to {VERSION}"
             ),
             Self::Malformed(e) => write!(f, "malformed record: {e}"),
         }
@@ -327,6 +343,7 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc),
             peer: "10.0.3.17:52344".parse().unwrap(),
+            listener: "0.0.0.0:587",
             helo: "app-7.internal",
             tls: true,
             auth_user: Some("marketing"),
@@ -367,6 +384,7 @@ mod tests {
                 "body_omitted",
                 "helo",
                 "id",
+                "listener",
                 "mail_from",
                 "params",
                 "peer",
@@ -585,9 +603,40 @@ mod tests {
     }
 
     #[test]
+    fn a_version_1_record_still_reads_with_no_listener() {
+        // D-099 added `listener` in version 2. A capture directory written by
+        // v0.8 must still replay.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&a_record(b"hi", 1 << 20).to_line().unwrap()).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("listener");
+        obj.insert("v".into(), serde_json::json!(1));
+        let line = serde_json::to_vec(&value).unwrap();
+
+        let back = Record::from_line(&line).expect("a v1 record reads");
+        assert_eq!(back.v, 1);
+        assert_eq!(back.listener, None);
+        assert_eq!(back.body().unwrap().as_deref(), Some(&b"hi"[..]));
+    }
+
+    #[test]
+    fn a_version_2_record_carries_its_listener() {
+        let r = a_record(b"hi", 1 << 20);
+        assert_eq!(r.v, 2);
+        let back = Record::from_line(&r.to_line().unwrap()).unwrap();
+        assert_eq!(back.listener.as_deref(), Some("0.0.0.0:587"));
+    }
+
+    #[test]
     fn a_future_schema_version_is_refused_rather_than_partially_read() {
-        let line = br#"{"v":2,"id":"x","at":"2026-09-20T14:23:07.412Z","something":"else"}"#;
-        assert_eq!(Record::from_line(line), Err(ParseError::Version(2)));
+        let future = VERSION + 1;
+        let line = format!(
+            r#"{{"v":{future},"id":"x","at":"2026-09-20T14:23:07.412Z","something":"else"}}"#
+        );
+        assert_eq!(
+            Record::from_line(line.as_bytes()),
+            Err(ParseError::Version(future))
+        );
     }
 
     #[test]

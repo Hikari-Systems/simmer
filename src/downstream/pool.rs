@@ -59,15 +59,21 @@ pub struct Pool {
     /// same `Config`, so a miss is unreachable in the service; making it
     /// *impossible* rather than merely unreachable costs one `RwLock` and removes
     /// a branch that could only ever have been handled by lying to a client.
-    routes: RwLock<HashMap<String, Arc<RoutePool>>>,
+    /// Keyed `(ramp, route)`: pools are per route *within its ramp* (D-099), so
+    /// two ramps pointing at one downstream each hold their own bound.
+    routes: RwLock<HashMap<(String, String), Arc<RoutePool>>>,
 }
 
 impl Pool {
     pub fn build(cfg: &Config) -> Pool {
-        // Keyed by route name: sound only while §4.2 allows one ramp (D-099).
         let routes = cfg
             .all_routes()
-            .map(|r| (r.name.clone(), Arc::new(RoutePool::new(r))))
+            .map(|r| {
+                (
+                    (r.ramp.clone(), r.name.clone()),
+                    Arc::new(RoutePool::new(r)),
+                )
+            })
             .collect();
         Pool {
             routes: RwLock::new(routes),
@@ -79,7 +85,7 @@ impl Pool {
             .routes
             .read()
             .expect("not poisoned")
-            .get(&route.name)
+            .get(&(route.ramp.clone(), route.name.clone()))
             .cloned()
         {
             return pool;
@@ -89,17 +95,17 @@ impl Pool {
             self.routes
                 .write()
                 .expect("not poisoned")
-                .entry(route.name.clone())
+                .entry((route.ramp.clone(), route.name.clone()))
                 .or_insert_with(|| Arc::new(RoutePool::new(route))),
         )
     }
 
     /// §9.2's "pool statistics", for one route.
-    pub fn stats(&self, route: &str) -> Option<PoolStats> {
+    pub fn stats(&self, ramp: &str, route: &str) -> Option<PoolStats> {
         self.routes
             .read()
             .expect("not poisoned")
-            .get(route)
+            .get(&(ramp.to_string(), route.to_string()))
             .map(|p| p.stats())
     }
 
@@ -450,7 +456,9 @@ ramps:
         let cfg = config("{ max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }");
 
         let pool = Pool::build(&cfg);
-        let stats = pool.stats("only").expect("a pool for the configured route");
+        let stats = pool
+            .stats("main", "only")
+            .expect("a pool for the configured route");
         assert_eq!(stats.max_connections, 4);
         assert_eq!(stats.idle, 0);
         assert_eq!(stats.active, 0);
@@ -464,7 +472,7 @@ ramps:
         let pool = Pool {
             routes: RwLock::new(HashMap::new()),
         };
-        assert!(pool.stats("only").is_none(), "nothing seeded yet");
+        assert!(pool.stats("main", "only").is_none(), "nothing seeded yet");
 
         let r = cfg.default_ramp().routes.first().expect("one route");
         let first = pool.for_route(r);
@@ -474,7 +482,12 @@ ramps:
             "the second call must reuse the pool the first created, or two \
              callers get two independent bounds on one downstream"
         );
-        assert_eq!(pool.stats("only").expect("now seeded").max_connections, 2);
+        assert_eq!(
+            pool.stats("main", "only")
+                .expect("now seeded")
+                .max_connections,
+            2
+        );
     }
 
     #[tokio::test]
