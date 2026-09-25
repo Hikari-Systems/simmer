@@ -1877,3 +1877,55 @@ gating near 1 MiB/h would restore the 64 B/message sensitivity and better.
 - The limit itself. +0.39 MiB/h is F7, which is known, bounded by D-093's idle
   expiry, and not a defect. A gate at 1 MiB/h passes it; a gate at 0.25 would
   not. Picking the number means deciding what counts as F7's ceiling.
+
+## 16. v0.9.0 (named ramps, MX grouping) — 40 minutes with jemalloc's counters
+
+### What was run
+
+Images built from the `v0.9.0` release commit `35fffb1`, with
+`SIMMER_CARGO_FEATURES="--features alloc-stats"` and
+`SIMMER_ALLOC_STATS_FILE=/tmp/simmer-alloc-stats` (`app` `9264dcbd…`, `app2`
+`9ea02bf4…`). **Not a published build**: jemalloc's `stats` option is on. The
+shipped soak config has one ramp, `main`, and the stack was reset with `-v`, so
+the ramp migration ran on a fresh schema. 40 minutes at 10 msg/s per instance,
+with a 5-minute warm-up. 2026-09-25, 15:48–16:28 UTC.
+`target/soak-runs/2026-09-25-v090-je/run.sh`.
+
+**The first attempt stopped at its own gate**, and the reason is a trap. The
+script rebuilt only `app` and `app2`. `down -v` removed the config volume, but
+`up` refilled it from a `simmer-stress-config` image 29 hours old, which held the
+pre-ramps config. v0.9.0 refused it, as designed ("moved under ramps"), and
+`app` exited, so the gate saw no allocator stats. The script now builds every
+service. **After any config-schema change, rebuild the stack whole**; the config
+image is a service like any other.
+
+### The answer: correct, and the live heap flat
+
+- **Correctness.** 24,010 of 24,010 accepted per instance (0 deferred, 0 refused,
+  0 transport). V4 behaved as designed: 140 accepted and 7 cut by the session
+  timeout per instance, none at the dot, `reservations_in_flight` 0 after the
+  drain, and 0 reservations expired by the sweeper. Every route series carried
+  `ramp="main"`, and `simmer_ramp_selected_total{ramp="main",source="default"}`
+  was 24,150 per instance.
+- **Back at rest:** threads 3 and tasks 12, as before the first message; 0
+  unaccounted descriptors; peak `CLOSE_WAIT` 1.
+- **`je_allocated`,** simmer's live heap: 1.4–2.1 MiB (`app`) and 1.5–2.0 MiB
+  (`app2`), slopes +0.73 and +0.46 MiB/h. The same band §13 measured on v0.7.
+  Named ramps and MX grouping added no measurable steady-state heap; the soak
+  config has no `mx` lists, so no MX cache was filled.
+- **`je_resident` and `je_retained`** swing to 75–78 MiB and about 164 MiB during
+  the large-message bursts, and come back. This is the allocator, as §13 found,
+  and it is not judged.
+- **F7, as expected:** unmatched-sender series 151 → 1,193 over 35 minutes. That's
+  the known client-controlled `domain` label, bounded by D-093's idle expiry, and
+  still an XFAIL.
+
+### What this run did not establish
+
+- **A leak verdict.** 35 minutes after the warm-up is seven five-minute floors,
+  and `leak::verdict` needs eight, so `anon`, `fds` and `threads` are
+  *inconclusive*, not green. An hour settles them, as in §3a.
+- **More than one ramp under load.** The soak config has one. Two ramps were
+  exercised end to end in the upgrade rehearsal (`docs/STATE.md` §0), not for
+  duration.
+- **The SQL Server build.**

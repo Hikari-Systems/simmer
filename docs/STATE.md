@@ -87,6 +87,15 @@ the pre-ramps image (`main` at 422e291) and then this branch's image:
 - *The fence.* Restarted against the migrated database, the old binary exited
   with `migration 20260925000000 was previously applied but is missing`.
 
+**Soak (2026-09-25), 40 minutes at the release commit, with jemalloc's counters**
+(`docs/SOAK.md` §16):
+- 24,010 of 24,010 accepted per instance, and V4 as designed.
+- Threads, tasks and descriptors back at rest.
+- `je_allocated` flat at 1.4–2.1 MiB.
+- F7 the known XFAIL.
+- The leak gates were inconclusive: 7 floors, and they need 8, so an hour is
+  needed.
+
 The acceptance stack on the new image gave the day-0 split, 5 in `trap-warming`
 and 1 in `trap-overflow`.
 
