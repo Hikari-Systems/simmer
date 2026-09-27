@@ -1054,6 +1054,7 @@ docs/SPEC.md    the specification
 docs/STATE.md   where the build has got to (snapshot, for session handover)
 docs/ACCEPTANCE.md  the §12.3 acceptance harness: design, and now built
 DECISIONS.md    divergences from it, and the questions still open
+LICENSE         Apache-2.0, the full text; NOTICE is the attribution
 LICENSES.md     dependency licence findings
 ```
 
@@ -1095,3 +1096,13 @@ sit where cleartext credentials are unacceptable, not where hostile peers can re
 it. Exposing an SMTP port to a host interface must be a deliberate act. To serve
 587 or 465, mount a certificate and key readable by UID 1000 and name them in
 `server.tls`; see [Listeners and TLS](#listeners-and-tls).
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) for the
+full text and [`NOTICE`](NOTICE) for attribution. Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in this work,
+as defined in the Apache 2.0 license, shall be licensed as above, without any
+additional terms or conditions.
+
+SPDX-License-Identifier: Apache-2.0

@@ -28,8 +28,8 @@ confidence-threshold = 0.9
 # warn about the ones nothing has matched.
 unused-allowed-license = "allow"
 
-# Crates with no `license` field at all. Exactly one now: `simmer` itself, which
-# sets `publish = false` to say so deliberately.
+# Unpublished crates. Exactly one: `simmer` itself (`publish = false`), which
+# since it took the Apache-2.0 LICENSE also declares `license = "Apache-2.0"`.
 #
 # `hs-utils` used to be the other, and needed an `ignore-sources` exemption for
 # the git source it came from. D-060 removed that dependency — its one used

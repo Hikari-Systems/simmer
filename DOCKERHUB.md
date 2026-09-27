@@ -443,6 +443,7 @@ docker pull hikarisystems/simmer:latest-mssql
 - **Releases & changelog:** <https://github.com/Hikari-Systems/simmer/releases>
 - **Full README, specification and decision log:**
   <https://github.com/Hikari-Systems/simmer#readme>
+- **License:** Apache-2.0
 
 This page is generated from
 [`DOCKERHUB.md`](https://github.com/Hikari-Systems/simmer/blob/main/DOCKERHUB.md)
