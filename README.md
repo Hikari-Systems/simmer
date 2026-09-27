@@ -46,124 +46,9 @@ client record *permanent* state about a message or recipient. A chain exhausted
 by its daily quota returns `451`, not `550` — a `550` would put a perfectly
 deliverable recipient on a suppression list that outlives Simmer by years.
 
-## Status
+## Limits
 
-All ten phases of `docs/SPEC.md` §13, except phase 9, which is void — see D-047
-below — plus phase 11, which came after them.
-
-**Phase 1** — configuration loading, full startup validation, structured
-logging, the container skeleton.
-
-**Phase 2** — SMTP ingress and the outbound leg. Simmer accepts a message on
-port 25, authenticates the client, buffers the body, forwards it to a
-downstream over TLS, and maps the downstream's verdict back on the same
-connection.
-
-**Phase 3** — the warm-up itself. Route selection now walks the chain by quota
-state: a warming route carries traffic up to its daily allowance for that
-recipient's domain group, and everything beyond it falls through to the overflow
-route. Counters increment on downstream `2xx` only, via the §7.4
-reserve/send/commit protocol, so a failed send never consumes allowance and
-concurrent sessions cannot both claim the last slot.
-
-**Phase 4** — the rewriting engine, which is what makes a route's *outbound
-identity* mean anything. Authentication artefacts are stripped unconditionally
-(§6.5), `remove_headers` and `set_headers` are applied with §6.3's templates
-rendered against the message as it arrived, a `Received:` header is prepended, and
-the envelope sender is computed from the route. §6.6's stability property —
-`rewrite(rewrite(m)) == rewrite(m)` — is enforced at startup against a synthetic
-probe and again as a property test over generated messages.
-
-Phase 4 also built the §12.3 acceptance suite ahead of schedule: two Mailpit traps
-on a compose profile, a ramp walked across simulated days by moving
-`warmup.started`, and an assertion that both arrangements of the cutover invariant
-produce byte-equal output.
-
-**Phase 5** — body rewriting (§6.4), which completes §6. Each `text/*` part is
-decoded according to its `Content-Transfer-Encoding` and charset, the route's
-`body_rewrites` patterns are applied in order, and the part is written back in the
-encoding and charset it arrived with. A URL split across a quoted-printable soft
-line break matches, which is the case §6.4 exists for. Attachments, non-text
-parts, and signed or encrypted parts are never touched, and a part that cannot be
-decoded is left alone, warned about and counted.
-
-A part that matches nothing is not re-encoded at all — a body in which nothing
-matched is forwarded as the bytes it arrived as, MIME boundaries and trailing
-whitespace included.
-
-**Phase 6** — the recipient-frequency constraint (§7.3), preceded by a policy
-reversal: **a transaction may now carry exactly one recipient** (D-047, below).
-
-A route may declare `recipient_frequency`, and a recipient at or over its
-threshold inside a rolling window makes that route **ineligible** — the message
-steers to the next link in the chain and is never dropped. The recipient is
-normalised first, so `Bob.Smith+news@gmail.com` and `bobsmith@gmail.com` count as
-the one inbox they are: lowercased, everything from `+` to `@` removed, and dots
-folded out of the local part at the providers listed in `dot_insensitive_domains`.
-
-What is stored is a **keyed hash**, never the address: HMAC-SHA256 under a salt
-minted once and persisted in `instance_config`, truncated to 16 bytes. No
-plaintext address reaches the database, a log line or a metric label. Events are
-recorded only on a downstream `2xx`, in the same transaction that commits the
-quota, and only for routes that declare a constraint; an hourly sweeper evicts
-anything past the longest configured window plus a margin.
-
-**Phase 7** — the control plane (§9): a Prometheus exporter, a read API, a write
-API and dry run. The endpoints are below under [Control plane](#control-plane).
-
-Two things in it are worth knowing before you use it. The read API reports both
-what the *schedule* says and what the *row* says, and flags the difference,
-because `quota_usage.allowance` is authoritative once written (D-026) — a
-schedule edit plus a restart does not raise today's ceiling, and an API that
-reported the schedule would mislead you at exactly the wrong moment. And every
-mutation tells you which chains it has just left with no eligible route: pausing
-a route, or setting an allowance of zero, is a legitimate thing to do and also
-the thing most likely to make every message on a chain `451` without anyone
-meaning it.
-
-**Phase 8** — the DNS preflight (§6.7), which completes §6. A route with a
-`preflight` block has its outbound identity's domain checked for SPF, DKIM and
-DMARC at startup and every fifteen minutes. It is **non-blocking by design**: a
-failure is a `WARN` and a `0` gauge and nothing else, and only `strict: true`
-makes the route ineligible — at which point the message *steers* to the next link
-exactly as §7.3 does, and a chain with none left is §10.3's `451`, never a `5xx`.
-A route with no verdict yet is eligible, so a slow resolver at boot cannot empty a
-chain.
-
-**Phase 10** — hardening. §8.3's connection pool: per route, `max_connections`
-held as a bound rather than a hint, `RSET` between messages, `NOOP` validation of
-a connection idle beyond a short threshold, and retirement at `idle_ttl` or
-`max_messages_per_connection`. §10.4's shutdown drains it. Two things about it are
-worth knowing and are below under [Connection pooling](#connection-pooling).
-
-Phase 10 also fixed a defect carried since phase 2: the decoy hash that equalises
-the cost of a failed login now takes its parameters from the credentials actually
-configured, rather than from a fixed guess that only matched them by coincidence
-(`DECISIONS.md` D-066).
-
-**Phase 11** — listeners on 25, 587 and 465, inbound TLS, and a sender ACL
-(`docs/INGRESS.md`, D-070, D-071). Each listener has its own `tls` and `auth`
-policy, defaulting to what its port's RFC says. `STARTTLS` and implicit TLS use one
-PEM certificate read at startup. Each user carries `grants.send_as`, the sender
-identities it may present, and an authenticated message whose envelope or `From:`
-falls outside them is refused `550 5.7.1`. Details under
-[Listeners and TLS](#listeners-and-tls) and [Sender grants](#sender-grants).
-
-What works today: **an end-to-end relay that applies the ramp, rewrites both the
-identity and the body, paces how often one recipient hears from a warming route,
-keeps a conversation on the route that started it, pools its downstream
-connections, accepts submissions over verified TLS from
-applications limited to their own sender identities, and can be inspected and
-steered without a restart.** What does not:
-
-- **No scopes on admin tokens.** Every token can do everything; a token that
-  could read but not mutate is a plausible ask and is not built.
-- **No pre-authentication limits.** A client that never authenticates is bounded
-  by `max_concurrent_sessions` and the timeouts like any other, but there is no
-  separate, tighter budget for it (D-072). That matters only once Simmer listens
-  somewhere `allowed_cidrs` cannot be tight.
-
-And one thing that will not arrive, because it is a decision rather than a gap:
+One behaviour that is a decision rather than a gap:
 
 - **A transaction may carry exactly one recipient.** A second `RCPT TO` is
   refused `452 4.5.3 multiple recipients not permitted`, and no configuration
@@ -175,16 +60,14 @@ And one thing that will not arrive, because it is a decision rather than a gap:
   one recipient's permanent failure against the others. See `DECISIONS.md` D-047
   and `docs/RECIPIENTS.md`.
 
-```sh
-$ openssl s_client -quiet -starttls smtp -connect simmer:587 -servername simmer.internal
-EHLO me
-250-simmer.internal greets me
-250-PIPELINING
-250-8BITMIME
-250-SIZE 26214400
-250-AUTH PLAIN LOGIN
-250 AUTH=PLAIN LOGIN
-```
+And two things that are not built:
+
+- **No scopes on admin tokens.** Every token can do everything; a token that
+  could read but not mutate is a plausible ask and is not built.
+- **No pre-authentication limits.** A client that never authenticates is bounded
+  by `max_concurrent_sessions` and the timeouts like any other, but there is no
+  separate, tighter budget for it (D-072). That matters only once Simmer listens
+  somewhere `allowed_cidrs` cannot be tight.
 
 ## Quick start
 
