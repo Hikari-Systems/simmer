@@ -1960,6 +1960,24 @@ and the stack reset with `-v`. 2026-09-29, 11:42–12:40 UTC.
   shape, and the first relayed message came 24 s after start on both.
   **Cause undetermined.**
 
+### Following up the step (2026-09-29)
+
+- **It was released at rest.** In `rest-app.csv` (t = 3656 s, after the load
+  and V4's drain), `app`'s `je_allocated` is 2.3 MiB. So something that lived
+  exactly as long as the load held it, and dropped it when the load stopped.
+- **Not argon2.** A lone instance built from this image (`57248106…`) was
+  measured after 1 authentication, then 50 concurrent ones, then 20 s idle:
+  2.6, 3.0 and 2.8 MiB. The 19 MiB AUTH block is freed and not counted.
+- **Not a pooled downstream buffer.** After the large messages, the heap was
+  back to baseline within the minute, with two pooled connections still idle.
+- **An in-flight 4 MiB message costs about 14 MiB, and gives it back.** Under
+  the soak's own mix at 10 msg/s, sampled every 5 s, the heap alternated between
+  2.3 and 16.3 MiB and returned to 2.3 as each large message finished.
+- **So the soak did not behave like the reproduction.** There, `app2` never
+  showed such a spike in 354 samples (maximum 2.2 MiB), and `app` held a flat
+  20.4–21.2 MiB. The allocator settings and the 5 s stats epoch are the same in
+  both. The difference is unexplained.
+
 ### What this run did not establish
 
 - **Where the 18 MiB is.** `stats.allocated` counts bytes the allocator has
