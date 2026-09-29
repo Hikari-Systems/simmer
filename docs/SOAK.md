@@ -1929,3 +1929,43 @@ image is a service like any other.
   exercised end to end in the upgrade rehearsal (`docs/STATE.md` §0), not for
   duration.
 - **The SQL Server build.**
+
+## 17. v0.9.0, the hour — the leak verdict §16 could not give
+
+### What was run
+
+§16's script with `SOAK_DURATION=1h`, on the tagged release commit `35fffb1`,
+checked out detached (`app` `57248106…`, `app2` `7fdb2341…`, `alloc-stats` on),
+and the stack reset with `-v`. 2026-09-29, 11:42–12:40 UTC.
+`target/soak-runs/2026-09-29-v090-je-hour/run.sh`.
+
+### The answer: green, with one unexplained one-off
+
+- **The leak gates are green on both instances** (eleven floors after the
+  warm-up; §16 had seven). `anon` slope +1.99 and +2.37 MiB/h; fds and threads
+  flat.
+- **Correctness.** 36,010 of 36,010 accepted per instance, none over 200 ms
+  (max 82.5 ms), 0 deferred, refused or transport errors. V4: 220 accepted and
+  11 cut per instance, none at the dot, `reservations_in_flight` 0 throughout,
+  and 0 expired by the sweeper. Back at rest: threads 3, tasks 12, 0
+  unaccounted descriptors.
+- **F7:** unmatched-sender series 151 → 1,796 over 55 minutes, still the
+  XFAIL. `app2`'s `je_allocated` creeps +0.50 MiB/h (1.5–2.2 MiB), which is
+  about F7's size.
+- **`app` took a one-off 18 MiB step at the start of the load and held it.**
+  `je_allocated` went 2.0 → 20.4 MiB between t = 0.4 s and t = 10.6 s. It then
+  rose only +0.64 MiB/h to 21.2 MiB over the hour, the same slope as `app2`.
+  So it is a single retention, not growth. `app2` did not do it; nor did either
+  instance in §16, on the same code. The two instances' logs are identical in
+  shape, and the first relayed message came 24 s after start on both.
+  **Cause undetermined.**
+
+### What this run did not establish
+
+- **Where the 18 MiB is.** `stats.allocated` counts bytes the allocator has
+  handed out. That includes freed regions still in a thread cache, so this may
+  be allocator caching rather than something simmer holds. Telling the two
+  apart needs jemalloc's heap profiler (`prof`), which no build here enables.
+  It is worth doing before trusting a gate on `je_allocated` if §13's
+  open question makes it one.
+- **Two ramps under load, and the SQL Server build.** As in §16.

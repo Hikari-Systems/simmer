@@ -96,6 +96,12 @@ the pre-ramps image (`main` at 422e291) and then this branch's image:
 - The leak gates were inconclusive: 7 floors, and they need 8, so an hour is
   needed.
 
+**The hour (2026-09-29), on the tagged commit** (`docs/SOAK.md` §17):
+- Leak gates green on both instances.
+- 36,010 of 36,010 accepted per instance, none over 200 ms.
+- One instance took an unexplained one-off 18 MiB `je_allocated` step in the
+  first 10 s of load, then held flat. Not growth; the cause needs heap profiling.
+
 The acceptance stack on the new image gave the day-0 split, 5 in `trap-warming`
 and 1 in `trap-overflow`.
 
