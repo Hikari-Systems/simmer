@@ -129,6 +129,7 @@ fn state_from(pool: PgPool, cfg: Config) -> AdminState {
             preflight: Arc::new(simmer::preflight::Registry::new()),
             groups: Arc::new(simmer::routing::domain_group::Grouper::literal()),
             capture: None,
+            spool: None,
         },
         // No recorder: `metrics` allows exactly one per process and installing it
         // here would fail in whichever test ran second.

@@ -233,7 +233,8 @@ async fn run() -> anyhow::Result<()> {
     // §11 — the storage layer behind its trait: `PgQuotaStore`, or
     // `MssqlQuotaStore` in the `-mssql` build (D-084). The trait is also what
     // lets the §7.4 protocol be reasoned about and tested without a database.
-    let quota: Arc<dyn quota::QuotaStore> = Arc::clone(&backend.store);
+    let quota: Arc<dyn quota::QuotaStore> =
+        Arc::clone(&backend.store) as Arc<dyn quota::QuotaStore>;
 
     // §6 — templates compiled once. Infallible here: `config::load` has already
     // run §4.2, which compiles every one of them to check §6.6's property, so a
@@ -331,6 +332,28 @@ async fn run() -> anyhow::Result<()> {
         None => (None, None),
     };
 
+    // §7.7 (D-116) — the spool, only when some ramp spools. `config::validate`
+    // has refused `delivery: spool` without a `spool:` block and probed the
+    // volume; this opens it (or builds the object store's client) for real.
+    let spool = match &config.spool {
+        Some(cfg)
+            if config
+                .ramps
+                .iter()
+                .any(|r| r.delivery == config::Delivery::Spool) =>
+        {
+            let s = simmer::spool::Spool::open(
+                cfg,
+                Arc::clone(&backend.store),
+                (*tls.verifying()).clone(),
+                &config.server.hostname,
+            )?;
+            info!(owner = %s.owner, body_store = ?s.body, "spool opened (D-116)");
+            Some(Arc::new(s))
+        }
+        _ => None,
+    };
+
     let engine = relay::Engine {
         config: Arc::clone(&config),
         tls: Arc::new(tls),
@@ -342,6 +365,7 @@ async fn run() -> anyhow::Result<()> {
         preflight: Arc::clone(&preflight),
         groups: Arc::new(groups),
         capture: capture.clone(),
+        spool: spool.clone(),
     };
 
     // §5.1 — bind before announcing readiness, so a port clash is a startup
@@ -453,6 +477,19 @@ async fn run() -> anyhow::Result<()> {
             stop_accepting.clone(),
         ))
     });
+
+    // §7.7 — the dispatcher and the spool's housekeeping. Not started without a
+    // spooling ramp, like every other optional task here.
+    let spool_dispatcher = spool.clone().map(|s| {
+        tokio::spawn(simmer::spool::dispatch::run(
+            engine.clone(),
+            s,
+            stop_accepting.clone(),
+        ))
+    });
+    let spool_sweeper = spool
+        .clone()
+        .map(|s| tokio::spawn(simmer::spool::sweeper::run(s, stop_accepting.clone())));
 
     // D-076 (finding F8). Histogram samples accumulate in the exporter until
     // `run_upkeep` drains them, and `install_recorder` starts no task to call it
@@ -579,6 +616,34 @@ async fn run() -> anyhow::Result<()> {
             aborted,
             "relays still in flight past the shutdown bound were cut; their reservations are released"
         );
+    }
+
+    // §7.7 — the dispatcher stopped claiming at `stop_accepting`; its attempts
+    // in flight finish under the same bound as the sessions' relays (D-106's
+    // rule), and an attempt cut past it leaves a lease that simply expires for
+    // the next claimant (D-122).
+    if let Some(task) = spool_dispatcher {
+        match task.await {
+            Ok(mut attempts) => {
+                let bound = smtp::relay_drain_bound(&config);
+                let finished = tokio::time::timeout(bound, async {
+                    while attempts.join_next().await.is_some() {}
+                })
+                .await;
+                if finished.is_err() {
+                    warn!(
+                        cut = attempts.len(),
+                        "spool attempts still in flight past the shutdown bound were cut; \
+                         their leases expire and another claim retries them"
+                    );
+                    attempts.abort_all();
+                }
+            }
+            Err(e) => error!("spool dispatcher task failed: {e}"),
+        }
+    }
+    if let Some(task) = spool_sweeper {
+        let _ = task.await;
     }
 
     // §10.4 — "release any reservations still outstanding". After D-106 no

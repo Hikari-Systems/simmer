@@ -1,7 +1,7 @@
 //! Storage backends — one per build (D-084).
 //!
 //! The default `postgres` feature is §11's backend, unchanged. The `mssql`
-//! feature swaps in SQL Server behind the same [`QuotaStore`] trait, for the
+//! feature swaps in SQL Server behind the same [`QuotaStore`](crate::quota::QuotaStore) trait, for the
 //! `-mssql` image. Exactly one is compiled in: a binary that carried both would
 //! have to choose at runtime, and the choice would then be a configuration
 //! mistake waiting to happen rather than a property of the image someone pulled.
@@ -17,7 +17,6 @@ compile_error!("enable exactly one storage feature: `postgres` (the default) or 
 use std::sync::Arc;
 
 use crate::config::Database;
-use crate::quota::QuotaStore;
 
 #[cfg(feature = "mssql")]
 pub mod mssql;
@@ -43,14 +42,15 @@ pub struct PoolStats {
 }
 
 /// Whatever pool the backend uses, reduced to what the gauges need. Kept off
-/// [`QuotaStore`], which deliberately says nothing about connections.
+/// [`QuotaStore`](crate::quota::QuotaStore), which deliberately says nothing about connections.
 pub trait PoolGauge: Send + Sync + 'static {
     fn stats(&self) -> PoolStats;
 }
 
 /// An opened backend: the store the relay uses and the pool the gauges read.
 pub struct Backend {
-    pub store: Arc<dyn QuotaStore>,
+    /// The quota store and, on the same pool, the spool's (D-122).
+    pub store: Arc<dyn crate::spool::SpoolStore>,
     pub gauge: Arc<dyn PoolGauge>,
 }
 

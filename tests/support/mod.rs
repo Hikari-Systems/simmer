@@ -92,6 +92,10 @@ pub struct Script {
     /// second message on a *reused* connection while the fresh connection a
     /// retry would open behaves normally — the shape D-068's retry is about.
     pub transactions: Vec<Turn>,
+    /// Record every message that reaches its final dot, whatever the reply —
+    /// so a test can compare what two attempts of one spooled message sent
+    /// (D-116) when the first was refused.
+    pub record_all: bool,
 }
 
 /// One transaction's overrides; see [`Script::transactions`].
@@ -124,6 +128,7 @@ impl Default for Script {
             close_after_rset: false,
             final_dot_delay: None,
             transactions: Vec::new(),
+            record_all: false,
         }
     }
 }
@@ -417,7 +422,7 @@ async fn serve_one(
             // Record *before* replying. Simmer answers its own client as soon as
             // this reply lands, so a test that asserts on `messages()` right
             // after a 250 would otherwise race the push and flake.
-            if matches!(final_dot, Act::Ok) {
+            if matches!(final_dot, Act::Ok) || script.record_all {
                 sink.lock().expect("not poisoned").push(seen.clone());
             }
             if let Some(delay) = script.final_dot_delay {
@@ -489,6 +494,9 @@ pub struct Simmer {
     /// D-085 — held so the writer's channel stays open for the life of the
     /// fixture, and closes when it is dropped.
     _capture: Option<simmer::capture::Capture>,
+    /// §7.7 — the spool, when the fixture was started with one.
+    pub spool: Option<Arc<simmer::spool::Spool>>,
+    dispatcher: Option<tokio::task::JoinHandle<tokio::task::JoinSet<()>>>,
 }
 
 impl Drop for Simmer {
@@ -520,6 +528,29 @@ impl Simmer {
         quota: Arc<dyn QuotaStore>,
         preflight: Arc<simmer::preflight::Registry>,
     ) -> Simmer {
+        Simmer::build(yaml, quota, preflight, None).await
+    }
+
+    /// §7.7 — with the config's `spool:` opened over `store` (a real one: the
+    /// spool needs `SpoolStore`) and the dispatcher running, as `main.rs`
+    /// starts them. The sweeper is not started; a test calls
+    /// `spool::sweeper::sweep_once` when it wants one.
+    pub async fn start_spooled(yaml: &str, store: Arc<dyn simmer::spool::SpoolStore>) -> Simmer {
+        Simmer::build(
+            yaml,
+            Arc::clone(&store) as Arc<dyn QuotaStore>,
+            Arc::new(simmer::preflight::Registry::new()),
+            Some(store),
+        )
+        .await
+    }
+
+    async fn build(
+        yaml: &str,
+        quota: Arc<dyn QuotaStore>,
+        preflight: Arc<simmer::preflight::Registry>,
+        spool_store: Option<Arc<dyn simmer::spool::SpoolStore>>,
+    ) -> Simmer {
         let config = simmer::config::from_str(yaml, "test-config").unwrap_or_else(|e| {
             panic!("test config is invalid:\n{e}");
         });
@@ -541,6 +572,22 @@ impl Simmer {
                 .0
         });
 
+        let spool = spool_store.map(|store| {
+            let cfg = config
+                .spool
+                .as_ref()
+                .expect("a spooled fixture has a spool: block");
+            Arc::new(
+                simmer::spool::Spool::open(
+                    cfg,
+                    store,
+                    (*tls.verifying()).clone(),
+                    &config.server.hostname,
+                )
+                .unwrap_or_else(|e| panic!("opening the test spool: {e}")),
+            )
+        });
+
         let engine = Engine {
             config: Arc::new(config),
             tls: Arc::new(tls),
@@ -552,6 +599,7 @@ impl Simmer {
             preflight,
             groups: Arc::new(simmer::routing::domain_group::Grouper::literal()),
             capture: capture.clone(),
+            spool: spool.clone(),
         };
 
         let listener = smtp::Listener::bind(engine.clone())
@@ -568,6 +616,13 @@ impl Simmer {
         let stop = smtp::Shutdown::new();
         let hard = smtp::Shutdown::new();
         let serve = tokio::spawn(listener.serve(stop.clone(), hard.clone()));
+        let dispatcher = spool.clone().map(|s| {
+            tokio::spawn(simmer::spool::dispatch::run(
+                engine.clone(),
+                s,
+                stop.clone(),
+            ))
+        });
 
         Simmer {
             addr,
@@ -579,11 +634,23 @@ impl Simmer {
             serve: Some(serve),
             engine,
             _capture: capture,
+            spool,
+            dispatcher,
         }
     }
 
     pub async fn connect(&self) -> Client {
         Client::connect(self.addr).await
+    }
+
+    /// Stop the dispatcher claiming and wait for its attempts in flight —
+    /// §10.4 for the spool. Idempotent.
+    pub async fn stop_dispatcher(&mut self) {
+        self.stop.cancel();
+        if let Some(task) = self.dispatcher.take() {
+            let mut attempts = task.await.expect("the dispatcher task");
+            while attempts.join_next().await.is_some() {}
+        }
     }
 
     /// §10.4 past its grace period, in `main.rs`'s order: stop accepting, fire

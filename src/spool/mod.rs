@@ -16,11 +16,66 @@
 //!   capture is written before the relay precisely so that it cannot know the
 //!   outcome; the spool exists to know it.
 
+pub mod accept;
 pub mod body;
+pub mod dispatch;
+pub mod envelope;
+pub mod http;
 pub mod object;
 pub mod store;
+pub mod sweeper;
+pub mod webhook;
 
 pub use store::{
     BookedSlot, ClaimRequest, Claimed, DeadEntry, DeadLetterRequest, DeadReason, LaneStats,
     NewSpooled, Reschedule, RetryDead, SpoolRampState, SpoolStore, SpoolTotals,
 };
+
+use std::sync::Arc;
+
+/// Everything the spool needs at runtime, built once at startup when some ramp
+/// has `delivery: spool`, and `None` on the [`crate::relay::Engine`] otherwise.
+pub struct Spool {
+    pub cfg: crate::config::Spool,
+    pub store: Arc<dyn SpoolStore>,
+    pub body: body::BodyStore,
+    /// This instance's name on the leases it holds, for diagnosis only.
+    pub owner: String,
+    pub webhook: Option<(http::HttpsClient, crate::config::Webhook)>,
+}
+
+impl Spool {
+    pub fn open(
+        cfg: &crate::config::Spool,
+        store: Arc<dyn SpoolStore>,
+        tls: rustls::ClientConfig,
+        hostname: &str,
+    ) -> anyhow::Result<Self> {
+        let body = body::BodyStore::open(&cfg.body_store)?;
+        let webhook = cfg
+            .dead_letter
+            .webhook
+            .as_ref()
+            .map(|w| (http::client(tls.clone(), w.timeout), w.clone()));
+        Ok(Self {
+            cfg: cfg.clone(),
+            store,
+            body,
+            owner: format!(
+                "{hostname}/{}/{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ),
+            webhook,
+        })
+    }
+}
+
+impl std::fmt::Debug for Spool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Spool")
+            .field("owner", &self.owner)
+            .field("body", &self.body)
+            .finish_non_exhaustive()
+    }
+}

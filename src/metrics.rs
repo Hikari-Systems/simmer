@@ -406,6 +406,40 @@ fn describe() {
          these are gaps in the capture and nothing else — the mail was unaffected"
     );
     describe_counter!(
+        "simmer_spool_accepted_total",
+        "D-116 messages a delivery: spool ramp stored and answered 250 queued"
+    );
+    describe_counter!(
+        "simmer_spool_admission_refused_total",
+        "D-119 messages a spooling ramp answered 451 4.7.1 without storing: full \
+         (max_messages or max_bytes), backlog (the lane's forecast wait exceeds the \
+         hold), draining, or unavailable (the store or body store failed)"
+    );
+    describe_counter!(
+        "simmer_spool_attempts_total",
+        "D-116 dispatcher attempts by result: delivered, deferred (a rate slot, D-118), \
+         retry (transient or no route), pool_exhausted (not an attempt), rejected, expired"
+    );
+    describe_counter!(
+        "simmer_spool_dead_total",
+        "D-120 messages that became dead letters, by reason: rejected (a 5xx at RCPT TO), \
+         expired (the hold ran out) or corrupt (the body was missing or changed)"
+    );
+    describe_counter!(
+        "simmer_spool_lease_lost_total",
+        "D-122 attempts that finished after their lease had been taken by another \
+         claimant. Delivery is at least once; each of these may be a duplicate"
+    );
+    describe_counter!(
+        "simmer_spool_orphans_swept_total",
+        "D-117 bodies deleted because no spool row named them"
+    );
+    describe_counter!(
+        "simmer_spool_webhook_total",
+        "D-120 dead-letter webhook POSTs by result: ok or error. A failure never \
+         changes the message's state"
+    );
+    describe_counter!(
         "simmer_capture_deferred_total",
         "D-085 messages answered 451 because the capture could not be written and \
          capture.on_error is defer. ALERT ON THIS: mail is being stopped for a \
@@ -1035,4 +1069,53 @@ pub fn capture_disk_bytes(n: u64) {
 /// why that pass stays authoritative rather than being replaced by this.
 pub fn capture_disk_grew(n: u64) {
     metrics::gauge!("simmer_capture_disk_bytes").increment(n as f64);
+}
+
+// ---------------------------------------------------------------------------
+// the spool (§7.7, D-116)
+// ---------------------------------------------------------------------------
+
+/// D-116 — a message stored and answered `250 queued`.
+pub fn spool_accepted(ramp: &str) {
+    counter!("simmer_spool_accepted_total", "ramp" => ramp.to_string()).increment(1);
+}
+
+/// D-119 — reason: `full`, `backlog`, `draining` or `unavailable`.
+pub fn spool_admission_refused(ramp: &str, reason: &'static str) {
+    counter!(
+        "simmer_spool_admission_refused_total",
+        "ramp" => ramp.to_string(), "reason" => reason,
+    )
+    .increment(1);
+}
+
+/// D-116 — one dispatcher attempt's result. `route` is `-` when none was chosen.
+pub fn spool_attempt(ramp: &str, route: &str, result: &'static str) {
+    counter!(
+        "simmer_spool_attempts_total",
+        "ramp" => ramp.to_string(), "route" => route.to_string(), "result" => result,
+    )
+    .increment(1);
+}
+
+/// D-120 — reason: `rejected`, `expired` or `corrupt`.
+pub fn spool_dead(ramp: &str, reason: &'static str) {
+    counter!(
+        "simmer_spool_dead_total",
+        "ramp" => ramp.to_string(), "reason" => reason,
+    )
+    .increment(1);
+}
+
+pub fn spool_lease_lost() {
+    counter!("simmer_spool_lease_lost_total").increment(1);
+}
+
+pub fn spool_orphans_swept(n: u64) {
+    counter!("simmer_spool_orphans_swept_total").increment(n);
+}
+
+/// D-120 — result: `ok` or `error`.
+pub fn spool_webhook(result: &'static str) {
+    counter!("simmer_spool_webhook_total", "result" => result).increment(1);
 }

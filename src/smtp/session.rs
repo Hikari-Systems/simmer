@@ -1016,6 +1016,23 @@ impl Session {
             correlation_id: self.correlation_id.clone(),
         };
 
+        // §7.7 (D-116) — a spooling ramp stores the message and answers
+        // `250 queued`; the dispatcher relays it later. A synchronous ramp
+        // never reaches the spool.
+        if selection.ramp.delivery == crate::config::Delivery::Spool {
+            if let Some(spool) = engine.spool.clone() {
+                return crate::spool::accept::accept(
+                    &engine,
+                    &spool,
+                    &selection,
+                    &senders,
+                    from_header.as_deref(),
+                    message,
+                )
+                .await;
+            }
+        }
+
         relay::reserve_relay_commit_owned(
             &engine,
             &selection.to_owned_selection(),

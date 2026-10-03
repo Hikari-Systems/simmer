@@ -84,6 +84,10 @@ pub struct Engine {
     /// of this field can consult the capture to decide what to deliver. That
     /// absence is what keeps §2.2 true — see `src/capture/mod.rs`.
     pub capture: Option<crate::capture::Capture>,
+    /// §7.7 (D-116) — the spool, when some ramp has `delivery: spool`. `None`
+    /// is the whole of "off": no body store, no dispatcher, and a session never
+    /// looks at it for a synchronous ramp.
+    pub spool: Option<Arc<crate::spool::Spool>>,
 }
 
 /// Why no route could be selected. Each maps to a specific reply, and the

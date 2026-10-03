@@ -460,6 +460,42 @@ pub fn smtputf8_unsupported() -> Reply {
     Reply::new(550, "5.6.7 SMTPUTF8 addresses not supported")
 }
 
+// ---------------------------------------------------------------------------
+// the spool (§7.7, D-116, D-119). None of these is a 5xx: a spool condition is
+// Simmer's transient state, never a verdict on the recipient (§14.1).
+// ---------------------------------------------------------------------------
+
+/// D-116 — stored durably; delivery is the dispatcher's from here.
+pub fn queued(id: uuid::Uuid) -> Reply {
+    Reply::new(250, format!("2.0.0 queued as {id}"))
+}
+
+/// D-119 — `max_messages` or `max_bytes` would be exceeded.
+pub fn spool_full() -> Reply {
+    Reply::new(451, "4.7.1 spool full, try again later")
+}
+
+/// D-119 — the lane's forecast wait is longer than the message could be held.
+pub fn spool_backlog() -> Reply {
+    Reply::new(
+        451,
+        "4.7.1 delivery backlog for this destination, try again later",
+    )
+}
+
+/// §9.3 — the ramp is draining for cutover and accepts nothing new.
+pub fn spool_draining() -> Reply {
+    Reply::new(
+        451,
+        "4.7.1 not accepting new mail for this route, try again later",
+    )
+}
+
+/// The spool's store or body store failed; nothing was stored.
+pub fn spool_unavailable() -> Reply {
+    Reply::new(451, "4.3.0 spool unavailable, try again later")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +627,26 @@ mod tests {
         assert_eq!(r.code, 451);
         assert!(r.to_wire().starts_with("451 4.3.0"), "{}", r.to_wire());
         assert!(!r.closes_connection());
+    }
+
+    #[test]
+    fn no_spool_condition_is_permanent() {
+        // D-116, D-119: a full spool, a backlog, a drain and a store outage are
+        // all Simmer's transient state. None may suppress a recipient (§14.1).
+        for (name, r) in [
+            ("spool_full", spool_full()),
+            ("spool_backlog", spool_backlog()),
+            ("spool_draining", spool_draining()),
+            ("spool_unavailable", spool_unavailable()),
+        ] {
+            assert_eq!(r.code, 451, "{name}");
+            assert!(!r.closes_connection(), "{name}");
+        }
+        let q = queued(uuid::Uuid::nil());
+        assert_eq!(
+            q.to_wire(),
+            "250 2.0.0 queued as 00000000-0000-0000-0000-000000000000\r\n"
+        );
     }
 
     #[test]
