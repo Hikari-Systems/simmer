@@ -207,13 +207,21 @@ fn quota_failure(cfg: &Config, ramp: &Ramp, e: quota::QuotaError, during: &str) 
         metrics::quota_unavailable(&ramp.name, "-");
         SelectError::QuotaUnavailable
     } else {
-        // Explicitly opted out of §7.5's default. Loud, because it means the
-        // ramp is not being enforced right now.
+        // Explicitly opted out of §7.5's default. What that opt-out *does* is
+        // not specified: §7.5 defines only the `true` case. The implementation
+        // has always treated the outage as an exhausted chain, so the client
+        // gets the ramp's `exhausted_chain_reply` (`451 4.7.1` by default)
+        // rather than §7.5's `451 4.3.0` — nothing is sent either way, and the
+        // ramp is not bypassed. The log used to claim the message proceeded
+        // "WITHOUT quota enforcement", which was never true. Raised as O-19;
+        // until it is answered the behaviour is kept and only described
+        // truthfully (D-107).
         tracing::error!(
             error = %e,
             during,
-            "quota store unavailable and fail_closed is false; proceeding WITHOUT \
-             quota enforcement. The warm-up ramp is not being applied."
+            "quota store unavailable and fail_closed is false; refusing as an exhausted \
+             chain (exhausted_chain_reply, 451 4.7.1 by default) rather than \
+             451 4.3.0. Nothing is sent; see O-19"
         );
         SelectError::ChainExhausted
     }
@@ -790,6 +798,52 @@ ramps:
         let r = SelectError::QuotaUnavailable.to_reply(cfg.default_ramp());
         assert_eq!(r.code, 451);
         assert!(r.to_wire().contains("4.3.0"));
+    }
+
+    #[test]
+    fn fail_open_is_answered_as_an_exhausted_chain_today() {
+        // D-107 / O-19: pins what `fail_closed: false` does now, pending the
+        // spec author's answer — NOT what it should do. It never sends: the
+        // outage becomes the ramp's exhausted-chain reply (451 4.7.1 by default,
+        // and 550 under `exhausted_chain_reply: "550"`), not §7.5's 451 4.3.0.
+        let mut cfg = config(&[]);
+        cfg.database.fail_closed = false;
+        let ramp = cfg.default_ramp();
+        let err = quota_failure(
+            &cfg,
+            ramp,
+            quota::QuotaError::Storage("down".into()),
+            "test",
+        );
+        assert_eq!(err, SelectError::ChainExhausted);
+        let r = err.to_reply(ramp);
+        assert_eq!(r.code, 451);
+        assert!(r.to_wire().contains("4.7.1"), "{}", r.to_wire());
+
+        let mut cfg = config(&[("exhausted_chain_reply", "\"550\"")]);
+        cfg.database.fail_closed = false;
+        let ramp = cfg.default_ramp();
+        let err = quota_failure(
+            &cfg,
+            ramp,
+            quota::QuotaError::Storage("down".into()),
+            "test",
+        );
+        assert_eq!(
+            err.to_reply(ramp).code,
+            550,
+            "O-19 asks about this case too"
+        );
+
+        let cfg = config(&[]);
+        let ramp = cfg.default_ramp();
+        let err = quota_failure(
+            &cfg,
+            ramp,
+            quota::QuotaError::Storage("down".into()),
+            "test",
+        );
+        assert_eq!(err, SelectError::QuotaUnavailable, "the default is §7.5's");
     }
 
     #[test]

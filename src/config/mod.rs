@@ -443,6 +443,11 @@ pub struct Database {
     pub connect_timeout: Duration,
     /// §7.5 — default true. A quota enforcer that stops enforcing under failure
     /// provides no guarantee at all.
+    ///
+    /// `false` does **not** send without enforcement: a store failure is then
+    /// answered as an exhausted chain — the ramp's `exhausted_chain_reply`,
+    /// `451 4.7.1` by default — instead of `451 4.3.0`. §7.5 does not say what
+    /// `false` should do; that is O-19 (D-107).
     #[serde(default = "yes")]
     pub fail_closed: bool,
 }

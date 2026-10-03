@@ -5099,6 +5099,36 @@ runs `main`'s order):
 - `the_hard_stop_cuts_a_data_transfer_without_relaying`.
 
 
+### D-107 — `fail_closed: false` is described as what it does; what it *should* do is O-19
+
+> Phase 0 (groundwork) of the segment rate-limit/spool plan, 2026-10-03.
+> Logging, comments and docs only; behaviour unchanged.
+
+**The problem.** With `database.fail_closed: false`, `relay::quota_failure` logged
+"proceeding WITHOUT quota enforcement. The warm-up ramp is not being applied" and
+returned `SelectError::ChainExhausted`. Nothing proceeds: the message is answered
+with the ramp's `exhausted_chain_reply` — `451 4.7.1 no eligible route, try later`
+by default — and is not sent. The log line told an operator the opposite of what
+happened, at the moment they were diagnosing an outage (CLAUDE.md's "the control
+plane must not lie").
+
+**Why not fix the behaviour.** §7.5 defines only `fail_closed: true` (`451 4.3.0`
+and send nothing). It says nothing about `false`, and the two readings are far
+apart: "fail open" (send without a reservation, bypassing the ramp) or "the same
+refusal under a different code". Choosing either is the spec author's call.
+
+**The change.** The log line, the `DatabaseConfig::fail_closed` doc comment and
+DOCKERHUB.md's operating note now say what happens. A unit test pins today's
+behaviour so that an answer to O-19 changes it deliberately:
+`relay::tests::fail_open_is_answered_as_an_exhausted_chain_today`.
+
+**Found on the way, and part of O-19:** because the outage is mapped to an
+exhausted chain, a ramp with `exhausted_chain_reply: "550"` answers a *database
+outage* with `550 5.7.1` under `fail_closed: false`. That is a permanent reply
+for a transient Simmer failure — exactly what §14.1 forbids — reachable only by
+two non-default settings together. Recorded, not changed.
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -5124,6 +5154,7 @@ the phase that depends on each.
 | ~~O-17~~ | *Settled 2026-09-21 by the spec's author: amend the spec. Thread affinity is global, may take a pinned route past its cap (counted), and bypasses §7.3 on it. §2.1, §2.2, §3.2 (step 2a), §4.1, §4.2, §5.4, §7.3, §7.4, §9.1, §9.4 and §9.5 now carry it — see **D-090**.* | | |
 | O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment. *Deferred again, explicitly, by the 2026-09-24 amendment — see **D-099**.* |
 | ~~O-18~~ | *Settled 2026-09-23 by the spec's author: `554`, not configurable, and amend the spec. §5.5 (the end-of-data marker is `CRLF . CRLF` and nothing else, and the whole payload is refused), §9.1 (`simmer_ambiguous_terminator_total`) and §10.3 (the one permanent reply that is a statement about the message, and why §14.1's worked example does not reach it) now carry it — see **D-095**.* | | |
+| O-19 | What should `database.fail_closed: false` do? §7.5 defines only `true` (`451 4.3.0`, send nothing). The implementation answers a store failure under `false` as an exhausted chain — the ramp's `exhausted_chain_reply`, so `451 4.7.1` by default and **`550 5.7.1` if the ramp sets `"550"`**, which §14.1 would forbid for a transient failure. The old log line claimed the message was sent unenforced; it never was. Options: (a) true fail-open, relaying without a reservation; (b) keep refusing, but always `451` (4.3.0 or 4.7.1); (c) remove the key. | Behaviour unchanged; log and docs made truthful — see **D-107** | Before any phase that touches §7.5 or the reservation path |
 
 
 ---

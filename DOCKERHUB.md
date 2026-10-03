@@ -360,7 +360,9 @@ Every mutation is audited at `INFO` with the acting token's name.
   both, will disagree. A rolling deploy that briefly runs two is tolerable; a
   standing pair is not.
 - **Leave `database.fail_closed: true`.** A quota enforcer that stops enforcing
-  when its database is unreachable provides no guarantee at all.
+  when its database is unreachable provides no guarantee at all. (`false` does
+  not actually send unenforced today: an outage is answered like an exhausted
+  chain, `451 4.7.1` by default, instead of `451 4.3.0`.)
 - **A captured record reaches the file within ten buffered lines or 500 ms of
   quiet** (0.3.1 and later), so `tail -f` on the current bucket is useful. Those
   are flushes, not `fsync`s; only `on_error: defer` is durable before the client
