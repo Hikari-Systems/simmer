@@ -2180,3 +2180,64 @@ and it is a condition of this host, not of simmer.
   the collector writing nothing, would separate the disk from the export.
 - **Which fix removed A's early tail.** It was absent here too, but the two
   fixes still went in together.
+
+## 19. `main` at `417e148` — the rates, the spool and D-127's spans, export on, SQL Server, an hour
+
+### What was run
+
+§18's hour script, unchanged but for where it runs, against `main` at `417e148`:
+the per-segment rates and the opt-in spool (D-101 – D-125), the single-statement
+SQL Server claim (D-122), and D-127's spans. The SQL Server build against
+Express, OTLP export on both instances to the dummy collector, jemalloc's
+counters on (`alloc-stats`, **not a published build**). Run from the
+`simmer-spool` worktree, so the compose project is `simmer-spool`. Image
+`4b325220…` on both instances. Scripts and every artefact in
+`target/soak-runs/2026-10-03-main-417e148-mssql-otel-je-hour`.
+
+The soak configuration's ramps are synchronous and carry no `rate`, so this
+hour exercises what the branch changed on the **shared** path — `relay::attempt`
+(D-116), the walk's ordered checks (D-109), the injected clock (D-108), the owned
+hand-off (D-110), bounded reply writes (D-101), shutdown (D-105, D-106), and the
+new spans — not the spool's own code, which no soak has run yet.
+
+An earlier start of the same hour on `2d4c057` was cancelled 25 minutes in to
+land the claim fix and D-127 first. It gave no verdict and is not counted.
+
+### Result: correct, complete, and the tail back where it belongs
+
+- **Correctness.** 36,010 of 36,010 accepted per instance, none deferred,
+  refused or failed in transport. V4 as always: 220 accepted and 11 cut per
+  instance, none at the dot.
+- **Latency.** p50 21.9 / 23.5 ms, p90 49.3 / 50.8 ms, p99 74.4 / 65.0 ms, max
+  448 / 428 ms; **one** message per instance over 200 ms. §18's fixed hour had
+  p99 102 / 108 ms and 204 over 200 ms on a full disk; its export-on 20 minutes
+  (C) had p99 79.0 / 70.3 ms. So the hour sits with C and with §11's export-off
+  figures, not with §18's late burst — consistent with §18's attribution of that
+  burst to the host's disk rather than the export. Not proof of it: this host's
+  disk was at 98% throughout, not full.
+- **The export was complete.** The collector accepted 514,448 spans, 159,461 log
+  records and 8,976 metric points, and refused or failed none. Zero WARN or ERROR
+  lines from the SDK's own targets on either instance.
+- **Memory, descriptors and threads passed** on both instances. `anon` +4.89 and
+  −0.84 MiB/h; fds flat. `app`'s threads rose by one and were back at baseline at
+  rest — flagged as a ratchet, not a leak. At rest on both: threads 7 → 6, tasks
+  22 → 22, 0 unaccounted descriptors.
+- **jemalloc, reported and not judged (D-092).** `je_allocated` +0.65 / +0.48
+  MiB/h within 6–21 MiB. `je_retained` rose +46 / +53 MiB/h to 174 MiB, against
+  §18's +8 and −26 MiB/h to 148 and 175 MiB: the same ceiling, reached on a
+  different path through the hour. Retained is address space jemalloc holds for
+  reuse, which `anon` and `je_resident` (+3.7 / −1.3 MiB/h) do not show being
+  touched.
+- **F7** as expected: the unmatched-sender series grew by 1,646.
+
+### Not established
+
+- **The spool under load.** No soak has a spooling ramp: the dispatcher, the
+  body store, the claim under contention for an hour, the sweeper, and D-127's
+  spool spans all ran only in `cargo test`. A spooling soak configuration is the
+  next soak to write.
+- **The rates under load**, for the same reason: no route in the soak
+  configuration has a `rate`.
+- **Whether `je_retained`'s path matters.** Two hours with the same ceiling and
+  opposite slopes say it does not trend; a longer run would say whether it
+  plateaus.
