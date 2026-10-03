@@ -597,7 +597,7 @@ fn known_route<'a>(
 
 /// §9.3: "All mutations are logged at `INFO` with the acting token's
 /// identifier."
-fn audit(
+pub(super) fn audit(
     action: &'static str,
     actor: &Actor,
     ramp: &str,

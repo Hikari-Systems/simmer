@@ -187,6 +187,26 @@ pub struct RecipientOutcome {
     /// Absent when no route was selected: there is no identity to render.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outbound: Option<Outbound>,
+    /// §7.7 — present for a `delivery: spool` ramp: what admission would say
+    /// and how long the message would wait. `evaluation` is then the first
+    /// attempt's walk, made now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool: Option<SpoolView>,
+}
+
+/// D-119 through §9.4: the same `spool::accept::admission` the accept path
+/// calls.
+#[derive(Debug, Serialize)]
+pub struct SpoolView {
+    /// `admit`, `full`, `backlog` or `draining`.
+    pub admission: &'static str,
+    /// What the client would be answered at the final dot.
+    pub would_reply: String,
+    /// The lane's forecast wait ahead of this message; `null` when nothing in
+    /// front would queue it.
+    pub expected_wait_seconds: Option<i64>,
+    /// The end of the hold (Q4): delivered by then, or dead-lettered.
+    pub hold_until: chrono::DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -446,6 +466,29 @@ async fn evaluate_one(
         .as_ref()
         .map(|route| render(state, &ramp.name, route, recipient, request, now));
 
+    // §7.7 — a spooling ramp answers at the final dot with admission's
+    // verdict, not the walk's; the walk is the first attempt's.
+    let spool = match (&state.engine.spool, ramp.delivery) {
+        (Some(spool), crate::config::Delivery::Spool) => {
+            use crate::spool::accept::{admission, Admit};
+            let bytes = i64::try_from(synthesise(request, recipient).len()).unwrap_or(i64::MAX);
+            let v = admission(&state.engine, spool, ramp, chain, &domain_group, bytes, now).await?;
+            let reply = match v.outcome {
+                Admit::Admit => crate::smtp::reply::queued(uuid::Uuid::nil()),
+                Admit::Draining => crate::smtp::reply::spool_draining(),
+                Admit::Full => crate::smtp::reply::spool_full(),
+                Admit::Backlog => crate::smtp::reply::spool_backlog(),
+            };
+            Some(SpoolView {
+                admission: v.outcome.as_str(),
+                would_reply: reply.to_wire().trim_end().to_string(),
+                expected_wait_seconds: v.expected_wait.map(|w| w.num_seconds()),
+                hold_until: v.hold_until,
+            })
+        }
+        _ => None,
+    };
+
     Ok(RecipientOutcome {
         recipient: recipient.to_string(),
         domain_group,
@@ -454,6 +497,7 @@ async fn evaluate_one(
         selected,
         would_reply,
         outbound,
+        spool,
     })
 }
 

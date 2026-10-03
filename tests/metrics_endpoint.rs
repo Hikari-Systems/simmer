@@ -637,6 +637,60 @@ async fn the_rate_metrics_are_histogram_and_counter_with_help(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn the_spool_metrics_reach_the_scrape_with_help(pool: PgPool) {
+    let _serialised = exclusive().await;
+    // D-116 – D-125. The gauges are written by /metrics from the store when a
+    // spool exists; written directly here, the scrape must still describe them.
+    let state = state(pool);
+    simmer::metrics::spool_accepted("main");
+    simmer::metrics::spool_admission_refused("main", "full");
+    simmer::metrics::spool_attempt("main", "warming", "delivered");
+    simmer::metrics::spool_dead("main", "rejected");
+    simmer::metrics::spool_lease_lost();
+    simmer::metrics::spool_orphans_swept(2);
+    simmer::metrics::spool_webhook("ok");
+    simmer::metrics::spool_depth("main", "google", 3);
+    simmer::metrics::spool_bytes(1234);
+    simmer::metrics::spool_oldest_seconds(9);
+
+    let (_, body) = scrape(&state).await;
+    for help in [
+        "# HELP simmer_spool_accepted_total",
+        "# HELP simmer_spool_admission_refused_total",
+        "# HELP simmer_spool_attempts_total",
+        "# HELP simmer_spool_dead_total",
+        "# HELP simmer_spool_lease_lost_total",
+        "# HELP simmer_spool_orphans_swept_total",
+        "# HELP simmer_spool_webhook_total",
+        "# HELP simmer_spool_depth",
+        "# HELP simmer_spool_bytes",
+        "# HELP simmer_spool_oldest_seconds",
+    ] {
+        assert!(body.contains(help), "{help}: {body}");
+    }
+    assert_eq!(
+        value(
+            &body,
+            "simmer_spool_attempts_total",
+            &[
+                ("ramp", "main"),
+                ("route", "warming"),
+                ("result", "delivered")
+            ]
+        ),
+        "1"
+    );
+    assert_eq!(
+        value(
+            &body,
+            "simmer_spool_depth",
+            &[("ramp", "main"), ("domain_group", "google")]
+        ),
+        "3"
+    );
+}
+
+#[sqlx::test]
 async fn no_scrape_exposes_a_recipient(pool: PgPool) {
     let _serialised = exclusive().await;
     // §7.3, applied to the one place where a high-cardinality label would be

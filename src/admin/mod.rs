@@ -31,6 +31,7 @@ pub mod auth;
 pub mod dryrun;
 pub mod error;
 pub mod mutate;
+pub mod spool;
 pub mod view;
 
 use axum::extract::{Path, Query, State};
@@ -116,6 +117,14 @@ pub fn router(state: AdminState) -> Router {
         // -- D-099: the pre-ramp paths, gone rather than aliased ---------
         .route("/routes", any(gone))
         .route("/routes/{*rest}", any(gone))
+        // -- §7.7 the spool (D-125) ------------------------------------
+        .route("/spool", get(spool::overview))
+        .route("/spool/dead", get(spool::dead))
+        .route("/spool/dead/{id}/retry", post(spool::retry))
+        .route("/spool/{id}", axum::routing::delete(spool::delete))
+        .route("/ramps/{ramp}/spool/pause", post(spool::pause))
+        .route("/ramps/{ramp}/spool/resume", post(spool::resume))
+        .route("/ramps/{ramp}/spool/drain", post(spool::drain))
         // -- §9.4 ------------------------------------------------------
         .route("/dryrun", post(dryrun::dryrun));
     let router = if metrics_enabled {
@@ -250,6 +259,9 @@ async fn metrics_endpoint(State(state): State<AdminState>) -> Response {
     // `0`, which is the answer — not silence.
     if let Err(e) = refresh_gauges(&state).await {
         tracing::warn!(error = %e, "could not refresh quota gauges for /metrics");
+    }
+    if let Err(e) = spool::refresh_gauges(&state).await {
+        tracing::warn!(error = %e, "could not refresh spool gauges for /metrics");
     }
 
     match &state.metrics {

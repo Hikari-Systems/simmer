@@ -643,6 +643,11 @@ impl Simmer {
         Client::connect(self.addr).await
     }
 
+    /// The engine the listener holds, for an `AdminState` that shares it.
+    pub fn engine(&self) -> &Engine {
+        &self.engine
+    }
+
     /// Stop the dispatcher claiming and wait for its attempts in flight —
     /// §10.4 for the spool. Idempotent.
     pub async fn stop_dispatcher(&mut self) {

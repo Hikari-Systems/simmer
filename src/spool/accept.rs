@@ -54,32 +54,6 @@ pub async fn accept(
         r
     };
 
-    match spool.store.spool_states().await {
-        Ok(states) if states.get(&ramp.name).is_some_and(|s| s.draining) => {
-            return refuse("draining", reply::spool_draining());
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::error!(correlation_id = cid, error = %e, "spool state unavailable");
-            return refuse("unavailable", reply::spool_unavailable());
-        }
-    }
-
-    let bytes = i64::try_from(message.body.len()).unwrap_or(i64::MAX);
-    match spool.store.totals().await {
-        Ok(t) => {
-            let max_messages = i64::try_from(spool.cfg.max_messages).unwrap_or(i64::MAX);
-            let max_bytes = i64::try_from(spool.cfg.max_bytes).unwrap_or(i64::MAX);
-            if t.messages >= max_messages || t.bytes.saturating_add(bytes) > max_bytes {
-                return refuse("full", reply::spool_full());
-            }
-        }
-        Err(e) => {
-            tracing::error!(correlation_id = cid, error = %e, "spool totals unavailable");
-            return refuse("unavailable", reply::spool_unavailable());
-        }
-    }
-
     let recipient = message
         .envelope
         .recipients
@@ -91,20 +65,21 @@ pub async fn accept(
         Some(r) => (r.group.name.clone(), r.basis.describe()),
         None => ("catchall".to_string(), "fallback".to_string()),
     };
+    let bytes = i64::try_from(message.body.len()).unwrap_or(i64::MAX);
 
-    let expires_at = hold_until(spool, ramp, chain, now);
-
-    // D-119's forecast: how long this lane's queue would take to drain at the
-    // first waiting route's rate, against how long this message may wait.
-    match forecast(engine, spool, ramp, chain, &group, now).await {
-        Ok(Some(wait)) if now + wait > expires_at => {
-            return refuse("backlog", reply::spool_backlog());
-        }
-        Ok(_) => {}
+    let verdict = match admission(engine, spool, ramp, chain, &group, bytes, now).await {
+        Ok(v) => v,
         Err(e) => {
-            tracing::error!(correlation_id = cid, error = %e, "spool lane depth unavailable");
+            tracing::error!(correlation_id = cid, error = %e, "spool admission state unavailable");
             return refuse("unavailable", reply::spool_unavailable());
         }
+    };
+    let expires_at = verdict.hold_until;
+    match verdict.outcome {
+        Admit::Admit => {}
+        Admit::Draining => return refuse("draining", reply::spool_draining()),
+        Admit::Full => return refuse("full", reply::spool_full()),
+        Admit::Backlog => return refuse("backlog", reply::spool_backlog()),
     }
 
     let id = Uuid::new_v4();
@@ -149,6 +124,71 @@ pub async fn accept(
         "spooled"
     );
     reply::queued(id)
+}
+
+/// D-119's verdict on one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admit {
+    Admit,
+    Draining,
+    Full,
+    Backlog,
+}
+
+impl Admit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Admit::Admit => "admit",
+            Admit::Draining => "draining",
+            Admit::Full => "full",
+            Admit::Backlog => "backlog",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Admission {
+    pub outcome: Admit,
+    pub hold_until: DateTime<Utc>,
+    /// D-119's forecast: how long the lane's queue would take to drain ahead
+    /// of this message. `None` when no route in front would queue it.
+    pub expected_wait: Option<chrono::Duration>,
+}
+
+/// D-119 — the one admission decision, for the accept path and §9.4's dry run
+/// alike, so the two cannot disagree. Read-only.
+pub async fn admission(
+    engine: &Engine,
+    spool: &Spool,
+    ramp: &Ramp,
+    chain: &[String],
+    group: &str,
+    bytes: i64,
+    now: DateTime<Utc>,
+) -> Result<Admission, quota::QuotaError> {
+    let hold_until = hold_until(spool, ramp, chain, now);
+    let expected_wait = forecast(engine, spool, ramp, chain, group, now).await?;
+    let mut verdict = Admission {
+        outcome: Admit::Admit,
+        hold_until,
+        expected_wait,
+    };
+    let states = spool.store.spool_states().await?;
+    if states.get(&ramp.name).is_some_and(|s| s.draining) {
+        verdict.outcome = Admit::Draining;
+        return Ok(verdict);
+    }
+    let t = spool.store.totals().await?;
+    let max_messages = i64::try_from(spool.cfg.max_messages).unwrap_or(i64::MAX);
+    let max_bytes = i64::try_from(spool.cfg.max_bytes).unwrap_or(i64::MAX);
+    if t.messages >= max_messages || t.bytes.saturating_add(bytes) > max_bytes {
+        verdict.outcome = Admit::Full;
+        return Ok(verdict);
+    }
+    if expected_wait.is_some_and(|w| now + w > hold_until) {
+        verdict.outcome = Admit::Backlog;
+    }
+    Ok(verdict)
 }
 
 /// Q4 — `received_at + max_hold`, and never past the next day boundary of the

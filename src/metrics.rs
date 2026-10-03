@@ -405,6 +405,20 @@ fn describe() {
          write_error, open_error or shutdown. Under the default on_error: continue \
          these are gaps in the capture and nothing else — the mail was unaffected"
     );
+    describe_gauge!(
+        "simmer_spool_depth",
+        "D-116 live messages in each spooling ramp's domain-group lane, read on the \
+         scrape (D-056); 0 for an empty lane"
+    );
+    describe_gauge!(
+        "simmer_spool_bytes",
+        Unit::Bytes,
+        "D-119 bytes the body store holds for spool rows, retained dead letters included"
+    );
+    describe_gauge!(
+        "simmer_spool_oldest_seconds",
+        "D-116 age of the oldest live spooled message; 0 when the spool is empty"
+    );
     describe_counter!(
         "simmer_spool_accepted_total",
         "D-116 messages a delivery: spool ramp stored and answered 250 queued"
@@ -1118,4 +1132,21 @@ pub fn spool_orphans_swept(n: u64) {
 /// D-120 — result: `ok` or `error`.
 pub fn spool_webhook(result: &'static str) {
     counter!("simmer_spool_webhook_total", "result" => result).increment(1);
+}
+
+/// D-056 — written by `/metrics` from the store.
+pub fn spool_depth(ramp: &str, domain_group: &str, depth: i64) {
+    metrics::gauge!(
+        "simmer_spool_depth",
+        "ramp" => ramp.to_string(), "domain_group" => domain_group.to_string(),
+    )
+    .set(depth as f64);
+}
+
+pub fn spool_bytes(bytes: i64) {
+    metrics::gauge!("simmer_spool_bytes").set(bytes as f64);
+}
+
+pub fn spool_oldest_seconds(secs: i64) {
+    metrics::gauge!("simmer_spool_oldest_seconds").set(secs as f64);
 }
