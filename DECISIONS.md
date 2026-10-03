@@ -5776,6 +5776,44 @@ becoming or feeding the spool; a DSN, ever). The README has a Spooling section.
 `docker-compose.yml` has the spool volume, commented out for the capture's
 reason.
 
+### D-127 — Telemetry for the rates and the spool
+
+> 2026-10-03, after the spool merged. Asked for directly: every feature the
+> branch introduced gets OTel coverage, and the existing spans carry what the
+> new features add.
+
+**New spans** (all `info`, so `telemetry.level`'s default exports them):
+- `simmer.spool.accept` under `smtp.transaction`, with `simmer.spool.admission`
+  and `simmer.spool.enqueue` under it — the verdict and every input to it
+  (domain group and its basis, expected wait, hold, bytes, body store), and the
+  id the client was given. A refusal is an error status, like any `4xx`.
+- `simmer.spool.attempt`, a **root** span per dispatcher attempt. It is not a
+  child of the accept: the accept's trace ended with the client's `250`, hours
+  may separate them, and a span parented across that would hold a trace open
+  for the hold. It carries the accepting transaction's `correlation_id`, which
+  joins the two — the same id the logs have always used. Also the attempt
+  number, age, time left in the hold, pin and booking, and the outcome; a dead
+  letter is an error status with its reason and code. The lease renewer and a
+  dead letter's `simmer.spool.webhook` (a client span; never the URL) run
+  under it although they are spawned.
+- `simmer.spool.body.{put,get,delete,list}` per body-store operation, `simmer.spool.sweep` per
+  sweeper pass (counts for each of its three steps), `simmer.spool.probe` at
+  startup, and `simmer.rate.wait` for a synchronous client held for its slot.
+
+**Extended spans.** `smtp.transaction`: `delivery`, `spool_id`. `simmer.relay`:
+`spooled`, `spool_id`, `pinned_route`, `pinned_fallback`, `rate_slot`,
+`rate_wait_ms`, `deferred_until`. `simmer.route`: `chains_walked`,
+`rate_send_at`, `deferred_until`. `simmer.quota.resolve`: `spool_lease_held`.
+`chain::unbook` records `rate_slot = given_back` on whichever span is current.
+
+**A gauge bug, fixed with it.** `main`'s OTLP gauge task refreshed every
+scrape-time gauge but the spool's, so an OTLP-only deployment exported no spool
+depth at all. It now calls `admin::spool::refresh_gauges` too.
+
+**What stays out**, as §9.5 and D-126 require: no envelope address, no body, no
+downstream text (only codes), and no webhook URL. `tests/telemetry.rs` checks
+the spool's two traces, their join, and that neither names the recipient.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

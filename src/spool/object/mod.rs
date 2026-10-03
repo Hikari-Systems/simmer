@@ -72,14 +72,24 @@ impl ObjectStore {
         })
     }
 
+    pub fn provider(&self) -> &'static str {
+        match self.backend {
+            Backend::S3(_) => "s3",
+            Backend::Azure(_) => "azure",
+        }
+    }
+
     fn key_for(&self, id: Uuid) -> String {
         format!("{}{id}.eml", self.prefix)
     }
 
     async fn send(&self, req: hyper::Request<Full<Bytes>>) -> Result<http::Response, BodyError> {
-        http::send(&self.client, req, self.timeout)
+        let resp = http::send(&self.client, req, self.timeout)
             .await
-            .map_err(BodyError::Io)
+            .map_err(BodyError::Io)?;
+        // §9.6 — on the operation's `simmer.spool.body` span (D-127).
+        tracing::Span::current().record("http.response.status_code", resp.status);
+        Ok(resp)
     }
 
     pub async fn put(&self, id: Uuid, bytes: &[u8]) -> Result<String, BodyError> {

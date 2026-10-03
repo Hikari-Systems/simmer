@@ -334,3 +334,149 @@ async fn no_recipient_address_is_exported() {
     assert_eq!(attr_str(down, "smtp.response.code").as_deref(), Some("550"));
     assert_eq!(attr_str(down, "smtp.stage").as_deref(), Some("rcpt_to"));
 }
+
+// ---------------------------------------------------------------------------
+// D-127 — the spool's spans
+// ---------------------------------------------------------------------------
+
+/// A spooled message is two traces joined by `correlation_id`: the client's
+/// (`smtp.transaction` → `simmer.spool.accept`, with the admission decision
+/// and the body's `put`), and the dispatcher's (`simmer.spool.attempt` →
+/// `simmer.relay` → the usual tree, with the body's `get` and `delete`).
+#[cfg(feature = "postgres")]
+#[sqlx::test]
+async fn a_spooled_message_is_an_accept_trace_and_an_attempt_trace(pool: sqlx::PgPool) {
+    exported();
+    const SPOOLED_RECIPIENT: &str = "spool-telemetry-victim@example.net";
+    let downstream = FakeDownstream::start(Script::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = config_for(
+        downstream.addr,
+        &format!(
+            "{CORRELATION_HEADER}  delivery: spool\nspool:\n  body_store: {{ kind: volume, path: \"{}\" }}\n  \
+             dispatch: {{ poll_interval: 50ms, batch: 8 }}\n",
+            dir.path().display()
+        ),
+    );
+    let store = std::sync::Arc::new(simmer::quota::PgQuotaStore::new(pool));
+    let simmer = Simmer::start_spooled(&yaml, store).await;
+    let mut client = simmer.connect().await;
+    client.hello().await;
+    let reply = client
+        .deliver(
+            "jane@oldbrand.com",
+            SPOOLED_RECIPIENT,
+            "From: jane@oldbrand.com\r\nSubject: spooled\r\n\r\nhello\r\n",
+        )
+        .await;
+    assert_eq!(reply.code, 250, "{reply:?}");
+    let spool_id = reply.text().rsplit(' ').next().unwrap().trim().to_string();
+    client.command("QUIT").await;
+    drop(client);
+
+    // Delivered, then the attempt span closes.
+    for _ in 0..100 {
+        if exported()
+            .spans
+            .get_finished_spans()
+            .unwrap()
+            .iter()
+            .any(|s| {
+                s.name == "simmer.spool.attempt"
+                    && attr_str(s, "spool_id").as_deref() == Some(&spool_id)
+            })
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let all = exported().spans.get_finished_spans().unwrap();
+
+    // The accept.
+    let accept = all
+        .iter()
+        .find(|s| {
+            s.name == "simmer.spool.accept" && attr_str(s, "spool_id").as_deref() == Some(&spool_id)
+        })
+        .expect("a simmer.spool.accept span with the id the client was given");
+    assert_eq!(attr_str(accept, "admission").as_deref(), Some("admit"));
+    assert_eq!(attr_str(accept, "body_store").as_deref(), Some("volume"));
+    assert_eq!(attr_str(accept, "smtp.reply.code").as_deref(), Some("250"));
+    let correlation_id = attr_str(accept, "correlation_id").expect("correlation_id");
+    let client_trace = trace_for(&correlation_id);
+    let tx = named(&client_trace, "smtp.transaction");
+    assert!(child_of(accept, tx));
+    assert_eq!(attr_str(tx, "delivery").as_deref(), Some("spool"));
+    assert_eq!(attr_str(tx, "spool_id").as_deref(), Some(spool_id.as_str()));
+    let put = client_trace
+        .iter()
+        .find(|s| s.name == "simmer.spool.body.put" && attr_str(s, "op").as_deref() == Some("put"))
+        .expect("the body's put");
+    assert!(child_of(put, accept));
+    assert_eq!(attr_str(put, "outcome").as_deref(), Some("ok"));
+    assert!(client_trace
+        .iter()
+        .any(|s| s.name == "simmer.spool.admission"));
+    assert!(client_trace
+        .iter()
+        .any(|s| s.name == "simmer.spool.enqueue"));
+    assert!(
+        !client_trace.iter().any(|s| s.name == "simmer.relay"),
+        "nothing is relayed on the client's time"
+    );
+
+    // The attempt.
+    let attempt = all
+        .iter()
+        .find(|s| {
+            s.name == "simmer.spool.attempt"
+                && attr_str(s, "spool_id").as_deref() == Some(&spool_id)
+        })
+        .expect("a simmer.spool.attempt span");
+    assert_eq!(attr_str(attempt, "outcome").as_deref(), Some("delivered"));
+    assert_eq!(attr_str(attempt, "attempt").as_deref(), Some("1"));
+    assert_eq!(attr_str(attempt, "route").as_deref(), Some("only"));
+    assert_eq!(
+        attr_str(attempt, "correlation_id").as_deref(),
+        Some(correlation_id.as_str()),
+        "the attempt joins the accept through the client's correlation id"
+    );
+    let attempt_trace: Vec<_> = all
+        .iter()
+        .filter(|s| s.span_context.trace_id() == attempt.span_context.trace_id())
+        .cloned()
+        .collect();
+    let relay = named(&attempt_trace, "simmer.relay");
+    assert!(child_of(relay, attempt));
+    assert_eq!(attr_str(relay, "spooled").as_deref(), Some("true"));
+    assert_eq!(
+        attr_str(relay, "spool_id").as_deref(),
+        Some(spool_id.as_str())
+    );
+    let resolve = named(&attempt_trace, "simmer.quota.resolve");
+    assert_eq!(
+        attr_str(resolve, "spool_lease_held").as_deref(),
+        Some("true")
+    );
+    for op in ["get", "delete"] {
+        assert!(
+            attempt_trace
+                .iter()
+                .any(|s| s.name == format!("simmer.spool.body.{op}")
+                    && attr_str(s, "body_store").as_deref() == Some("volume")),
+            "the body's {op} is in the attempt's trace"
+        );
+    }
+
+    // And neither trace names the recipient.
+    let local = SPOOLED_RECIPIENT.split('@').next().unwrap();
+    for s in client_trace.iter().chain(attempt_trace.iter()) {
+        let text = format!("{:?} {:?}", s.attributes, s.events);
+        assert!(
+            !text.contains(local),
+            "span {} carries the recipient: {text}",
+            s.name
+        );
+    }
+}

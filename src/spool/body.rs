@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest as _, Sha256};
+use tracing::field::Empty;
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::config::BodyStoreConfig;
@@ -64,6 +66,33 @@ pub enum BodyStore {
 }
 
 impl BodyStore {
+    /// `volume`, `s3` or `azure`, for spans and logs.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Volume(_) => "volume",
+            Self::Object(o) => o.provider(),
+        }
+    }
+
+    /// §9.6 — one span per body-store operation: which store, which operation,
+    /// how many bytes, and how it ended. An object store records its HTTP
+    /// status on it too. Never the body, and never a key beyond the spool id
+    /// it is named after.
+    fn span(&self, op: &'static str, body_ref: Option<&str>) -> tracing::Span {
+        tracing::info_span!(
+            "simmer.spool.body",
+            otel.name = format!("simmer.spool.body.{op}"),
+            otel.status_code = Empty,
+            body_store = self.kind(),
+            op,
+            body_ref = body_ref.unwrap_or(""),
+            bytes = Empty,
+            listed = Empty,
+            outcome = Empty,
+            http.response.status_code = Empty,
+        )
+    }
+
     /// Open the configured store: create a volume's directory (`0700`), or
     /// build an object store's client. Startup refuses on failure.
     pub fn open(cfg: &BodyStoreConfig, tls: rustls::ClientConfig) -> anyhow::Result<Self> {
@@ -77,14 +106,24 @@ impl BodyStore {
 
     /// Store `bytes` durably under a name derived from `id`.
     pub async fn put(&self, id: Uuid, bytes: &[u8]) -> Result<Stored, BodyError> {
+        let span = self.span("put", None);
+        span.record("bytes", bytes.len());
         let sha256 = digest(bytes);
         let len = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
-        let body_ref = match self {
-            Self::Volume(v) => v.put(id, bytes.to_vec()).await?,
-            Self::Object(o) => o.put(id, bytes).await?,
-        };
+        let body_ref = async {
+            match self {
+                Self::Volume(v) => v.put(id, bytes.to_vec()).await,
+                Self::Object(o) => o.put(id, bytes).await,
+            }
+        }
+        .instrument(span.clone())
+        .await;
+        finish(&span, &body_ref);
+        if let Ok(r) = &body_ref {
+            span.record("body_ref", r.as_str());
+        }
         Ok(Stored {
-            body_ref,
+            body_ref: body_ref?,
             bytes: len,
             sha256,
         })
@@ -92,28 +131,54 @@ impl BodyStore {
 
     /// Read a body back and check it against the digest the row recorded.
     pub async fn get(&self, body_ref: &str, sha256: &[u8]) -> Result<Vec<u8>, BodyError> {
-        let bytes = match self {
-            Self::Volume(v) => v.get(body_ref).await?,
-            Self::Object(o) => o.get(body_ref).await?,
-        };
-        if digest(&bytes) != sha256 {
-            return Err(BodyError::Corrupt(body_ref.to_string()));
+        let span = self.span("get", Some(body_ref));
+        let result = async {
+            let bytes = match self {
+                Self::Volume(v) => v.get(body_ref).await?,
+                Self::Object(o) => o.get(body_ref).await?,
+            };
+            if digest(&bytes) != sha256 {
+                return Err(BodyError::Corrupt(body_ref.to_string()));
+            }
+            Ok(bytes)
         }
-        Ok(bytes)
+        .instrument(span.clone())
+        .await;
+        if let Ok(b) = &result {
+            span.record("bytes", b.len());
+        }
+        finish(&span, &result);
+        result
     }
 
     /// Delete a body. Already gone is success.
     pub async fn delete(&self, body_ref: &str) -> Result<(), BodyError> {
-        match self {
-            Self::Volume(v) => v.delete(body_ref).await,
-            Self::Object(o) => o.delete(body_ref).await,
+        let span = self.span("delete", Some(body_ref));
+        let result = async {
+            match self {
+                Self::Volume(v) => v.delete(body_ref).await,
+                Self::Object(o) => o.delete(body_ref).await,
+            }
         }
+        .instrument(span.clone())
+        .await;
+        finish(&span, &result);
+        result
     }
 
     /// Write, read back and delete one body: the whole of what the store does,
     /// so wrong credentials, a missing bucket or a read-only mount refuse
     /// startup rather than the first `250 queued` (D-117).
     pub async fn probe(&self) -> anyhow::Result<()> {
+        let span = tracing::info_span!(
+            "simmer.spool.probe",
+            otel.name = "simmer.spool.probe",
+            body_store = self.kind(),
+        );
+        self.probe_inner().instrument(span).await
+    }
+
+    async fn probe_inner(&self) -> anyhow::Result<()> {
         let id = Uuid::new_v4();
         let bytes = format!("simmer spool probe {id}\r\n").into_bytes();
         let stored = self
@@ -131,10 +196,36 @@ impl BodyStore {
     /// A volume's abandoned temporary files are deleted here rather than
     /// listed: no row can name one.
     pub async fn list_older_than(&self, cutoff: SystemTime) -> Result<Vec<String>, BodyError> {
-        match self {
-            Self::Volume(v) => v.list_older_than(cutoff).await,
-            Self::Object(o) => o.list_older_than(cutoff).await,
+        let span = self.span("list", None);
+        let result = async {
+            match self {
+                Self::Volume(v) => v.list_older_than(cutoff).await,
+                Self::Object(o) => o.list_older_than(cutoff).await,
+            }
         }
+        .instrument(span.clone())
+        .await;
+        if let Ok(l) = &result {
+            span.record("listed", l.len());
+        }
+        finish(&span, &result);
+        result
+    }
+}
+
+/// `outcome` (`ok`, `not_found`, `corrupt`, `error`) and an error status on
+/// failure. A missing body is an error for `get` and `ok` for `delete`, which
+/// treats it as success.
+fn finish<T>(span: &tracing::Span, result: &Result<T, BodyError>) {
+    let outcome = match result {
+        Ok(_) => "ok",
+        Err(BodyError::NotFound(_)) => "not_found",
+        Err(BodyError::Corrupt(_)) => "corrupt",
+        Err(BodyError::Io(_)) => "error",
+    };
+    span.record("outcome", outcome);
+    if result.is_err() {
+        span.record("otel.status_code", "ERROR");
     }
 }
 

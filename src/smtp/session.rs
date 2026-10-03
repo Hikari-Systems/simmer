@@ -675,6 +675,10 @@ impl Session {
             correlation_id = %self.correlation_id,
             smtp.reply.code = Empty,
             bytes = Empty,
+            // §7.7 (D-127): `spool` and the id it was queued under, for a
+            // spooling ramp's message; absent for a synchronous one.
+            delivery = Empty,
+            spool_id = Empty,
         );
         self.transaction = Some(Transaction {
             mail_from: from,

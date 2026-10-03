@@ -28,6 +28,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tracing::field::Empty;
+use tracing::{Instrument as _, Span};
 
 use super::body::BodyError;
 use super::envelope::Envelope;
@@ -80,6 +82,14 @@ pub async fn run(engine: Engine, spool: Arc<Spool>, stop: Shutdown) -> JoinSet<(
                 continue;
             }
         };
+        if !claims.is_empty() {
+            tracing::info!(
+                claimed = claims.len(),
+                free_slots = free,
+                owner = %spool.owner,
+                "claimed spooled messages (D-116)"
+            );
+        }
         for claim in claims {
             let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
                 break;
@@ -102,13 +112,52 @@ pub fn lease_for(engine: &Engine) -> Duration {
     crate::smtp::relay_drain_bound(&engine.config) + Duration::from_secs(60)
 }
 
+/// §9.6 (D-127) — one root span per attempt: which message, how old, which
+/// try, what it was pinned to or booked, and what became of it. The relay's
+/// `simmer.relay` tree hangs under it, so a spooled delivery reads like a
+/// synchronous one with its spool facts around it. `correlation_id` is the one
+/// the client's `250 queued` transaction carried, which joins the attempt to
+/// the accept's trace through the logs.
+fn attempt_span(spool: &Spool, claim: &Claimed) -> Span {
+    let now = Utc::now();
+    tracing::info_span!(
+        "simmer.spool.attempt",
+        otel.name = "simmer.spool.attempt",
+        otel.status_code = Empty,
+        spool_id = %claim.id,
+        correlation_id = Empty,
+        ramp = %claim.ramp,
+        domain_group = %claim.domain_group,
+        attempt = claim.attempts + 1,
+        age_seconds = (now - claim.received_at).num_seconds(),
+        expires_in_seconds = (claim.expires_at - now).num_seconds(),
+        pinned_route = claim.pinned_route.as_deref().unwrap_or(""),
+        booked_route = claim.booked.as_ref().map_or("", |b| b.route.as_str()),
+        body_store = spool.body.kind(),
+        route = Empty,
+        outcome = Empty,
+        next_attempt_in_seconds = Empty,
+        dead_reason = Empty,
+        last_code = Empty,
+        lease_lost = Empty,
+    )
+}
+
 async fn process(engine: &Engine, spool: &Spool, claim: Claimed, lease: Duration) {
+    let span = attempt_span(spool, &claim);
+    process_inner(engine, spool, claim, lease)
+        .instrument(span)
+        .await;
+}
+
+async fn process_inner(engine: &Engine, spool: &Spool, claim: Claimed, lease: Duration) {
     let lost = Arc::new(AtomicBool::new(false));
-    let renewer = {
-        let store = Arc::clone(&spool.store);
-        let lost = Arc::clone(&lost);
-        let (id, token) = (claim.id, claim.lease_token);
-        tokio::spawn(async move {
+    let renewer =
+        {
+            let store = Arc::clone(&spool.store);
+            let lost = Arc::clone(&lost);
+            let (id, token) = (claim.id, claim.lease_token);
+            tokio::spawn(async move {
             let half = lease / 2;
             loop {
                 tokio::time::sleep(half).await;
@@ -123,12 +172,14 @@ async fn process(engine: &Engine, spool: &Spool, claim: Claimed, lease: Duration
                     Err(e) => tracing::warn!(spool_id = %id, error = %e, "renewing a spool lease"),
                 }
             }
-        })
-    };
+        }
+        .instrument(Span::current()))
+        };
     attempt(engine, spool, &claim).await;
     renewer.abort();
     if lost.load(Ordering::Relaxed) {
         metrics::spool_lease_lost();
+        Span::current().record("lease_lost", true);
     }
 }
 
@@ -167,6 +218,7 @@ async fn attempt(engine: &Engine, spool: &Spool, claim: &Claimed) {
             .await;
         }
     };
+    Span::current().record("correlation_id", envelope.correlation_id.as_str());
     let Some(ramp) = engine.config.ramps.get(&claim.ramp) else {
         // A configuration change since acceptance removed the ramp. Nothing
         // here can route it, and no later attempt could either.
@@ -273,6 +325,12 @@ async fn attempt(engine: &Engine, spool: &Spool, claim: &Claimed) {
     match outcome.kind {
         AttemptKind::Relayed(r) if r.delivered => {
             metrics::spool_attempt(&claim.ramp, &r.route, "delivered");
+            let span = Span::current();
+            span.record("outcome", "delivered");
+            span.record("route", r.route.as_str());
+            if r.lease_held == Some(false) {
+                span.record("lease_lost", true);
+            }
             if r.lease_held == Some(false) {
                 metrics::spool_lease_lost();
                 tracing::warn!(
@@ -289,6 +347,8 @@ async fn attempt(engine: &Engine, spool: &Spool, claim: &Claimed) {
         AttemptKind::Relayed(r) => match r.failure {
             Some(Failure::PoolExhausted) => {
                 metrics::spool_attempt(&claim.ramp, &r.route, "pool_exhausted");
+                Span::current().record("outcome", "pool_exhausted");
+                Span::current().record("route", r.route.as_str());
                 let at = cap(now + chrono::Duration::seconds(1), claim);
                 requeue(spool, claim, at, false, None, None, None, None).await;
             }
@@ -313,6 +373,12 @@ async fn attempt(engine: &Engine, spool: &Spool, claim: &Claimed) {
                     _ => (None, String::new()),
                 };
                 metrics::spool_attempt(&claim.ramp, &r.route, "retry");
+                let span = Span::current();
+                span.record("outcome", "retry");
+                span.record("route", r.route.as_str());
+                if let Some(c) = code {
+                    span.record("last_code", c);
+                }
                 let at = backoff_at(claim.attempts + 1);
                 requeue(
                     spool,
@@ -334,6 +400,8 @@ async fn attempt(engine: &Engine, spool: &Spool, claim: &Claimed) {
             until,
         } => {
             metrics::spool_attempt(&claim.ramp, &route, "deferred");
+            Span::current().record("outcome", "deferred");
+            Span::current().record("route", route.as_str());
             let slot = BookedSlot {
                 route,
                 domain_group,
@@ -364,6 +432,7 @@ async fn attempt(engine: &Engine, spool: &Spool, claim: &Claimed) {
         }
         AttemptKind::NotSelected(e) => {
             metrics::spool_attempt(&claim.ramp, "-", "retry");
+            Span::current().record("outcome", "no_route");
             let at = backoff_at(claim.attempts.max(1));
             requeue(
                 spool,
@@ -379,6 +448,7 @@ async fn attempt(engine: &Engine, spool: &Spool, claim: &Claimed) {
         }
         AttemptKind::Internal => {
             metrics::spool_attempt(&claim.ramp, "-", "retry");
+            Span::current().record("outcome", "internal");
             let at = backoff_at(claim.attempts.max(1));
             requeue(
                 spool,
@@ -425,6 +495,10 @@ async fn requeue(
     last_code: Option<i64>,
     last_error: Option<String>,
 ) -> bool {
+    Span::current().record(
+        "next_attempt_in_seconds",
+        (at - Utc::now()).num_seconds().max(0),
+    );
     match spool
         .store
         .reschedule(&Reschedule {
@@ -490,6 +564,16 @@ async fn dead(
         }
     }
     metrics::spool_dead(&claim.ramp, reason.as_str());
+    let span = Span::current();
+    span.record("outcome", "dead");
+    span.record("dead_reason", reason.as_str());
+    span.record("otel.status_code", "ERROR");
+    if let Some(c) = code {
+        span.record("last_code", c);
+    }
+    if let Some(r) = &route {
+        span.record("route", r.as_str());
+    }
     if reason == DeadReason::Expired {
         metrics::spool_attempt(&claim.ramp, route.as_deref().unwrap_or("-"), "expired");
     }

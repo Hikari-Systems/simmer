@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
+use tracing::field::Empty;
+use tracing::{Instrument as _, Span};
 
 use super::body::ORPHAN_AGE;
 use super::Spool;
@@ -32,7 +34,31 @@ pub async fn run(spool: Arc<Spool>, stop: Shutdown) {
     }
 }
 
+/// One pass, as one §9.6 span (D-127): what each of the three steps found and
+/// removed. A pass that finds nothing is still a span — it is every ten minutes,
+/// and "the sweeper ran and found nothing" is the answer to "is it running".
 pub async fn sweep_once(spool: &Spool) {
+    let span = tracing::info_span!(
+        "simmer.spool.sweep",
+        otel.name = "simmer.spool.sweep",
+        otel.status_code = Empty,
+        body_store = spool.body.kind(),
+        dead_bodies_released = Empty,
+        dead_purged = Empty,
+        orphan_candidates = Empty,
+        orphans_swept = Empty,
+        errors = Empty,
+    );
+    sweep_inner(spool).instrument(span).await;
+}
+
+async fn sweep_inner(spool: &Spool) {
+    let span = Span::current();
+    let mut errors = 0u32;
+    let mut fail = |what: &str, e: &dyn std::fmt::Display| {
+        errors += 1;
+        tracing::warn!(error = %e, "spool sweep: {what}");
+    };
     let now = Utc::now();
     let to_chrono = |d: Duration| chrono::Duration::from_std(d).unwrap_or_default();
 
@@ -41,8 +67,11 @@ pub async fn sweep_once(spool: &Spool) {
         .take_dead_bodies(now - to_chrono(spool.cfg.dead_letter.keep_body))
         .await
     {
-        Ok(refs) => delete_all(spool, &refs, "dead letter past keep_body").await,
-        Err(e) => tracing::warn!(error = %e, "spool sweep: releasing dead letters' bodies"),
+        Ok(refs) => {
+            span.record("dead_bodies_released", refs.len());
+            delete_all(spool, &refs, "dead letter past keep_body").await
+        }
+        Err(e) => fail("releasing dead letters' bodies", &e),
     }
 
     match spool
@@ -50,33 +79,46 @@ pub async fn sweep_once(spool: &Spool) {
         .purge_dead(now - to_chrono(spool.cfg.dead_letter.retention))
         .await
     {
-        Ok(refs) => delete_all(spool, &refs, "dead letter past retention").await,
-        Err(e) => tracing::warn!(error = %e, "spool sweep: purging dead letters"),
+        Ok(refs) => {
+            span.record("dead_purged", refs.len());
+            delete_all(spool, &refs, "dead letter past retention").await
+        }
+        Err(e) => fail("purging dead letters", &e),
     }
 
     let cutoff = SystemTime::now() - ORPHAN_AGE;
     let candidates = match spool.body.list_older_than(cutoff).await {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %e, "spool sweep: listing bodies");
+            fail("listing bodies", &e);
+            span.record("errors", errors);
+            span.record("otel.status_code", "ERROR");
             return;
         }
     };
+    span.record("orphan_candidates", candidates.len());
     let mut swept = 0u64;
     for chunk in candidates.chunks(CHUNK) {
         let known = match spool.store.known_body_refs(chunk).await {
             Ok(k) => k,
             Err(e) => {
-                tracing::warn!(error = %e, "spool sweep: checking bodies against rows");
+                fail("checking bodies against rows", &e);
+                span.record("errors", errors);
+                span.record("otel.status_code", "ERROR");
                 return;
             }
         };
         for body_ref in chunk.iter().filter(|r| !known.contains(*r)) {
             match spool.body.delete(body_ref).await {
                 Ok(()) => swept += 1,
-                Err(e) => tracing::warn!(error = %e, body_ref, "spool sweep: deleting an orphan"),
+                Err(e) => fail("deleting an orphan", &e),
             }
         }
+    }
+    span.record("orphans_swept", swept);
+    span.record("errors", errors);
+    if errors > 0 {
+        span.record("otel.status_code", "ERROR");
     }
     if swept > 0 {
         metrics::spool_orphans_swept(swept);

@@ -407,6 +407,17 @@ pub async fn attempt(
         ramp = %selection.ramp.name,
         ramp_source = selection.source.as_str(),
         spooled = ctx.spool.is_some(),
+        // D-127: a spooled attempt's row, and Q3's pin with whether it fell
+        // back to the whole chain (paused, not started or gone).
+        spool_id = Empty,
+        pinned_route = Empty,
+        pinned_fallback = Empty,
+        // D-111/D-118: the rate slot's fate — `booked`, `reused` (a deferred
+        // attempt's stored slot), `over_limit` or `given_back` — the wait for
+        // it, and a deferral's instant.
+        rate_slot = Empty,
+        rate_wait_ms = Empty,
+        deferred_until = Empty,
         route = Empty,
         domain_group = Empty,
         day_index = Empty,
@@ -438,6 +449,12 @@ async fn attempt_inner(
     // is within this ramp.
     let ramp = selection.ramp;
     let now = ctx.walk_now;
+    if let Some(s) = &ctx.spool {
+        Span::current().record("spool_id", s.id.to_string());
+        if let Some(p) = s.pinned_route {
+            Span::current().record("pinned_route", p);
+        }
+    }
     let not_selected = |e: SelectError| Attempt {
         reply: e.to_reply(ramp),
         kind: AttemptKind::NotSelected(e),
@@ -482,12 +499,19 @@ async fn attempt_inner(
         // fields, and §9.5 wants the id on every line (D-126).
         correlation_id,
         chain = Empty,
+        // D-127: 2 when Q3's pinned route could not send and the whole chain
+        // was walked after it.
+        chains_walked = Empty,
         route = Empty,
         domain_group = Empty,
         day_index = Empty,
         over_cap = Empty,
+        rate_send_at = Empty,
+        deferred_until = Empty,
     );
+    let mut chains_walked = 0;
     for (i, candidate_chain) in chains.iter().enumerate() {
+        chains_walked = i + 1;
         // -- §3.2 step 2a (D-090) -------------------------------------
         //
         // A reply into a thread Simmer started walks the route that started
@@ -556,6 +580,10 @@ async fn attempt_inner(
     }
     Span::current().record("thread_pin", pin.as_log());
     walk_span.record("chain", chain::render(&evaluation).to_string());
+    walk_span.record("chains_walked", chains_walked);
+    if chains.len() > 1 {
+        Span::current().record("pinned_fallback", chains_walked > 1);
+    }
 
     // D-118: a slot an earlier attempt booked that this walk did not use goes
     // back, if nothing was booked after it.
@@ -584,6 +612,24 @@ async fn attempt_inner(
                 span.record("day_index", s.day_index);
                 span.record("over_cap", s.over_cap);
             }
+            if let Some(b) = &s.rate {
+                walk_span.record("rate_send_at", b.send_at.to_rfc3339());
+                let reused = ctx
+                    .spool
+                    .as_ref()
+                    .and_then(|sp| sp.booked)
+                    .is_some_and(|slot| slot.tat == b.booked_tat);
+                Span::current().record(
+                    "rate_slot",
+                    if reused {
+                        "reused"
+                    } else if b.over_limit {
+                        "over_limit"
+                    } else {
+                        "booked"
+                    },
+                );
+            }
             s
         }
         Ok(Walk::Deferred {
@@ -592,6 +638,12 @@ async fn attempt_inner(
             booking,
             until,
         }) => {
+            for span in [&walk_span, &Span::current()] {
+                span.record("route", route.name.as_str());
+                span.record("domain_group", domain_group.as_str());
+                span.record("deferred_until", until.to_rfc3339());
+            }
+            Span::current().record("rate_slot", "booked");
             tracing::info!(
                 correlation_id,
                 route = %route.name,
@@ -645,6 +697,7 @@ async fn attempt_inner(
             &selected.domain_group,
             wait.as_secs_f64(),
         );
+        Span::current().record("rate_wait_ms", wait.as_millis() as u64);
         if !wait.is_zero() {
             tracing::debug!(
                 correlation_id,
@@ -653,7 +706,19 @@ async fn attempt_inner(
                 wait_ms = wait.as_millis() as u64,
                 "holding the client for the route's next rate slot (D-111)"
             );
-            tokio::time::sleep(wait).await;
+            // §9.6 (D-127): the hold as its own span, so a trace shows the
+            // client waiting on the rate rather than an unexplained gap
+            // between the walk and the rewrite.
+            tokio::time::sleep(wait)
+                .instrument(tracing::info_span!(
+                    "simmer.rate.wait",
+                    otel.name = "simmer.rate.wait",
+                    correlation_id,
+                    route = %selected.route.name,
+                    domain_group = %selected.domain_group,
+                    wait_ms = wait.as_millis() as u64,
+                ))
+                .await;
         }
     }
 
@@ -856,6 +921,8 @@ async fn attempt_inner(
         otel.status_code = Empty,
         committed = outcome.commit,
         reservation = %selected.reservation.id,
+        // D-122: whether the spooled row was still this attempt's at commit.
+        spool_lease_held = Empty,
     );
     let mut lease_held = None;
     let resolution = async {
@@ -882,6 +949,7 @@ async fn attempt_inner(
                     .await
                     .map(|held| {
                         lease_held = Some(held);
+                        Span::current().record("spool_lease_held", held);
                     }),
             }
         } else {

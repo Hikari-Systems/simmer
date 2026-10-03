@@ -1684,6 +1684,24 @@ back for §9.1's gauges). A `4xx` or `5xx`
   final reply marks the transaction and relay spans as errors. Also: one `simmer.preflight` span
   per §6.7 pass, one `admin.request` per §9.2–§9.4 request except `/health`, `/healthcheck`
   and `/metrics`, and one `link_proxy.request` per §5.7 request.
+- **Rates and the spool.** `simmer.relay` also carries the rate slot's fate (`booked`,
+  `reused`, `over_limit`, `given_back`), the wait for it, and for a spooled attempt the spool
+  id, the pinned route and whether it fell back to the whole chain; `simmer.route` carries the
+  slot's instant, a deferral's, and how many chains were walked; a wait for a slot is its own
+  `simmer.rate.wait`. A spooling ramp's `smtp.transaction` carries `delivery: spool` and the
+  spool id, with a child `simmer.spool.accept` — the admission verdict, expected wait, hold,
+  domain group and body store — and under it `simmer.spool.admission`,
+  `simmer.spool.enqueue` and the body's `put`. Each dispatcher attempt is a root
+  `simmer.spool.attempt` — the spool id, the accepting transaction's `correlation_id`, the
+  attempt number, age, time left in the hold, pin, booking and outcome (`delivered`,
+  `deferred`, `retry`, `no_route`, `pool_exhausted` or `dead` with its reason), and whether
+  the lease was lost — with the relay tree, the body's `get` and `delete`, and a dead letter's
+  `simmer.spool.webhook` under it; `simmer.quota.resolve` says whether the spooled row was
+  still the attempt's at commit. Every body-store operation is a span named
+  `simmer.spool.body.put`, `.get`, `.delete` or `.list` (the store kind, bytes, outcome and,
+  for an object store, the HTTP status), each sweeper pass a `simmer.spool.sweep`, and startup's probe a
+  `simmer.spool.probe`. None carries an envelope address, a body, or a webhook URL.
+  *(Added. See `DECISIONS.md` D-127.)*
 - **Metrics.** §9.1's, as described there.
 - **Logs.** Every §9.5 log event, correlated with the span it was emitted in.
 

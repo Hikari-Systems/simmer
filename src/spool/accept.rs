@@ -9,6 +9,8 @@
 //! durably), then the row, then `250` (D-117's ordering).
 
 use chrono::{DateTime, Utc};
+use tracing::field::Empty;
+use tracing::{Instrument as _, Span};
 use uuid::Uuid;
 
 use super::envelope::Envelope;
@@ -29,6 +31,48 @@ pub async fn accept(
     senders: &Senders,
     from_header: Option<&str>,
     message: OwnedMessage,
+) -> Reply {
+    // §9.6 (D-127) — the accept path as one span under `smtp.transaction`,
+    // which is current here: the admission verdict and its inputs, where the
+    // body went, and the id the client was given. The transaction span learns
+    // the id too, so a trace search by it finds the accept.
+    let tx = Span::current();
+    tx.record("delivery", "spool");
+    let span = tracing::info_span!(
+        "simmer.spool.accept",
+        otel.name = "simmer.spool.accept",
+        otel.status_code = Empty,
+        correlation_id = %message.correlation_id,
+        ramp = %selection.ramp.name,
+        ramp_source = selection.source.as_str(),
+        bytes = message.body.len(),
+        domain_group = Empty,
+        group_basis = Empty,
+        admission = Empty,
+        expected_wait_seconds = Empty,
+        hold_seconds = Empty,
+        body_store = spool.body.kind(),
+        spool_id = Empty,
+        smtp.reply.code = Empty,
+    );
+    let reply = accept_inner(engine, spool, selection, senders, from_header, message, &tx)
+        .instrument(span.clone())
+        .await;
+    span.record("smtp.reply.code", reply.code);
+    if reply.code >= 400 {
+        span.record("otel.status_code", "ERROR");
+    }
+    reply
+}
+
+async fn accept_inner(
+    engine: &Engine,
+    spool: &Spool,
+    selection: &Selection<'_>,
+    senders: &Senders,
+    from_header: Option<&str>,
+    message: OwnedMessage,
+    tx: &Span,
 ) -> Reply {
     let ramp = selection.ramp;
     let now = message.received_at;
@@ -67,7 +111,17 @@ pub async fn accept(
     };
     let bytes = i64::try_from(message.body.len()).unwrap_or(i64::MAX);
 
-    let verdict = match admission(engine, spool, ramp, chain, &group, bytes, now).await {
+    let span = Span::current();
+    span.record("domain_group", group.as_str());
+    span.record("group_basis", basis.as_str());
+    let verdict = match admission(engine, spool, ramp, chain, &group, bytes, now)
+        .instrument(tracing::info_span!(
+            "simmer.spool.admission",
+            otel.name = "simmer.spool.admission",
+            correlation_id = cid,
+        ))
+        .await
+    {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(correlation_id = cid, error = %e, "spool admission state unavailable");
@@ -75,6 +129,11 @@ pub async fn accept(
         }
     };
     let expires_at = verdict.hold_until;
+    span.record("admission", verdict.outcome.as_str());
+    span.record("hold_seconds", (expires_at - now).num_seconds());
+    if let Some(w) = verdict.expected_wait {
+        span.record("expected_wait_seconds", w.num_seconds());
+    }
     match verdict.outcome {
         Admit::Admit => {}
         Admit::Draining => return refuse("draining", reply::spool_draining()),
@@ -105,7 +164,17 @@ pub async fn accept(
         body_sha256: stored.sha256,
         uuid_seed: Uuid::new_v4(),
     };
-    if let Err(e) = spool.store.enqueue(&row).await {
+    let enqueued = spool
+        .store
+        .enqueue(&row)
+        .instrument(tracing::info_span!(
+            "simmer.spool.enqueue",
+            otel.name = "simmer.spool.enqueue",
+            correlation_id = cid,
+            spool_id = %id,
+        ))
+        .await;
+    if let Err(e) = enqueued {
         tracing::error!(correlation_id = cid, error = %e, "recording a spooled message failed");
         // Best effort: the orphan sweeper is the backstop (D-117).
         let _ = spool.body.delete(&stored.body_ref).await;
@@ -113,6 +182,8 @@ pub async fn accept(
     }
 
     metrics::spool_accepted(&ramp.name);
+    span.record("spool_id", id.to_string());
+    tx.record("spool_id", id.to_string());
     tracing::info!(
         correlation_id = cid,
         ramp = %ramp.name,

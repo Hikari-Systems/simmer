@@ -138,7 +138,11 @@ pub async fn unbook(store: &dyn QuotaStore, booking: &RateBooking, why: &str) {
         .unbook_rate_slot(&booking.key, booking.rate, booking.booked_tat)
         .await
     {
-        Ok(true) => metrics::rate_slot_unbooked(&booking.key.ramp, &booking.key.route),
+        Ok(true) => {
+            metrics::rate_slot_unbooked(&booking.key.ramp, &booking.key.route);
+            // §9.6 (D-127): on the relay span, when it is current.
+            tracing::Span::current().record("rate_slot", "given_back");
+        }
         Ok(false) => tracing::debug!(
             route = %booking.key.route,
             domain_group = %booking.key.domain_group,

@@ -529,6 +529,12 @@ async fn run() -> anyhow::Result<()> {
                             if let Err(e) = admin::refresh_gauges(&state).await {
                                 warn!(error = %e, "could not refresh quota gauges for the OTLP export");
                             }
+                            // §7.7's gauges too (D-127): `/metrics` refreshed
+                            // them and this task did not, so an OTLP-only
+                            // deployment exported a spool depth of nothing.
+                            if let Err(e) = admin::spool::refresh_gauges(&state).await {
+                                warn!(error = %e, "could not refresh spool gauges for the OTLP export");
+                            }
                         }
                     }
                 }
