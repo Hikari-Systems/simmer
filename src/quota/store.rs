@@ -176,6 +176,30 @@ impl Adoption {
     }
 }
 
+/// D-111 — one rate bucket's key: the quota's own `(ramp, route, domain_group)`,
+/// without a day index. A rate is "per hour", and an hour does not care which
+/// ramp day it falls in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RateKey {
+    pub ramp: String,
+    pub route: String,
+    pub domain_group: String,
+}
+
+/// D-111 — everything booking a rate slot needs. See `quota::rate::decide`,
+/// which is the whole decision; the store supplies the row lock around it.
+#[derive(Debug, Clone)]
+pub struct RateBookRequest {
+    pub key: RateKey,
+    pub rate: crate::quota::rate::Rate,
+    /// The caller's instant (D-108). The store reads no clock for the decision.
+    pub now: DateTime<Utc>,
+    /// A slot later than `now + max_wait` is refused.
+    pub max_wait: chrono::Duration,
+    /// Book even past `max_wait`, sending now (D-111's pinned reply).
+    pub force: bool,
+}
+
 #[async_trait]
 pub trait QuotaStore: Send + Sync + 'static {
     /// §7.4 phase 1 — reserve, in one transaction, under a row lock.
@@ -297,6 +321,31 @@ pub trait QuotaStore: Send + Sync + 'static {
     /// Refuses with [`QuotaError::LegacyConflict`] if a legacy
     /// `quota_usage` or `route_state` key already exists under `ramp`.
     async fn adopt_legacy_rows(&self, ramp: &str) -> Result<Adoption, QuotaError>;
+
+    /// D-111 — book a rate slot: create the bucket's row if absent, lock it,
+    /// apply `quota::rate::decide`, and write the new `tat` if a slot was
+    /// booked — one short transaction, released before anything is sent.
+    async fn book_rate_slot(
+        &self,
+        req: &RateBookRequest,
+    ) -> Result<crate::quota::rate::RateBooked, QuotaError>;
+
+    /// D-111 — give a booked slot back, under the row lock, **only if nothing
+    /// was booked after it** (`quota::rate::unbook`). True when it was given back.
+    async fn unbook_rate_slot(
+        &self,
+        key: &RateKey,
+        rate: crate::quota::rate::Rate,
+        booked_tat: DateTime<Utc>,
+    ) -> Result<bool, QuotaError>;
+
+    /// D-111 — every bucket's `tat` in one ramp, unlocked, keyed `(route,
+    /// domain_group)`: for §9.2's `next_slot_at` and §9.4's dry run. A bucket
+    /// never booked is absent.
+    async fn rate_tats(
+        &self,
+        ramp: &str,
+    ) -> Result<std::collections::HashMap<(String, String), DateTime<Utc>>, QuotaError>;
 
     /// Is the backing store reachable? §7.5.
     async fn is_available(&self) -> bool;

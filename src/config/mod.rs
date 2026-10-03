@@ -738,6 +738,86 @@ pub struct Route {
     pub warmup: Option<Warmup>,
     #[serde(default)]
     pub recipient_frequency: Option<RecipientFrequency>,
+    /// D-111 — a sending-rate limit per `(ramp, route, domain_group)`, the
+    /// quota's own key. Absent is no limit. See [`RateLimit`].
+    #[serde(default)]
+    pub rate: Option<RateLimit>,
+}
+
+/// D-111 — a per-segment sending rate, paced by GCRA (`quota::rate`).
+///
+/// Exactly one of `schedule` or `per_hour` (§4.2). In synchronous mode a limit
+/// can only **steer** a message to the next link, or hold its client for at
+/// most `max_wait` while a booked slot arrives — it never queues.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimit {
+    /// Messages per hour, indexed by the route's day index exactly as
+    /// `warmup.schedule` is: past the end the last value repeats, and a
+    /// graduated route uses the last value. Warming routes only.
+    #[serde(default)]
+    pub schedule: Option<RateSchedule>,
+    /// A fixed rate in messages per hour, for any route — the only form an
+    /// overflow route (D-024), which has no day index of its own, may use.
+    /// Signed so that §4.2 reports a bad value rather than a parse error.
+    #[serde(default)]
+    pub per_hour: Option<i64>,
+    /// How many messages may go back to back after an idle spell. Default 1.
+    #[serde(default = "RateLimit::default_burst")]
+    pub burst: i64,
+    /// What a message that finds no slot does. Only `steer` is built.
+    #[serde(default)]
+    pub on_limit: OnLimit,
+    /// How long a session may hold its client waiting for a booked slot.
+    /// Default 0: a message that cannot go now steers.
+    #[serde(default, deserialize_with = "duration::deserialize_opt")]
+    pub max_wait: Option<Duration>,
+}
+
+impl RateLimit {
+    fn default_burst() -> i64 {
+        1
+    }
+
+    /// `max_wait`, defaulted.
+    pub fn max_wait(&self) -> Duration {
+        self.max_wait.unwrap_or(Duration::ZERO)
+    }
+
+    /// Messages per hour for a group on a day index, or `None` for a schedule
+    /// that §4.2 has already rejected as empty. Mirrors
+    /// [`Schedule::allowance_for`]: the final value repeats indefinitely.
+    pub fn per_hour_for(&self, group: &str, day_index: u64) -> Option<i64> {
+        if let Some(n) = self.per_hour {
+            return Some(n);
+        }
+        let schedule = self.schedule.as_ref()?;
+        let series = schedule.overrides.get(group).unwrap_or(&schedule.default);
+        let last = series.len().checked_sub(1)?;
+        let idx = usize::try_from(day_index).unwrap_or(usize::MAX).min(last);
+        series.get(idx).copied()
+    }
+}
+
+/// D-111's `rate.schedule`: like `warmup.schedule`, but messages per hour.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateSchedule {
+    pub default: Vec<i64>,
+    /// Keyed by domain group name, like `warmup.schedule.overrides`.
+    #[serde(default)]
+    pub overrides: BTreeMap<String, Vec<i64>>,
+}
+
+/// D-111's `rate.on_limit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnLimit {
+    /// Skip the route for this message, as §7.3 does; the next link takes it.
+    #[default]
+    Steer,
+    /// Reserved for a deferred-delivery mode that is not built. §4.2 refuses it.
+    Wait,
 }
 
 #[derive(Debug, Clone, Deserialize)]

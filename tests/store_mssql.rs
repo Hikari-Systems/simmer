@@ -133,7 +133,19 @@ async fn migrations_are_idempotent_and_recorded() {
             .unwrap()
             .get::<i64, _>("n")
             .unwrap();
-        assert_eq!(n, 4, "one row per file in migrations-mssql/");
+        // Counted from the directory rather than written down: a literal here
+        // went stale the moment the next migration landed, and the suite that
+        // catches it is the one only the SQL Server CI leg runs.
+        let files = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations-mssql"))
+            .expect("migrations-mssql/")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "sql"))
+            .count();
+        assert_eq!(
+            n,
+            i64::try_from(files).unwrap(),
+            "one row per file in migrations-mssql/"
+        );
     })
     .await;
 }

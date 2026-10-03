@@ -42,9 +42,10 @@ use chrono::{DateTime, Utc};
 use tiberius::Row;
 use uuid::Uuid;
 
+use super::rate::{self, Rate, RateBooked};
 use super::store::{
-    Adoption, Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset,
-    RouteState, Usage, UsageKey,
+    Adoption, Expired, QuotaError, QuotaStore, RateBookRequest, RateKey, Reservation,
+    ReserveRequest, Reserved, Reset, RouteState, Usage, UsageKey,
 };
 use crate::db::mssql::{self, Pool};
 
@@ -109,6 +110,34 @@ const LOCK_USAGE: &str = "\
     SELECT allowance, allowance_override, committed, reserved \
       FROM dbo.quota_usage \
      WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3;";
+
+/// D-111 — the rate bucket's upsert-and-lock, `LOCK_USAGE`'s pattern: the
+/// `SERIALIZABLE` key-range lock is what stops two contenders both inserting an
+/// absent row. Never `MERGE`.
+const LOCK_RATE: &str = "\
+    UPDATE dbo.route_rate WITH (UPDLOCK, SERIALIZABLE) \
+       SET updated_at = SYSUTCDATETIME() \
+     WHERE ramp = @P1 AND route = @P2 AND domain_group = @P3; \
+    IF @@ROWCOUNT = 0 \
+        INSERT INTO dbo.route_rate (ramp, route, domain_group) VALUES (@P1, @P2, @P3); \
+    SELECT tat FROM dbo.route_rate \
+     WHERE ramp = @P1 AND route = @P2 AND domain_group = @P3;";
+
+/// D-111 — lock an existing bucket for `unbook`, creating nothing.
+const LOCK_RATE_EXISTING: &str = "\
+    SELECT tat FROM dbo.route_rate WITH (UPDLOCK, ROWLOCK) \
+     WHERE ramp = @P1 AND route = @P2 AND domain_group = @P3;";
+
+const SET_RATE_TAT: &str = "\
+    UPDATE dbo.route_rate SET tat = @P4, updated_at = SYSUTCDATETIME() \
+     WHERE ramp = @P1 AND route = @P2 AND domain_group = @P3;";
+
+/// A nullable UTC `DATETIME2` column.
+fn opt_instant(row: &Row, col: &str) -> Result<Option<DateTime<Utc>>, QuotaError> {
+    Ok(row
+        .try_get::<chrono::NaiveDateTime, _>(col)?
+        .map(|t| t.and_utc()))
+}
 
 /// `GREATEST(reserved - n, 0)`, for SQL Server before 2022.
 const RELEASE_USAGE: &str = "\
@@ -774,6 +803,115 @@ impl QuotaStore for MssqlQuotaStore {
             recipient_event: count("re")?,
             routes,
         };
+        conn.broken = false;
+        Ok(out)
+    }
+
+    async fn book_rate_slot(&self, req: &RateBookRequest) -> Result<RateBooked, QuotaError> {
+        let mut conn = mssql::get(&self.pool).await?;
+        conn.broken = true;
+        let client = &mut conn.client;
+
+        client
+            .simple_query("BEGIN TRANSACTION")
+            .await?
+            .into_results()
+            .await?;
+        let k = &req.key;
+        let row = client
+            .query(LOCK_RATE, &[&k.ramp, &k.route, &k.domain_group])
+            .await?
+            .into_row()
+            .await?
+            .ok_or_else(|| missing("locking the rate row"))?;
+        let tat = opt_instant(&row, "tat")?;
+
+        let outcome = rate::decide(tat, req.rate, req.now, req.max_wait, req.force);
+        let end = match outcome {
+            RateBooked::Booked { booked_tat, .. } => {
+                client
+                    .execute(
+                        SET_RATE_TAT,
+                        &[&k.ramp, &k.route, &k.domain_group, &booked_tat.naive_utc()],
+                    )
+                    .await?;
+                "COMMIT TRANSACTION"
+            }
+            RateBooked::TooLate { .. } => "ROLLBACK TRANSACTION",
+        };
+        client.simple_query(end).await?.into_results().await?;
+        conn.broken = false;
+        Ok(outcome)
+    }
+
+    async fn unbook_rate_slot(
+        &self,
+        key: &RateKey,
+        rate: Rate,
+        booked_tat: DateTime<Utc>,
+    ) -> Result<bool, QuotaError> {
+        let mut conn = mssql::get(&self.pool).await?;
+        conn.broken = true;
+        let client = &mut conn.client;
+
+        client
+            .simple_query("BEGIN TRANSACTION")
+            .await?
+            .into_results()
+            .await?;
+        let current = match client
+            .query(
+                LOCK_RATE_EXISTING,
+                &[&key.ramp, &key.route, &key.domain_group],
+            )
+            .await?
+            .into_row()
+            .await?
+        {
+            Some(row) => opt_instant(&row, "tat")?,
+            None => None,
+        };
+        let back = rate::unbook(current, rate, booked_tat);
+        if let Some(tat) = back {
+            client
+                .execute(
+                    SET_RATE_TAT,
+                    &[&key.ramp, &key.route, &key.domain_group, &tat.naive_utc()],
+                )
+                .await?;
+        }
+        let end = if back.is_some() {
+            "COMMIT TRANSACTION"
+        } else {
+            "ROLLBACK TRANSACTION"
+        };
+        client.simple_query(end).await?.into_results().await?;
+        conn.broken = false;
+        Ok(back.is_some())
+    }
+
+    async fn rate_tats(
+        &self,
+        ramp: &str,
+    ) -> Result<HashMap<(String, String), DateTime<Utc>>, QuotaError> {
+        let mut conn = mssql::get(&self.pool).await?;
+        conn.broken = true;
+        let rows = conn
+            .client
+            .query(
+                "SELECT route, domain_group, tat FROM dbo.route_rate \
+                  WHERE ramp = @P1 AND tat IS NOT NULL;",
+                &[&ramp],
+            )
+            .await?
+            .into_first_result()
+            .await?;
+        let mut out = HashMap::new();
+        for r in &rows {
+            if let Some(tat) = opt_instant(r, "tat")? {
+                out.insert((text(r, "route")?, text(r, "domain_group")?), tat);
+            }
+        }
         conn.broken = false;
         Ok(out)
     }

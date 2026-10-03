@@ -20,9 +20,10 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::rate::{self, Rate, RateBooked};
 use super::store::{
-    Adoption, Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset,
-    RouteState, Usage, UsageKey,
+    Adoption, Expired, QuotaError, QuotaStore, RateBookRequest, RateKey, Reservation,
+    ReserveRequest, Reserved, Reset, RouteState, Usage, UsageKey,
 };
 use crate::models;
 
@@ -272,6 +273,53 @@ impl QuotaStore for PgQuotaStore {
 
     async fn adopt_legacy_rows(&self, ramp: &str) -> Result<Adoption, QuotaError> {
         models::legacy::adopt(&self.pool, ramp).await
+    }
+
+    async fn book_rate_slot(&self, req: &RateBookRequest) -> Result<RateBooked, QuotaError> {
+        let mut tx = self.pool.begin().await?;
+        // The row lock, then the whole decision in Rust, then one write: the
+        // lock is held for two statements and never across a send.
+        let tat = models::route_rate::lock(&mut tx, &req.key).await?;
+        let outcome = rate::decide(tat, req.rate, req.now, req.max_wait, req.force);
+        match outcome {
+            RateBooked::Booked { booked_tat, .. } => {
+                models::route_rate::set_tat(&mut tx, &req.key, booked_tat).await?;
+                tx.commit().await?;
+            }
+            RateBooked::TooLate { .. } => tx.rollback().await?,
+        }
+        Ok(outcome)
+    }
+
+    async fn unbook_rate_slot(
+        &self,
+        key: &RateKey,
+        rate: Rate,
+        booked_tat: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, QuotaError> {
+        let mut tx = self.pool.begin().await?;
+        let current = models::route_rate::lock_existing(&mut tx, key).await?;
+        match rate::unbook(current, rate, booked_tat) {
+            Some(tat) => {
+                models::route_rate::set_tat(&mut tx, key, tat).await?;
+                tx.commit().await?;
+                Ok(true)
+            }
+            None => {
+                tx.rollback().await?;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn rate_tats(
+        &self,
+        ramp: &str,
+    ) -> Result<
+        std::collections::HashMap<(String, String), chrono::DateTime<chrono::Utc>>,
+        QuotaError,
+    > {
+        models::route_rate::all(&self.pool, ramp).await
     }
 
     async fn is_available(&self) -> bool {

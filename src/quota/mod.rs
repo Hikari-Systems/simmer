@@ -6,6 +6,7 @@ pub mod day;
 pub mod mssql;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod rate;
 pub mod registry;
 pub mod store;
 pub mod sweeper;
@@ -21,7 +22,8 @@ pub use mssql::MssqlQuotaStore;
 pub use postgres::PgQuotaStore;
 pub use registry::ReservationRegistry;
 pub use store::{
-    Adoption, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset, Usage, UsageKey,
+    Adoption, QuotaError, QuotaStore, RateBookRequest, RateKey, Reservation, ReserveRequest,
+    Reserved, Reset, Usage, UsageKey,
 };
 
 /// §7.4: "Reservations carry an expiry (default: downstream timeout budget +
@@ -101,6 +103,13 @@ pub fn allowance_for(
 /// has already been given back — recoverable (see `PgQuotaStore::commit`) but
 /// noisy. Expiring late only delays the release after a crash.
 pub fn reservation_expiry(route: &Route, recipients: usize) -> Duration {
+    downstream_budget(route, recipients) + EXPIRY_MARGIN
+}
+
+/// The route's whole downstream timeout budget — [`reservation_expiry`] without
+/// its margin. §4.2 holds a rate limit's `max_wait` plus this below
+/// `server.timeouts.data` (D-111), for the README's "Timeout budget" reason.
+pub fn downstream_budget(route: &Route, recipients: usize) -> Duration {
     let t = route.downstream.timeouts.as_ref();
     let connect = t.and_then(|t| t.connect).unwrap_or(Duration::from_secs(10));
     let command = t.and_then(|t| t.command).unwrap_or(Duration::from_secs(30));
@@ -108,7 +117,7 @@ pub fn reservation_expiry(route: &Route, recipients: usize) -> Duration {
 
     // greeting + EHLO + STARTTLS + EHLO + AUTH + MAIL + one per RCPT + DATA.
     let commands = 7 + recipients.max(1) as u32;
-    connect + command * commands + data + EXPIRY_MARGIN
+    connect + command * commands + data
 }
 
 #[cfg(test)]

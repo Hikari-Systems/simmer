@@ -241,6 +241,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "ramp",
         include_str!("../../migrations-mssql/20260925000000_ramp.sql"),
     ),
+    (
+        20261003000000,
+        "route rate",
+        include_str!("../../migrations-mssql/20261003000000_route_rate.sql"),
+    ),
 ];
 
 /// Apply migrations. Runs at startup, per §11.

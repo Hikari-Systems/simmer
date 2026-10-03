@@ -877,6 +877,8 @@ impl Reply {
 /// once, and that a failed send commits nothing.
 /// `(route, domain_group, day_index)` to its row, as `quota_usage` is keyed.
 type UsageRows = HashMap<(String, String, i64), Usage>;
+/// D-111 — `(route, domain_group)` to its bucket's `tat`.
+type RateRows = HashMap<(String, String), chrono::DateTime<chrono::Utc>>;
 
 #[derive(Default)]
 pub struct GrantAllQuota {
@@ -896,9 +898,19 @@ pub struct GrantAllQuota {
     /// put a route over its threshold without a database and without waiting for
     /// a window to fill.
     counts: Arc<Mutex<HashMap<String, i64>>>,
+    /// D-111 — each rate bucket's `tat`, keyed `(route, domain_group)`, driven
+    /// by the same pure `quota::rate` functions the real stores call.
+    rate: Arc<Mutex<RateRows>>,
+    /// D-111 — every slot given back, in order.
+    unbooked: Arc<Mutex<Vec<simmer::quota::RateKey>>>,
 }
 
 impl GrantAllQuota {
+    /// D-111 — the slots given back so far.
+    pub fn unbooked(&self) -> Vec<simmer::quota::RateKey> {
+        self.unbooked.lock().expect("not poisoned").clone()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -1123,6 +1135,54 @@ impl QuotaStore for GrantAllQuota {
         _cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, QuotaError> {
         Ok(0)
+    }
+
+    async fn book_rate_slot(
+        &self,
+        req: &simmer::quota::RateBookRequest,
+    ) -> Result<simmer::quota::rate::RateBooked, QuotaError> {
+        use simmer::quota::rate::{decide, RateBooked};
+        let mut rows = self.rate.lock().expect("not poisoned");
+        let k = (req.key.route.clone(), req.key.domain_group.clone());
+        let outcome = decide(
+            rows.get(&k).copied(),
+            req.rate,
+            req.now,
+            req.max_wait,
+            req.force,
+        );
+        if let RateBooked::Booked { booked_tat, .. } = outcome {
+            rows.insert(k, booked_tat);
+        }
+        Ok(outcome)
+    }
+
+    async fn unbook_rate_slot(
+        &self,
+        key: &simmer::quota::RateKey,
+        rate: simmer::quota::rate::Rate,
+        booked_tat: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, QuotaError> {
+        let mut rows = self.rate.lock().expect("not poisoned");
+        let k = (key.route.clone(), key.domain_group.clone());
+        self.unbooked
+            .lock()
+            .expect("not poisoned")
+            .push(key.clone());
+        match simmer::quota::rate::unbook(rows.get(&k).copied(), rate, booked_tat) {
+            Some(tat) => {
+                rows.insert(k, tat);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn rate_tats(
+        &self,
+        _ramp: &str,
+    ) -> Result<HashMap<(String, String), chrono::DateTime<chrono::Utc>>, QuotaError> {
+        Ok(self.rate.lock().expect("not poisoned").clone())
     }
 
     async fn is_available(&self) -> bool {

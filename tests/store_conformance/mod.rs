@@ -18,7 +18,11 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use simmer::config::FrequencyMode;
 use simmer::frequency::Keyer;
-use simmer::quota::{QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, UsageKey};
+use simmer::quota::rate::{Rate, RateBooked};
+use simmer::quota::{
+    QuotaError, QuotaStore, RateBookRequest, RateKey, Reservation, ReserveRequest, Reserved,
+    UsageKey,
+};
 use uuid::Uuid;
 
 /// A new store on a new pool, over the test's one database.
@@ -70,6 +74,15 @@ macro_rules! conformance_suite {
         $harness!(adoption_is_idempotent);
         $harness!(adoption_refuses_a_quota_key_that_exists_under_the_ramp);
         $harness!(adoption_refuses_a_route_state_that_exists_under_the_ramp);
+        $harness!(rate_bookings_take_the_burst_then_queue_in_order);
+        $harness!(rate_too_late_writes_nothing);
+        $harness!(rate_unbook_gives_back_only_the_last_slot);
+        $harness!(rate_unbook_of_a_missing_bucket_is_a_no_op);
+        $harness!(rate_buckets_are_independent_by_ramp_route_and_group);
+        $harness!(rate_a_forced_booking_is_counted);
+        $harness!(rate_tats_reads_what_was_booked);
+        $harness!(rate_instants_round_trip_to_the_microsecond);
+        $harness!(rate_concurrent_bookings_never_exceed_burst);
     };
 }
 
@@ -991,4 +1004,271 @@ pub async fn adoption_refuses_a_route_state_that_exists_under_the_ramp(stores: S
         "{err}"
     );
     assert!(s.route_states("").await.unwrap()["warming"].paused);
+}
+
+// ---------------------------------------------------------------------------
+// D-111 — per-segment rate buckets
+// ---------------------------------------------------------------------------
+
+fn rate_key(ramp: &str, route: &str, group: &str) -> RateKey {
+    RateKey {
+        ramp: ramp.into(),
+        route: route.into(),
+        domain_group: group.into(),
+    }
+}
+
+/// A fixed instant, whole seconds, so expectations can be written exactly.
+fn rate_t0() -> chrono::DateTime<Utc> {
+    "2026-10-03T12:00:00Z".parse().unwrap()
+}
+
+fn book_req(key: &RateKey, rate: Rate, now: chrono::DateTime<Utc>, wait_s: i64) -> RateBookRequest {
+    RateBookRequest {
+        key: key.clone(),
+        rate,
+        now,
+        max_wait: Duration::seconds(wait_s),
+        force: false,
+    }
+}
+
+pub async fn rate_bookings_take_the_burst_then_queue_in_order(stores: Stores<'_>) {
+    let s = stores();
+    let key = rate_key("main", "warming", "google");
+    let rate = Rate::new(3600, 2); // one a second, two at once
+    let mut sends = Vec::new();
+    for _ in 0..4 {
+        match s
+            .book_rate_slot(&book_req(&key, rate, rate_t0(), 60))
+            .await
+            .unwrap()
+        {
+            RateBooked::Booked {
+                send_at,
+                over_limit,
+                ..
+            } => {
+                assert!(!over_limit);
+                sends.push(send_at);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let t = rate_t0();
+    assert_eq!(
+        sends,
+        vec![t, t, t + Duration::seconds(1), t + Duration::seconds(2)]
+    );
+}
+
+pub async fn rate_too_late_writes_nothing(stores: Stores<'_>) {
+    let s = stores();
+    let key = rate_key("main", "warming", "google");
+    let rate = Rate::new(3600, 1);
+    assert!(matches!(
+        s.book_rate_slot(&book_req(&key, rate, rate_t0(), 0))
+            .await
+            .unwrap(),
+        RateBooked::Booked { .. }
+    ));
+    let before = s.rate_tats("main").await.unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            s.book_rate_slot(&book_req(&key, rate, rate_t0(), 0))
+                .await
+                .unwrap(),
+            RateBooked::TooLate {
+                earliest: rate_t0() + Duration::seconds(1)
+            }
+        );
+    }
+    assert_eq!(
+        s.rate_tats("main").await.unwrap(),
+        before,
+        "a refusal books nothing"
+    );
+}
+
+pub async fn rate_unbook_gives_back_only_the_last_slot(stores: Stores<'_>) {
+    let s = stores();
+    let key = rate_key("main", "warming", "google");
+    let rate = Rate::new(3600, 1);
+    let booked = |r: RateBooked| match r {
+        RateBooked::Booked { booked_tat, .. } => booked_tat,
+        other => panic!("{other:?}"),
+    };
+    let first = booked(
+        s.book_rate_slot(&book_req(&key, rate, rate_t0(), 60))
+            .await
+            .unwrap(),
+    );
+    let second = booked(
+        s.book_rate_slot(&book_req(&key, rate, rate_t0(), 60))
+            .await
+            .unwrap(),
+    );
+
+    // The earlier slot cannot be given back from under the later one.
+    assert!(!s.unbook_rate_slot(&key, rate, first).await.unwrap());
+    // The later one can, and then the earlier one.
+    assert!(s.unbook_rate_slot(&key, rate, second).await.unwrap());
+    assert!(s.unbook_rate_slot(&key, rate, first).await.unwrap());
+    // A second unbook of the same slot is refused: it is no longer the last.
+    assert!(!s.unbook_rate_slot(&key, rate, first).await.unwrap());
+
+    // Both returned: the bucket is full again at t0.
+    assert!(matches!(
+        s.book_rate_slot(&book_req(&key, rate, rate_t0(), 0)).await.unwrap(),
+        RateBooked::Booked { send_at, .. } if send_at == rate_t0()
+    ));
+}
+
+pub async fn rate_unbook_of_a_missing_bucket_is_a_no_op(stores: Stores<'_>) {
+    let s = stores();
+    let key = rate_key("main", "never", "google");
+    assert!(!s
+        .unbook_rate_slot(&key, Rate::new(60, 1), rate_t0())
+        .await
+        .unwrap());
+    assert!(s.rate_tats("main").await.unwrap().is_empty());
+}
+
+pub async fn rate_buckets_are_independent_by_ramp_route_and_group(stores: Stores<'_>) {
+    let s = stores();
+    let rate = Rate::new(3600, 1);
+    for key in [
+        rate_key("main", "warming", "google"),
+        rate_key("main", "warming", "yahoo"),
+        rate_key("main", "Warming", "google"),
+        rate_key("other", "warming", "google"),
+    ] {
+        assert!(
+            matches!(
+                s.book_rate_slot(&book_req(&key, rate, rate_t0(), 0))
+                    .await
+                    .unwrap(),
+                RateBooked::Booked { .. }
+            ),
+            "{key:?} has a bucket of its own"
+        );
+    }
+    assert_eq!(s.rate_tats("main").await.unwrap().len(), 3);
+    assert_eq!(s.rate_tats("other").await.unwrap().len(), 1);
+}
+
+pub async fn rate_a_forced_booking_is_counted(stores: Stores<'_>) {
+    let s = stores();
+    let key = rate_key("main", "warming", "google");
+    let rate = Rate::new(3600, 1);
+    s.book_rate_slot(&book_req(&key, rate, rate_t0(), 0))
+        .await
+        .unwrap();
+    let forced = s
+        .book_rate_slot(&RateBookRequest {
+            force: true,
+            ..book_req(&key, rate, rate_t0(), 0)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        forced,
+        RateBooked::Booked {
+            send_at: rate_t0(),
+            booked_tat: rate_t0() + Duration::seconds(2),
+            over_limit: true,
+        }
+    );
+    // ...and the next ordinary message waits behind it.
+    assert_eq!(
+        s.book_rate_slot(&book_req(&key, rate, rate_t0(), 0))
+            .await
+            .unwrap(),
+        RateBooked::TooLate {
+            earliest: rate_t0() + Duration::seconds(2)
+        }
+    );
+}
+
+pub async fn rate_tats_reads_what_was_booked(stores: Stores<'_>) {
+    let s = stores();
+    let key = rate_key("main", "warming", "google");
+    let rate = Rate::new(60, 1);
+    s.book_rate_slot(&book_req(&key, rate, rate_t0(), 0))
+        .await
+        .unwrap();
+    let tats = s.rate_tats("main").await.unwrap();
+    assert_eq!(
+        tats.get(&("warming".to_string(), "google".to_string())),
+        Some(&(rate_t0() + Duration::minutes(1)))
+    );
+}
+
+pub async fn rate_instants_round_trip_to_the_microsecond(stores: Stores<'_>) {
+    // `unbook` compares what it booked with what it reads back. A backend that
+    // stored less precision than `quota::rate` computes would never unbook.
+    let s = stores();
+    let key = rate_key("main", "warming", "google");
+    let rate = Rate::new(7, 1); // a non-integral interval
+    let now = rate_t0() + Duration::nanoseconds(123_456_789);
+    let booked = match s
+        .book_rate_slot(&book_req(&key, rate, now, 0))
+        .await
+        .unwrap()
+    {
+        RateBooked::Booked { booked_tat, .. } => booked_tat,
+        other => panic!("{other:?}"),
+    };
+    let stored = s.rate_tats("main").await.unwrap();
+    assert_eq!(
+        stored.get(&("warming".into(), "google".into())),
+        Some(&booked)
+    );
+    assert!(s.unbook_rate_slot(&key, rate, booked).await.unwrap());
+}
+
+pub async fn rate_concurrent_bookings_never_exceed_burst(stores: Stores<'_>) {
+    // The guarantee is the row lock, across two independent pools — two
+    // instances' worth of connections. Warmed, then released by a barrier, so
+    // the contenders really overlap; and fresh keys every round, so the first
+    // booking races the row's creation too.
+    const N: usize = 16;
+    const BURST: i64 = 3;
+    const ROUNDS: usize = 10;
+    let (a, b) = (stores(), stores());
+    warm(&[Arc::clone(&a), Arc::clone(&b)], N).await;
+
+    for round in 0..ROUNDS {
+        let key = rate_key("main", "warming", &format!("g{round}"));
+        let gate = Arc::new(tokio::sync::Barrier::new(N));
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let s = if i % 2 == 0 {
+                Arc::clone(&a)
+            } else {
+                Arc::clone(&b)
+            };
+            let gate = Arc::clone(&gate);
+            let key = key.clone();
+            handles.push(tokio::spawn(async move {
+                gate.wait().await;
+                s.book_rate_slot(&book_req(&key, Rate::new(60, BURST), rate_t0(), 0))
+                    .await
+            }));
+        }
+        let mut granted = 0;
+        for h in handles {
+            match h.await.expect("task").expect("book") {
+                RateBooked::Booked { send_at, .. } => {
+                    assert_eq!(send_at, rate_t0(), "max_wait 0: only immediate slots");
+                    granted += 1;
+                }
+                RateBooked::TooLate { .. } => {}
+            }
+        }
+        assert_eq!(
+            granted, BURST,
+            "round {round}: exactly burst within one interval"
+        );
+    }
 }
