@@ -246,6 +246,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "route rate",
         include_str!("../../migrations-mssql/20261003000000_route_rate.sql"),
     ),
+    (
+        20261004000000,
+        "spool",
+        include_str!("../../migrations-mssql/20261004000000_spool.sql"),
+    ),
 ];
 
 /// Apply migrations. Runs at startup, per §11.

@@ -26,6 +26,10 @@ use super::store::{
     ReserveRequest, Reserved, Reset, RouteState, Usage, UsageKey,
 };
 use crate::models;
+use crate::spool::store::{
+    ClaimRequest, Claimed, DeadEntry, DeadLetterRequest, LaneStats, NewSpooled, Reschedule,
+    RetryDead, SpoolRampState, SpoolStore, SpoolTotals,
+};
 
 pub struct PgQuotaStore {
     pool: PgPool,
@@ -87,46 +91,7 @@ impl QuotaStore for PgQuotaStore {
         recipient_keys: &[crate::frequency::Key],
     ) -> Result<(), QuotaError> {
         let mut tx = self.pool.begin().await?;
-
-        let still_reserved = models::quota::take_reservation(&mut tx, reservation.id).await?;
-        if !still_reserved {
-            // The sweeper beat us: the send took longer than `expires_at`. The
-            // message was still delivered, so the ramp has to count it.
-            tracing::warn!(
-                ramp = %reservation.ramp,
-                route = %reservation.route,
-                reservation = %reservation.id,
-                "reservation expired before the downstream replied; committing anyway. \
-                 A nonzero rate here means the reservation expiry is tuned shorter than \
-                 real downstream latency (§7.4)"
-            );
-        }
-
-        models::quota::commit_usage(
-            &mut tx,
-            &reservation.ramp,
-            &reservation.route,
-            &reservation.domain_group,
-            reservation.day_index,
-            reservation.count,
-            still_reserved,
-        )
-        .await?;
-
-        // §7.4 phase 3's second clause, in the same transaction as the first:
-        // "move the count from `reserved` to `committed` **and record
-        // recipient-frequency events**". Empty for a route with no constraint.
-        if !recipient_keys.is_empty() {
-            models::recipient_event::record(
-                &mut tx,
-                &reservation.ramp,
-                &reservation.route,
-                recipient_keys,
-                chrono::Utc::now(),
-            )
-            .await?;
-        }
-
+        commit_in(&mut tx, reservation, recipient_keys).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -324,5 +289,159 @@ impl QuotaStore for PgQuotaStore {
 
     async fn is_available(&self) -> bool {
         crate::db::is_reachable(&self.pool).await
+    }
+}
+
+/// §7.4 phase 3 inside the caller's transaction: [`QuotaStore::commit`] on its
+/// own, and `commit_and_complete` with the spool row's deletion beside it.
+async fn commit_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    reservation: &Reservation,
+    recipient_keys: &[crate::frequency::Key],
+) -> Result<(), QuotaError> {
+    let still_reserved = models::quota::take_reservation(tx, reservation.id).await?;
+    if !still_reserved {
+        // The sweeper beat us: the send took longer than `expires_at`. The
+        // message was still delivered, so the ramp has to count it.
+        tracing::warn!(
+            ramp = %reservation.ramp,
+            route = %reservation.route,
+            reservation = %reservation.id,
+            "reservation expired before the downstream replied; committing anyway. \
+             A nonzero rate here means the reservation expiry is tuned shorter than \
+             real downstream latency (§7.4)"
+        );
+    }
+
+    models::quota::commit_usage(
+        tx,
+        &reservation.ramp,
+        &reservation.route,
+        &reservation.domain_group,
+        reservation.day_index,
+        reservation.count,
+        still_reserved,
+    )
+    .await?;
+
+    // §7.4 phase 3's second clause, in the same transaction as the first:
+    // "move the count from `reserved` to `committed` **and record
+    // recipient-frequency events**". Empty for a route with no constraint.
+    if !recipient_keys.is_empty() {
+        models::recipient_event::record(
+            tx,
+            &reservation.ramp,
+            &reservation.route,
+            recipient_keys,
+            chrono::Utc::now(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[async_trait]
+impl SpoolStore for PgQuotaStore {
+    async fn enqueue(&self, msg: &NewSpooled) -> Result<(), QuotaError> {
+        models::spool_message::enqueue(&self.pool, msg).await
+    }
+
+    async fn claim_due(&self, req: &ClaimRequest) -> Result<Vec<Claimed>, QuotaError> {
+        models::spool_message::claim_due(&self.pool, req).await
+    }
+
+    async fn renew_lease(
+        &self,
+        id: Uuid,
+        token: Uuid,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, QuotaError> {
+        models::spool_message::renew_lease(&self.pool, id, token, until).await
+    }
+
+    async fn reschedule(&self, r: &Reschedule) -> Result<bool, QuotaError> {
+        models::spool_message::reschedule(&self.pool, r).await
+    }
+
+    async fn dead_letter(&self, d: &DeadLetterRequest) -> Result<bool, QuotaError> {
+        models::spool_message::dead_letter(&self.pool, d).await
+    }
+
+    async fn commit_and_complete(
+        &self,
+        reservation: &Reservation,
+        recipient_keys: &[crate::frequency::Key],
+        id: Uuid,
+        token: Uuid,
+    ) -> Result<bool, QuotaError> {
+        let mut tx = self.pool.begin().await?;
+        commit_in(&mut tx, reservation, recipient_keys).await?;
+        let held = models::spool_message::complete(&mut tx, id, token).await?;
+        tx.commit().await?;
+        Ok(held)
+    }
+
+    async fn take_dead_bodies(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<String>, QuotaError> {
+        models::spool_message::take_dead_bodies(&self.pool, cutoff).await
+    }
+
+    async fn purge_dead(
+        &self,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<String>, QuotaError> {
+        models::spool_message::purge_dead(&self.pool, cutoff).await
+    }
+
+    async fn known_body_refs(
+        &self,
+        refs: &[String],
+    ) -> Result<std::collections::HashSet<String>, QuotaError> {
+        models::spool_message::known_body_refs(&self.pool, refs).await
+    }
+
+    async fn totals(&self) -> Result<SpoolTotals, QuotaError> {
+        models::spool_message::totals(&self.pool).await
+    }
+
+    async fn lane_depth(&self, ramp: &str, domain_group: &str) -> Result<i64, QuotaError> {
+        models::spool_message::lane_depth(&self.pool, ramp, domain_group).await
+    }
+
+    async fn lanes(&self) -> Result<Vec<LaneStats>, QuotaError> {
+        models::spool_message::lanes(&self.pool).await
+    }
+
+    async fn dead_entries(&self, limit: u32) -> Result<Vec<DeadEntry>, QuotaError> {
+        models::spool_message::dead_entries(&self.pool, limit).await
+    }
+
+    async fn retry_dead(
+        &self,
+        id: Uuid,
+        now: chrono::DateTime<chrono::Utc>,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<RetryDead, QuotaError> {
+        models::spool_message::retry_dead(&self.pool, id, now, expires_at).await
+    }
+
+    async fn delete_message(&self, id: Uuid) -> Result<Option<Option<String>>, QuotaError> {
+        models::spool_message::delete_message(&self.pool, id).await
+    }
+
+    async fn set_spool_paused(&self, ramp: &str, paused: bool) -> Result<(), QuotaError> {
+        models::spool_message::set_paused(&self.pool, ramp, paused).await
+    }
+
+    async fn set_spool_draining(&self, ramp: &str, draining: bool) -> Result<(), QuotaError> {
+        models::spool_message::set_draining(&self.pool, ramp, draining).await
+    }
+
+    async fn spool_states(
+        &self,
+    ) -> Result<std::collections::HashMap<String, SpoolRampState>, QuotaError> {
+        models::spool_message::states(&self.pool).await
     }
 }

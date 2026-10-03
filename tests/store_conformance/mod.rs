@@ -25,6 +25,8 @@ use simmer::quota::{
 };
 use uuid::Uuid;
 
+pub mod spool;
+
 /// A new store on a new pool, over the test's one database.
 pub type Stores<'a> = &'a (dyn Fn() -> Arc<dyn QuotaStore> + Sync);
 

@@ -11,3 +11,4 @@ pub mod quota;
 pub mod recipient_event;
 pub mod route_rate;
 pub mod route_state;
+pub mod spool_message;

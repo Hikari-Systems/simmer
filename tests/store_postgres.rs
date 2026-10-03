@@ -36,6 +36,25 @@ macro_rules! pg {
 
 conformance_suite!(pg);
 
+macro_rules! pg_spool {
+    ($name:ident) => {
+        #[sqlx::test]
+        async fn $name(pool: PgPool) {
+            let options = (*pool.connect_options()).clone();
+            let stores = move || -> Arc<dyn simmer::spool::SpoolStore> {
+                Arc::new(PgQuotaStore::new(
+                    PgPoolOptions::new()
+                        .max_connections(8)
+                        .connect_lazy_with(options.clone()),
+                ))
+            };
+            store_conformance::spool::$name(&stores).await;
+        }
+    };
+}
+
+spool_conformance_suite!(pg_spool);
+
 // ---------------------------------------------------------------------------
 // D-099 — the upgrade from a v0.8 schema that already holds rows
 // ---------------------------------------------------------------------------
@@ -129,5 +148,102 @@ mod upgrade {
         .execute(&pool)
         .await;
         assert!(v08_pause.is_err(), "and so must the v0.8 pause");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D-116 — commit_and_complete is one transaction
+// ---------------------------------------------------------------------------
+
+mod spool_atomicity {
+    use chrono::{Duration, Utc};
+    use simmer::config::FrequencyMode;
+    use simmer::frequency::Keyer;
+    use simmer::quota::{PgQuotaStore, QuotaStore, ReserveRequest, Reserved};
+    use simmer::spool::{ClaimRequest, NewSpooled, SpoolStore};
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    /// The events insert is the last statement before the row's deletion.
+    /// Break it, and neither the quota commit before it nor the deletion after
+    /// it may survive.
+    #[sqlx::test]
+    async fn a_failure_inside_commit_and_complete_leaves_nothing_behind(pool: PgPool) {
+        let store = PgQuotaStore::new(pool.clone());
+        let keyer = Keyer::new(store.recipient_hash_salt().await.unwrap());
+        let key = keyer.key_for("jane@example.com", FrequencyMode::ToAddress, &[]);
+        let now = Utc::now();
+        let id = Uuid::new_v4();
+        store
+            .enqueue(&NewSpooled {
+                id,
+                ramp: "main".into(),
+                domain_group: "catchall".into(),
+                group_basis: "literal".into(),
+                received_at: now,
+                expires_at: now + Duration::hours(1),
+                next_attempt_at: now,
+                envelope: "{}".into(),
+                body_ref: format!("bodies/{id}"),
+                body_bytes: 1,
+                body_sha256: vec![0; 32],
+                uuid_seed: Uuid::new_v4(),
+            })
+            .await
+            .unwrap();
+        let claim = store
+            .claim_due(&ClaimRequest {
+                owner: "t".into(),
+                now,
+                batch: 1,
+                lease: Duration::seconds(1),
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        let Reserved::Taken(r) = store
+            .reserve(&ReserveRequest {
+                ramp: "main".into(),
+                route: "warming".into(),
+                domain_group: "catchall".into(),
+                day_index: 0,
+                allowance: Some(5),
+                count: 1,
+                correlation_id: "c".into(),
+                expires_at: now + Duration::minutes(10),
+                over_cap: false,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("headroom")
+        };
+
+        sqlx::query("ALTER TABLE recipient_event RENAME TO recipient_event_gone")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let failed = store
+            .commit_and_complete(&r, std::slice::from_ref(&key), id, claim.lease_token)
+            .await;
+        sqlx::query("ALTER TABLE recipient_event_gone RENAME TO recipient_event")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(failed.is_err(), "the injected failure must surface");
+
+        let u = store.usage("main", "warming", "catchall", 0).await.unwrap();
+        assert_eq!((u.committed, u.reserved), (0, 1), "the commit rolled back");
+        let again = store
+            .claim_due(&ClaimRequest {
+                owner: "t".into(),
+                now: now + Duration::seconds(2),
+                batch: 1,
+                lease: Duration::seconds(60),
+            })
+            .await
+            .unwrap();
+        assert_eq!(again.len(), 1, "the row is still there to retry");
+        assert_eq!(again[0].id, id);
     }
 }

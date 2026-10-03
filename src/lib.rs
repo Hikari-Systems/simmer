@@ -30,4 +30,5 @@ pub mod relay;
 pub mod rewrite;
 pub mod routing;
 pub mod smtp;
+pub mod spool;
 pub mod telemetry;

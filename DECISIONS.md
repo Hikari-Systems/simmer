@@ -5544,6 +5544,78 @@ retained. §4.2 refuses `keep_body` longer than `retention`: a body outliving th
 row that names it would be a plaintext message nothing points at until the
 orphan sweeper found it.
 
+### D-122 — The spool's storage: leases, fencing, and a delivered message's row deleted with its quota commit
+
+> Phase 2, 2026-10-03. Two departures from `docs/SPOOL_PLAN.md` §3.3, each
+> recorded here.
+
+**Shape.** `spool_message` and `spool_ramp_state` in both `migrations/` and
+`migrations-mssql/` (BIN2 keys). `SpoolStore` extends `QuotaStore` — one store
+object, one pool — because `commit_and_complete` has to put §7.4's commit and
+the row's deletion in one transaction. Every method is in both stores, with the
+nineteen `tests/store_conformance/spool.rs` tests written first and run against
+both, plus a backend-specific test each that breaks the events insert inside
+`commit_and_complete` (by renaming `recipient_event`) and checks that neither
+the quota commit before it nor the deletion after it survives.
+
+**Claims.** One statement each: Postgres `FOR UPDATE SKIP LOCKED` in a CTE that
+an `UPDATE` leases; SQL Server a `TOP (n) … ORDER BY` CTE read `WITH (UPDLOCK,
+READPAST, ROWLOCK)` and updated through. Each claim gets a fresh `lease_token`
+(`gen_random_uuid()` / `NEWID()`, both evaluated per row). The race test — two
+warmed pools behind a barrier, twelve claimants, fresh rows each round — fails
+with the lock removed on both backends (checked by mutation). On Postgres it
+still passes with `FOR UPDATE` and no `SKIP LOCKED`, which is right: that is
+exclusive, only serialised. The plan said it must fail without `SKIP LOCKED`;
+what it must fail without is the lock.
+
+**SQL Server needed an index the plan did not name.** The first run claimed 12
+of 20 due rows with no duplicates: `TOP … ORDER BY` over the `(state,
+next_attempt_at)` index sorts first, and under `UPDLOCK` every candidate row
+fed to the sort is locked, so one claimant held all twenty and `READPAST` sent
+the rest away empty. `spool_message_next (next_attempt_at, id) INCLUDE (state,
+lease_until, ramp)`, forced with `INDEX(…)`, scans in claim order and stops after
+`n` qualifying rows. No duplicates either way; the index is what makes a second
+dispatcher useful.
+
+**And a claim retries a deadlock victim.** CI's SQL Server (never the local
+one) chose a claimant as a deadlock victim (1205) in the race test: claimants
+leasing neighbouring rows update the same index entries under `UPDLOCK`. SQL
+Server rolls the victim's whole statement back, so nothing was claimed and
+trying again is safe; the claim tries up to five times with a short jittered
+pause. Past that it reports the error, and the dispatcher polls again.
+
+**Departure 1: `commit_and_complete` after a lost lease commits, and deletes.**
+The plan said a token mismatch rolls back everything. But a holder that reaches
+`commit_and_complete` was told `2xx` by the downstream: the message has been
+delivered. Rolling back its quota would under-count a real send — the overshoot
+§7.4 exists to prevent, and exactly the case `QuotaStore::commit` already
+resolves the other way when the sweeper beat it ("committing anyway"). So the
+quota commits regardless, and the row is deleted regardless: delivery is the
+one verdict no later holder can improve on, and deleting the row means a holder
+that has not yet sent finds nothing to complete — and, once the dispatcher
+checks before sending, nothing to send. The return value says whether the token
+still held it, so the lost lease is counted (`simmer_spool_lease_lost_total`).
+Every *other* fenced write — reschedule, dead-letter, renew — is refused on a
+mismatch, because there the later holder's decision is the better one.
+
+**Departure 2: a delivered row is deleted, not kept as `delivered`.** Nothing
+reads it — the metrics count deliveries as they happen — and keeping it would be
+a table of every address mailed, which §7.3 hashes recipients to avoid. States
+are `queued`, `leased`, `dead`.
+
+**Also.** `body_ref` is nullable: NULL once a dead letter's body is gone
+(D-121). The envelope is TEXT / NVARCHAR(MAX) JSON that SQL never looks inside,
+not JSONB, so both backends store it identically. A paused ramp's rows are
+excluded inside the claim (`NOT EXISTS spool_ramp_state.paused`), so every
+instance obeys one pause (Q5).
+
+**The mssql build was run in `rust:1-bookworm`** — the Dockerfile's builder,
+which carries the libssl-dev that native-tls needs — on the host network
+against the compose SQL Server, because the host has no OpenSSL headers. That
+run also fixed `migrations_are_idempotent_and_recorded`, which still expected
+four migrations: Phase 1's `route_rate` had already made it five, and the SQL
+Server suites had not been run since.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

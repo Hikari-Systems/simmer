@@ -109,6 +109,24 @@ macro_rules! ms {
 
 conformance_suite!(ms);
 
+macro_rules! ms_spool {
+    ($name:ident) => {
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn $name() {
+            with_database(|cfg| async move {
+                migrated(&cfg).await;
+                let stores = move || -> Arc<dyn simmer::spool::SpoolStore> {
+                    Arc::new(MssqlQuotaStore::new(mssql::build_pool(&cfg).expect("pool")))
+                };
+                store_conformance::spool::$name(&stores).await;
+            })
+            .await;
+        }
+    };
+}
+
+spool_conformance_suite!(ms_spool);
+
 // ---------------------------------------------------------------------------
 // This backend only
 // ---------------------------------------------------------------------------
@@ -341,6 +359,108 @@ async fn upgrade_refuses_a_stored_name_longer_than_128() {
             .unwrap()
             .get::<i16, _>("n");
         assert_eq!(has_ramp, None, "the migration rolled back whole");
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// D-116 — commit_and_complete is one transaction (see store_postgres.rs)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failure_inside_commit_and_complete_leaves_nothing_behind() {
+    use chrono::{Duration as ChronoDuration, Utc};
+    use simmer::config::FrequencyMode;
+    use simmer::frequency::Keyer;
+    use simmer::quota::{ReserveRequest, Reserved};
+    use simmer::spool::{ClaimRequest, NewSpooled, SpoolStore};
+    use uuid::Uuid;
+
+    with_database(|cfg| async move {
+        let pool = migrated(&cfg).await;
+        let store = MssqlQuotaStore::new(pool.clone());
+        let keyer = Keyer::new(store.recipient_hash_salt().await.unwrap());
+        let key = keyer.key_for("jane@example.com", FrequencyMode::ToAddress, &[]);
+        let now = Utc::now();
+        let id = Uuid::new_v4();
+        store
+            .enqueue(&NewSpooled {
+                id,
+                ramp: "main".into(),
+                domain_group: "catchall".into(),
+                group_basis: "literal".into(),
+                received_at: now,
+                expires_at: now + ChronoDuration::hours(1),
+                next_attempt_at: now,
+                envelope: "{}".into(),
+                body_ref: format!("bodies/{id}"),
+                body_bytes: 1,
+                body_sha256: vec![0; 32],
+                uuid_seed: Uuid::new_v4(),
+            })
+            .await
+            .unwrap();
+        let claim = store
+            .claim_due(&ClaimRequest {
+                owner: "t".into(),
+                now,
+                batch: 1,
+                lease: ChronoDuration::seconds(1),
+            })
+            .await
+            .unwrap()
+            .remove(0);
+        let Reserved::Taken(r) = store
+            .reserve(&ReserveRequest {
+                ramp: "main".into(),
+                route: "warming".into(),
+                domain_group: "catchall".into(),
+                day_index: 0,
+                allowance: Some(5),
+                count: 1,
+                correlation_id: "c".into(),
+                expires_at: now + ChronoDuration::minutes(10),
+                over_cap: false,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("headroom")
+        };
+
+        let rename = |from: &'static str, to: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let mut conn = pool.get().await.unwrap();
+                conn.client
+                    .simple_query(format!("EXEC sp_rename 'dbo.{from}', '{to}'"))
+                    .await
+                    .unwrap()
+                    .into_results()
+                    .await
+                    .unwrap();
+            }
+        };
+        rename("recipient_event", "recipient_event_gone").await;
+        let failed = store
+            .commit_and_complete(&r, std::slice::from_ref(&key), id, claim.lease_token)
+            .await;
+        rename("recipient_event_gone", "recipient_event").await;
+        assert!(failed.is_err(), "the injected failure must surface");
+
+        let u = store.usage("main", "warming", "catchall", 0).await.unwrap();
+        assert_eq!((u.committed, u.reserved), (0, 1), "the commit rolled back");
+        let again = store
+            .claim_due(&ClaimRequest {
+                owner: "t".into(),
+                now: now + ChronoDuration::seconds(2),
+                batch: 1,
+                lease: ChronoDuration::seconds(60),
+            })
+            .await
+            .unwrap();
+        assert_eq!(again.len(), 1, "the row is still there to retry");
+        assert_eq!(again[0].id, id);
     })
     .await;
 }

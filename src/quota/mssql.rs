@@ -247,67 +247,7 @@ impl QuotaStore for MssqlQuotaStore {
             .await?
             .into_results()
             .await?;
-
-        let taken = client
-            .query(TAKE_RESERVATION, &[&reservation.id])
-            .await?
-            .into_row()
-            .await?
-            .ok_or_else(|| missing("deleting the reservation"))?;
-        let still_reserved = int(&taken, "n")? > 0;
-        if !still_reserved {
-            // See `PgQuotaStore::commit`: delivered, so it counts.
-            tracing::warn!(
-                ramp = %reservation.ramp,
-                route = %reservation.route,
-                reservation = %reservation.id,
-                "reservation expired before the downstream replied; committing anyway. \
-                 A nonzero rate here means the reservation expiry is tuned shorter than \
-                 real downstream latency (§7.4)"
-            );
-        }
-
-        let sql = if still_reserved {
-            "UPDATE dbo.quota_usage \
-                SET reserved = CASE WHEN reserved - @P4 < 0 THEN 0 ELSE reserved - @P4 END, \
-                    committed = committed + @P4, \
-                    updated_at = SYSUTCDATETIME() \
-              WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3;"
-        } else {
-            "UPDATE dbo.quota_usage \
-                SET committed = committed + @P4, updated_at = SYSUTCDATETIME() \
-              WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3;"
-        };
-        client
-            .execute(
-                sql,
-                &[
-                    &reservation.route,
-                    &reservation.domain_group,
-                    &reservation.day_index,
-                    &reservation.count,
-                    &reservation.ramp,
-                ],
-            )
-            .await?;
-
-        // §7.4 phase 3's second clause, in the same transaction as the first.
-        let sent_at = Utc::now().naive_utc();
-        for key in recipient_keys {
-            client
-                .execute(
-                    "INSERT INTO dbo.recipient_event (recipient_hash, ramp, route, sent_at) \
-                     VALUES (@P1, @P4, @P2, @P3);",
-                    &[
-                        &key.as_bytes(),
-                        &reservation.route,
-                        &sent_at,
-                        &reservation.ramp,
-                    ],
-                )
-                .await?;
-        }
-
+        commit_in(client, reservation, recipient_keys).await?;
         client
             .simple_query("COMMIT TRANSACTION")
             .await?
@@ -948,3 +888,75 @@ impl MssqlQuotaStore {
         Ok(())
     }
 }
+
+/// §7.4 phase 3 inside the caller's open transaction: [`QuotaStore::commit`]
+/// on its own, and `commit_and_complete` with the spool row's deletion beside
+/// it.
+async fn commit_in(
+    client: &mut tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>,
+    reservation: &Reservation,
+    recipient_keys: &[crate::frequency::Key],
+) -> Result<(), QuotaError> {
+    let taken = client
+        .query(TAKE_RESERVATION, &[&reservation.id])
+        .await?
+        .into_row()
+        .await?
+        .ok_or_else(|| missing("deleting the reservation"))?;
+    let still_reserved = int(&taken, "n")? > 0;
+    if !still_reserved {
+        // See `PgQuotaStore::commit`: delivered, so it counts.
+        tracing::warn!(
+            ramp = %reservation.ramp,
+            route = %reservation.route,
+            reservation = %reservation.id,
+            "reservation expired before the downstream replied; committing anyway. \
+             A nonzero rate here means the reservation expiry is tuned shorter than \
+             real downstream latency (§7.4)"
+        );
+    }
+
+    let sql = if still_reserved {
+        "UPDATE dbo.quota_usage \
+            SET reserved = CASE WHEN reserved - @P4 < 0 THEN 0 ELSE reserved - @P4 END, \
+                committed = committed + @P4, \
+                updated_at = SYSUTCDATETIME() \
+          WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3;"
+    } else {
+        "UPDATE dbo.quota_usage \
+            SET committed = committed + @P4, updated_at = SYSUTCDATETIME() \
+          WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3;"
+    };
+    client
+        .execute(
+            sql,
+            &[
+                &reservation.route,
+                &reservation.domain_group,
+                &reservation.day_index,
+                &reservation.count,
+                &reservation.ramp,
+            ],
+        )
+        .await?;
+
+    // §7.4 phase 3's second clause, in the same transaction as the first.
+    let sent_at = Utc::now().naive_utc();
+    for key in recipient_keys {
+        client
+            .execute(
+                "INSERT INTO dbo.recipient_event (recipient_hash, ramp, route, sent_at) \
+                 VALUES (@P1, @P4, @P2, @P3);",
+                &[
+                    &key.as_bytes(),
+                    &reservation.route,
+                    &sent_at,
+                    &reservation.ramp,
+                ],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+mod spool;
