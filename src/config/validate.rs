@@ -22,7 +22,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use super::{AutoShare, Config, Identity, IngressAuth, Ramp, Route, ShareSchedule};
+use super::{
+    AutoShare, BodyStoreConfig, Config, Delivery, Identity, IngressAuth, ObjectProvider,
+    ObjectStoreConfig, OnLimit, Ramp, Route, ShareSchedule,
+};
 use crate::rewrite::{stability, RouteRewrite};
 
 /// The identity fields of §6.6. A stability violation in one of these is fatal
@@ -177,6 +180,7 @@ pub fn validate(cfg: &Config) -> ViolationList {
     check_link_proxy(cfg, &mut v);
     check_capture(cfg, &mut v);
     check_telemetry(cfg, &mut v);
+    check_spool(cfg, &mut v);
     check_storage(cfg, &mut v);
 
     v
@@ -315,6 +319,39 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
         }
     }
 
+    // D-116 — a spool nothing uses. Not a violation: a staged rollout may add
+    // the block before flipping a ramp. But it is a body store probed and
+    // tables migrated for nothing, and an operator may believe a ramp spools.
+    if let Some(sp) = &cfg.spool {
+        if !cfg.ramps.iter().any(|r| r.delivery == Delivery::Spool) {
+            out.push(Warning {
+                path: "spool".to_string(),
+                message: "is configured, but no ramp has `delivery: spool`, so nothing is \
+                          spooled (D-116)"
+                    .to_string(),
+            });
+        } else if let BodyStoreConfig::Volume { path } = &sp.body_store {
+            out.push(Warning {
+                path: "spool.body_store.path".to_string(),
+                message: format!(
+                    "'{path}' passed a write, fsync and read-back probe. On a network \
+                     filesystem that proves it is writable, not that an fsync is durable; \
+                     a spooled message is only as safe as that fsync (D-117)"
+                ),
+            });
+        }
+        if let Some(w) = &sp.dead_letter.webhook {
+            if w.include_addresses && w.url.to_ascii_lowercase().starts_with("http://") {
+                out.push(Warning {
+                    path: "spool.dead_letter.webhook.url".to_string(),
+                    message: "is http:// with include_addresses: true, so every dead letter's \
+                              sender and recipient cross the network unencrypted (D-120)"
+                        .to_string(),
+                });
+            }
+        }
+    }
+
     // §9.3's write API can pause a route or set an allowance of zero, and either
     // one turns into `451` on every message that steers there. A short token is
     // the difference between "an operator did that" and "anyone who could reach
@@ -361,6 +398,22 @@ fn ramp_warnings(ramp: &Ramp) -> Vec<Warning> {
     // decorative, and an operator reading the schedule would not know it.
     for route in &ramp.routes {
         out.extend(rate_cap_warnings(ramp, route));
+    }
+
+    // D-118: `max_wait` holds a synchronous client for a slot. A spooling ramp
+    // has already answered its client, so the key describes nothing.
+    if ramp.delivery == Delivery::Spool {
+        for route in &ramp.routes {
+            if route.rate.as_ref().is_some_and(|r| !r.max_wait().is_zero()) {
+                out.push(Warning {
+                    path: format!("routes.{}.rate.max_wait", route.name),
+                    message: "has no effect on a `delivery: spool` ramp, whose client is \
+                              answered before delivery; use on_limit: wait to defer to a \
+                              slot (D-118)"
+                        .to_string(),
+                });
+            }
+        }
     }
 
     // §7.3 is a *steering* rule: over threshold means "try the next link". A
@@ -916,6 +969,269 @@ fn writable(dir: &Path) -> std::io::Result<()> {
     std::fs::File::create(&probe)?;
     let _ = std::fs::remove_file(&probe);
     Ok(())
+}
+
+/// §4.2 for §7.7's spool (D-116). The probe of a volume path writes, `fsync`s,
+/// reads back and deletes a file — the whole of what the body store will do —
+/// so a mount that accepts a create but not a write is refused here, not on the
+/// first `250 queued`.
+fn check_spool(cfg: &Config, v: &mut ViolationList) {
+    // D-116: a ramp must not claim to spool without spooling. Before this rule
+    // `delivery: spool` loaded and was ignored, which is the worst outcome — the
+    // operator believes the client is answered at once and it is held instead.
+    if cfg.spool.is_none() {
+        for ramp in cfg.ramps.iter() {
+            if ramp.delivery == Delivery::Spool {
+                v.push(
+                    format!("ramps.{}.delivery", ramp.name),
+                    "is `spool`, but there is no top-level `spool:` block saying where \
+                     messages are kept (§7.7, D-116)",
+                );
+            }
+        }
+    }
+
+    let Some(sp) = &cfg.spool else {
+        return;
+    };
+
+    match &sp.body_store {
+        BodyStoreConfig::Volume { path } => check_spool_volume(path, v),
+        BodyStoreConfig::Object(o) => check_object_store(o, v),
+    }
+
+    if sp.max_hold.is_zero() {
+        v.push("spool.max_hold", "must be greater than zero");
+    }
+
+    let r = &sp.retry;
+    if r.initial.is_zero() {
+        v.push("spool.retry.initial", "must be greater than zero");
+    }
+    if r.max.is_zero() {
+        v.push("spool.retry.max", "must be greater than zero");
+    }
+    if !r.factor.is_finite() || r.factor < 1.0 {
+        v.push(
+            "spool.retry.factor",
+            format!(
+                "is {}; must be a finite number of at least 1, or the backoff shrinks",
+                r.factor
+            ),
+        );
+    }
+    if r.initial > r.max {
+        v.push(
+            "spool.retry.initial",
+            format!(
+                "is {}s, above spool.retry.max ({}s)",
+                r.initial.as_secs(),
+                r.max.as_secs()
+            ),
+        );
+    }
+
+    if sp.max_messages == 0 {
+        v.push("spool.max_messages", "must be at least 1");
+    }
+    if sp.max_bytes < cfg.server.max_message_bytes {
+        v.push(
+            "spool.max_bytes",
+            format!(
+                "is {}, below server.max_message_bytes ({}); the largest messages could never \
+                 be admitted (D-119)",
+                sp.max_bytes, cfg.server.max_message_bytes
+            ),
+        );
+    }
+
+    if sp.dispatch.poll_interval.is_zero() {
+        v.push("spool.dispatch.poll_interval", "must be greater than zero");
+    }
+    if sp.dispatch.batch == 0 {
+        v.push("spool.dispatch.batch", "must be at least 1");
+    }
+
+    let dl = &sp.dead_letter;
+    if dl.retention.is_zero() {
+        v.push("spool.dead_letter.retention", "must be greater than zero");
+    }
+    // A body kept past its row would be an orphan the sweeper deletes anyway,
+    // and in the meantime a plaintext message nothing points at (Q6).
+    if dl.keep_body > dl.retention {
+        v.push(
+            "spool.dead_letter.keep_body",
+            format!(
+                "is {}s, longer than spool.dead_letter.retention ({}s); a body cannot outlive \
+                 the entry that names it (D-121)",
+                dl.keep_body.as_secs(),
+                dl.retention.as_secs()
+            ),
+        );
+    }
+    if let Some(w) = &dl.webhook {
+        if w.timeout.is_zero() {
+            v.push(
+                "spool.dead_letter.webhook.timeout",
+                "must be greater than zero",
+            );
+        }
+        if let Some(problem) = http_url_problem(&w.url, true) {
+            // The URL itself is not echoed: a webhook URL often carries a token.
+            v.push("spool.dead_letter.webhook.url", problem);
+        }
+    }
+}
+
+fn check_spool_volume(path: &str, v: &mut ViolationList) {
+    const AT: &str = "spool.body_store.path";
+    let dir = Path::new(path);
+    if path.trim().is_empty() {
+        v.push(AT, "is empty");
+        return;
+    }
+    if !dir.is_absolute() {
+        v.push(AT, format!("'{path}' is not an absolute path"));
+        return;
+    }
+    // The body store creates a missing directory itself (0700), so what must be
+    // writable then is the parent; the round trip is checked in whichever
+    // exists.
+    let target = if dir.exists() {
+        if !dir.is_dir() {
+            v.push(AT, format!("'{path}' exists and is not a directory"));
+            return;
+        }
+        dir
+    } else {
+        match dir.parent() {
+            Some(parent) if parent.is_dir() => parent,
+            Some(parent) => {
+                v.push(
+                    AT,
+                    format!(
+                        "'{path}' does not exist and neither does its parent '{}'",
+                        parent.display()
+                    ),
+                );
+                return;
+            }
+            None => {
+                v.push(AT, format!("'{path}' has no parent directory"));
+                return;
+            }
+        }
+    };
+    if let Err(e) = round_trip(target) {
+        v.push(
+            AT,
+            format!(
+                "'{}' failed a write, fsync and read-back probe: {e}",
+                target.display()
+            ),
+        );
+    }
+}
+
+/// Write, `fsync`, read back and delete a probe file in `dir`.
+fn round_trip(dir: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    const PROBE: &[u8] = b"simmer spool probe\n";
+    let probe = dir.join(format!(".simmer-spool-probe-{}", std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::File::create(&probe)?;
+        f.write_all(PROBE)?;
+        f.sync_all()?;
+        drop(f);
+        let mut back = Vec::new();
+        std::fs::File::open(&probe)?.read_to_end(&mut back)?;
+        if back != PROBE {
+            return Err(std::io::Error::other("read back different bytes"));
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&probe);
+    result
+}
+
+fn check_object_store(o: &ObjectStoreConfig, v: &mut ViolationList) {
+    let at = |field: &str| format!("spool.body_store.{field}");
+    let set = |f: &Option<String>| f.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let named = |f: &Option<String>| f.is_some();
+
+    match o.provider {
+        ObjectProvider::S3 => {
+            if !set(&o.bucket) {
+                v.push(at("bucket"), "is required for provider: s3");
+            }
+            for (field, value) in [
+                ("container", &o.container),
+                ("account", &o.account),
+                ("access_key", &o.access_key),
+            ] {
+                if named(value) {
+                    v.push(at(field), "is an Azure field; provider is s3");
+                }
+            }
+            if set(&o.access_key_id) != set(&o.secret_access_key) {
+                v.push(
+                    at("access_key_id"),
+                    "and secret_access_key must be given together, or neither",
+                );
+            }
+        }
+        ObjectProvider::Azure => {
+            if !set(&o.container) {
+                v.push(at("container"), "is required for provider: azure");
+            }
+            if !set(&o.account) {
+                v.push(at("account"), "is required for provider: azure");
+            }
+            for (field, value) in [
+                ("bucket", &o.bucket),
+                ("region", &o.region),
+                ("access_key_id", &o.access_key_id),
+                ("secret_access_key", &o.secret_access_key),
+            ] {
+                if named(value) {
+                    v.push(at(field), "is an S3 field; provider is azure");
+                }
+            }
+        }
+    }
+
+    if let Some(prefix) = &o.prefix {
+        if prefix.starts_with('/') {
+            v.push(at("prefix"), "must not start with '/'");
+        }
+    }
+    if let Some(endpoint) = &o.endpoint {
+        if let Some(problem) = http_url_problem(endpoint, o.allow_http) {
+            v.push(at("endpoint"), problem);
+        }
+    }
+    if o.timeout.is_zero() {
+        v.push(at("timeout"), "must be greater than zero");
+    }
+}
+
+/// Why `url` is not an absolute `https://` URL with a host (or `http://`, when
+/// `allow_http`), or `None` if it is. Never echoes the URL.
+fn http_url_problem(url: &str, allow_http: bool) -> Option<&'static str> {
+    let Ok(uri) = url.parse::<axum::http::Uri>() else {
+        return Some("is not a valid URL");
+    };
+    if uri.host().is_none_or(str::is_empty) {
+        return Some("has no host");
+    }
+    match uri.scheme_str().map(str::to_ascii_lowercase).as_deref() {
+        Some("https") => None,
+        Some("http") if allow_http => None,
+        Some("http") => {
+            Some("is http://; bodies and addresses are mail, so set allow_http: true to permit it")
+        }
+        _ => Some("must be an http:// or https:// URL"),
+    }
 }
 
 /// Why `upstream` is not `scheme://host[:port][/prefix]`, or `None` if it is.
@@ -1727,13 +2043,33 @@ fn check_rate(ramp: &Ramp, route: &Route, client_data: Duration, v: &mut Violati
         );
     }
 
-    if rate.on_limit == super::OnLimit::Wait {
-        v.push(
-            at("on_limit"),
-            "is `wait`, which needs `delivery: spool` — deferred delivery, which is not built. \
-             In synchronous mode a rate limit can only steer (or hold a client for max_wait); \
-             use on_limit: steer (D-111)",
-        );
+    let spooling = ramp.delivery == Delivery::Spool;
+    if rate.on_limit == OnLimit::Wait {
+        if !spooling {
+            v.push(
+                at("on_limit"),
+                format!(
+                    "is `wait`, which needs `delivery: spool` on ramp '{}' — a synchronous \
+                     ramp has no later to defer a message to, so its rate limit can only \
+                     steer (or hold a client for max_wait); use on_limit: steer (D-118)",
+                    ramp.name
+                ),
+            );
+        }
+        // D-097's `auto` share exists only because Simmer could not wait, and a
+        // fixed share turns away messages a waiting route would have queued.
+        // Both at once means two rules disagreeing about the same message.
+        if route
+            .warmup
+            .as_ref()
+            .is_some_and(|w| w.schedule.has_partial_ramp())
+        {
+            v.push(
+                at("on_limit"),
+                "is `wait` on a route with a warmup.schedule.share; a share turns messages \
+                 away that the wait would have deferred. Use one or the other (D-118)",
+            );
+        }
     }
 
     let max_wait = rate.max_wait();
@@ -1757,7 +2093,9 @@ fn check_rate(ramp: &Ramp, route: &Route, client_data: Duration, v: &mut Violati
     // formula the shipped defaults (10 + 30×8 + 120 = 370s) already exceed the
     // default 300s data timeout, which O-21 asks about (D-115).
     let budget = crate::quota::downstream_budget(route, 1);
-    if !max_wait.is_zero() && max_wait + budget >= client_data {
+    // A spooling ramp never holds its client for the downstream, so the budget
+    // rule is not its business; `max_wait` there is warned about instead.
+    if !spooling && !max_wait.is_zero() && max_wait + budget >= client_data {
         v.push(
             at("max_wait"),
             format!(
@@ -2177,7 +2515,16 @@ fn check_chain(ramp: &Ramp, chain: &[String], path: &str, v: &mut ViolationList)
             .is_some_and(|w| w.schedule.has_partial_ramp());
         // D-111, for D-091's reason: a rate-limited route turns messages away
         // while it still has headroom, and last in a chain each is a `451`.
-        if route.rate.is_some() && i == chain.len() - 1 {
+        // D-118: on a spooling ramp a waiting route does not turn messages away
+        // inside their hold; it defers them. Past the hold the message expires
+        // into the dead-letter list rather than becoming a 451, so last in the
+        // chain is exactly where "pace this, nothing else" puts it.
+        let defers = ramp.delivery == Delivery::Spool
+            && route
+                .rate
+                .as_ref()
+                .is_some_and(|r| r.on_limit == OnLimit::Wait);
+        if route.rate.is_some() && !defers && i == chain.len() - 1 {
             v.push(
                 path,
                 format!(

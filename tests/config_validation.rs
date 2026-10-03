@@ -2436,12 +2436,16 @@ fn rejects_bad_rate_values_and_reports_them_all() {
 }
 
 #[test]
-fn rejects_on_limit_wait_until_spool_mode_exists() {
+fn rejects_on_limit_wait_on_a_synchronous_ramp() {
     rejected_for(
         &with_rate("      per_hour: 10\n      on_limit: wait\n"),
         "needs `delivery: spool`",
     );
     load(&with_rate("      per_hour: 10\n      on_limit: steer\n")).expect("steer is valid");
+    load(&spooling(&with_rate(
+        "      per_hour: 10\n      on_limit: wait\n",
+    )))
+    .expect("wait is valid on a spooling ramp (D-118)");
 }
 
 /// [`with_rate`], with downstream timeouts on the warming route small enough
@@ -2525,4 +2529,241 @@ fn warns_for_each_day_the_rate_cannot_reach_the_cap() {
     assert!(warnings
         .iter()
         .all(|w| w.contains("ramp 'main', route 'warming'")));
+}
+
+// -- §4.2: spool (§7.7, D-116..D-121) ----------------------------------------
+
+/// A `spool:` block on a volume under a fresh temporary directory. The
+/// directory is leaked so the path outlives the call; it is small and per test.
+fn spool_block(extra: &str) -> String {
+    let dir = tempfile::tempdir().expect("tempdir").keep();
+    format!(
+        "spool:\n  body_store: {{ kind: volume, path: \"{}/bodies\" }}\n{extra}",
+        dir.display()
+    )
+}
+
+/// `yaml` with a volume spool block and the `main` ramp spooling.
+fn spooling(yaml: &str) -> String {
+    spooling_with(yaml, "")
+}
+
+fn spooling_with(yaml: &str, extra: &str) -> String {
+    with_spool_block(yaml, &spool_block(extra)).replace(" main:\n", " main:\n  delivery: spool\n")
+}
+
+fn with_spool_block(yaml: &str, block: &str) -> String {
+    yaml.replace(
+        "default_ramp: main\n",
+        &format!("{block}default_ramp: main\n"),
+    )
+}
+
+#[test]
+fn accepts_a_spooling_ramp_and_defaults_the_spool() {
+    let cfg = load(&spooling(BASE)).expect("valid");
+    let sp = cfg.spool.as_ref().expect("spool block");
+    assert_eq!(sp.max_hold.as_secs(), 6 * 3600);
+    assert!(!sp.cross_day_boundary);
+    assert_eq!(sp.retry.initial.as_secs(), 60);
+    assert_eq!(sp.retry.max.as_secs(), 1800);
+    assert_eq!(sp.max_messages, 10_000);
+    assert_eq!(sp.dispatch.batch, 32);
+    assert!(sp.dead_letter.keep_body.is_zero());
+    assert_eq!(
+        cfg.ramp("main").expect("main").delivery,
+        config::Delivery::Spool
+    );
+    // And without one, every ramp is synchronous.
+    let plain = load(BASE).expect("valid");
+    assert!(plain.spool.is_none());
+    assert_eq!(
+        plain.ramp("main").expect("main").delivery,
+        config::Delivery::Synchronous
+    );
+}
+
+#[test]
+fn rejects_delivery_spool_without_a_spool_block() {
+    rejected_for(
+        &BASE.replace(" main:\n", " main:\n  delivery: spool\n"),
+        "no top-level `spool:` block",
+    );
+}
+
+#[test]
+fn warns_about_a_spool_block_no_ramp_uses() {
+    let cfg = load(&with_spool_block(BASE, &spool_block(""))).expect("a warning only");
+    let warnings: Vec<String> = config::validate::warnings(&cfg)
+        .into_iter()
+        .map(|w| w.to_string())
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("no ramp has `delivery: spool`")),
+        "{warnings:#?}"
+    );
+}
+
+#[test]
+fn rejects_bad_spool_values_and_reports_them_all() {
+    let yaml = spooling_with(
+        BASE,
+        "  max_hold: 0s\n  retry: { initial: 10m, max: 5m, factor: 0.5 }\n  max_messages: 0\n  \
+         max_bytes: 1024\n  dispatch: { poll_interval: 0s, batch: 0 }\n  dead_letter: \
+         { retention: 1h, keep_body: 2h, webhook: { url: \"ftp://x\", timeout: 0s } }\n",
+    );
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            for path in [
+                "spool.max_hold",
+                "spool.retry.initial",
+                "spool.retry.factor",
+                "spool.max_messages",
+                "spool.max_bytes",
+                "spool.dispatch.poll_interval",
+                "spool.dispatch.batch",
+                "spool.dead_letter.keep_body",
+                "spool.dead_letter.webhook.url",
+                "spool.dead_letter.webhook.timeout",
+            ] {
+                assert!(v.mentions(path), "missing {path}. Got:\n{v}");
+            }
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_a_relative_or_unwritable_volume_path() {
+    let yaml = spooling(BASE);
+    let relative = regex_replace_path(&yaml, "relative/bodies");
+    rejected_for(&relative, "is not an absolute path");
+    let missing = regex_replace_path(&yaml, "/nonexistent-simmer-parent/x/bodies");
+    rejected_for(&missing, "neither does its parent");
+}
+
+/// `yaml` with the spool volume path replaced by `path`.
+fn regex_replace_path(yaml: &str, path: &str) -> String {
+    let start =
+        yaml.find("kind: volume, path: \"").expect("volume") + "kind: volume, path: \"".len();
+    let end = start + yaml[start..].find('"').expect("closing quote");
+    format!("{}{path}{}", &yaml[..start], &yaml[end..])
+}
+
+/// `BASE` spooling into an object store described by `fields` (flow-mapping
+/// body, without braces).
+fn object_store(fields: &str) -> String {
+    with_spool_block(
+        BASE,
+        &format!("spool:\n  body_store: {{ kind: object, {fields} }}\n"),
+    )
+    .replace(" main:\n", " main:\n  delivery: spool\n")
+}
+
+#[test]
+fn checks_object_store_fields_against_the_provider() {
+    load(&object_store("provider: s3, bucket: b, region: eu-west-2")).expect("s3 is valid");
+    load(&object_store(
+        "provider: azure, container: c, account: a, access_key: k",
+    ))
+    .expect("azure is valid");
+
+    rejected_for(
+        &object_store("provider: s3"),
+        "is required for provider: s3",
+    );
+    rejected_for(
+        &object_store("provider: s3, bucket: b, container: c"),
+        "is an Azure field",
+    );
+    rejected_for(
+        &object_store("provider: s3, bucket: b, access_key_id: k"),
+        "must be given together",
+    );
+    rejected_for(
+        &object_store("provider: azure, account: a"),
+        "is required for provider: azure",
+    );
+    rejected_for(
+        &object_store("provider: azure, container: c, account: a, bucket: b"),
+        "is an S3 field",
+    );
+    rejected_for(
+        &object_store("provider: s3, bucket: b, endpoint: \"http://minio:9000\""),
+        "set allow_http: true",
+    );
+    load(&object_store(
+        "provider: s3, bucket: b, endpoint: \"http://minio:9000\", allow_http: true",
+    ))
+    .expect("http with allow_http");
+}
+
+#[test]
+fn object_store_and_webhook_debug_redact_their_secrets() {
+    let yaml = object_store(
+        "provider: s3, bucket: b, access_key_id: AKIAEXAMPLE, secret_access_key: s3cr3t-value",
+    )
+    .replace(
+        " }\ndefault_ramp",
+        " }\n  dead_letter: { webhook: { url: \"https://hooks.test/T0K3N\" } }\ndefault_ramp",
+    );
+    let cfg = load(&yaml).expect("valid");
+    let sp = cfg.spool.as_ref().expect("spool");
+    assert!(
+        sp.dead_letter.webhook.is_some(),
+        "the fixture must carry a webhook"
+    );
+    let debug = format!("{cfg:?}");
+    assert!(debug.contains("AKIAEXAMPLE"), "the key id is not a secret");
+    assert!(!debug.contains("s3cr3t-value"), "{debug}");
+    assert!(!debug.contains("T0K3N"), "{debug}");
+    assert!(debug.contains("<redacted>"), "{debug}");
+}
+
+#[test]
+fn rejects_wait_alongside_a_share() {
+    let yaml = spooling(&with_rate("      per_hour: 10\n      on_limit: wait\n")).replace(
+        "        default: [50, 100, 200]\n",
+        "        default: [50, 100, 200]\n        share: [0.5]\n",
+    );
+    rejected_for(&yaml, "a share turns messages away");
+}
+
+#[test]
+fn a_waiting_route_may_be_last_in_a_spooling_chain() {
+    let yaml = with_rate("      per_hour: 10\n      on_limit: wait\n")
+        .replace("chain: [warming, overflow]", "chain: [warming]");
+    load(&spooling(&yaml)).expect("D-118: a waiting route defers rather than refusing");
+    // Steering on the same ramp still has nowhere to go.
+    let steer =
+        with_rate("      per_hour: 10\n").replace("chain: [warming, overflow]", "chain: [warming]");
+    match load(&spooling(&steer)) {
+        Err(LoadError::Invalid(v)) => {
+            assert!(
+                v.mentions("has a rate limit and is last in the chain"),
+                "{v}"
+            )
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_spooling_ramp_is_exempt_from_the_client_budget_and_warns_on_max_wait() {
+    // With the default downstream timeouts any nonzero max_wait overruns the
+    // 300s data timeout on a synchronous ramp. A spooling ramp holds no client.
+    let yaml = spooling(&with_rate("      per_hour: 10\n      max_wait: 1s\n"));
+    let cfg = load(&yaml).expect("no client is held");
+    let warnings: Vec<String> = config::validate::warnings(&cfg)
+        .into_iter()
+        .map(|w| w.to_string())
+        .collect();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("rate.max_wait") && w.contains("no effect")),
+        "{warnings:#?}"
+    );
 }

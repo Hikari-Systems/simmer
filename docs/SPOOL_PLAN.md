@@ -22,7 +22,7 @@ per-phase approval. Every decision still gets a `DECISIONS.md` entry.
 | --- | --- | --- |
 | 0 — groundwork, defect fixes | **Done**, pushed | `ca60b07`…`be0f6f3`, D-101–D-110, O-19 |
 | 1 — per-segment rate limits, synchronous mode | **Done**, pushed | `476d6e4`…`29c94ed`, D-111–D-115, O-20, O-21 |
-| 2 — the spool core + spec amendment | **Started**: config types only (see §1.1) | — |
+| 2 — the spool core + spec amendment | **In progress**: config types, §4.2 checks, redaction, D-116–D-121 (see §1.1) | — |
 | 3 — operating the spool: control plane, metrics, drain, PR | Not started | — |
 
 ### 1.1 Exactly what Phase 2 has so far
@@ -36,7 +36,9 @@ There is one commit of work in progress, in `src/config/mod.rs` only. It compile
 - `DeadLetter { retention 7d, keep_body 0s, webhook }`, `Webhook { url, timeout 5s, include_addresses true }`.
 - The `OnLimit::Wait` doc comment now describes spool semantics.
 
-**Must fix before anything else in Phase 2:**
+**Step 0 — done (2026-10-03, second session).** All three items below are fixed: `check_spool` in `config/validate.rs`, redacting `Debug` on `ObjectStoreConfig` and `Webhook`, and D-116–D-121 written. D-118 also lets a waiting route be last in a spooling chain and exempts spooling ramps from D-115's client-budget rule.
+
+**Were to be fixed before anything else in Phase 2:**
 
 1. **Unvalidated opt-in.** `delivery: spool` currently loads and is silently ignored, so the ramp stays synchronous. Add the §4.2 checks in §3.2 below *before* any other Phase 2 work, so that a config cannot claim to spool without spooling.
 2. **Credentials leak through `Debug`.** `ObjectStoreConfig` derives `Debug`, but it holds `secret_access_key` and `access_key`. Give it a redacting `Debug`, as the rest of `config/mod.rs` does for credentials, and do the same for `Webhook.url` if it can carry a token.
@@ -89,7 +91,7 @@ spool:
   cross_day_boundary: false
   retry: { initial: 1m, max: 30m, factor: 2.0 }     # full jitter
   max_messages: 10000
-  max_bytes: 1GiB
+  max_bytes: 1073741824   # bytes, like capture.max_queue_bytes
   dispatch: { poll_interval: 1s, batch: 32 }
   dead_letter:
     retention: 7d

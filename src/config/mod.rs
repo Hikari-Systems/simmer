@@ -1128,7 +1128,10 @@ pub enum BodyStoreConfig {
 
 /// §7.7's object store. Which fields apply depends on `provider`; §4.2 says
 /// which are missing or out of place.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Debug` is by hand: two of these fields are secrets, and the whole `Config`
+/// is logged at startup.
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectStoreConfig {
     pub provider: ObjectProvider,
@@ -1168,6 +1171,31 @@ pub struct ObjectStoreConfig {
         deserialize_with = "duration::deserialize"
     )]
     pub timeout: Duration,
+}
+
+/// `Some("<redacted>")` for a present secret, so a log still says whether one
+/// was given.
+fn redacted(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<redacted>")
+}
+
+impl fmt::Debug for ObjectStoreConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObjectStoreConfig")
+            .field("provider", &self.provider)
+            .field("bucket", &self.bucket)
+            .field("container", &self.container)
+            .field("account", &self.account)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &redacted(&self.secret_access_key))
+            .field("access_key", &redacted(&self.access_key))
+            .field("allow_http", &self.allow_http)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 fn default_object_timeout() -> Duration {
@@ -1283,7 +1311,10 @@ fn default_dead_retention() -> Duration {
 }
 
 /// A POST per dead letter. Its failure never changes the message's state.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Debug` is by hand: a webhook URL routinely carries its token in the path or
+/// the query.
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Webhook {
     pub url: String,
@@ -1296,6 +1327,16 @@ pub struct Webhook {
     /// the ids and the verdict only.
     #[serde(default = "default_true")]
     pub include_addresses: bool,
+}
+
+impl fmt::Debug for Webhook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Webhook")
+            .field("url", &"<redacted>")
+            .field("timeout", &self.timeout)
+            .field("include_addresses", &self.include_addresses)
+            .finish()
+    }
 }
 
 fn default_webhook_timeout() -> Duration {

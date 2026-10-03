@@ -5286,7 +5286,7 @@ can tell a forced booking from an ordinary one.
 
 **Validation** (`check_rate`, accumulating): exactly one of `schedule`/`per_hour`;
 every value ≥ 1 and arrays non-empty; override keys name a group; `burst ≥ 1`;
-`on_limit: wait` refused with "needs `delivery: spool`, which is not built";
+`on_limit: wait` refused with "needs `delivery: spool`, which is not built" (since D-118, refused only on a synchronous ramp);
 `max_wait ≤ 60s`; and a **nonzero** `max_wait` plus `quota::downstream_budget`
 (the expiry's budget without its margin, now its own function) must be below
 `server.timeouts.data` — see D-115 for why zero is exempt. `check_chain` refuses
@@ -5386,6 +5386,163 @@ README's "Timeout budget" (which counts connect + command + data = 160 s) and th
 expiry's more conservative count. Whether the shipped defaults should change, or
 which budget the README means, is O-21.
 
+
+### D-116 — The spool: opt-in per ramp, state in the database, bodies in a body store, delivery at least once
+
+> Phase 2 of the segment rate-limit/spool plan, 2026-10-03. Settled by the
+> spec's author (Q1, Q5, O-20): a spool, **disabled by default**, enabled per
+> ramp, with `SPEC.md` amended on this branch. `docs/SPOOL_PLAN.md` is the plan.
+
+**What.** A top-level `spool:` block says where messages are kept; a ramp opts
+in with `delivery: spool` (default `synchronous`). A spooling ramp answers the
+client `250 2.0.0 queued as <id>` once the message is durably stored, and a
+dispatcher delivers it later through the same walk, rewrite and relay a
+synchronous ramp uses. With no `spool:` block and no ramp opting in, behaviour is
+byte for byte what it was: no table read, no body store opened, no task started.
+
+**Why it does not contradict rule #1 for anyone else.** The rule protected
+three things, and each survives for a synchronous ramp unchanged: nothing is
+persisted, the client hears the downstream's verdict, and a `5xx` reaches the
+client only from a downstream that said it. A spooling ramp trades the second
+for pacing, explicitly, per ramp. The capture (D-085) stays write-only and is
+never read by the spool; the spool is its own module, `src/spool/`.
+
+**Shape.**
+- **State lives in the database** (`spool_message`), **bodies in the body store**
+  (D-117). A 25 MiB body in a row would share the pool with §7.4's reservations,
+  write twice through WAL/TOAST, and bloat every backup.
+- **Claims are short row locks plus a lease**; no lock is held across a
+  delivery. Completion is fenced by a `lease_token` and is **one transaction
+  with the quota commit**, so a message is never counted delivered without its
+  quota, nor its quota spent twice for one claim.
+- **Delivery is at least once**: §10.2's ambiguous final dot is still ambiguous,
+  and a lease that expires mid-delivery lets another instance try. Counted
+  (`simmer_ambiguous_delivery_total`, `simmer_spool_lease_lost_total`), never
+  hidden.
+- **Safe for several instances** sharing one database and one body store (Q5);
+  a single instance remains the *supported* deployment.
+
+**Validation (built first, so a config cannot claim to spool without
+spooling).** Before §4.2 knew about it, `delivery: spool` loaded and was
+ignored, so an operator believing their clients were answered at once would
+have had them held for the downstream instead. Now `check_spool` refuses
+`delivery: spool` without a `spool:` block, and checks every spool value
+together (zero durations, `retry.factor < 1` or non-finite, `retry.initial >
+retry.max`, `max_messages: 0`, `max_bytes` below `server.max_message_bytes`,
+`dispatch.batch: 0`, `keep_body > retention`, a webhook that is not an
+`http(s)` URL). A `spool:` block no ramp uses is a warning.
+
+### D-117 — The body store: a volume or an object store; atomicity by ordering; the orphan sweeper
+
+> Phase 2, 2026-10-03. Settled by the spec's author: both, by configuration.
+
+**Kinds.** `body_store: {kind: volume, path}` — one file per message, on a
+local disk (one instance) or a shared volume (several). `{kind: object,
+provider: s3 | azure, …}` — an S3-compatible bucket or an Azure Blob container.
+
+**Atomicity comes from ordering, not co-location.** Accept is `put` the body
+(durable) → insert the row → reply `250`. A crash between the first two leaves
+a body no row names, which the **orphan sweeper** deletes after ten minutes; a
+crash after the second leaves a deliverable message. Nothing can leave a row
+without a body. Delivery and dead-letter delete the body *after* the row's
+transaction commits, best effort, with the sweeper as the backstop.
+
+**The volume.** A body is written to a temporary name, `fsync`ed, renamed, and
+the directory `fsync`ed; files `0600` in a `0700` directory. §4.2 probes the
+path by writing, `fsync`ing, reading back and deleting a file — the whole of
+what the store does — and refuses to start if any step fails. A relative path,
+a path that is not a directory, and a missing parent are refused too. On a
+network filesystem the probe proves writability, not that `fsync` is durable,
+and a startup `WARN` says so.
+
+**The object store.** §4.2 checks the fields against the provider: S3 needs
+`bucket` and takes no Azure field; Azure needs `container` and `account` and
+takes no S3 field; S3 credentials come both or neither; an `http://` endpoint
+needs `allow_http: true` (bodies are mail); a `prefix` may not start with `/`.
+`ObjectStoreConfig` and the dead-letter `Webhook` have a **redacting `Debug`**,
+as every other credential in `config/mod.rs` does: the whole `Config` is logged
+at startup, and before this the S3 secret and the Azure key would have been in
+it. The webhook URL is redacted whole because a token in its path or query is
+the common case, and §4.2 never echoes it in a violation either. The crate (or
+hand-written signer) is a later entry.
+
+### D-118 — `on_limit: wait` defers on a spooling ramp; the deferred attempt reuses its booked slot
+
+> Phase 2, 2026-10-03. Replaces D-111's blanket refusal of `wait`.
+
+**Rule.** `on_limit: wait` is valid on a route of a `delivery: spool` ramp and
+refused on any other. In the dispatcher's walk, a route whose next slot falls
+inside the message's remaining hold **books it** and returns `Deferred { until
+}`: no reservation is taken, the booking (`booked_route`, `booked_group`,
+`booked_tat`) is stored on the row, and `next_attempt_at` becomes the slot. The
+deferred attempt **uses that slot** rather than booking again; if its
+reservation then finds no headroom, the slot is given back (only if last,
+D-114) and the walk continues under its normal rules. A slot past the hold
+steers, exactly like `steer`.
+
+**Three §4.2 consequences.**
+- `wait` together with `warmup.schedule.share` on one route is refused. A share
+  turns away messages a waiting route would have deferred, and D-097's `auto`
+  exists only because Simmer could not wait — two rules would disagree about
+  the same message.
+- A route with `on_limit: wait` on a spooling ramp **may be last in a chain**
+  (D-111's rule otherwise forbids a rate-limited route there). It does not turn
+  a message away inside its hold; past the hold the message expires into the
+  dead-letter list (D-120), not into a `451`, and admission (D-119) refuses a
+  message whose forecast wait already exceeds its hold. "Pace this and nothing
+  else" is a chain of one waiting route. A *steering* rate-limited route last in
+  a chain is still refused on a spooling ramp.
+- On a spooling ramp `max_wait` describes nothing — the client has already been
+  answered — so the D-115 client-budget rule does not apply there and a nonzero
+  `max_wait` is a warning. O-21 is unaffected: no client is held longer.
+
+### D-119 — Admission bounds and the lane forecast; a refusal is always `451 4.7.1`
+
+> Phase 2, 2026-10-03.
+
+At the final dot of a spooling ramp's message, after every synchronous check
+(ACL, strict senders, malformed `From:`, smuggling, size, ramp selection),
+admission refuses with `451 4.7.1` — never a `5xx`, since a full spool is
+Simmer's transient state (§14.1) — when:
+- `max_messages` or `max_bytes` would be exceeded; or
+- the **forecast wait** for the message's lane `(ramp, domain_group)` exceeds its
+  hold. The forecast is the lane's queued messages divided by today's hourly
+  rate of the first rate-limited route in the resolved chain for that group; an
+  unrated route earlier in the chain makes it 0.
+
+§4.2 requires `max_bytes ≥ server.max_message_bytes`, so the largest permitted
+message is always admissible into an empty spool.
+
+### D-120 — The dead-letter list and its webhook
+
+> Phase 2, 2026-10-03. Settled by the spec's author (Q2): Simmer never composes
+> mail, so no DSN.
+
+A message that can never be delivered — a downstream `5xx` (`rejected`) or a
+hold that ran out (`expired`) — becomes a **dead letter**: its row is kept in
+state `dead` for `dead_letter.retention` (default 7 days) with the reason, the
+last code and text, the attempt count and the times, and is counted in
+`simmer_spool_dead_total{ramp,reason}`. An optional webhook receives one POST per
+dead letter (id, ramp, domain group, route, code, text, attempts, received_at,
+and the envelope addresses unless `include_addresses: false`), with a bounded
+timeout; its failure is logged and counted and never changes the message's
+state. An `http://` webhook with `include_addresses: true` is a startup warning.
+`GET /spool/dead` (Phase 3) lists entries **without** addresses, for §9's
+no-`@` rule.
+
+### D-121 — Q2 against Q6: the body is deleted at dead-letter by default; `keep_body` retains it
+
+> Phase 2, 2026-10-03. Put to the spec's author, who did not override the
+> default.
+
+Q6 says bodies are deleted promptly on delivery *or dead-letter*; Q2's list is
+more useful if an entry can be retried, which needs the body. The default
+follows Q6: the body goes at dead-letter, and the entry is metadata only.
+`dead_letter.keep_body: <duration>` (default `0s`) keeps the body that long, and
+`POST /spool/dead/{id}/retry` requeues an entry only while its body is
+retained. §4.2 refuses `keep_body` longer than `retention`: a body outliving the
+row that names it would be a plaintext message nothing points at until the
+orphan sweeper found it.
 
 ## Still open — to settle at the start of the phase that needs them
 
