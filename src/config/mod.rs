@@ -57,6 +57,13 @@ pub struct Config {
     #[serde(default)]
     pub telemetry: Option<Telemetry>,
 
+    /// §7.7 (D-116) — the optional spool. Absent means no body store, no
+    /// tables read, no dispatcher: every ramp is synchronous, byte for byte as
+    /// before. A ramp opts in with `delivery: spool`, which §4.2 refuses
+    /// without this block.
+    #[serde(default)]
+    pub spool: Option<Spool>,
+
     /// §7.3. The spec defaults this to "the `google` group's domains", which
     /// couples behaviour to a configuration-defined group name that may not
     /// exist. Made explicit instead — see `DECISIONS.md` D-010.
@@ -119,7 +126,34 @@ pub struct Ramp {
     #[serde(default)]
     pub exhausted_chain_reply: ExhaustedChainReply,
 
+    /// §7.7 (D-116) — `synchronous` (the default, and everything before it)
+    /// relays at the final dot and maps the downstream's verdict back.
+    /// `spool` stores the message, answers `250 queued`, and delivers it
+    /// later, at least once. Needs the top-level `spool:` block (§4.2).
+    #[serde(default)]
+    pub delivery: Delivery,
+
     pub routes: Vec<Route>,
+}
+
+/// §7.7 (D-116) — how a ramp's messages leave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    /// Relay at the final dot, as Simmer always has. Nothing is persisted.
+    #[default]
+    Synchronous,
+    /// Accept into the spool and deliver from the dispatcher (§7.7).
+    Spool,
+}
+
+impl Delivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Delivery::Synchronous => "synchronous",
+            Delivery::Spool => "spool",
+        }
+    }
 }
 
 /// `ramps:` — a YAML mapping from name to [`Ramp`], kept in document order so
@@ -765,7 +799,8 @@ pub struct RateLimit {
     /// How many messages may go back to back after an idle spell. Default 1.
     #[serde(default = "RateLimit::default_burst")]
     pub burst: i64,
-    /// What a message that finds no slot does. Only `steer` is built.
+    /// What a message that finds no slot does: `steer` (default), or `wait`
+    /// on a spooling ramp's route (D-118).
     #[serde(default)]
     pub on_limit: OnLimit,
     /// How long a session may hold its client waiting for a booked slot.
@@ -816,7 +851,12 @@ pub enum OnLimit {
     /// Skip the route for this message, as §7.3 does; the next link takes it.
     #[default]
     Steer,
-    /// Reserved for a deferred-delivery mode that is not built. §4.2 refuses it.
+    /// §7.6 (D-118) — on a route of a `delivery: spool` ramp only: a message
+    /// whose slot is later than now books it anyway, if it falls inside the
+    /// message's remaining hold, and is deferred to it with no reservation
+    /// taken. Past the hold it steers like `steer`. §4.2 refuses it anywhere
+    /// else, and alongside `warmup.schedule.share` (D-097 exists only because
+    /// Simmer could not wait).
     Wait,
 }
 
@@ -1017,6 +1057,253 @@ fn default_upstream_response() -> Duration {
 }
 fn default_idle() -> Duration {
     Duration::from_secs(60)
+}
+
+// ---------------------------------------------------------------------------
+// spool (§7.7, D-116)
+// ---------------------------------------------------------------------------
+
+/// §7.7 (D-116) — the spool: where `delivery: spool` ramps keep a message
+/// between `250 queued` and its delivery.
+///
+/// State lives in the database (`spool_message`), bodies in `body_store`.
+/// Every key but `body_store` has a default; presence is the opt-in, and a
+/// ramp must still say `delivery: spool` for anything to be spooled.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Spool {
+    pub body_store: BodyStoreConfig,
+
+    /// The longest a message may wait between acceptance and delivery. Past
+    /// it the message is dead-lettered `expired` (Q4, default 6h).
+    #[serde(
+        default = "default_spool_max_hold",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub max_hold: Duration,
+
+    /// Q4: by default a message's hold also ends at the next day boundary of
+    /// the first route in its chain, so yesterday's backlog never spends
+    /// tomorrow's cap. `true` lifts that; `max_hold` still applies.
+    #[serde(default)]
+    pub cross_day_boundary: bool,
+
+    #[serde(default)]
+    pub retry: SpoolRetry,
+
+    /// Admission bounds (D-119). Above either, a new message is answered
+    /// `451 4.7.1` and nothing is stored.
+    #[serde(default = "default_spool_max_messages")]
+    pub max_messages: u64,
+    #[serde(default = "default_spool_max_bytes")]
+    pub max_bytes: u64,
+
+    #[serde(default)]
+    pub dispatch: SpoolDispatch,
+
+    #[serde(default)]
+    pub dead_letter: DeadLetter,
+}
+
+fn default_spool_max_hold() -> Duration {
+    Duration::from_secs(6 * 3600)
+}
+fn default_spool_max_messages() -> u64 {
+    10_000
+}
+fn default_spool_max_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
+/// Where spooled bodies are kept (§7.7, D-117).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BodyStoreConfig {
+    /// One file per message under `path`: a local disk, or a shared volume
+    /// for several instances.
+    Volume { path: String },
+    /// An S3-compatible bucket or an Azure Blob container.
+    Object(Box<ObjectStoreConfig>),
+}
+
+/// §7.7's object store. Which fields apply depends on `provider`; §4.2 says
+/// which are missing or out of place.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObjectStoreConfig {
+    pub provider: ObjectProvider,
+    /// S3: the bucket.
+    #[serde(default)]
+    pub bucket: Option<String>,
+    /// Azure: the container.
+    #[serde(default)]
+    pub container: Option<String>,
+    /// Azure: the storage account.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Key prefix inside the bucket or container, without a leading `/`.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// S3: the region. Default `us-east-1`.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// An S3-compatible or Azure-compatible endpoint, for anything that is not
+    /// the provider's own public one.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// S3 credentials. Both or neither; `${ENV_VAR}` is the place for them.
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+    /// Azure shared key.
+    #[serde(default)]
+    pub access_key: Option<String>,
+    /// Permit a plain `http://` endpoint. Off: bodies are mail.
+    #[serde(default)]
+    pub allow_http: bool,
+    /// Per-request bound. Default 30s.
+    #[serde(
+        default = "default_object_timeout",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub timeout: Duration,
+}
+
+fn default_object_timeout() -> Duration {
+    Duration::from_secs(30)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectProvider {
+    S3,
+    Azure,
+}
+
+/// The retry schedule: exponential from `initial` to `max`, with full jitter.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpoolRetry {
+    #[serde(
+        default = "default_retry_initial",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub initial: Duration,
+    #[serde(
+        default = "default_retry_max",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub max: Duration,
+    #[serde(default = "default_retry_factor")]
+    pub factor: f64,
+}
+
+impl Default for SpoolRetry {
+    fn default() -> Self {
+        Self {
+            initial: default_retry_initial(),
+            max: default_retry_max(),
+            factor: default_retry_factor(),
+        }
+    }
+}
+
+fn default_retry_initial() -> Duration {
+    Duration::from_secs(60)
+}
+fn default_retry_max() -> Duration {
+    Duration::from_secs(30 * 60)
+}
+fn default_retry_factor() -> f64 {
+    2.0
+}
+
+/// How often the dispatcher looks for due messages, and how many it claims.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpoolDispatch {
+    #[serde(
+        default = "default_poll_interval",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub poll_interval: Duration,
+    /// Also the bound on attempts in flight at once.
+    #[serde(default = "default_dispatch_batch")]
+    pub batch: u32,
+}
+
+impl Default for SpoolDispatch {
+    fn default() -> Self {
+        Self {
+            poll_interval: default_poll_interval(),
+            batch: default_dispatch_batch(),
+        }
+    }
+}
+
+fn default_poll_interval() -> Duration {
+    Duration::from_secs(1)
+}
+fn default_dispatch_batch() -> u32 {
+    32
+}
+
+/// Q2 — what becomes of a message that can never be delivered (D-120).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeadLetter {
+    /// How long a dead letter's metadata is kept. Default 7d.
+    #[serde(
+        default = "default_dead_retention",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub retention: Duration,
+    /// Q6 against Q2 (D-121): the body is deleted at dead-letter by default,
+    /// which makes the entry unretryable. A nonzero value keeps it that long
+    /// so `POST /spool/dead/{id}/retry` can requeue it.
+    #[serde(default, deserialize_with = "duration::deserialize")]
+    pub keep_body: Duration,
+    #[serde(default)]
+    pub webhook: Option<Webhook>,
+}
+
+impl Default for DeadLetter {
+    fn default() -> Self {
+        Self {
+            retention: default_dead_retention(),
+            keep_body: Duration::ZERO,
+            webhook: None,
+        }
+    }
+}
+
+fn default_dead_retention() -> Duration {
+    Duration::from_secs(7 * 86_400)
+}
+
+/// A POST per dead letter. Its failure never changes the message's state.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Webhook {
+    pub url: String,
+    #[serde(
+        default = "default_webhook_timeout",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub timeout: Duration,
+    /// Include `mail_from` and `rcpt` in the payload. Default true; false sends
+    /// the ids and the verdict only.
+    #[serde(default = "default_true")]
+    pub include_addresses: bool,
+}
+
+fn default_webhook_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,10 +1512,6 @@ impl fmt::Debug for Telemetry {
             .field("timeout", &self.timeout)
             .finish()
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// `telemetry.metrics_temporality` (D-126).
