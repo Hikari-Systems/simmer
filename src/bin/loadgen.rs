@@ -22,7 +22,8 @@
 //! no new flags the bytes it sends are exactly what they were, which matters: the
 //! §1.1 cutover test compares two runs byte for byte.
 //!
-//! **As a load generator:** `--concurrency`, an open-loop `--rate`, a
+//! **As a load generator:** `--concurrency`, an open-loop `--rate` (spaced
+//! evenly, as a Poisson process, or in bursts — `--arrival`), a
 //! `--duration`, size distributions, TLS modes, persistent sessions, and a
 //! streaming `--jsonl` record of every message. For load, `--stamp` gives every
 //! message a test id — in the RCPT local part and an `X-Test-Id` header — which
@@ -94,6 +95,65 @@ enum Behaviour {
     NoLf,
 }
 
+/// `--arrival` (SOAK.md §20): when open-loop sessions are started.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Arrival {
+    Uniform,
+    Poisson,
+    Bursts { on: Duration, off: Duration },
+}
+
+impl Arrival {
+    fn parse(s: &str) -> Self {
+        match s {
+            "uniform" => Arrival::Uniform,
+            "poisson" => Arrival::Poisson,
+            _ => {
+                let parts: Vec<&str> = s.split(':').collect();
+                match parts.as_slice() {
+                    ["bursts", on, off] => {
+                        let (on, off) = (parse_duration(on), parse_duration(off));
+                        assert!(
+                            !on.is_zero(),
+                            "--arrival bursts: the on window must be nonzero"
+                        );
+                        Arrival::Bursts { on, off }
+                    }
+                    _ => panic!("--arrival is uniform, poisson or bursts:<on>:<off>, not {s:?}"),
+                }
+            }
+        }
+    }
+
+    /// The start of session `k`, as an offset from the run's start, given the
+    /// previous one's position on the pattern's own clock (`virtual_s`, which
+    /// this advances). `interval` is the mean gap `--rate` asks for.
+    ///
+    /// Bursts run Poisson arrivals on a clock that only ticks during `on`
+    /// windows, at the rate that keeps the overall mean: `interval × on /
+    /// (on + off)` apart. Mapped back to real time, every `on` seconds of that
+    /// clock is followed by `off` seconds in which nothing starts.
+    fn next(self, virtual_s: &mut f64, interval: f64, seed: u64, k: u64) -> f64 {
+        let exp = |mean: f64| -(1.0 - unit(seed, k, 4)).ln() * mean;
+        match self {
+            Arrival::Uniform => {
+                *virtual_s += interval;
+                *virtual_s
+            }
+            Arrival::Poisson => {
+                *virtual_s += exp(interval);
+                *virtual_s
+            }
+            Arrival::Bursts { on, off } => {
+                let (on, off) = (on.as_secs_f64(), off.as_secs_f64());
+                *virtual_s += exp(interval * on / (on + off));
+                let cycles = (*virtual_s / on).floor();
+                cycles * (on + off) + (*virtual_s - cycles * on)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Args {
     host: String,
@@ -104,6 +164,11 @@ struct Args {
     duration: Option<Duration>,
     concurrency: usize,
     rate: Option<f64>,
+    /// How open-loop sessions are spaced around `--rate`: `uniform` (the
+    /// default, and every tier before this flag), `poisson`, or
+    /// `bursts:<on>:<off>` — Poisson arrivals packed into `on` windows with
+    /// `off` of silence between, the average still `--rate`.
+    arrival: Arrival,
     per_session: usize,
     from: String,
     from_header: String,
@@ -157,6 +222,7 @@ fn args() -> Args {
         duration: None,
         concurrency: 1,
         rate: None,
+        arrival: Arrival::Uniform,
         per_session: 1,
         from: "jane@oldbrand.com".to_string(),
         from_header: "Jane Smith <jane@oldbrand.com>".to_string(),
@@ -235,6 +301,7 @@ fn args() -> Args {
             "--duration" => a.duration = Some(parse_duration(&value())),
             "--concurrency" => a.concurrency = value().parse().expect("--concurrency"),
             "--rate" => a.rate = Some(value().parse().expect("--rate")),
+            "--arrival" => a.arrival = Arrival::parse(&value()),
             "--per-session" => a.per_session = value().parse().expect("--per-session"),
             "--from" => a.from = value(),
             "--from-header" => a.from_header = value(),
@@ -390,7 +457,10 @@ async fn main() {
         let sessions_per_sec = rate / args.per_session as f64;
         let interval = Duration::from_secs_f64(1.0 / sessions_per_sec);
         let permits = Arc::new(Semaphore::new(args.concurrency));
-        let mut next = tokio::time::Instant::now();
+        let origin = tokio::time::Instant::now();
+        let mut next = origin;
+        let mut virtual_s = 0.0;
+        let mut k = 0u64;
         let mut running = tokio::task::JoinSet::new();
         loop {
             if !time_left() {
@@ -402,7 +472,14 @@ async fn main() {
             }
             tokio::time::sleep_until(next).await;
             let scheduled = next.into_std();
-            next += interval;
+            k += 1;
+            next = origin
+                + Duration::from_secs_f64(args.arrival.next(
+                    &mut virtual_s,
+                    interval.as_secs_f64(),
+                    args.seed,
+                    k,
+                ));
             let permit = Arc::clone(&permits)
                 .acquire_owned()
                 .await
@@ -1201,4 +1278,58 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod arrival_tests {
+    use super::*;
+
+    fn starts(a: Arrival, n: u64) -> Vec<f64> {
+        let mut v = 0.0;
+        (1..=n).map(|k| a.next(&mut v, 0.1, 7, k)).collect()
+    }
+
+    #[test]
+    fn every_pattern_keeps_the_mean_rate() {
+        // 10 sessions/s for 20,000 sessions: ~2,000 s whatever the pattern —
+        // give or take, for bursts, one cycle: the last start lands somewhere
+        // in an `on` window, before that cycle's silence.
+        let bursts = Arrival::Bursts {
+            on: Duration::from_secs(30),
+            off: Duration::from_secs(90),
+        };
+        for (a, tolerance) in [
+            (Arrival::Uniform, 1.0),
+            (Arrival::Poisson, 60.0),
+            (bursts, 120.0),
+        ] {
+            let last = *starts(a, 20_000).last().unwrap();
+            assert!((last - 2000.0).abs() < tolerance, "{a:?} ended at {last}");
+        }
+    }
+
+    #[test]
+    fn bursts_leave_their_off_windows_empty_and_pack_the_on_windows() {
+        let a = Arrival::Bursts {
+            on: Duration::from_secs(30),
+            off: Duration::from_secs(90),
+        };
+        let t = starts(a, 20_000);
+        assert!(
+            t.iter().all(|s| s % 120.0 < 30.0),
+            "a start fell in an off window"
+        );
+        // The on windows run at four times the mean: ~40/s.
+        let first_window = t.iter().filter(|s| **s < 30.0).count();
+        assert!((1000..=1400).contains(&first_window), "{first_window}");
+    }
+
+    #[test]
+    fn poisson_gaps_vary_and_uniform_ones_do_not() {
+        let gaps = |t: Vec<f64>| t.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>();
+        let p = gaps(starts(Arrival::Poisson, 1000));
+        assert!(p.iter().any(|g| *g < 0.02) && p.iter().any(|g| *g > 0.3));
+        let u = gaps(starts(Arrival::Uniform, 1000));
+        assert!(u.iter().all(|g| (g - 0.1).abs() < 1e-9));
+    }
 }

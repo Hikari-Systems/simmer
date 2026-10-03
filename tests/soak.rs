@@ -24,6 +24,7 @@
 //!
 //! | | |
 //! |---|---|
+//! | `SOAK_ARRIVAL=poisson` or `bursts:30s:90s` | the main streams' arrivals randomised or packed into bursts around the same mean rate (loadgen `--arrival`). Unset is even spacing |
 //! | `SOAK_BACKEND=mssql` | D-084's SQL Server build, against SQL Server **Express** (`test/compose/mssql.yml`) |
 //! | `SIMMER_CAPTURE=on` | D-085's capture, on **both** instances (`test/compose/capture.yml` and the generated config twin). **Not soak-specific** — the same variable captures any tier whose config comes from the config volume |
 //! | `SIMMER_OTEL=on` | D-126's OTLP export to the dummy collector, on **both** instances (`test/compose/otel.yml` and the generated `.otel` twin). Not soak-specific either, and it combines with the capture |
@@ -338,8 +339,9 @@ fn soak_run() {
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(10.0);
     eprintln!(
-        "soak: {:.0} minutes at {rate} msg/s per instance, sampling every {}s",
+        "soak: {:.0} minutes at {rate} msg/s per instance ({} arrivals), sampling every {}s",
         duration.as_secs_f64() / 60.0,
+        std::env::var("SOAK_ARRIVAL").unwrap_or_else(|_| "uniform".to_string()),
         SAMPLE_EVERY.as_secs()
     );
     eprintln!("soak: {}", stack_name());
@@ -445,6 +447,11 @@ fn soak_run() {
                 format!("soak-{instance}"),
                 "--rate".to_string(),
                 rate.to_string(),
+                // SOAK.md §20: `SOAK_ARRIVAL` reshapes the arrivals around the
+                // same mean — `poisson`, or `bursts:<on>:<off>` — for the rate
+                // limit's sake. Unset is today's even spacing.
+                "--arrival".to_string(),
+                std::env::var("SOAK_ARRIVAL").unwrap_or_else(|_| "uniform".to_string()),
                 "--duration".to_string(),
                 seconds.clone(),
                 "--concurrency".to_string(),
