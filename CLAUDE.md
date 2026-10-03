@@ -243,7 +243,9 @@ src/config/interpolate.rs  ${ENV_VAR}, over the parsed tree not the raw text
 src/routing/sender_match.rs  §5.4 — wildcard precedence, first match wins
 src/smtp/session.rs      §5.2 state machine; PIPELINING means never drop buffered input —
                          except behind STARTTLS, where it means drop the connection (D-070)
-src/smtp/mod.rs          §5.1 listeners: one per port, one shared session bound and CIDR check
+src/smtp/mod.rs          §5.1 listeners: one per port, one shared session bound and CIDR check.
+                         Sessions live in a JoinSet so §10.4 can await relays before
+                         releasing (D-106); the hard stop is observed in `session.rs`
 src/smtp/tls.rs          §5.1's certificate. `load` is what §4.2 AND the listener call —
                          one function, so they cannot disagree. notAfter read by hand
 src/smtp/acl.rs          §5.3's grants (D-071). Refuses; never routes

@@ -81,6 +81,14 @@ impl Budget {
     }
 }
 
+/// D-106 — a route's downstream conversation as D-081 bounds it: the pool wait
+/// and the connect (each the route's `connect`), a command and the data stage.
+/// What §10.4's shutdown allows a relay in flight before it is cut.
+pub fn conversation_budget(route: &Route) -> Duration {
+    let b = Budget::for_route(route);
+    b.connect * 2 + b.command + b.data
+}
+
 /// A parsed downstream reply.
 #[derive(Debug, Clone)]
 struct WireReply {

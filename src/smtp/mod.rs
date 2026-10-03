@@ -13,11 +13,13 @@ pub mod session;
 pub mod tls;
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ipnet::IpNet;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tracing::Instrument;
 
@@ -240,13 +242,17 @@ impl Listener {
         Arc::clone(&self.shared.sessions)
     }
 
-    /// Accept on every listener until `stop_accepting` fires.
+    /// Accept on every listener until `stop_accepting` fires, then hand back the
+    /// sessions still running.
     ///
     /// §10.4 is two-phase and both phases are needed: `stop_accepting` breaks the
     /// accept loops, and `hard_stop` — fired by the caller once the grace period
-    /// has elapsed — is what makes a session still running at that point emit
-    /// `421` rather than being cut off mid-reply.
-    pub async fn serve(self, stop_accepting: Shutdown, hard_stop: Shutdown) {
+    /// has elapsed — makes a session still running at that point emit `421` at
+    /// its next wait on the client rather than being cut off mid-reply. A relay
+    /// in flight is not cut (D-106): the caller awaits [`Sessions::finish`]
+    /// before releasing what is still outstanding.
+    pub async fn serve(self, stop_accepting: Shutdown, hard_stop: Shutdown) -> Sessions {
+        let sessions = Arc::new(Mutex::new(JoinSet::new()));
         let loops: Vec<_> = self
             .bound
             .into_iter()
@@ -257,6 +263,7 @@ impl Listener {
                     Arc::clone(&self.shared),
                     stop_accepting.clone(),
                     hard_stop.clone(),
+                    Arc::clone(&sessions),
                 ))
             })
             .collect();
@@ -265,8 +272,60 @@ impl Listener {
         }
 
         tracing::info!("SMTP listeners stopped accepting");
+        let set = std::mem::take(&mut *sessions.lock().expect("not poisoned"));
+        Sessions(set)
     }
 }
+
+/// The session tasks still running once the listeners have stopped (D-106).
+#[derive(Default)]
+pub struct Sessions(JoinSet<()>);
+
+impl Sessions {
+    /// How many sessions are still running.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Wait for every session to end, for at most `bound`; abort any still
+    /// running after it and wait for the aborts to land. Returns how many were
+    /// aborted.
+    ///
+    /// Call after `hard_stop`: by then every session waiting on its client has
+    /// answered `421`, and what is left are relays in flight, each bounded by
+    /// its route's downstream budget. Once this returns no session task exists,
+    /// so nothing can commit or release a reservation concurrently with
+    /// `relay::release_outstanding` — the race this replaced (D-106).
+    pub async fn finish(mut self, bound: Duration) -> usize {
+        let all = async { while self.0.join_next().await.is_some() {} };
+        if tokio::time::timeout(bound, all).await.is_ok() {
+            return 0;
+        }
+        let aborted = self.0.len();
+        self.0.abort_all();
+        while self.0.join_next().await.is_some() {}
+        aborted
+    }
+}
+
+/// D-106 — how long §10.4 waits, after the hard stop, for relays still in
+/// flight: the slowest route's downstream budget as D-081 counts it — the pool
+/// wait and the connect (each `connect`), one command and the data stage —
+/// plus a margin for the quota statements either side. Not a tuning knob.
+pub fn relay_drain_bound(cfg: &crate::config::Config) -> Duration {
+    cfg.all_routes()
+        .map(crate::downstream::client::conversation_budget)
+        .max()
+        .unwrap_or_default()
+        + RELAY_DRAIN_MARGIN
+}
+
+/// See [`relay_drain_bound`].
+const RELAY_DRAIN_MARGIN: Duration = Duration::from_secs(5);
 
 async fn accept_loop(
     listener: TcpListener,
@@ -274,6 +333,7 @@ async fn accept_loop(
     shared: Arc<Shared>,
     stop_accepting: Shutdown,
     hard_stop: Shutdown,
+    sessions: Arc<Mutex<JoinSet<()>>>,
 ) {
     loop {
         let accepted = tokio::select! {
@@ -310,7 +370,11 @@ async fn accept_loop(
             username = tracing::field::Empty,
             end = tracing::field::Empty,
         );
-        tokio::spawn(
+        // D-106 — kept, so §10.4 can wait for it. Finished sessions are reaped
+        // as the next one starts, so the set holds only live ones.
+        let mut set = sessions.lock().expect("not poisoned");
+        while set.try_join_next().is_some() {}
+        set.spawn(
             async move {
                 handle(stream, peer, policy, shared, hard_stop).await;
             }
@@ -372,7 +436,13 @@ async fn handle(
     // holds a slot for no longer than an idle plaintext one would.
     let stream = if implicit {
         let acceptor = policy.acceptor.clone().expect("Listener::bind checked");
-        match tokio::time::timeout(cfg.server.timeouts.command, acceptor.accept(stream)).await {
+        let handshake = tokio::select! {
+            biased;
+            // D-106 — a wait on the client; nothing to say a 421 on yet.
+            _ = hard_stop.cancelled() => return,
+            h = tokio::time::timeout(cfg.server.timeouts.command, acceptor.accept(stream)) => h,
+        };
+        match handshake {
             Ok(Ok(tls)) => Stream::Tls(Box::new(tls.into())),
             Ok(Err(e)) => {
                 tracing::info!(peer = %peer, error = %e, "implicit TLS handshake failed");
@@ -397,25 +467,22 @@ async fn handle(
         Arc::clone(&shared.acl),
         shared.verifies.clone(),
         policy,
+        hard_stop,
     );
 
-    let end = tokio::select! {
-        // §8.4 / §4.1 `timeouts.session` is enforced inside `run`, at every wait
-        // on the client and never mid-relay (D-081). It was a timer here, and
-        // when it fired during a relay it dropped the relay future: the client
-        // was told `421` for a message the downstream had stored, and the
-        // reservation was never resolved (F2).
-        end = session.run() => end,
-
-        // §10.4 — "Sessions exceeding the grace period receive 421 and are
-        // closed." Cutting the socket instead would leave a client unable to
-        // tell a refusal from a network fault, and it would retry either way;
-        // the 421 at least says which.
-        _ = hard_stop.cancelled() => {
-            session.refuse(&reply::shutting_down()).await;
-            session::SessionEnd::ShuttingDown
-        }
-    };
+    // §8.4 / §4.1 `timeouts.session` is enforced inside `run`, at every wait on
+    // the client and never mid-relay (D-081). It was a timer here, and when it
+    // fired during a relay it dropped the relay future: the client was told
+    // `421` for a message the downstream had stored, and the reservation was
+    // never resolved (F2).
+    //
+    // §10.4's hard stop had the same shape here until D-106, and the same
+    // defect: fired after the final dot, it dropped the relay, the client heard
+    // `421`, and its retry delivered the message twice. It is now observed where
+    // the deadline is — inside `run`, at every wait on the client — so a
+    // session answers "421 4.3.2 service shutting down" there, and a relay in
+    // flight finishes and its client gets the real reply first.
+    let end = session.run().await;
 
     session.close().await;
     tracing::Span::current().record("end", tracing::field::debug(end));

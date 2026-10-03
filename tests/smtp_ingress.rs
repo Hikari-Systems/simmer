@@ -1193,3 +1193,101 @@ async fn a_client_that_never_reads_does_not_hold_its_session_permit_forever() {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// §10.4 — the hard stop (D-106)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_hard_stop_answers_an_idle_session_421() {
+    let (_d, mut simmer) = stack("").await;
+    let mut c = simmer.connect().await;
+    c.hello().await;
+
+    assert_eq!(simmer.hard_stop().await, 0, "nothing needed aborting");
+    let r = c.read_reply().await;
+    assert_eq!(r.code, 421, "{r:?}");
+    assert!(r.contains("4.3.2"), "{r:?}");
+    assert!(c.is_closed().await);
+}
+
+#[tokio::test]
+async fn the_hard_stop_lets_a_relay_past_the_final_dot_finish() {
+    // §10.2's window, reached by §10.4 instead of by a timeout. The downstream
+    // has the message and answers late. Before D-106 the hard stop dropped the
+    // relay future: the client heard 421, retried, and the recipient got two
+    // copies — and `release_outstanding` then released a reservation for a
+    // message the downstream had accepted, racing the session's own commit.
+    let quota = std::sync::Arc::new(support::GrantAllQuota::new());
+    let down = FakeDownstream::start(Script::with(|s| {
+        s.final_dot_delay = Some(std::time::Duration::from_millis(800))
+    }))
+    .await;
+    let mut simmer = Simmer::start_with_quota(&config_for(down.addr, ""), quota.clone()).await;
+
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    assert_eq!(c.command("MAIL FROM:<jane@oldbrand.com>").await.code, 250);
+    assert_eq!(c.command("RCPT TO:<bob@gmail.com>").await.code, 250);
+    assert_eq!(c.command("DATA").await.code, 354);
+    c.send_raw(format!("{BODY}.\r\n").as_bytes()).await;
+
+    // Wait until the downstream holds the message: the relay is now past the dot.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while down.messages().is_empty() {
+        assert!(
+            std::time::Instant::now() < until,
+            "the relay never reached the dot"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        simmer.hard_stop().await,
+        0,
+        "the relay finished inside the bound"
+    );
+
+    let r = c.read_reply().await;
+    assert_eq!(
+        r.code, 250,
+        "the real reply, not a 421 the client would retry: {r:?}"
+    );
+    let r = c.read_reply().await;
+    assert_eq!(r.code, 421, "then the stop: {r:?}");
+    assert!(r.contains("4.3.2"), "{r:?}");
+
+    assert_eq!(down.messages().len(), 1);
+    assert_eq!(
+        quota.committed().len(),
+        1,
+        "the session committed its own reservation"
+    );
+    assert!(
+        quota.released().is_empty(),
+        "and shutdown released nothing behind it: {:?}",
+        quota.released()
+    );
+    assert!(simmer.registry.is_empty());
+}
+
+#[tokio::test]
+async fn the_hard_stop_cuts_a_data_transfer_without_relaying() {
+    let (down, mut simmer) = stack("").await;
+    let mut c = simmer.connect().await;
+    c.hello().await;
+    assert_eq!(c.command("MAIL FROM:<jane@oldbrand.com>").await.code, 250);
+    assert_eq!(c.command("RCPT TO:<bob@gmail.com>").await.code, 250);
+    assert_eq!(c.command("DATA").await.code, 354);
+    c.send_raw(b"From: jane@oldbrand.com\r\nSubject: half\r\n")
+        .await;
+
+    simmer.hard_stop().await;
+    let r = c.read_reply().await;
+    assert_eq!(r.code, 421, "{r:?}");
+    assert!(r.contains("4.3.2"), "{r:?}");
+    assert!(
+        down.last().is_none(),
+        "an unfinished message is never relayed"
+    );
+}

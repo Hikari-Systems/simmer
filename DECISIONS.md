@@ -5040,6 +5040,65 @@ thread runtime; the cancel runs on another task before any waiter exists). It
 failed before the change.
 
 
+### D-106 — §10.4's hard stop is observed at waits on the client, and shutdown waits for relays before releasing
+
+> Phase 0 (groundwork) of the segment rate-limit/spool plan, 2026-10-03.
+
+**The problem.** Two defects in the same shutdown path, both D-081's shape:
+
+1. `smtp::handle` raced `session.run()` against `hard_stop.cancelled()` in a
+   `select!`. A hard stop that fired after the final dot dropped the relay future:
+   the downstream had (or was about to have) the message, the client was told
+   nothing or `421`, and its retry delivered it twice (§10.2). It is exactly F2,
+   which D-081 fixed for `timeouts.session` and left in place here ("§10.4's hard
+   stop stays").
+2. `main` called `relay::release_outstanding` straight after the hard stop, while
+   session tasks — never awaited — could still be inside `reserve_relay_commit`.
+   A session committing its reservation and shutdown releasing the same one raced;
+   the outcome was whichever statement the store ran second.
+
+**The rule.**
+- The hard stop is a field of the `Session` and is observed exactly where D-081's
+  deadline is: the command read, the `DATA` read, the `STARTTLS` handshake, the
+  D-079 verify-permit wait, and (in `handle`) the implicit-TLS handshake. At a
+  read it answers `421 4.3.2 service shutting down` and ends the session; a
+  half-received `DATA` is never relayed. Checked before each read as well as
+  raced against it, so a pipelined command is not served after the stop. A relay
+  in flight is never cut: it finishes, its client gets the real reply, the session
+  resolves its own reservation, and the next read answers `421`.
+- Session tasks are spawned into a `JoinSet` (finished ones reaped at each
+  accept). `Listener::serve` returns them as `smtp::Sessions` once accepting has
+  stopped, and `main` awaits `Sessions::finish(relay_drain_bound)` **before**
+  `release_outstanding`. Nothing can commit or release concurrently with it.
+- `relay_drain_bound` is the slowest route's D-081 conversation budget
+  (`2 × connect + command + data`, `client::conversation_budget`) plus 5 s for
+  the quota statements. Past it the remaining tasks are aborted — the old
+  behaviour, now the exception — logged at WARN, and their reservations are what
+  `release_outstanding` releases.
+
+**What it costs.** Shutdown can now take the grace period plus one relay's
+budget: 30 s + 175 s at the shipped defaults (10 + 10 + 30 + 120 + 5). An
+orchestrator that kills at 30 s (Docker's default `stop_grace_period` is 10 s)
+cuts it short either way; what changed is that inside whatever time the
+orchestrator gives, no relay is dropped by Simmer itself. This is a divergence in
+emphasis from §10.4's "Sessions exceeding the grace period receive 421 and are
+closed": a session in a relay receives its real reply first and the `421` after.
+Not put to the author as a question, because the alternative is §10.2's duplicate,
+which §10.2 and D-081 already decided against.
+
+**Not changed:** the link proxy's own hard stop (§5.7, D-083), which carries no
+mail and cuts requests as the spec says.
+
+**Tested** (`tests/smtp_ingress.rs`, through `support::Simmer::hard_stop`, which
+runs `main`'s order):
+- `the_hard_stop_lets_a_relay_past_the_final_dot_finish` — the downstream holds the
+  message and answers 800 ms late; the client gets `250` then `421`, one message,
+  one commit, **no release**, empty registry. Fails (connection closed without a
+  reply) with the old `select!` restored.
+- `the_hard_stop_answers_an_idle_session_421`.
+- `the_hard_stop_cuts_a_data_transfer_without_relaying`.
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

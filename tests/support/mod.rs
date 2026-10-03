@@ -483,6 +483,9 @@ pub struct Simmer {
     pub registry: ReservationRegistry,
     stop: smtp::Shutdown,
     hard: smtp::Shutdown,
+    /// The listener task; it resolves to the sessions still running (D-106).
+    serve: Option<tokio::task::JoinHandle<smtp::Sessions>>,
+    engine: Engine,
     /// D-085 — held so the writer's channel stays open for the life of the
     /// fixture, and closes when it is dropped.
     _capture: Option<simmer::capture::Capture>,
@@ -551,7 +554,9 @@ impl Simmer {
             capture: capture.clone(),
         };
 
-        let listener = smtp::Listener::bind(engine).await.expect("bind simmer");
+        let listener = smtp::Listener::bind(engine.clone())
+            .await
+            .expect("bind simmer");
         let addr = listener.local_addr().expect("addr");
         let addrs = listener
             .local_addrs()
@@ -562,7 +567,7 @@ impl Simmer {
 
         let stop = smtp::Shutdown::new();
         let hard = smtp::Shutdown::new();
-        tokio::spawn(listener.serve(stop.clone(), hard.clone()));
+        let serve = tokio::spawn(listener.serve(stop.clone(), hard.clone()));
 
         Simmer {
             addr,
@@ -571,12 +576,33 @@ impl Simmer {
             registry,
             stop,
             hard,
+            serve: Some(serve),
+            engine,
             _capture: capture,
         }
     }
 
     pub async fn connect(&self) -> Client {
         Client::connect(self.addr).await
+    }
+
+    /// §10.4 past its grace period, in `main.rs`'s order: stop accepting, fire
+    /// the hard stop, wait (bounded) for the sessions still running, then
+    /// release whatever is outstanding. Returns how many sessions were aborted.
+    pub async fn hard_stop(&mut self) -> usize {
+        self.stop.cancel();
+        self.hard.cancel();
+        let sessions = self
+            .serve
+            .take()
+            .expect("hard_stop called once")
+            .await
+            .expect("the listener task");
+        let aborted = sessions
+            .finish(smtp::relay_drain_bound(&self.engine.config))
+            .await;
+        simmer::relay::release_outstanding(&self.engine).await;
+        aborted
     }
 }
 

@@ -553,9 +553,36 @@ async fn run() -> anyhow::Result<()> {
     }
     hard_stop.cancel();
 
-    // §10.4 — "release any reservations still outstanding". Sessions cut off by
-    // the grace period never reached their own commit-or-release, so this is the
-    // only thing that gives their headroom back before `expires_at`.
+    // D-106 — the hard stop is observed at waits on the client, never mid-relay,
+    // so a session in the downstream conversation finishes it: its client gets
+    // the real reply, and the session commits or releases its own reservation.
+    // Wait for that, bounded by the slowest route's downstream budget, BEFORE
+    // releasing what is outstanding — releasing while sessions still run raced
+    // their own commit. Past the bound a session is aborted, which is the old
+    // behaviour, and its reservation is released below.
+    let in_flight = match smtp_task.await {
+        Ok(sessions) => sessions,
+        Err(e) => {
+            error!("SMTP listener task failed: {e}");
+            smtp::Sessions::default()
+        }
+    };
+    if !in_flight.is_empty() {
+        info!(
+            sessions = in_flight.len(),
+            "waiting for relays in flight to finish"
+        );
+    }
+    let aborted = in_flight.finish(smtp::relay_drain_bound(&config)).await;
+    if aborted > 0 {
+        warn!(
+            aborted,
+            "relays still in flight past the shutdown bound were cut; their reservations are released"
+        );
+    }
+
+    // §10.4 — "release any reservations still outstanding". After D-106 no
+    // session task exists by here, so only an aborted one can have left any.
     relay::release_outstanding(&engine).await;
 
     // §10.4 — "drain pools". Last of the four clauses, and in this order for a
@@ -564,7 +591,6 @@ async fn run() -> anyhow::Result<()> {
     // connections a drain is for.
     pools.drain().await;
 
-    let _ = smtp_task.await;
     if let Some(task) = link_proxy_task {
         let _ = task.await;
     }

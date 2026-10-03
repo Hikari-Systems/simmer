@@ -44,7 +44,7 @@ use super::auth::{self, AuthState, AuthStep, Verifier, VerifyLimit};
 use super::buffer::{self, MessageBuffer};
 use super::command::{self, Command, MailParams, ParseError};
 use super::reply::{self, Reply};
-use super::Policy;
+use super::{Policy, Shutdown};
 use crate::capture;
 use crate::config::{CaptureOnError, Config, IngressAuth, IngressTls};
 use crate::downstream::stream::Stream;
@@ -111,6 +111,9 @@ pub struct Session {
     /// has entered. Held so that `username` can be recorded on it from inside a
     /// transaction, where it is not the current span.
     session_span: Span,
+    /// §10.4's hard stop (D-106). Observed exactly where the deadline is — at
+    /// waits on the client — and never mid-relay.
+    hard_stop: Shutdown,
 }
 
 /// State between `MAIL FROM` and the final dot.
@@ -140,6 +143,7 @@ pub enum SessionEnd {
 }
 
 impl Session {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         io: Stream,
         peer: SocketAddr,
@@ -148,6 +152,7 @@ impl Session {
         acl: Arc<Acl>,
         verifies: VerifyLimit,
         policy: Arc<Policy>,
+        hard_stop: Shutdown,
     ) -> Self {
         // D-081 — from here, the instant the caller's timer used to start.
         let deadline = tokio::time::Instant::now() + engine.config.server.timeouts.session;
@@ -168,6 +173,7 @@ impl Session {
             correlation_id: new_correlation_id(),
             deadline,
             session_span: Span::current(),
+            hard_stop,
         }
     }
 
@@ -231,6 +237,10 @@ impl Session {
                 Err(ReadError::SessionTimeout) => {
                     let _ = self.send(&reply::session_timeout()).await;
                     return SessionEnd::SessionTimeout;
+                }
+                Err(ReadError::ShuttingDown) => {
+                    let _ = self.send(&reply::shutting_down()).await;
+                    return SessionEnd::ShuttingDown;
                 }
                 Err(ReadError::TooLong) => {
                     // Do not close: RFC 2920 wants us to stay in step. But the
@@ -417,7 +427,15 @@ impl Session {
         // A handshake that the deadline cuts short ends like one that timed out:
         // there is no channel left to report on either way.
         let (timeout, _) = self.budget(self.config().server.timeouts.command);
-        match tokio::time::timeout(timeout, acceptor.accept(tcp)).await {
+        let stop = self.hard_stop.clone();
+        let handshake = tokio::select! {
+            biased;
+            // D-106 — a wait on the client like any other. There is no channel
+            // to send a 421 on mid-handshake, so the close is the answer.
+            _ = stop.cancelled() => return Ok(Some(SessionEnd::ShuttingDown)),
+            h = tokio::time::timeout(timeout, acceptor.accept(tcp)) => h,
+        };
+        match handshake {
             Ok(Ok(tls)) => *self.io.get_mut() = Stream::Tls(Box::new(tls.into())),
             // There is no channel left to report on: the TLS layer owns the
             // socket and the handshake did not produce one. The close is the
@@ -534,7 +552,16 @@ impl Session {
                 // D-081 — waiting for a permit is not waiting on the client, but
                 // it is a wait inside the session, so the deadline bounds it too.
                 let (left, _) = self.budget(Duration::MAX);
-                let Ok(permit) = tokio::time::timeout(left, self.verifies.acquire()).await else {
+                let stop = self.hard_stop.clone();
+                let waited = tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => {
+                        let _ = self.send(&reply::shutting_down()).await;
+                        return Ok(Some(SessionEnd::ShuttingDown));
+                    }
+                    w = tokio::time::timeout(left, self.verifies.acquire()) => w,
+                };
+                let Ok(permit) = waited else {
                     let _ = self.send(&reply::session_timeout()).await;
                     return Ok(Some(SessionEnd::SessionTimeout));
                 };
@@ -784,6 +811,13 @@ impl Session {
                 let _ = self.send(&r).await;
                 return Ok(Some(SessionEnd::SessionTimeout));
             }
+            Err(DataError::ShuttingDown) => {
+                // D-106 — the message was never complete, so nothing was
+                // relayed and nothing was reserved.
+                self.reset_transaction();
+                let _ = self.send(&reply::shutting_down()).await;
+                return Ok(Some(SessionEnd::ShuttingDown));
+            }
             Err(DataError::AmbiguousTerminator) => {
                 // Nothing was relayed. The session is still in step — the real
                 // terminator has been read — so it carries on, exactly as it
@@ -982,6 +1016,13 @@ impl Session {
     // -- I/O -------------------------------------------------------------
 
     async fn read_command_line(&mut self) -> Result<Option<String>, ReadError> {
+        // D-106 — §10.4's hard stop, observed here and not mid-relay. Checked
+        // before the read for the same reason the zero deadline is below: a
+        // pipelined command would otherwise be served after the stop.
+        if self.hard_stop.is_cancelled() {
+            return Err(ReadError::ShuttingDown);
+        }
+        let stop = self.hard_stop.clone();
         let (timeout, by_deadline) = self.budget(self.config().server.timeouts.command);
         // `timeout` polls the read once before looking at the clock, so a command
         // already pipelined would still be served with no time left. Without this,
@@ -1013,7 +1054,13 @@ impl Session {
             (n, line)
         };
 
-        match tokio::time::timeout(timeout, read).await {
+        let read = tokio::time::timeout(timeout, read);
+        let read = tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Err(ReadError::ShuttingDown),
+            r = read => r,
+        };
+        match read {
             Err(_) if by_deadline => Err(ReadError::SessionTimeout),
             Err(_) => Err(ReadError::Timeout),
             Ok((Err(_), _)) => Err(ReadError::Io),
@@ -1046,7 +1093,16 @@ impl Session {
         if by_deadline && budget.is_zero() {
             return Err(DataError::SessionTimeout);
         }
-        match tokio::time::timeout(budget, self.read_data_inner(body, max)).await {
+        if self.hard_stop.is_cancelled() {
+            return Err(DataError::ShuttingDown);
+        }
+        let stop = self.hard_stop.clone();
+        let read = tokio::select! {
+            biased;
+            _ = stop.cancelled() => return Err(DataError::ShuttingDown),
+            r = tokio::time::timeout(budget, self.read_data_inner(body, max)) => r,
+        };
+        match read {
             Err(_) if by_deadline => Err(DataError::SessionTimeout),
             Err(_) => Err(DataError::Timeout),
             Ok(r) => r,
@@ -1227,13 +1283,6 @@ impl Session {
         self.reset_transaction();
     }
 
-    /// Emit a final reply on a session being terminated from outside — §10.4's
-    /// hard stop. Best-effort: the peer may already be gone, and there is nothing
-    /// useful to do if it is. Bounded like every other write, by [`Self::send`].
-    pub async fn refuse(&mut self, r: &Reply) {
-        let _ = self.send(r).await;
-    }
-
     /// End the connection cleanly: TLS `close_notify` then a TCP FIN on an
     /// encrypted session, a FIN on a plaintext one.
     ///
@@ -1251,6 +1300,8 @@ enum ReadError {
     Timeout,
     /// D-081 — the session's deadline ran out, not the command budget.
     SessionTimeout,
+    /// D-106 — §10.4's hard stop fired while waiting on the client.
+    ShuttingDown,
     TooLong,
     Io,
 }
@@ -1259,6 +1310,8 @@ enum DataError {
     Timeout,
     /// D-081 — the session's deadline ran out, not the data budget.
     SessionTimeout,
+    /// D-106 — §10.4's hard stop fired mid-transfer.
+    ShuttingDown,
     TooLarge,
     /// A `.` line with a bare LF beside it, or a `<CR>.<CR>`: an end-of-data
     /// marker that other SMTP implementations may honour and this one does not.
