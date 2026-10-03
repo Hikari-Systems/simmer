@@ -47,7 +47,7 @@ jobs:
       - name: Run the acceptance suite
         run: cargo test --locked --test acceptance -- --ignored --test-threads=1
 
-      # D-101 — the OTLP export, read back from the dummy collector's files.
+      # D-126 — the OTLP export, read back from the dummy collector's files.
       - name: Run the telemetry export test
         run: cargo test --locked --test telemetry_compose -- --ignored --test-threads=1
 

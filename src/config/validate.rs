@@ -287,7 +287,7 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
         });
     }
 
-    // D-101 — vendor API keys travel as gRPC metadata. Over a plain `http://`
+    // D-126 — vendor API keys travel as gRPC metadata. Over a plain `http://`
     // endpoint off this host they cross the network in the clear: the link
     // proxy's `http://` warning, for the same reason. Loopback is a sidecar
     // collector, which is the usual and safe arrangement.
@@ -306,9 +306,9 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
             out.push(Warning {
                 path: "telemetry".to_string(),
                 message: if t.enabled {
-                    "is present but its endpoint is empty, so nothing is exported (D-101)"
+                    "is present but its endpoint is empty, so nothing is exported (D-126)"
                 } else {
-                    "is present but enabled: false, so nothing is exported (D-101)"
+                    "is present but enabled: false, so nothing is exported (D-126)"
                 }
                 .to_string(),
             });
@@ -945,7 +945,7 @@ fn upstream_problem(upstream: &str) -> Option<&'static str> {
 /// §5.1's certificate, loaded exactly as the listener will load it, so a file
 /// that is missing, unreadable, unparseable or paired with the wrong key is a
 /// startup violation rather than a listener that fails its first handshake.
-/// §4.2 for §9.6's `telemetry` (D-101). Checked whenever the block is present,
+/// §4.2 for §9.6's `telemetry` (D-126). Checked whenever the block is present,
 /// enabled or not, so switching it on later surfaces nothing new — the
 /// `admin.metrics` precedent. Only the endpoint is skipped when empty, since
 /// empty is how it is switched off.

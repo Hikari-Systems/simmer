@@ -528,7 +528,7 @@ Microsoft's new `mssql-tds` 0.1.0 was taken.
 `hash-password` had only ever compiled because sqlx's feature unification
 switched on `rand_core/getrandom`.
 
-## 10. D-101 — the OTLP telemetry export
+## 10. D-126 — the OTLP telemetry export
 
 Compiled into both builds and used only when `telemetry:` is configured.
 Checked against crates.io 2026-10-02. `cargo deny check` passes for both

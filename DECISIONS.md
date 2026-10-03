@@ -4677,7 +4677,7 @@ jail, and a dry run against a deployed instance.
 
 ## OpenTelemetry (2026-10-02)
 
-### D-101 — Optional OTLP export of traces, metrics and logs (§9.6)
+### D-126 — Optional OTLP export of traces, metrics and logs (§9.6)
 
 > **Settled 2026-10-02 by the spec's author, who asked for it; the spec is
 > amended (§4.1, §4.2, §9.1, §9.5, §9.6 (new), §12.1, §12.3, §13).** The

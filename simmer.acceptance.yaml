@@ -80,7 +80,7 @@ logging:
 # below lives inside one; a second ramp would repeat the whole block under its
 # own name, sharing nothing with this one. `default_ramp` is the ramp a message
 # is routed in when neither its listener nor an X-Simmer-Ramp header names one.
-# §9.6 (D-101) — export to the acceptance stack's dummy collector, which writes
+# §9.6 (D-126) — export to the acceptance stack's dummy collector, which writes
 # what it receives to files for tests/telemetry_compose.rs. Metrics every 5s
 # rather than 60s, so the test is not a minute long.
 telemetry:

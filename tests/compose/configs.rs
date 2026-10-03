@@ -39,7 +39,7 @@ pub fn load(path: &str) -> Config {
         ("SIMMER_SESSION_TIMEOUT", "120s"),
         ("DATABASE_URL", "postgres://simmer:simmer@127.0.0.1:5433/simmer"),
         ("SIMMER_ADMIN_TOKEN", "test-tier-admin-token"),
-        // D-101's export twins (test/config/telemetry.block.yaml); the
+        // D-126's export twins (test/config/telemetry.block.yaml); the
         // values test/compose/otel.yml gives `app`.
         ("SIMMER_OTEL_ENDPOINT", "http://otel-collector:4317"),
         ("SIMMER_OTEL_INSTANCE", "app"),

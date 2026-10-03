@@ -1,4 +1,4 @@
-# D-101's OTLP export, as a fragment appended to every tier config by
+# D-126's OTLP export, as a fragment appended to every tier config by
 # test/config/Dockerfile — the capture.block.yaml pattern. An absent
 # `telemetry:` block is the off switch and YAML has no conditional block, so
 # each config gets a `<name>.otel.yaml` twin (and `<name>.capture.otel.yaml`)

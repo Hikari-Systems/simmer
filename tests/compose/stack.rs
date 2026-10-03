@@ -35,7 +35,7 @@ pub fn capture_on() -> bool {
     std::env::var("SIMMER_CAPTURE").is_ok_and(|v| v == "on")
 }
 
-/// D-101's export overlay: `SIMMER_OTEL_ENDPOINT` and the instance names.
+/// D-126's export overlay: `SIMMER_OTEL_ENDPOINT` and the instance names.
 /// Layered onto any stack when `SIMMER_OTEL=on`.
 const OTEL_OVERRIDE: &str = "test/compose/otel.yml";
 
@@ -171,7 +171,7 @@ impl Stack {
     /// for — D-085's rule that a capture configured and silently not writing is
     /// the worst outcome available, applied to the harness.
     ///
-    /// D-101's export is the same mechanism with `telemetry.block.yaml`, and
+    /// D-126's export is the same mechanism with `telemetry.block.yaml`, and
     /// the two combine: `<name>.capture.otel.yaml` carries both blocks.
     fn config_path(&self) -> String {
         if !capture_on() && !otel_on() {

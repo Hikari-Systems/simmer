@@ -1,4 +1,4 @@
-//! D-101 — the §9.1 metrics over OTLP.
+//! D-126 — the §9.1 metrics over OTLP.
 //!
 //! Every metric in this crate is recorded through the `metrics` facade, behind
 //! the named functions in `crate::metrics`, so exporting them over OTLP is a
@@ -8,7 +8,7 @@
 //!
 //! Written here rather than taken from `metrics-exporter-opentelemetry`, which
 //! pins OpenTelemetry 0.31 and would put a second OpenTelemetry in the graph
-//! beside the 0.33 everything else uses (D-101).
+//! beside the 0.33 everything else uses (D-126).
 //!
 //! The mapping:
 //!
@@ -317,7 +317,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{name} was not exported"))
     }
 
-    /// D-101's default `metrics_temporality: delta`, as `telemetry::init`
+    /// D-126's default `metrics_temporality: delta`, as `telemetry::init`
     /// builds it: a counter series that saw nothing in an interval is not
     /// exported — and so not held — while a gauge that did not change still is.
     /// The first half is what bounds F7's client-controlled label (docs/SOAK.md

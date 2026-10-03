@@ -107,7 +107,7 @@ pub struct Session {
     /// D-081 — when `timeouts.session` runs out. Every wait on the client is
     /// capped by it; a relay in flight never is.
     deadline: tokio::time::Instant,
-    /// §9.6 (D-101) — the connection's `smtp.session` span, which the caller
+    /// §9.6 (D-126) — the connection's `smtp.session` span, which the caller
     /// has entered. Held so that `username` can be recorded on it from inside a
     /// transaction, where it is not the current span.
     session_span: Span,
@@ -118,7 +118,7 @@ struct Transaction {
     mail_from: Option<String>,
     params: MailParams,
     recipients: Vec<String>,
-    /// §9.6 (D-101) — `smtp.transaction`, from the accepted `MAIL FROM` to its
+    /// §9.6 (D-126) — `smtp.transaction`, from the accepted `MAIL FROM` to its
     /// final reply. Every command of the transaction runs inside it, and
     /// dropping it with the transaction is what ends it.
     span: Span,

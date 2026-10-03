@@ -1,4 +1,4 @@
-//! §9.6 (D-101) — what the OTLP export would carry, captured in memory.
+//! §9.6 (D-126) — what the OTLP export would carry, captured in memory.
 //!
 //! Its own binary because it installs the process's global subscriber and
 //! metrics recorder — exactly the layers `main` would, via
@@ -177,7 +177,7 @@ async fn a_delivered_message_is_one_trace_from_session_to_quota() {
     let rewrite = named(&trace, "simmer.rewrite");
     let down = named(&trace, "smtp.downstream");
     let resolve = named(&trace, "simmer.quota.resolve");
-    // The post-commit read for the §9.1 gauges (D-101, docs/SOAK.md §18).
+    // The post-commit read for the §9.1 gauges (D-126, docs/SOAK.md §18).
     let usage = named(&trace, "simmer.quota.usage");
 
     assert!(child_of(tx, session), "transaction under the session");
@@ -316,7 +316,7 @@ async fn no_recipient_address_is_exported() {
     }
     for l in &logs {
         // The downstream's reply text above quotes the address back; outcome.rs
-        // redacts its local part before logging it (D-101).
+        // redacts its local part before logging it (D-126).
         let text = format!(
             "{:?} {:?}",
             l.record.body(),

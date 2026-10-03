@@ -1,4 +1,4 @@
-//! §9.6 (D-101) against a real collector: the acceptance stack's dummy
+//! §9.6 (D-126) against a real collector: the acceptance stack's dummy
 //! `otel-collector`, which writes what it receives to the `otel-out` volume.
 //!
 //! `tests/telemetry.rs` proves what the pipeline *would* export, in memory.
@@ -281,7 +281,7 @@ fn a_relayed_message_reaches_the_collector_as_traces_metrics_and_logs() {
         .filter(|req| collected_since(req, since))
         .map(Value::to_string)
         .collect();
-    // A scrape-time gauge, recomputed by the export's own task (D-101): this
+    // A scrape-time gauge, recomputed by the export's own task (D-126): this
     // stack has admin.metrics on too, but nothing scrapes it during the test.
     assert!(
         text.contains("\"simmer_quota_allowance\""),

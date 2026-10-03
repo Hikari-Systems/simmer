@@ -1,4 +1,4 @@
-//! §9.5 structured logging, and §9.6's export layers (D-101).
+//! §9.5 structured logging, and §9.6's export layers (D-126).
 //!
 //! > Structured JSON. Every message carries a `correlation_id` propagated through
 //! > every log line... Message bodies are never logged; recipient addresses are
@@ -11,7 +11,7 @@
 //! shared implementation. The `text` format exists for local development, where
 //! JSON on a terminal is unreadable.
 //!
-//! Since D-101 the message path runs inside spans (`smtp.session`,
+//! Since D-126 the message path runs inside spans (`smtp.session`,
 //! `smtp.transaction` and their children), and a JSON line carries the fields
 //! of the span it was emitted in — which is what puts `correlation_id` on the
 //! downstream outcome lines that never had it. Only the innermost span is

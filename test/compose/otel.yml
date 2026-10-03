@@ -1,4 +1,4 @@
-# D-101's OTLP export, turned on for both instances of whatever stack is running
+# D-126's OTLP export, turned on for both instances of whatever stack is running
 # (docs/SOAK.md §18). The capture.yml pattern: an overlay of its own because the
 # export is orthogonal to the tier and the backend, and it pairs with the
 # generated `<name>.otel.yaml` config twin (test/config/telemetry.block.yaml).

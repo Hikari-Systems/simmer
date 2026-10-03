@@ -26,7 +26,7 @@
 //! |---|---|
 //! | `SOAK_BACKEND=mssql` | D-084's SQL Server build, against SQL Server **Express** (`test/compose/mssql.yml`) |
 //! | `SIMMER_CAPTURE=on` | D-085's capture, on **both** instances (`test/compose/capture.yml` and the generated config twin). **Not soak-specific** — the same variable captures any tier whose config comes from the config volume |
-//! | `SIMMER_OTEL=on` | D-101's OTLP export to the dummy collector, on **both** instances (`test/compose/otel.yml` and the generated `.otel` twin). Not soak-specific either, and it combines with the capture |
+//! | `SIMMER_OTEL=on` | D-126's OTLP export to the dummy collector, on **both** instances (`test/compose/otel.yml` and the generated `.otel` twin). Not soak-specific either, and it combines with the capture |
 //!
 //! Neither is a §1 variant: V2, V3 and V4 all run unchanged under both. They
 //! change what the stack *is*, which is why they are four stacks rather than a

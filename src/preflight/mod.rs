@@ -357,7 +357,7 @@ pub async fn check_route(plan: &Plan, resolver: &dyn TxtResolver) -> RouteReport
 
 /// One pass over every planned route, updating the registry and the gauges.
 pub async fn check_once(plans: &[Plan], resolver: &dyn TxtResolver, registry: &Registry) {
-    // §9.6 (D-101) — one span per pass, at startup and on the interval. A
+    // §9.6 (D-126) — one span per pass, at startup and on the interval. A
     // failing check is a WARN event inside it.
     let span = tracing::info_span!(
         "simmer.preflight",

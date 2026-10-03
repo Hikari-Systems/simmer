@@ -293,7 +293,7 @@ async fn accept_loop(
         let policy = Arc::clone(&policy);
         let shared = Arc::clone(&shared);
         let hard_stop = hard_stop.clone();
-        // §9.6 (D-101) — one span per connection, refused ones included: a
+        // §9.6 (D-126) — one span per connection, refused ones included: a
         // CIDR or session-bound refusal is a connection that happened. The
         // transaction spans are its children.
         let span = tracing::info_span!(

@@ -1,4 +1,4 @@
-# D-101 — the acceptance stack's dummy OTLP collector. It receives what Simmer
+# D-126 — the acceptance stack's dummy OTLP collector. It receives what Simmer
 # exports over gRPC and writes it to files, one OTLP JSON request per line, so
 # `tests/telemetry_compose.rs` can read back exactly what left the process:
 #

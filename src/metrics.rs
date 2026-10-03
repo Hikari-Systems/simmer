@@ -40,7 +40,7 @@ pub fn install(idle_timeout: std::time::Duration) -> anyhow::Result<PrometheusHa
 
 /// Install the §9.1 recorder: Prometheus when `prometheus` carries D-093's idle
 /// timeout (`admin.metrics` is on), the OTLP bridge when `otel` is given
-/// (`telemetry.metrics` is on, D-101), both behind one fan-out when both are,
+/// (`telemetry.metrics` is on, D-126), both behind one fan-out when both are,
 /// and nothing at all when neither is — every `metrics::` call then stays the
 /// no-op D-093 promises.
 ///

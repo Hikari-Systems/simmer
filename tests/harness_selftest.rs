@@ -471,7 +471,7 @@ fn the_capture_twin_of_every_tier_config_is_valid() {
     );
 }
 
-/// D-101's export twins, as `test/config/Dockerfile` generates them: every tier
+/// D-126's export twins, as `test/config/Dockerfile` generates them: every tier
 /// config plus `telemetry.block.yaml`, and the capture twin plus it too. The
 /// capture test's reasoning — nothing on the host would otherwise look at one —
 /// and one more: an export block that resolved to *off* would run a soak that

@@ -111,7 +111,7 @@ impl Proxy {
 
     /// Forward one request from `peer` and return what the client should see.
     pub async fn handle(&self, req: Request<Body>, peer: SocketAddr) -> Response<Body> {
-        // §9.6 (D-101) — the path only, by the rule above: a tracking token in
+        // §9.6 (D-126) — the path only, by the rule above: a tracking token in
         // the query identifies a recipient. And nothing is injected into the
         // forwarded request — no `traceparent` — because the upstream sees what
         // it would without Simmer (§1.1).

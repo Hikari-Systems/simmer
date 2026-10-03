@@ -1,4 +1,4 @@
-//! §9.6 (D-101) — optional OTLP export of traces, metrics and logs.
+//! §9.6 (D-126) — optional OTLP export of traces, metrics and logs.
 //!
 //! Off unless `telemetry:` is configured with a non-empty endpoint
 //! ([`crate::config::Config::telemetry`]). When off, nothing here is built: no
@@ -25,7 +25,7 @@
 //!    behind its config, and the endpoint and timeout are set explicitly, which
 //!    the SDK ranks above its environment variables. (It still *adds*
 //!    `OTEL_EXPORTER_OTLP_HEADERS` and honours `…_COMPRESSION`/`…_INSECURE` if
-//!    set; D-101 records that.)
+//!    set; D-126 records that.)
 
 pub mod metrics;
 
@@ -80,7 +80,7 @@ pub struct Pipeline {
 /// there. Fails only on a configuration the exporter refuses, which §4.2 has
 /// already checked — so a failure here is the second line of defence, and
 /// `main` refuses to start on it rather than run with an export that silently
-/// sends nothing (D-085's reasoning, D-101).
+/// sends nothing (D-085's reasoning, D-126).
 pub fn init(cfg: &config::Telemetry, backend: &str) -> anyhow::Result<Pipeline> {
     let resource = resource(cfg, backend);
 

@@ -303,7 +303,7 @@ hyper-util = { version = "0.1", features = [
 ] }
 http-body-util = "0.1"
 
-# --- OpenTelemetry (D-101) -------------------------------------------------
+# --- OpenTelemetry (D-126) -------------------------------------------------
 
 # Optional OTLP export of traces, metrics and logs, off unless `telemetry:` is
 # configured. The 0.33 line throughout: `tracing-opentelemetry` 0.34 is built
@@ -373,7 +373,7 @@ http-body-util = "0.1"
 # nothing in the repository is a private key and nothing expires in CI. `MIT OR
 # Apache-2.0`. `ring` rather than the default `aws-lc-rs`, for the reason the
 # rustls entry above gives.
-# D-101 — in-memory span, log and metric exporters, so tests/telemetry.rs can
+# D-126 — in-memory span, log and metric exporters, so tests/telemetry.rs can
 # assert on what would have been exported without a collector.
 opentelemetry_sdk = { version = "0.33", default-features = false, features = [
     "trace",

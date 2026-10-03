@@ -207,7 +207,7 @@ committed and none can drift. A stack reading its config from the image rather
 than the config volume — the acceptance tier — has no twin, and asking to capture
 it fails saying so rather than running uncaptured.
 
-`SIMMER_OTEL=on` does the same for D-101's export: `test/compose/otel.yml` points
+`SIMMER_OTEL=on` does the same for D-126's export: `test/compose/otel.yml` points
 both instances at the dummy collector, and the `.otel` twin appends
 `test/config/telemetry.block.yaml`. The two combine (`.capture.otel.yaml`).
 
@@ -298,7 +298,7 @@ src/routing/partial.rs   §3.2 step 3c′ (D-091, D-097) — `schedule.share`. A
 src/metrics.rs           §9.1 counters, the recorder, and every `# HELP` line. The
                          recorder exists only with `admin.metrics` (D-093): off, every
                          `metrics::` call is a no-op and /metrics is a 404
-src/telemetry/mod.rs     §9.6 (D-101) — the optional OTLP/gRPC export. Off unless
+src/telemetry/mod.rs     §9.6 (D-126) — the optional OTLP/gRPC export. Off unless
                          `Config::telemetry()` says so. OBSERVES ONLY: never add trace
                          context to relayed mail or link-proxy requests (§1.1), and
                          nothing on the message path may wait on an export
@@ -362,9 +362,9 @@ tests/admin_api.rs       §9. Pins dry run against the REAL walk, step for step
 tests/metrics_endpoint.rs  §9.1. Its own binary — one global recorder per process
 tests/metrics_idle.rs    D-093's counter expiry. Its own binary, for the same reason
 tests/link_proxy.rs      D-083 on the wire: raw client, recording upstream
-tests/telemetry.rs       D-101 over in-memory exporters: the span tree, and that NO
+tests/telemetry.rs       D-126 over in-memory exporters: the span tree, and that NO
                          recipient address is exported. Its own binary (global subscriber)
-tests/telemetry_compose.rs  D-101 against the acceptance stack's dummy collector
+tests/telemetry_compose.rs  D-126 against the acceptance stack's dummy collector
 tests/acceptance.rs      §12.3 against real mail servers; behind --ignored
 simmer.acceptance.yaml   the acceptance stack's config (D-042)
 ```

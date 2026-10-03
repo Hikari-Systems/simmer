@@ -278,7 +278,7 @@ services:
     healthcheck:
       disable: true
 
-  # D-101 — a dummy OTLP collector for the acceptance stack, which
+  # D-126 — a dummy OTLP collector for the acceptance stack, which
   # `simmer.acceptance.yaml` exports to. It writes everything it receives to the
   # `otel-out` volume as JSON lines (test/otel/collector.yaml), and
   # tests/telemetry_compose.rs reads them back through the loadgen, which mounts
@@ -336,7 +336,7 @@ services:
       # For `--starttls`: the CA the loadgen verifies Simmer's certificate
       # against.
       - acceptance-tls:/tls:ro
-      # D-101 — what the dummy collector received, for tests/telemetry_compose.rs
+      # D-126 — what the dummy collector received, for tests/telemetry_compose.rs
       # to `cat`.
       - otel-out:/otel:ro
     depends_on:
@@ -354,5 +354,5 @@ volumes:
   # a plain `docker compose up`, where tls-init never runs, would give `app` an
   # empty root store and break every real `required_verify` route.
   test-trust:
-  # D-101 — the dummy collector's output. Acceptance only.
+  # D-126 — the dummy collector's output. Acceptance only.
   otel-out:

@@ -128,7 +128,7 @@ pub fn router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-/// §9.6 (D-101) — one span per admin request, so a mutation's audit line and
+/// §9.6 (D-126) — one span per admin request, so a mutation's audit line and
 /// any auth refusal arrive attached to the request that caused them.
 ///
 /// The route **template** (`/ramps/{ramp}/routes/{name}/pause`), never the raw
@@ -281,7 +281,7 @@ async fn metrics_endpoint(State(state): State<AdminState>) -> Response {
 /// the process and runtime, and the quota projection. Called by `/metrics` and,
 /// when §9.6's metric export is on, by `main`'s gauge task on the export
 /// interval — without which an OTLP-only deployment would export whatever the
-/// last relayed message happened to set, which is D-056's bug again (D-101).
+/// last relayed message happened to set, which is D-056's bug again (D-126).
 ///
 /// Only the quota half touches storage, and only it can fail; the other two
 /// are refreshed whatever it does.

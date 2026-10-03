@@ -231,7 +231,7 @@ pub async fn reserve_relay_commit(
     message: Message<'_>,
     correlation_id: &str,
 ) -> Reply {
-    // §9.6 (D-101) — the decision and its consequences as one span, with the
+    // §9.6 (D-126) — the decision and its consequences as one span, with the
     // walk, the rewrite, the downstream conversation and the quota resolution
     // as its children. Every log line below lands inside it, which is what
     // gives the downstream outcome lines the `correlation_id` they never had.
@@ -306,7 +306,7 @@ async fn reserve_relay_commit_inner(
         "simmer.route",
         otel.name = "simmer.route",
         // On every child too: stdout carries only the innermost span's
-        // fields, and §9.5 wants the id on every line (D-101).
+        // fields, and §9.5 wants the id on every line (D-126).
         correlation_id,
         chain = Empty,
         route = Empty,
@@ -578,7 +578,7 @@ async fn reserve_relay_commit_inner(
         // §9.1 gauges, from the row we just moved. A read of the row other
         // instances are locking, on the client's time: its own span, so a trace
         // shows it rather than a gap after `simmer.quota.resolve` — §18's
-        // slowest message spent 430 ms here (D-101).
+        // slowest message spent 430 ms here (D-126).
         if let Ok(usage) = store
             .usage(
                 &selected.reservation.ramp,

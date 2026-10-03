@@ -50,7 +50,7 @@ pub struct Config {
     #[serde(default)]
     pub capture: Option<Capture>,
 
-    /// §9.6 (D-101) — optional OTLP export of traces, metrics and logs. Absent,
+    /// §9.6 (D-126) — optional OTLP export of traces, metrics and logs. Absent,
     /// `enabled: false`, or an empty `endpoint` all mean nothing is exported and
     /// no exporter is built; read it through [`Config::telemetry`], which is the
     /// one place that rule lives.
@@ -1037,10 +1037,10 @@ impl CaptureOnError {
 }
 
 // ---------------------------------------------------------------------------
-// telemetry (§9.6, D-101)
+// telemetry (§9.6, D-126)
 // ---------------------------------------------------------------------------
 
-/// §9.6 (D-101). OTLP/gRPC export of spans, the §9.1 metrics and log events.
+/// §9.6 (D-126). OTLP/gRPC export of spans, the §9.1 metrics and log events.
 ///
 /// Presence is the opt-in, like `capture` and `link_proxy`, and every key but
 /// `endpoint` has a default. Nothing here can change what Simmer emits on the
@@ -1077,7 +1077,7 @@ pub struct Telemetry {
     /// shipping debug lines to a vendor. Default `info,sqlx=warn,tiberius=warn`,
     /// the published stdout guidance: both drivers log every transaction at
     /// INFO, and the §18 soak exported four tiberius lines a message under a
-    /// bare `info` (D-101).
+    /// bare `info` (D-126).
     #[serde(default = "default_telemetry_level")]
     pub level: String,
 
@@ -1146,7 +1146,7 @@ fn default_true() -> bool {
     true
 }
 
-/// `telemetry.metrics_temporality` (D-101).
+/// `telemetry.metrics_temporality` (D-126).
 ///
 /// **`delta`** is the SDK's low-memory mix: counters and histograms report what
 /// happened since the last export, and their series are dropped once an export
@@ -1738,7 +1738,7 @@ impl Config {
         self.ramps.get(name)
     }
 
-    /// §9.6 (D-101) — the telemetry block, if it asks for anything to be
+    /// §9.6 (D-126) — the telemetry block, if it asks for anything to be
     /// exported. `None` when the block is absent, says `enabled: false`, or its
     /// `endpoint` is empty — the last so that `endpoint: "${SIMMER_OTEL_ENDPOINT}"`
     /// can be switched off per environment by leaving the variable empty.

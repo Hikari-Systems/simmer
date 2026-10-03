@@ -2143,7 +2143,7 @@ fn warnings_inside_a_ramp_name_the_ramp() {
     );
 }
 
-// -- §9.6, D-101: telemetry -----------------------------------------------
+// -- §9.6, D-126: telemetry -----------------------------------------------
 
 fn with_telemetry(block: &str) -> String {
     format!("{BASE}telemetry:\n{block}")
@@ -2163,7 +2163,7 @@ fn a_telemetry_block_needs_only_an_endpoint_and_defaults_the_rest() {
     assert!(t.enabled && t.traces && t.metrics && t.logs);
     assert_eq!(t.service_name, "simmer");
     // The published stdout guidance, not a bare `info`: both drivers log every
-    // transaction at INFO (D-101, docs/SOAK.md §18).
+    // transaction at INFO (D-126, docs/SOAK.md §18).
     assert_eq!(t.level, "info,sqlx=warn,tiberius=warn");
     assert_eq!(t.sample_ratio, 1.0);
     assert_eq!(t.metrics_interval, std::time::Duration::from_secs(60));

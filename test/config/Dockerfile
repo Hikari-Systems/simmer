@@ -18,7 +18,7 @@ COPY test/config/ /files/
 # capture belongs to no particular tier. `SIMMER_CAPTURE=on` points `app` at the
 # twin; see tests/compose/stack.rs.
 #
-# D-101's export works the same way: `<name>.otel.yaml` appends
+# D-126's export works the same way: `<name>.otel.yaml` appends
 # telemetry.block.yaml, and `<name>.capture.otel.yaml` appends both, so
 # `SIMMER_CAPTURE=on` and `SIMMER_OTEL=on` combine freely.
 RUN set -e; \

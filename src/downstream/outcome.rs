@@ -105,7 +105,7 @@ pub enum RelayError {
 
 impl RelayError {
     /// The `class` label `simmer_downstream_errors_total` gives this error, and
-    /// the `outcome` §9.6's downstream span records (D-101). A `Rejected`
+    /// the `outcome` §9.6's downstream span records (D-126). A `Rejected`
     /// splits by code family, as [`failed`] does.
     pub fn class(&self) -> &'static str {
         match self {
@@ -321,7 +321,7 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
 /// §9.5 allows recipient addresses only at `DEBUG`, and a downstream's reply
 /// routinely quotes the recipient back — `550 5.1.1 <jane@example.com> unknown
 /// user` — so logging its text verbatim at `INFO` put the address in every
-/// log shipper and, since D-101, every telemetry backend. The domain stays: it
+/// log shipper and, since D-126, every telemetry backend. The domain stays: it
 /// is what an operator needs to tell one provider's refusals from another's,
 /// and domains are logged elsewhere at `WARN` already. The client's reply is
 /// not this: §10.1 quotes the text back to the client that sent the address,

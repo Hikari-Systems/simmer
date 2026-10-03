@@ -75,7 +75,7 @@ async fn run() -> anyhow::Result<()> {
     // be skipped later.
     let config = Arc::new(config::load(&path)?);
 
-    // §9.6 (D-101) — the OTLP export, when configured. Built before the
+    // §9.6 (D-126) — the OTLP export, when configured. Built before the
     // subscriber, which takes its span and log layers from it, and inside the
     // runtime, where tonic spawns its channel. A configured export that cannot
     // be built refuses to start, like a configured capture: running with an
@@ -103,7 +103,7 @@ async fn run() -> anyhow::Result<()> {
     // installed, every `metrics::` call stays a no-op, nothing is held for a
     // scrape that will never come, and `/metrics` is not served.
     //
-    // D-101: the OTLP metric export is a second recorder beside it, fanned out
+    // D-126: the OTLP metric export is a second recorder beside it, fanned out
     // from the same facade, and independent of `admin.metrics`. Neither on
     // still means no recorder at all.
     let otel_recorder = telemetry.as_ref().and_then(|t| t.recorder());
@@ -472,7 +472,7 @@ async fn run() -> anyhow::Result<()> {
         })
     });
 
-    // D-101 — the scrape-time gauges, recomputed on the export interval when
+    // D-126 — the scrape-time gauges, recomputed on the export interval when
     // nothing else would: `/metrics` refreshes them per scrape, and an
     // OTLP-only deployment has no scrape.
     let gauge_task = telemetry
@@ -612,7 +612,7 @@ async fn run() -> anyhow::Result<()> {
 
     info!("shutdown complete");
 
-    // D-101 — last, so the spans and log lines of everything above, the final
+    // D-126 — last, so the spans and log lines of everything above, the final
     // drained sessions included, are in the final export. Blocking (each
     // provider waits for its last export), hence `spawn_blocking`, and bounded,
     // since a collector that has gone away must not hold up a shutdown that
@@ -632,7 +632,7 @@ async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// D-101 — how long the final telemetry flush may take. A backstop against a
+/// D-126 — how long the final telemetry flush may take. A backstop against a
 /// collector that accepts connections and never answers; the export timeout
 /// already bounds each individual call.
 const TELEMETRY_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_secs(15);

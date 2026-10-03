@@ -31,7 +31,7 @@ simmer's live heap is 1.5–2.0 MiB while `anon` swings across 60, so the anon g
 has been judging the allocator. Its one real growth is F7, measured at about 204
 bytes per unmatched-sender series, which D-093 now expires. With `/metrics` off
 (§14), simmer's live heap was flat over 30 minutes and F7 passed for the first
-time. With D-101's OTLP export on (§18), on SQL Server, the first
+time. With D-126's OTLP export on (§18), on SQL Server, the first
 hour found a latency tail, F7 again on the export side and a baseline the harness
 measured too early; after the fixes, 20 minutes matched the export-off control to
 within 14 ms of p99, and an hour gave the first green leak verdict with the export
@@ -1993,11 +1993,11 @@ and the stack reset with `-v`. 2026-09-29, 11:42–12:40 UTC.
   open question makes it one.
 - **Two ramps under load, and the SQL Server build.** As in §16.
 
-## 18. OTLP export on (D-101) — SQL Server, an hour, then a control and a fix
+## 18. OTLP export on (D-126) — SQL Server, an hour, then a control and a fix
 
 ### What was run
 
-D-101's export on both instances, to the acceptance stack's dummy collector, on
+D-126's export on both instances, to the acceptance stack's dummy collector, on
 the SQL Server build against Express, with jemalloc's counters. Three runs, each
 from a stack reset with `-v`, images built from the working tree
 (`feat/opentelemetry`, uncommitted; `alloc-stats` on, **not a published
@@ -2030,7 +2030,7 @@ resource. Everything else is the documented default, including the 60 s
 - The collector's own counters are on `otel-collector:8888`. That is what
   accounts for what arrived.
 - `otel-init` no longer empties the files: re-run under a collector that was
-  already running, deleting them left it writing to unlinked inodes. D-101 has
+  already running, deleting them left it writing to unlinked inodes. D-126 has
   the detail. `tests/telemetry_compose.rs` now reads only what was exported
   after it started.
 

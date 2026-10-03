@@ -131,7 +131,7 @@ logging:
 #     upstream_response: 30s         # to response headers; 504 after
 #     idle: 60s
 
-# §9.6 (D-101) — optional OTLP/gRPC export of traces, metrics and logs. Absent
+# §9.6 (D-126) — optional OTLP/gRPC export of traces, metrics and logs. Absent
 # means nothing is exported and no exporter is built; so does `enabled: false`,
 # and so does an empty `endpoint`, which lets `${SIMMER_OTEL_ENDPOINT}` switch it
 # per environment. It observes only: no header is added to relayed mail, and a

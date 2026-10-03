@@ -587,7 +587,7 @@ this inverts: plaintext AUTH is now refused unless allowed. The rest are new. Se
   - `allowed_cidrs` is empty or contains an invalid block.
   - `max_connections`, `max_request_bytes` or any timeout is zero.
 - `telemetry` is present — enabled or not — and any of the following hold *(added, see
-  `DECISIONS.md` D-101)*:
+  `DECISIONS.md` D-126)*:
   - `endpoint` is non-empty and is not an `http` or `https` URI with a host and a port and no
     path.
   - A `headers` name is not a valid gRPC metadata key, is reserved (`content-type`, `te`,
@@ -1369,7 +1369,7 @@ independent, and neither on means no recorder at all. The gauges this section sa
 scrape time are then also recomputed every `telemetry.metrics_interval`, since an OTLP-only
 deployment has no scrape. Counters and histograms are exported as deltas unless
 `telemetry.metrics_temporality` is `cumulative`, so a series idle for a whole interval is not
-held; gauges are always cumulative. *(Added. See `DECISIONS.md` D-101.)*
+held; gauges are always cumulative. *(Added. See `DECISIONS.md` D-126.)*
 
 ### 9.2 Read API
 
@@ -1457,7 +1457,7 @@ string, cookies and body are never logged, because a tracking token identifies a
 A downstream's reply text is logged with the local part of every address in it replaced by `*`
 — `550 5.1.1 <*@example.com> unknown user` — because a downstream routinely quotes the recipient
 back, and that put recipient addresses in `INFO` and `WARN` lines. The client's reply (§10.1) is
-unchanged. *(Added. See `DECISIONS.md` D-101.)*
+unchanged. *(Added. See `DECISIONS.md` D-126.)*
 
 ### 9.6 Telemetry export
 
@@ -1493,7 +1493,7 @@ cannot be built at all is a startup failure, like any other invalid configuratio
 
 The resource is `service.name`, `service.version`, a per-process `service.instance.id`,
 `simmer.backend` and `telemetry.resource`, and the YAML is its only source: `OTEL_SERVICE_NAME`
-and `OTEL_RESOURCE_ATTRIBUTES` are not read. *(Added. See `DECISIONS.md` D-101.)*
+and `OTEL_RESOURCE_ATTRIBUTES` are not read. *(Added. See `DECISIONS.md` D-126.)*
 
 ---
 
@@ -1622,7 +1622,7 @@ over a `hyper-rustls` connector built on the same ring provider and platform roo
 *(Added. See `DECISIONS.md` D-083 and `LICENSES.md` §8.)* For §9.6, `opentelemetry`,
 `opentelemetry_sdk` and `opentelemetry-otlp` (gRPC over `tonic`, ring and the platform roots),
 `tracing-opentelemetry` and `opentelemetry-appender-tracing`, all on one OpenTelemetry release.
-*(Added. See `DECISIONS.md` D-101 and `LICENSES.md` §10.)*
+*(Added. See `DECISIONS.md` D-126 and `LICENSES.md` §10.)*
 
 **Licence check required before adopting any parsing crate.** Several of the well-known mail
 crates in the Rust ecosystem are AGPL-licensed or have changed licence between versions.
@@ -1654,7 +1654,7 @@ default.
 - **Telemetry** — §9.6 against in-memory exporters (the span tree, the reply codes, and that no
   recipient address is exported), and against a dummy OTLP collector in the acceptance compose
   stack that writes what it receives to files the suite reads back. *(Added. See `DECISIONS.md`
-  D-101.)*
+  D-126.)*
 
 ---
 
@@ -1682,7 +1682,7 @@ Each phase should end in a working, testable artefact.
 13. Named ramps (§3.4, §5.8): the ramps-only schema, storage keyed by ramp with legacy
     adoption, the control plane per ramp, then selection by listener and header.
     *(Added. See `DECISIONS.md` D-099.)*
-14. The optional OTLP telemetry export (§9.6). *(Added. See `DECISIONS.md` D-101.)*
+14. The optional OTLP telemetry export (§9.6). *(Added. See `DECISIONS.md` D-126.)*
 
 ---
 

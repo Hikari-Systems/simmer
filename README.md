@@ -563,7 +563,7 @@ repoint the public name at the upstream directly and remove the block.
 ### OpenTelemetry
 
 Optional OTLP/gRPC export of traces, metrics and logs (`SPEC.md` §9.6,
-`DECISIONS.md` D-101). It is off when the block is absent, when it says
+`DECISIONS.md` D-126). It is off when the block is absent, when it says
 `enabled: false`, or when `endpoint` is empty:
 
 ```yaml
@@ -920,7 +920,7 @@ of the cutover invariant (§1.1) produce byte-equal output. It also submits over
 for each run. `docs/ACCEPTANCE.md`
 explains the topology; `DECISIONS.md` D-042 explains what will bite.
 
-The same stack runs a dummy OpenTelemetry collector (`otel-collector`, D-101)
+The same stack runs a dummy OpenTelemetry collector (`otel-collector`, D-126)
 that `simmer.acceptance.yaml` exports to. It writes every trace, metric and log
 it receives to the `otel-out` volume as OTLP JSON lines, and one more test reads
 them back:
