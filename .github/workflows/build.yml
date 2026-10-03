@@ -237,7 +237,13 @@ jobs:
 
       - name: Copy multi-arch manifest from S3 registry to GHCR
         run: |
-          for TAG in ${{ github.sha }} ${{ env.BRANCH_NAME }} latest; do
+          # `latest` only from main (D-104): a branch push used to move it too,
+          # so whichever branch built last was what `:latest` pulled.
+          TAGS="${{ github.sha }} ${{ env.BRANCH_NAME }}"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TAGS="$TAGS latest"
+          fi
+          for TAG in $TAGS; do
             skopeo copy \
               --all \
               --src-tls-verify=false \
@@ -457,7 +463,13 @@ jobs:
 
       - name: Copy multi-arch manifest from S3 registry to GHCR
         run: |
-          for TAG in ${{ github.sha }}-mssql ${{ env.BRANCH_NAME }}-mssql latest-mssql; do
+          # `latest-mssql` only from main (D-104): a branch push used to move it too,
+          # so whichever branch built last was what `:latest-mssql` pulled.
+          TAGS="${{ github.sha }}-mssql ${{ env.BRANCH_NAME }}-mssql"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TAGS="$TAGS latest-mssql"
+          fi
+          for TAG in $TAGS; do
             skopeo copy \
               --all \
               --src-tls-verify=false \

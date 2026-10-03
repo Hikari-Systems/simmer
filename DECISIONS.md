@@ -5000,6 +5000,25 @@ line is recorded with its arrival `Instant` and connection number
   retryable (checked, then restored).
 
 
+### D-104 — GHCR's `latest` and `latest-mssql` move only on a push to `main`
+
+> Phase 0 (groundwork) of the segment rate-limit/spool plan, 2026-10-03.
+
+**The problem.** Both `merge-manifest` jobs in `.github/workflows/build.yml` copied
+every build to `<sha>`, `<branch>` **and** `latest` (`latest-mssql`), and the
+workflow runs on every branch (`'**'`). So `ghcr.io/hikari-systems/simmer:latest`
+was whichever branch built last — a feature branch included.
+
+**The rule.** `<sha>` and `<branch>` tags are unchanged; `latest`/`latest-mssql`
+are added only when `github.ref == refs/heads/main`. Docker Hub's `:latest`
+(DOCKERHUB.md: "the most recent release") is published elsewhere and is not
+touched.
+
+**Not tested** beyond YAML parsing: the change is in a CI shell step that only
+runs on GitHub. The first push of this branch is its test — it must not move
+GHCR's `latest`.
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
