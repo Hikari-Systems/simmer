@@ -5019,6 +5019,27 @@ runs on GitHub. The first push of this branch is its test — it must not move
 GHCR's `latest`.
 
 
+### D-105 — The shutdown token stores its cancel: `send_replace`, not `send`
+
+> Phase 0 (groundwork) of the segment rate-limit/spool plan, 2026-10-03.
+
+**The problem.** `smtp::Shutdown` (the `tokio_util_shim` cancellation token) is a
+`watch::Sender<bool>` whose receivers are created only inside `cancelled()`.
+`watch::Sender::send` returns an error **and stores nothing** when no receiver is
+alive. A `cancel()` that ran before any task was awaiting `cancelled()` — a SIGTERM
+during startup, or a test fixture dropped before an accept loop polled — was
+lost: `is_cancelled()` stayed false and a later `cancelled()` waited forever, so
+§10.4's stop could fail to stop.
+
+**The rule.** `cancel()` uses `send_replace(true)`, which stores the value
+whether or not a receiver exists. No other `watch` sender in the crate relies on
+`send`.
+
+**Tested:** `smtp::tests::a_cancel_with_no_waiter_yet_is_still_observed` (multi-
+thread runtime; the cancel runs on another task before any waiter exists). It
+failed before the change.
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

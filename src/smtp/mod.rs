@@ -39,8 +39,11 @@ mod tokio_util_shim {
             Self(tokio::sync::watch::channel(false).0)
         }
 
+        /// `send_replace`, never `send`: `send` stores nothing when no receiver
+        /// is alive, and none is until somebody awaits [`Self::cancelled`] — so
+        /// a cancel that came first was silently lost (D-105).
         pub fn cancel(&self) {
-            let _ = self.0.send(true);
+            self.0.send_replace(true);
         }
 
         pub fn is_cancelled(&self) -> bool {
@@ -486,6 +489,22 @@ mod tests {
         let allowed = nets(&["fd00::/8"]);
         assert!(is_allowed("fd00::1".parse().unwrap(), &allowed));
         assert!(!is_allowed("10.0.0.1".parse().unwrap(), &allowed));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_with_no_waiter_yet_is_still_observed() {
+        // `watch::Sender::send` stores nothing when there is no live receiver,
+        // and nothing subscribes until somebody awaits `cancelled()`. So a
+        // cancel that landed first — main's signal handler firing before an
+        // accept loop polled — was lost: `is_cancelled` said no and
+        // `cancelled()` waited forever.
+        let t = Shutdown::new();
+        let t2 = t.clone();
+        tokio::spawn(async move { t2.cancel() }).await.unwrap();
+        assert!(t.is_cancelled(), "the cancel must be stored");
+        tokio::time::timeout(std::time::Duration::from_secs(2), t.cancelled())
+            .await
+            .expect("a waiter arriving after the cancel must resolve");
     }
 
     #[tokio::test]
