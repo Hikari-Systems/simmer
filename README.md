@@ -17,10 +17,16 @@ and is then removed. `docs/SPEC.md` is the authoritative specification;
 ## What it is not
 
 Simmer is **not an MTA**, and the distinction is load-bearing rather than
-pedantic. There is no spool, no queue, no retry scheduler and no DSN generation.
-The client connection is held for the duration of the downstream conversation; a
-message is either delivered during that conversation or the client is told it was
-not. The only things persisted are quota state and recipient-frequency events.
+pedantic. By default there is no spool, no queue, no retry scheduler and no DSN
+generation. The client connection is held for the duration of the downstream
+conversation; a message is either delivered during that conversation or the
+client is told it was not. The only things persisted are quota state and
+recipient-frequency events.
+
+The one exception is opt-in and per ramp: a ramp with `delivery: spool` answers
+`250 queued`, keeps the message, and delivers it later at the route's pace — see
+[Spooling](#spooling). Even then Simmer never composes mail: a message it cannot
+deliver becomes a dead letter, not a bounce.
 
 It also holds no DKIM key material and performs no signing. The downstream signs,
 exactly as it would have if the application had connected to it directly.
@@ -410,7 +416,7 @@ domain_group)` — the quota's own key — beside the cap (`DECISIONS.md` D-111)
         overrides:
           yahoo: [2, 4, 8, 15, 30]      # keyed by domain group, like the caps
       burst: 5                          # back to back after an idle spell; default 1
-      on_limit: steer                   # the default, and the only value built
+      on_limit: steer                   # steer (default) | wait — wait needs delivery: spool
       max_wait: 0s                      # how long to hold the client for a slot
 ```
 
@@ -429,13 +435,14 @@ plus the route's downstream budget must stay below `server.timeouts.data`, the
 same reasoning as the [timeout budget](#timeout-budget)). So the warming route
 sends at its pace and the rest of the traffic goes out under the established
 identity, which is what a ramp wants. `on_limit: wait` — hold the message until
-its slot, however far off — needs a deferred-delivery mode that does not exist,
-and startup refuses it.
+its slot, however far off — needs somewhere to keep it, so it is allowed only on
+a [spooling](#spooling) ramp's route, and startup refuses it anywhere else.
 
 Two consequences follow, and §4.2 enforces both:
 
 - A route with a `rate` may not be **last** in a chain, for the partial ramp's
-  reason: every message it turned away would be a `451`.
+  reason: every message it turned away would be a `451`. A route with
+  `on_limit: wait` on a spooling ramp may: it defers rather than turning away.
 - A rate that cannot carry the cap is legal, but the cap is then decorative.
   Startup logs a `WARN` naming each ramp, route, group and day where
   `per_hour × 24 + burst` is below the day's cap.
@@ -710,6 +717,88 @@ database:
   and `warming` are two routes, as they are in Postgres, even though SQL
   Server's default collation would merge them.
 - SQL Server authentication only: no Windows or Kerberos integrated login.
+
+## Spooling
+
+**Off by default.** With no `spool:` block and no ramp opting in, nothing below
+exists — no table read, no body store, no dispatcher — and every ramp is
+synchronous exactly as described above. A ramp opts in with `delivery: spool`
+(`DECISIONS.md` D-116 – D-125, spec §7.7):
+
+```yaml
+spool:
+  body_store: { kind: volume, path: /var/lib/simmer/spool }
+  max_hold: 6h                    # delivered by then, or dead-lettered `expired`
+  retry: { initial: 1m, max: 30m, factor: 2.0 }
+  max_messages: 10000             # above either: 451 4.7.1, nothing stored
+  max_bytes: 1073741824
+  dead_letter:
+    retention: 7d
+    keep_body: 0s                 # >0 keeps the body so a dead letter can be retried
+    webhook: { url: "https://hooks.example/simmer", timeout: 5s }
+
+ramps:
+  main:
+    delivery: spool
+    routes:
+      - name: warming
+        rate: { schedule: { default: [20, 40, 80] }, on_limit: wait }
+```
+
+A spooling ramp runs every synchronous check first — the ACL, size, the
+end-of-data rule, the sender rules — then **admission**: `451 4.7.1` when the
+spool is full, the ramp is draining, or the message's lane already holds more
+than its route could send within the message's hold. Otherwise the body is
+written durably, the row inserted, and the client told `250 2.0.0 queued as
+<id>`. The dispatcher then delivers it through the same walk, rewrite and relay
+a synchronous message takes — at the route's rate, deferring to the next slot
+with `on_limit: wait`. Every attempt sends identical bytes, `Message-ID` and
+`Received:` included. A retry stays on the route of the first attempt (a pinned
+route that has run out of headroom waits; it never hands the message to another
+identity). Only a `5xx` at `RCPT TO` is final; a message whose hold runs out
+expires. Both become **dead letters**: kept for `retention`, counted, and POSTed
+to the optional webhook.
+
+**Delivery is at least once.** The ambiguous final dot is still ambiguous, and
+an instance that loses its lease mid-delivery may deliver while another does.
+Both are counted (`simmer_ambiguous_delivery_total`,
+`simmer_spool_lease_lost_total`).
+
+**Where bodies go.** `kind: volume` is a directory: a local disk for one
+instance, a shared volume for several. The container's root filesystem is
+read-only, so mount a writable volume owned by UID 1000 at the path, as for the
+capture. `kind: object` is an S3-compatible bucket (`provider: s3`, `bucket`,
+`region`, optional `endpoint` for MinIO, R2 or Ceph) or an Azure Blob container
+(`provider: azure`, `account`, `container`, `access_key`). Credentials come from
+the config — use `${ENV_VAR}` — or the providers' standard environment
+variables. Startup writes, reads back and deletes one body and refuses to start
+if any step fails. Simmer never creates the bucket.
+
+**Data protection.** A spooled body is the whole message, recipient included,
+at rest until it is delivered or dead-lettered — then it is deleted, unless
+`keep_body` keeps a dead letter's. Encrypt the volume or the bucket; Simmer
+does not. The read endpoints never show an envelope address, and a dead
+letter's downstream text has anything address-shaped redacted. The webhook
+carries the addresses unless `include_addresses: false`, and an `http://`
+webhook that does is a startup warning.
+
+**Removing Simmer from a spooling ramp** is a drain first:
+
+```sh
+curl -XPOST -H "Authorization: Bearer $TOKEN" localhost:8080/ramps/main/spool/drain
+# … new mail to the ramp is now 451 4.7.1; wait until it reports drained:
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/spool | jq .ramps.main.drained
+```
+
+Then cut over as usual. `GET /spool` shows every lane's depth and oldest
+message; `GET /spool/dead` the dead letters; `POST /spool/dead/{id}/retry`
+requeues one whose body was kept; `DELETE /spool/{id}` removes a message; and
+`POST /ramps/{ramp}/spool/pause` and `/resume` stop and restart delivery. Every
+mutation is audited. The dry run reports a spooling ramp's admission verdict and
+expected wait.
+
+Several instances may share one database and one body store — claims are leases
+fenced by a token — but one instance is the supported deployment.
 
 ## Capturing and replaying traffic
 

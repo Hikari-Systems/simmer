@@ -22,8 +22,8 @@ per-phase approval. Every decision still gets a `DECISIONS.md` entry.
 | --- | --- | --- |
 | 0 — groundwork, defect fixes | **Done**, pushed | `ca60b07`…`be0f6f3`, D-101–D-110, O-19 |
 | 1 — per-segment rate limits, synchronous mode | **Done**, pushed | `476d6e4`…`29c94ed`, D-111–D-115, O-20, O-21 |
-| 2 — the spool core + spec amendment | **In progress**: config types, §4.2 checks, redaction, D-116–D-121 (see §1.1) | — |
-| 3 — operating the spool: control plane, metrics, drain, PR | Not started | — |
+| 2 — the spool core + spec amendment | **Done** (second session) | `2e02f3f`…`e6d73af`, D-116–D-124 |
+| 3 — operating the spool: control plane, metrics, drain, PR | **Done** but for the PR (second session) | `b539089`…, D-125 |
 
 ### 1.1 Exactly what Phase 2 has so far
 

@@ -29,21 +29,32 @@ lists), after O-17 was. And the same day's for the partial ramp (§3.2 step 3c�
 2026-09-23 one for the end-of-data rule (§5.5, §9.1 and §10.3), after O-18 was —
 see D-095. And the 2026-09-24 one for named ramps (§3.4 and §5.8, new, and the
 sections D-099 lists), which the author asked for directly; it re-defers O-14 and
-O-15 explicitly.
+O-15 explicitly. And the 2026-10-03 one for per-segment sending rates and the
+opt-in spool (§1, §1.1, §2.1–§2.3, §3.2 step 3c″, §4.1, §4.2, §7.4, §7.6 and §7.7
+new, §8.1, §9.1–§9.4, §10.1, §10.2, §10.4, §11, §13), which the author asked for
+directly and which closed O-20 — see D-111 – D-125.
 
-> **Branch `feature/segment-rate-limits-and-spool` only:** the spec's author has
-> approved an opt-in spool and per-segment rate limits, including amending
-> `SPEC.md` (2026-10-03). Read **`docs/SPOOL_PLAN.md`** before anything else on
-> this branch — it is the plan, the author's decisions and the current status,
-> and it is the sanctioned exception to rule #1 below. Synchronous ramps keep
-> every rule here unchanged. Remove this note when the branch merges.
+> **Branch `feature/segment-rate-limits-and-spool` only:** `docs/SPOOL_PLAN.md`
+> is the plan this branch was built to, with the author's decisions (Q1–Q7) and
+> the status. Rules #1 and #8 below already describe the result. Remove this
+> note when the branch merges.
 
 ## The four things that will bite you
 
-1. **This is not an MTA.** No spool, no queue, no retry scheduler, no DSN
-   generation. If you find yourself designing message persistence, stop. The only
-   persistence is quota state and recipient-frequency events. The `DATA` buffer
-   (§8.1) spills to tmpfs and is explicitly *not* durable.
+1. **This is not an MTA — except, opt-in and per ramp, the spool.** A
+   synchronous ramp (the default, and every ramp unless configured otherwise)
+   has no spool, no queue, no retry scheduler, and nothing about a message
+   outlives its client connection: the only persistence is quota state and
+   recipient-frequency events, and the `DATA` buffer (§8.1) spills to tmpfs and
+   is explicitly *not* durable. Since D-116 a ramp with `delivery: spool` keeps
+   messages in **`src/spool/`** and nowhere else: state in `spool_message`,
+   bodies in a body store, delivered at least once by the dispatcher through the
+   same `relay::attempt` a session uses, and dead-lettered — a row, a metric, a
+   webhook — when they cannot be. **There is still no DSN, ever.** If you find
+   yourself adding persistence anywhere *else* — a synchronous path, the relay,
+   the capture — stop. And keep the spool's own limits: a message is held only
+   within its hold, retried only on its pinned route (Q3), and a spool condition
+   is never a `5xx` to the client (§14.1).
 
 2. **The cutover invariant (§1.1) outranks convenience.** Simmer is temporary, so
    its output must always be exactly expressible as application-side config.
@@ -145,9 +156,13 @@ the session in step, and do not reset `auth_failures` in the handshake reset
 (D-070).
 
 And an eighth, from D-085, because it is exactly what a future reader will
-misjudge: **the capture is not a spool, and the way it is not is structural.**
-If you add an outcome field, a retry count, a "pending" state, or any read path
-from `capture::` into `relay::`, you have built the thing §2.2 forbids. The
+misjudge: **the capture is not a spool, and the way it is not is structural** —
+and since D-116 there *is* a spool, which makes the distinction more important,
+not less. The capture never becomes the spool and never feeds it: the spool is
+`src/spool/`, takes the message from the session's final dot itself, and
+nothing in `spool::` reads `capture::`. If you add an outcome field, a retry
+count, a "pending" state, or any read path from `capture::` into `relay::` or
+`spool::`, you have built a second spool out of a debugging feature. The
 record is written *before* the relay precisely so it cannot know what happened —
 which is also what lets `on_error: defer` answer `451` honestly, since nothing
 has been relayed yet. Move the capture after the relay and that `451` becomes a
@@ -276,8 +291,24 @@ src/rewrite/stability.rs §6.6's property; `validate.rs` runs it at startup. The
                          body half is `body::Rules::fixed_point_violation` (D-046)
 src/relay.rs             decide → reserve → [wait for the rate slot] → rewrite → relay →
                          commit/release (§7.4, D-111). The wait holds the reservation.
-                         The session hands over an OWNED message (D-110). Not a spool:
-                         nothing stores or reads one back
+                         ONE `attempt()` under an `AttemptCtx`: the session's is
+                         synchronous; the dispatcher's walks at the attempt and
+                         rewrites at received_at with a seeded {{uuid}} (D-124).
+                         It stores nothing — the spool is spool::
+src/spool/mod.rs         §7.7 (D-116) — the opt-in spool. `None` on the Engine unless a
+                         ramp has delivery: spool. Never reads capture::
+src/spool/accept.rs      the final dot for a spooling ramp: sender policy, then ONE
+                         `admission()` (also the dry run's), then body → row → 250
+src/spool/dispatch.rs    claims as leases, renews at half-time; the attempt → row
+                         table is in its module docs. Only RCPT TO 5xx is final (D-124)
+src/spool/store.rs       SpoolStore: QuotaStore. commit_and_complete is the quota
+                         commit AND the row's deletion, one transaction (D-122)
+src/spool/body.rs        D-117 — put durable before the row; the sweeper takes orphans
+src/spool/object/        D-123 — S3 SigV4 and Azure Shared Key, BY HAND (ring only).
+                         s3.rs is tested against AWS's published signatures
+src/models/spool_message.rs  Postgres claims: FOR UPDATE SKIP LOCKED in one statement
+src/quota/mssql/spool.rs SQL Server claims: UPDLOCK, READPAST over spool_message_next —
+                         the index is what stops one claimant locking every row
 src/preflight/mod.rs     §6.7 — the three checks, the registry, the interval loop.
                          A route with NO report is eligible: fail open (D-064)
 src/preflight/resolver.rs  the DNS leg, behind a trait. A TXT record's strings are
@@ -387,6 +418,12 @@ tests/link_proxy.rs      D-083 on the wire: raw client, recording upstream
 tests/telemetry.rs       D-126 over in-memory exporters: the span tree, and that NO
                          recipient address is exported. Its own binary (global subscriber)
 tests/telemetry_compose.rs  D-126 against the acceptance stack's dummy collector
+
+tests/spool.rs           §7.7 end to end over Postgres: pacing, Q3, dead letters + webhook,
+                         expiry, takeover after a lost lease, byte-identical retries
+tests/spool_admin.rs     the spool's control plane against the real router
+tests/spool_object.rs    D-123 against SeaweedFS / Azurite; a no-op without their env vars
+tests/store_conformance/spool.rs  the spool's §11 contract; the claim race is mutation-checked
 tests/acceptance.rs      §12.3 against real mail servers; behind --ignored
 simmer.acceptance.yaml   the acceptance stack's config (D-042)
 ```

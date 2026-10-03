@@ -46,6 +46,16 @@ services:
       # It holds plaintext mail — treat it as a mailbox, and
       # `docker volume rm simmer_capture` when the investigation is over.
       # - capture:/var/lib/simmer/capture
+      #
+      # §7.7's spool body store (D-117), for a ramp with `delivery: spool` and a
+      # `spool: { body_store: { kind: volume, path: /var/lib/simmer/spool } }`
+      # block. Commented out for the capture's reason above, and it needs the
+      # capture's one-time `chown 1000:1000` too (startup's write-and-read-back
+      # probe refuses otherwise). Unlike the capture this is NOT a debugging
+      # artefact: it holds accepted mail Simmer has promised to deliver, so it
+      # must outlive the container — never a tmpfs — and must be drained
+      # (`POST /ramps/{ramp}/spool/drain`) before it is removed.
+      # - spool:/var/lib/simmer/spool
     read_only: true
     # The container runs as non-root (UID 1000), and §5.1 defaults the listener
     # to port 25 — a privileged port. Without this the SMTP bind fails with
@@ -348,6 +358,8 @@ volumes:
   # block in simmer.yaml are both uncommented. Declared unconditionally because a
   # volume nothing mounts costs nothing.
   capture:
+  # §7.7's spool body store; used only when the mount above is uncommented.
+  spool:
   acceptance-tls:
   # tls-init's OS trust store: Debian's roots plus the per-run test CA. Mounted
   # only by the acceptance override (test/compose/acceptance.yml) — mounted here,

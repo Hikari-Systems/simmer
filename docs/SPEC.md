@@ -18,7 +18,9 @@ externalises it. It is an SMTP relay that sits between an application and one or
 SMTP providers ("downstreams" — SendGrid, Postal, and similar). It accepts a message,
 selects an outbound route according to quota state, rewrites the message's identity to match
 that route, forwards it, and returns the downstream's verdict to the client on the same
-connection.
+connection — or, on a ramp that opts into the spool (§7.7), stores it, answers `250 queued`, and
+delivers it later at the pace the route's rate allows (§7.6). *(Amended — the spool is new and
+off by default. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
 
 Simmer is **temporary infrastructure**. It exists for the duration of a warm-up and is then
 removed. Every design decision below is subordinate to that.
@@ -58,6 +60,13 @@ output, which Simmer always strips (§6.5), so it never reaches the downstream u
 arrangement. After cutover the application drops it, or keeps sending it to nothing.
 *(Added. See `DECISIONS.md` D-099.)*
 
+A ramp with `delivery: spool` (§7.7) holds messages it has already answered `250` for, so
+removing Simmer from it is preceded by a **drain**: `POST /ramps/{ramp}/spool/drain` (§9.3)
+makes the ramp refuse new mail with `451 4.7.1`, the backlog is delivered, and `GET /spool`
+reports the ramp `drained`. Only then is it unplugged. Nothing about the output changes — a
+spooled message is rewritten exactly as a synchronous one, and identically on every attempt
+(§7.7) — so either ordering above still holds. *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
+
 ---
 
 ## 2. Scope
@@ -70,7 +79,11 @@ arrangement. After cutover the application drops it, or keeps sending it to noth
 - Route selection driven by incoming identity, warm-up quota state, and per-recipient
   frequency state.
 - Header, envelope, and `text/*` body rewriting per route.
-- Synchronous relay to a downstream with the downstream's reply mapped back to the client.
+- Synchronous relay to a downstream with the downstream's reply mapped back to the client —
+  and, per ramp and only when configured, an opt-in spool that accepts, stores, and delivers
+  later, at least once (§7.7). *(Amended. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
+- Per-segment sending rates: a route may limit its messages per hour per domain group, on its
+  own per-day schedule (§7.6). *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
 - Postgres-backed quota accounting with reservation semantics.
 - Admin HTTP API, Prometheus metrics, structured logging.
 - DNS preflight validation of SPF/DKIM/DMARC for warming routes.
@@ -86,10 +99,17 @@ arrangement. After cutover the application drops it, or keeps sending it to noth
 
 Simmer is **not an MTA**. It does not own messages.
 
-- **No spool, no queue, no retry scheduler.** The client connection is held for the duration
-  of the downstream conversation. A message is either delivered during that conversation or
-  the client is told it was not.
-- **No DSN or bounce generation.** Simmer never composes mail.
+- **No spool, no queue, no retry scheduler — for a synchronous ramp.** The client connection is
+  held for the duration of the downstream conversation. A message is either delivered during
+  that conversation or the client is told it was not. *(Amended — the one exception is a ramp
+  that sets `delivery: spool` (§7.7), which is off by default: with no `spool:` block and no
+  ramp opting in, nothing is persisted, exactly as before. Even then the spool is not a general
+  queue: it holds a message only within its hold (default 6 hours, never past the route's day
+  boundary unless configured), retries only on the route of the first downstream attempt, and
+  never composes mail. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
+- **No DSN or bounce generation.** Simmer never composes mail. A spooled message that can never
+  be delivered becomes a dead letter — a row, a metric and an optional webhook (§7.7) — never a
+  bounce. *(Amended. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
 - **No inbound mail handling, no bounce processing, no reply routing.** "Reply routing" means
   the recipient's replies, which go wherever the route's `Reply-To:` or `From:` sends them and
   never pass through Simmer. The application's *outbound* replies are ordinary submissions, and
@@ -107,14 +127,18 @@ Simmer is **not an MTA**. It does not own messages.
   contenders whether they are two tasks in one process or two processes on different hosts.
   What actually constrains running two is narrower and is stated in §2.3. *(Amended — the
   original wording described an ownership model the implementation does not have. See
-  `DECISIONS.md` D-061 and `docs/MULTI_INSTANCE.md`.)*
+  `DECISIONS.md` D-061 and `docs/MULTI_INSTANCE.md`.)* The spool (§7.7) is built for several
+  instances sharing one database and one body store — claims are leases fenced by a token — but
+  a single instance remains the supported deployment. *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
 - **No hot config reload.** Configuration changes require a restart.
 
 ### 2.3 Deployment assumption
 
 Simmer runs on a trusted internal network segment. It is a submission relay for our own
 applications, and TLS and AUTH do not change that: there is no inbound mail handling, no
-bounce processing, no defence against hostile peers, and no rate limiting beyond §5.5. What
+bounce processing, no defence against hostile peers, and no *ingress* rate limiting beyond
+§5.5 — §7.6's rates shape what Simmer sends, not what it accepts. *(Amended — was "no rate
+limiting beyond §5.5". See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)* What
 inbound TLS buys is the ability to sit on a segment where *cleartext credentials* are
 unacceptable, which is a much smaller claim than "internet-facing". The container must not be
 exposed to an untrusted network. Bind defaults to a private interface; publishing an SMTP port
@@ -238,6 +262,13 @@ for it — every rule, group, chain and route below is that ramp's:
       share itself is computed from the day's usage row and the clock, so the row is read
       — without a lock, and before the reservation — to decide it. *(Added. See
       `DECISIONS.md` D-097.)*
+   c″. If the route has a `rate` (§7.6), book its next slot for this domain group. A slot
+      later than now plus `max_wait` cannot be booked, and the route is skipped — the message
+      *steers* to the next link. On a spooling ramp's route with `on_limit: wait`, a slot
+      inside the message's hold is booked instead and the message is **deferred** to it, with
+      no reservation taken; the deferred attempt uses that slot. A route that is skipped after
+      booking gives the slot back if nothing was booked after it. This is the last check
+      because it is the only one that writes. *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
    c. If the route is warming and has no remaining headroom for this domain group today,
       skip.
    d. Otherwise, attempt reservation (§7.4). If reservation fails due to a concurrent
@@ -501,6 +532,40 @@ ramps:                                 # each is a complete, isolated routing pr
         # ... downstream, identity
 ```
 
+A route may limit its sending rate per domain group (§7.6), and a ramp may opt into the spool
+(§7.7), which then needs a top-level `spool:` block:
+
+```yaml
+spool:                                     # absent: nothing is spooled, anywhere
+  body_store: { kind: volume, path: /var/lib/simmer/spool }
+  # or { kind: object, provider: s3, bucket: …, region: …, access_key_id: …, secret_access_key: … }
+  # or { kind: object, provider: azure, account: …, container: …, access_key: … }
+  max_hold: 6h                             # delivered by then, or dead-lettered `expired`
+  cross_day_boundary: false                # by default a hold also ends at the route's next day
+  retry: { initial: 1m, max: 30m, factor: 2.0 }
+  max_messages: 10000                      # admission bounds: above either, 451 4.7.1
+  max_bytes: 1073741824
+  dispatch: { poll_interval: 1s, batch: 32 }
+  dead_letter:
+    retention: 7d
+    keep_body: 0s                          # >0 keeps the body so a dead letter can be retried
+    webhook: { url: "https://…", timeout: 5s, include_addresses: true }
+
+ramps:
+  main:
+    delivery: spool                        # synchronous (default) | spool
+    routes:
+      - name: warming
+        rate:
+          schedule: { default: [20, 40, 80], overrides: { google: [10, 20, 40] } }  # per hour
+          # per_hour: 600                  # or a fixed rate — the only form for an overflow route
+          burst: 1
+          on_limit: wait                   # steer (default) | wait — wait only on a spooling ramp
+          max_wait: 0s                     # synchronous ramps: how long a client may be held
+```
+
+*(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
+
 *(Amended — `domain_groups`, `senders`, `default_chain`, `strict_senders`, `thread_affinity`,
 `exhausted_chain_reply` and `routes` were top-level keys; they now sit, unchanged, inside each
 entry of `ramps`, and a configuration that still carries any of them at the top level is refused
@@ -595,6 +660,25 @@ this inverts: plaintext AUTH is now refused unless allowed. The rest are new. Se
   - `sample_ratio` is outside [0, 1]; `metrics_interval` is under 1s; `timeout` is zero;
     `level` is not a valid filter directive; `service_name` is empty.
   - `traces`, `metrics` and `logs` are all `false`.
+
+- A route's `rate` is present and any of the following hold *(added, see `DECISIONS.md` D-111 – D-125)*:
+  - it gives both or neither of `schedule` and `per_hour`; a value is below 1, an array is
+    empty, or an override names an unknown domain group; `burst` is below 1;
+  - an overflow route gives a `schedule` (it has no day of its own to index it by);
+  - `on_limit: wait` on a route of a synchronous ramp, or alongside `warmup.schedule.share`;
+  - `max_wait` exceeds 60s, or on a synchronous ramp a nonzero `max_wait` plus the route's
+    downstream budget is not below `server.timeouts.data`;
+  - a rate-limited route is last in a chain, unless it waits on a spooling ramp.
+- `spool` and `delivery` *(added, see `DECISIONS.md` D-111 – D-125)*:
+  - a ramp has `delivery: spool` and there is no `spool:` block;
+  - `max_hold`, `retry.initial`, `retry.max`, `dispatch.poll_interval` or
+    `dead_letter.retention` is zero; `retry.factor` is below 1; `retry.initial` exceeds
+    `retry.max`; `max_messages` or `dispatch.batch` is zero; `max_bytes` is below
+    `server.max_message_bytes`; `dead_letter.keep_body` exceeds `dead_letter.retention`;
+  - a volume path is relative, not a directory, or fails a write, `fsync`, read-back and
+    delete probe; an object store's fields do not match its provider, its credentials are
+    half-given, or an `http://` endpoint lacks `allow_http`; the webhook URL is not `http(s)`.
+  - A `spool:` block no ramp uses is a warning, not a violation.
 
 **Note on `envelope_from`, added after implementation.** The example in §4.1 originally read
 `bounce+{{original.envelope_from.local}}@newbrand.com`. That is a *relative transformation* —
@@ -1234,7 +1318,8 @@ both observe the last remaining slot:
 2. **Send.** Conduct the downstream transaction, holding the client connection.
 3. **Commit or release.** On downstream `2xx`, move the count from `reserved` to `committed`
    and record recipient-frequency events. On any failure, decrement `reserved` and delete the
-   reservation.
+   reservation. For a spooled message (§7.7) the commit also deletes the spool row, in the same
+   transaction. *(Amended. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
 
 Reservations carry an expiry (default: downstream timeout budget + 60s). A sweeper releases
 expired reservations, covering process crashes mid-send. Expiry release is logged and
@@ -1260,6 +1345,94 @@ does. *(Added. See `DECISIONS.md` D-090.)*
 reply `451 4.3.0 quota service unavailable` and send nothing. A quota enforcer that stops
 enforcing under failure provides no guarantee at all.
 
+### 7.6 Sending rates
+
+*(Added — this section is new. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
+
+The day's cap says how many; a rate says how fast. A route may carry a `rate`: messages per
+hour per `(ramp, route, domain_group)` — the quota's key without the day index — on its own
+per-day `schedule` indexed exactly as `warmup.schedule` is (the last value repeats; a
+graduated route is at the last value), or a fixed `per_hour`, the only form an overflow route
+may use. `burst` (default 1) is how many may go back to back after an idle spell.
+
+The algorithm is GCRA with slot booking: one theoretical arrival time per bucket, stored in
+`route_rate` and changed under a row lock in one short transaction, never held across a send,
+so it is global across instances like the quota. A message books the next slot at §3.2 step
+3c″. What happens when the slot is not now:
+
+- **Synchronous ramp, `on_limit: steer`** (the default). If the slot is within `max_wait`
+  (default 0, at most 60s) the client is held, *holding the reservation*, until the slot;
+  otherwise the route is skipped and the message steers to the next link, as §7.3 does. A
+  chain with nothing left is §10.3's `451`.
+- **Spooling ramp, `on_limit: wait`.** A slot inside the message's hold is booked and the
+  message deferred to it (§7.7), with no reservation held meanwhile. Past the hold it steers.
+
+Every outcome that does not commit gives the slot back, if nothing was booked after it —
+except §10.2's ambiguous final dot, where the downstream may have the message and the slot
+stays spent. A thread-affinity reply on its pinned route (§3.2 step 2a) books past the limit,
+counted, and is never skipped for rate. A rate that cannot carry the day's cap is a startup
+warning.
+
+### 7.7 The spool
+
+*(Added — this section is new, and the feature is off by default. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
+
+A ramp with `delivery: spool` answers a message at the final dot with `250 2.0.0 queued as
+<id>` once it is durably stored, and a dispatcher delivers it later through the same walk,
+rewrite and relay a synchronous ramp uses. Everything here applies to that ramp only.
+
+**Acceptance.** Every synchronous check runs first and answers exactly as it would — the
+sender ACL, size, §5.5's end-of-data rule, ramp selection, and §3.2 step 1's sender policy.
+Then admission refuses with `451 4.7.1`, storing nothing, when the spool is at `max_messages`
+or would exceed `max_bytes`, when the ramp is draining (§9.3), or when the message's lane
+`(ramp, domain_group)` already holds more than the chain's first waiting route could send
+within the message's hold. Then the body is written to the body store and made durable, the
+row is inserted, and only then is `250` sent. A crash between the two leaves a body no row
+names, which a sweeper deletes after ten minutes; nothing can leave a row without a body.
+
+**State and bodies.** State lives in the database (§11); bodies in the body store: one file
+per message on a volume (`0600` in a `0700` directory, written to a temporary name, `fsync`ed,
+renamed, the directory `fsync`ed), or an object in an S3-compatible bucket or an Azure Blob
+container. Startup writes, reads back and deletes a probe body and refuses to start if it
+cannot. A body is deleted when its message is delivered or dead-lettered.
+
+**The hold.** A message may wait `max_hold` (default 6h), and by default never past the next
+day boundary of the first route in its chain, so yesterday's backlog never spends tomorrow's
+cap; `cross_day_boundary: true` lifts the second limit. Past its hold it is dead-lettered
+`expired`.
+
+**Dispatch.** The dispatcher claims due messages — up to `dispatch.batch` in flight — as
+leases fenced by a fresh token, renewed while an attempt runs; no lock is held across a
+delivery, and a lease that runs out (a crashed instance) is simply claimed again. Each attempt
+walks at the attempt's own instant and rewrites at the instant the message was received, with
+one `{{uuid}}` seed per message, so **every attempt sends identical bytes**. Once a message has
+been offered to a downstream it is pinned to that route: later attempts walk it alone, falling
+back to the whole chain only if it is paused, not started or no longer configured — never
+because it has no headroom, which would emit under another identity (§3.3). What an attempt
+comes to:
+
+| Attempt | The message |
+|---|---|
+| `2xx` on the final dot | Delivered: quota committed and row deleted in one transaction (§7.4) |
+| Deferred to a rate slot (§7.6) | Waits for the slot, which it keeps |
+| `4xx`, connect, TLS, timeout, protocol error, or no eligible route | Retried after `initial × factor^n` (capped at `max`), jittered |
+| Ambiguous final dot (§10.2) | Retried; the downstream may already have it |
+| `5xx` at `RCPT TO` | Dead letter, `rejected` |
+| `5xx` at any other stage | Retried, as §10.1 treats it — a configuration fault, not a verdict |
+| Hold ran out | Dead letter, `expired` |
+| Body missing or changed | Dead letter, `corrupt` |
+
+**Delivery is at least once.** §10.2's ambiguity remains, and an instance that loses its lease
+mid-attempt may deliver while another also does. Both are counted, never hidden.
+
+**Dead letters.** A dead letter is kept for `dead_letter.retention` (default 7 days) with its
+reason, last code and text and attempt count, counted, and POSTed to the optional webhook (with
+the envelope addresses unless `include_addresses: false`); the webhook's failure never changes
+the message's state. Its body is deleted at once unless `dead_letter.keep_body` is set, in which
+case §9.3's retry can requeue it until then.
+
+**Removing Simmer** from a spooling ramp is preceded by a drain (§1.1).
+
 ---
 
 ## 8. Outbound leg
@@ -1272,6 +1445,9 @@ decision may depend on the body's `From:` header. It is buffered in memory up to
 
 This is a transient buffer, not a spool. No durability guarantee attaches to it and it is not
 recovered after a crash — at the point of a crash, no `250` has been returned to the client.
+
+A spooling ramp's message (§7.7) is copied from this buffer into the body store, durably,
+before its `250`; the buffer itself is no different. *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
 
 ### 8.2 TLS
 
@@ -1358,6 +1534,19 @@ See `DECISIONS.md` D-099.)*
 - `simmer_mx_lookups_total{result}` — result: `ok`, `cached`, `error`, `timeout` (§3.2 step
   2). `error` and `timeout` each put a recipient in the catch-all
 
+- `simmer_rate_wait_seconds{route,domain_group}` — histogram of how long a message waited for
+  its rate slot (§7.6); `simmer_rate_slots_unbooked_total{route}` — slots given back; `rate` is
+  a `simmer_route_skipped_total` reason
+- `simmer_spool_accepted_total`, `simmer_spool_admission_refused_total{reason}` (`full`,
+  `backlog`, `draining`, `unavailable`), `simmer_spool_attempts_total{route,result}`
+  (`delivered`, `deferred`, `retry`, `pool_exhausted`, `rejected`, `expired`),
+  `simmer_spool_dead_total{reason}`, `simmer_spool_lease_lost_total`,
+  `simmer_spool_orphans_swept_total`, `simmer_spool_webhook_total{result}` (§7.7)
+- `simmer_spool_depth{domain_group}`, `simmer_spool_bytes`, `simmer_spool_oldest_seconds` —
+  read from the store on each scrape
+
+*(The rate and spool metrics are added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
+
 *(The four `simmer_link_proxy_*` metrics are added. See `DECISIONS.md` D-083.
 `simmer_header_rewrite_skipped_total` is added; see D-089. `simmer_thread_affinity_total` is
 added; see D-090. The two `simmer_ramp_*` metrics and the `ramp` label are added; see D-099.
@@ -1386,6 +1575,12 @@ held; gauges are always cumulative. *(Added. See `DECISIONS.md` D-126.)*
 - `GET /quota?ramp=&route=&group=` — current window detail. `ramp` is required once more than
   one ramp is configured.
 - `GET /metrics` — Prometheus, when `admin.metrics` is enabled (§9.1).
+- `GET /spool` — totals, every lane's depth, bytes, oldest age and next attempt, and each
+  spooling ramp's paused, draining and `drained` state. `GET /spool/dead` — dead letters,
+  newest first, with no envelope address; a downstream's text has anything address-shaped
+  redacted. Both `404` when no ramp spools. *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
+- A domain-group window of a route with a `rate` also reports its rate per hour, the day's
+  capacity at that rate, and the next free slot. *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
 
 The pre-ramp paths `/routes` and `/routes/{name}`, and every write path under them, answer
 `410 Gone` with the path that replaces them, rather than acting on `default_ramp`: a mutation
@@ -1405,6 +1600,14 @@ identifier.
   expires at the next day boundary.
 - `POST /quota/reset` — reset counters for a ramp/route/group; `ramp` is required. Destructive;
   requires an explicit confirmation field in the body.
+
+- `POST /spool/dead/{id}/retry` — requeue a dead letter whose body is kept (§7.7); `409` once
+  it is not. `DELETE /spool/{id}` — remove a spooled message in any state, and its body.
+- `POST /ramps/{ramp}/spool/pause` and `/resume` — stop and restart delivery for a spooling
+  ramp; accepted messages keep counting down their hold. `POST /ramps/{ramp}/spool/drain` —
+  refuse new mail into the ramp with `451 4.7.1` and keep delivering; the response says how
+  many remain, and `{"draining": false}` reverses it. This is the cutover step (§1.1).
+  *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
 
 Every mutation acts within one ramp, and the chains it reports emptied are that ramp's.
 *(Amended — the paths gained `/ramps/{ramp}`. See `DECISIONS.md` D-099.)*
@@ -1438,6 +1641,12 @@ Each recipient's domain group is reported with the basis it was chosen on: `lite
 `mx:<host>` (the exchange host that matched), `fallback`, or `fallback:mx-unavailable`. The
 lookup is the real one and fills the same cache the walk reads. *(Added. See `DECISIONS.md`
 D-100.)*
+
+A route with a `rate` is reported with the slot it would be given and the wait, or skipped
+with reason `rate` and its earliest slot. For a spooling ramp each recipient also carries
+`spool`: the admission verdict (`admit`, `full`, `backlog`, `draining`) from the same function
+acceptance calls, the reply the client would get, the lane's expected wait and the end of the
+hold; the evaluation is then the first attempt's walk, made now. *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
 
 This is the primary tool for validating a configuration before it carries live traffic, and
 should be treated as a first-class feature rather than a debugging afterthought.
@@ -1514,6 +1723,10 @@ and `OTEL_RESOURCE_ATTRIBUTES` are not read. *(Added. See `DECISIONS.md` D-126.)
 Downstream text is included because it is frequently the only diagnostic the operator will
 see, but is sanitised of control characters and truncated to a safe length.
 
+On a spooling ramp (§7.7) the client is answered at the final dot — `250 2.0.0 queued as <id>`,
+or an admission refusal, always `451 4.7.1` — and the table above decides what becomes of the
+message, not what the client hears; §7.7's table says how. *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
+
 ### 10.2 Ambiguity at the final dot
 
 If the connection drops after the terminating dot is written but before a reply is read, the
@@ -1522,6 +1735,9 @@ increments `simmer_ambiguous_delivery_total`. This risks a duplicate on client r
 trade-off is chosen deliberately: for warm-up traffic, a duplicate is a smaller harm than a
 silently lost message, and the alternative (`250` on an unconfirmed send) would make Simmer
 lie about a delivery it cannot vouch for.
+
+A spooled message in the same window keeps its rate slot spent and is retried by the
+dispatcher: delivery from the spool is at least once (§7.7). *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
 
 ### 10.3 No eligible route
 
@@ -1576,6 +1792,10 @@ On `SIGTERM`: stop accepting connections, allow in-flight sessions to complete u
 period (default 30s), release any reservations still outstanding, drain pools, exit. Sessions
 exceeding the grace period receive `421` and are closed.
 
+The spool's dispatcher (§7.7) stops claiming at the same moment. Its attempts in flight finish
+under the same bound as the sessions' relays; one cut past it leaves a lease that runs out, and
+the message is claimed again by the next instance to start. *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
+
 The link proxy (§5.7) stops accepting at the same moment, and its in-flight requests share the
 same grace period. Idle keep-alive connections close at once. Requests still running when the
 grace period ends are cut. *(Added. See `DECISIONS.md` D-083.)*
@@ -1599,6 +1819,14 @@ Indicative tables:
 - `route_state(ramp, route, paused, graduated, allowance_override, override_expires_at,
   updated_at)` — admin mutations, so they survive restart.
 - `instance_config(key, value)` — the recipient hash salt and similar singletons.
+- `route_rate(ramp, route, domain_group, tat, updated_at)` — §7.6's buckets, primary key on
+  the first three. *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
+- `spool_message(id, ramp, domain_group, state, next_attempt_at, lease_owner, lease_until,
+  lease_token, attempts, pinned_route, booked_route, booked_group, booked_tat, received_at,
+  expires_at, envelope, body_ref, body_bytes, body_sha256, uuid_seed, dead_reason, last_code,
+  last_error, dead_at, …)` — §7.7's state; indexed for claiming by `next_attempt_at`. A
+  delivered message's row is deleted. `spool_ramp_state(ramp, paused, draining)` — §9.3's
+  spool mutations. Bodies are never stored here, but in the body store. *(Added. See `DECISIONS.md` D-111 – D-125 and `docs/SPOOL_PLAN.md`.)*
 
 *(Amended — `ramp` is new in every table but `instance_config`. The migration that adds it
 fills existing rows with a sentinel that cannot be a ramp name and then drops the column
@@ -1683,6 +1911,12 @@ Each phase should end in a working, testable artefact.
     adoption, the control plane per ramp, then selection by listener and header.
     *(Added. See `DECISIONS.md` D-099.)*
 14. The optional OTLP telemetry export (§9.6). *(Added. See `DECISIONS.md` D-126.)*
+15. Per-segment sending rates in synchronous mode (§7.6). *(Added. See `DECISIONS.md`
+    D-111 – D-115.)*
+16. The opt-in spool (§7.7): validation, storage in both backends, the body stores, the
+    accept path and the dispatcher. *(Added. See `DECISIONS.md` D-116 – D-124.)*
+17. Operating the spool: the control plane, its metrics, the drain and the dry run.
+    *(Added. See `DECISIONS.md` D-125.)*
 
 ---
 

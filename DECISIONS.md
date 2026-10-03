@@ -5711,6 +5711,52 @@ admission forecast (D-119) counts only a route that would *queue*: the chain's
 first route, if it has `on_limit: wait`. A first route that steers or has no
 rate takes what a waiting route behind it cannot, so nothing queues.
 
+### D-125 — Operating the spool: the control plane, the scrape-time gauges, the dry run, and the amendment
+
+> Phase 3 of the segment rate-limit/spool plan, 2026-10-03.
+
+**Endpoints** (`src/admin/spool.rs`), all behind the bearer token (D-055), all
+`404 spool_disabled` when no ramp spools:
+- `GET /spool` — totals and limits, every lane with a live message (depth,
+  bytes, oldest age, next attempt), and per spooling ramp `paused`, `draining`,
+  `depth` and `drained` (draining and empty: the cutover signal).
+- `GET /spool/dead?limit=` — newest first. **No envelope address**, and the
+  last downstream text has anything address-shaped replaced by `<redacted>`:
+  real downstreams quote the recipient (`550 5.1.1 <bob@…> unknown`), and a
+  read endpoint that relayed it would be the list §7.3 hashes recipients to
+  avoid. Tested on the wire.
+- `POST /spool/dead/{id}/retry` — requeued with a fresh hold, its pin kept
+  (Q3); `409 no_body` once the body is gone (D-121).
+- `DELETE /spool/{id}` — a message in any state, and its body.
+- `POST /ramps/{ramp}/spool/pause`, `/resume`, `/drain` (`{"draining": false}`
+  reverses it). Pause and drain live in `spool_ramp_state`, so every instance
+  obeys one (Q5); a paused ramp's rows are excluded inside the claim itself.
+
+Every mutation is audited through `mutate::audit` with the acting token's name,
+and pause and drain return a warning saying what they do to the ramp's mail —
+which is still only ever `451` (§14.1), never a `5xx`.
+
+**Gauges.** `simmer_spool_depth{ramp,domain_group}`, `simmer_spool_bytes` and
+`simmer_spool_oldest_seconds` are read from the store on each scrape (D-056).
+Every configured lane of every spooling ramp is published, `0` when empty, so a
+lane that drains does not keep its last depth. The counters are named in
+`src/metrics.rs` with their `# HELP` lines, and pinned in
+`tests/metrics_endpoint.rs`.
+
+**Dry run.** For a spooling ramp each recipient carries `spool`: the admission
+verdict, the reply, the expected wait and the hold — from
+`spool::accept::admission`, which the accept path also calls, so the two cannot
+disagree (D-109's principle applied to admission).
+
+**The amendment** (O-20, answered by the author on 2026-10-03: amend on this
+branch). `SPEC.md` §1, §1.1, §2.1–§2.3, §3.2 step 3c″, §4.1, §4.2, §7.4, §7.6
+and §7.7 (new), §8.1, §9.1–§9.4, §10.1, §10.2, §10.4, §11 and §13 carry it,
+each marked. `CLAUDE.md` rules #1 and #8 now say what is allowed (an opt-in
+spool in `src/spool/`) and what is not (persistence anywhere else; the capture
+becoming or feeding the spool; a DSN, ever). The README has a Spooling section.
+`docker-compose.yml` has the spool volume, commented out for the capture's
+reason.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -5737,7 +5783,7 @@ the phase that depends on each.
 | O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment. *Deferred again, explicitly, by the 2026-09-24 amendment — see **D-099**.* |
 | ~~O-18~~ | *Settled 2026-09-23 by the spec's author: `554`, not configurable, and amend the spec. §5.5 (the end-of-data marker is `CRLF . CRLF` and nothing else, and the whole payload is refused), §9.1 (`simmer_ambiguous_terminator_total`) and §10.3 (the one permanent reply that is a statement about the message, and why §14.1's worked example does not reach it) now carry it — see **D-095**.* | | |
 | O-19 | What should `database.fail_closed: false` do? §7.5 defines only `true` (`451 4.3.0`, send nothing). The implementation answers a store failure under `false` as an exhausted chain — the ramp's `exhausted_chain_reply`, so `451 4.7.1` by default and **`550 5.7.1` if the ramp sets `"550"`**, which §14.1 would forbid for a transient failure. The old log line claimed the message was sent unenforced; it never was. Options: (a) true fail-open, relaying without a reservation; (b) keep refusing, but always `451` (4.3.0 or 4.7.1); (c) remove the key. | Behaviour unchanged; log and docs made truthful — see **D-107** | Before any phase that touches §7.5 or the reservation path |
-| O-20 | `SPEC.md` §2.3 says "no rate limiting beyond §5.5". D-111 adds per-segment sending rates on routes. Amend §2.3 (and §3.2 step 3 for check c″, §4.1/§4.2 for the `rate` block and its rules, §9.1 for `simmer_rate_wait_seconds`, `simmer_rate_slots_unbooked_total` and the `rate` skip reason, §9.2/§9.4 for the new fields, and §11 for `route_rate`)? | A divergence, recorded in D-111–D-115. `SPEC.md` is unchanged | Before the next spec amendment |
+| ~~O-20~~ | ~~`SPEC.md` §2.3 says "no rate limiting beyond §5.5". D-111 adds per-segment sending rates on routes. Amend §2.3 (and §3.2 step 3 for check c″, §4.1/§4.2 for the `rate` block and its rules, §9.1 for `simmer_rate_wait_seconds`, `simmer_rate_slots_unbooked_total` and the `rate` skip reason, §9.2/§9.4 for the new fields, and §11 for `route_rate`)?~~ | **Answered 2026-10-03:** amend on this branch. `SPEC.md` now carries rates (§7.6) and the spool (§7.7) — see **D-125** | — |
 | O-21 | Which downstream budget does the README's "Timeout budget" mean? It counts connect + command + data (160 s with the shipped timeouts); `quota::reservation_expiry` counts connect + command × 8 + data (370 s), which is above the default `server.timeouts.data` of 300 s. Should the shipped downstream timeouts, or the default data timeout, change? | D-115: the rate's client-budget rule uses the expiry's count but applies only to a nonzero `max_wait`, so a default-timeout route can carry a rate with `max_wait: 0` | Before any phase that holds a client longer (spool mode's `on_limit: wait` would) |
 
 
