@@ -31,6 +31,13 @@ see D-095. And the 2026-09-24 one for named ramps (§3.4 and §5.8, new, and the
 sections D-099 lists), which the author asked for directly; it re-defers O-14 and
 O-15 explicitly.
 
+> **Branch `feature/segment-rate-limits-and-spool` only:** the spec's author has
+> approved an opt-in spool and per-segment rate limits, including amending
+> `SPEC.md` (2026-10-03). Read **`docs/SPOOL_PLAN.md`** before anything else on
+> this branch — it is the plan, the author's decisions and the current status,
+> and it is the sanctioned exception to rule #1 below. Synchronous ramps keep
+> every rule here unchanged. Remove this note when the branch merges.
+
 ## The four things that will bite you
 
 1. **This is not an MTA.** No spool, no queue, no retry scheduler, no DSN
