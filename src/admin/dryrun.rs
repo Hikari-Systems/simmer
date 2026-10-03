@@ -863,6 +863,47 @@ mod tests {
     }
 
     #[test]
+    fn a_step_view_reports_the_rate_slot_and_wait() {
+        // D-111: §9.4 reports the rate step — the slot and the hold.
+        let at: chrono::DateTime<Utc> = "2026-10-03T12:00:00Z".parse().unwrap();
+        let rate = chain::RateStep {
+            send_at: at + chrono::Duration::milliseconds(2500),
+            wait: chrono::Duration::milliseconds(2500),
+            over_limit: false,
+        };
+        let held = step_view(&chain::Step {
+            route: "warming".into(),
+            outcome: Ok(()),
+            over_cap: false,
+            rate: Some(rate),
+        });
+        let r = held.rate.expect("a rate step");
+        assert_eq!(r.wait_seconds, 2.5);
+        assert_eq!(r.send_at, rate.send_at);
+        assert_eq!(held.outcome, "selected");
+
+        let steered = step_view(&chain::Step {
+            route: "warming".into(),
+            outcome: Err(SkipReason::Rate),
+            over_cap: false,
+            rate: Some(rate),
+        });
+        assert_eq!(steered.reason, Some("rate"));
+        assert!(steered.rate.is_some(), "the earliest slot, for a rate skip");
+        let json = serde_json::to_value(&steered).unwrap();
+        assert_eq!(json["rate"]["wait_seconds"], 2.5);
+
+        // No rate block: no field at all.
+        let plain = step_view(&chain::Step {
+            route: "overflow".into(),
+            outcome: Ok(()),
+            over_cap: false,
+            rate: None,
+        });
+        assert!(serde_json::to_value(&plain).unwrap().get("rate").is_none());
+    }
+
+    #[test]
     fn a_step_view_names_the_reason_and_omits_it_when_selected() {
         let selected = step_view(&chain::Step {
             route: "overflow".into(),

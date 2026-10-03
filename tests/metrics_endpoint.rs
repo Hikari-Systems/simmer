@@ -593,6 +593,48 @@ async fn the_metrics_carry_help_text(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn the_rate_metrics_are_histogram_and_counter_with_help(pool: PgPool) {
+    let _serialised = exclusive().await;
+    // D-111. A histogram with declared buckets, so it aggregates across
+    // instances; `rate` is a route_skipped reason like the others.
+    let state = state(pool);
+    simmer::metrics::rate_wait("main", "warming", "google", 0.0);
+    simmer::metrics::rate_wait("main", "warming", "google", 1.5);
+    simmer::metrics::rate_slot_unbooked("main", "warming");
+    simmer::metrics::route_skipped("main", "warming", "rate");
+
+    let (_, body) = scrape(&state).await;
+    for help in [
+        "# HELP simmer_rate_wait_seconds",
+        "# HELP simmer_rate_slots_unbooked_total",
+    ] {
+        assert!(body.contains(help), "{help}: {body}");
+    }
+    assert!(
+        body.contains(
+            r#"simmer_rate_wait_seconds_bucket{ramp="main",route="warming",domain_group="google",le="0"} 1"#
+        ),
+        "{body}"
+    );
+    assert_eq!(
+        value(
+            &body,
+            "simmer_rate_slots_unbooked_total",
+            &[("ramp", "main"), ("route", "warming")]
+        ),
+        "1"
+    );
+    assert_eq!(
+        value(
+            &body,
+            "simmer_route_skipped_total",
+            &[("ramp", "main"), ("route", "warming"), ("reason", "rate")]
+        ),
+        "1"
+    );
+}
+
+#[sqlx::test]
 async fn no_scrape_exposes_a_recipient(pool: PgPool) {
     let _serialised = exclusive().await;
     // §7.3, applied to the one place where a high-cardinality label would be
