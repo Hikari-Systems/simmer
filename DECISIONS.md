@@ -4886,7 +4886,8 @@ must never stop Simmer starting.
   idle for an interval is not exported and an unchanged gauge still is.
 - The T4 soak with export on, SQL Server Express, both instances, jemalloc's
   counters (`SIMMER_OTEL=on`, docs/SOAK.md §18): an hour, a 20-minute control
-  with export off, and 20 minutes after the fixes above.
+  with export off, then 20 minutes and an hour after the fixes above. The last
+  gave the first green leak verdict with the export on.
 - `cargo test`, `clippy -D warnings` and `cargo deny check` for both builds.
   The SQL Server build's clippy, lib, telemetry and config tests ran in a
   `rust:1-bookworm` container, for its OpenSSL headers.
@@ -4896,8 +4897,8 @@ must never stop Simmer starting.
   output.
 
 **Not run:**
-- An hour with the fixes in. The 20-minute run after them has too few floors
-  for a leak verdict.
+- The cause of the late latency burst in §18's fixed hour, which was traced to
+  SQL Server on a host whose disk had filled. That hour's leak gates were green.
 - The stress tier (T3) with export on.
 - An export to a TLS endpoint or a real vendor.
 

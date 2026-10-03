@@ -34,7 +34,9 @@ bytes per unmatched-sender series, which D-093 now expires. With `/metrics` off
 time. With D-101's OTLP export on (§18), on SQL Server, the first
 hour found a latency tail, F7 again on the export side and a baseline the harness
 measured too early; after the fixes, 20 minutes matched the export-off control to
-within 14 ms of p99.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
+within 14 ms of p99, and an hour gave the first green leak verdict with the export
+on, but also a burst of SQL Server latency in its last eight minutes, on a host
+whose disk had filled.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
 step 5 summary". This document records what
 the soak tier is, what ten runs have established, and — at least as usefully —
 what they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
@@ -2136,3 +2138,45 @@ ten more tasks, from before its first message.
   only in C (6.2–21.0 MiB), and not in B. That is not enough runs to tie it to
   the export, and it stays unexplained.
 - **The stress tier, a TLS endpoint, a real vendor.**
+
+### Hour D: the fixed build, 2026-10-03 14:16–15:15 UTC
+
+Run C's script for an hour, built from the commit that carries the fixes
+(`9edcb88`, image `17c70134…`). `target/soak-runs/2026-10-03-mssql-otel-je-hour-fixed`.
+
+- **The first leak verdict with the export on, and it is green.** On both
+  instances, eleven floors after the warm-up: `anon` +1.23 and +1.30 MiB/h,
+  fds and threads flat. At rest: tasks 22 → 22, threads 7 → 6, 0 unaccounted
+  descriptors. `soak_analyze` passed.
+- **Correctness.** 36,010 of 36,010 accepted per instance, none deferred,
+  refused or failed in transport. V4 as always.
+- **F7 on the export side is gone.** `je_allocated` was 5.9–8.3 MiB, sloping
+  +0.67 and +0.82 MiB/h, against A's +3.22 and +1.06 and §17's 0.50–0.64 with
+  no export. There was no ~18 MiB step on either instance.
+- **The export was complete and lighter.** The collector accepted 514,448
+  spans (now with `simmer.quota.usage`), 159,472 log records (A: 449,748) and
+  8,974 metric points (A: 120,546), and refused or failed none. There were no
+  SDK warnings. CPU was 8.2% and 8.1% of a core, against A's 11.3%.
+
+**A new burst: latency late in the hour.** p99 102 and 108 ms, max 2.76 and
+2.71 s. 204 and 203 messages took over 200 ms, and all but three per instance
+fell in minutes 53–60 (15:09–15:16 UTC). The first 52 minutes had one or two
+each. It is not A's tail, which came in the first sixteen minutes and stopped.
+Both instances slowed on the same message numbers (`soak-*-33770` was the
+slowest on both), so the cause is shared: the database or the host.
+
+The trace of the slowest (`soak-app-33770`, 2,756 ms) puts it in SQL Server:
+1,234 ms in `simmer.route`, which is §7.4's reserve, and 1,216 ms in
+`simmer.quota.resolve`, the commit, against 1.5 ms downstream. **The host disk
+was at 100% by the end of the run, with 8.2 GB free**, down from 22 GB at the
+start of §18's runs. The collector had rotated a 256 MiB trace file at 15:07,
+two minutes before the burst. A full disk stalling SQL Server's log flushes
+would fit two instances waiting on each other's row lock. It was not proven,
+and it is a condition of this host, not of simmer.
+
+#### What this hour did not establish
+
+- **The cause of the late burst.** A rerun on a host with free disk, or with
+  the collector writing nothing, would separate the disk from the export.
+- **Which fix removed A's early tail.** It was absent here too, but the two
+  fixes still went in together.
