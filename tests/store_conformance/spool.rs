@@ -613,6 +613,24 @@ pub async fn spool_concurrent_claims_are_exclusive(stores: SpoolStores<'_>) {
                     .map(|c| c.id),
             );
         }
+        // Exclusive, and nothing lost — but not necessarily all in the
+        // concurrent round: a claimant passes over rows another is examining
+        // (`SKIP LOCKED` / `READPAST`), and on SQL Server that can include rows
+        // the other does not end up taking. The next poll takes them, which is
+        // what the sequential claims below stand for (D-122).
+        loop {
+            let more = a
+                .claim_due(&ClaimRequest {
+                    lease: Duration::days(1),
+                    ..claim_at(now, 50)
+                })
+                .await
+                .expect("follow-up claim");
+            if more.is_empty() {
+                break;
+            }
+            ids.extend(more.into_iter().map(|c| c.id));
+        }
         let distinct: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(
             distinct.len(),

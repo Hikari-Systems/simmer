@@ -5584,6 +5584,15 @@ Server rolls the victim's whole statement back, so nothing was claimed and
 trying again is safe; the claim tries up to five times with a short jittered
 pause. Past that it reports the error, and the dispatcher polls again.
 
+**Exclusive, not exhaustive per round.** With the retry in, CI then had one
+concurrent round claim 17 of 20 due rows — no duplicates, three left for the
+next poll: a claimant holding update locks on rows it read but did not take
+makes the others `READPAST` them. That is the contract (no row claimed twice,
+none lost) and what a dispatcher's next poll repairs, so the race test now
+follows its concurrent round with sequential claims until nothing is due, and
+asserts both properties over the total. Removing the locks still yields
+duplicates in the concurrent round.
+
 **Departure 1: `commit_and_complete` after a lost lease commits, and deletes.**
 The plan said a token mismatch rolls back everything. But a holder that reaches
 `commit_and_complete` was told `2xx` by the downstream: the message has been
