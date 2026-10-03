@@ -113,7 +113,7 @@ pub struct RateStep {
     pub send_at: DateTime<Utc>,
     /// `send_at − now`, never negative.
     pub wait: chrono::Duration,
-    /// A thread-affinity reply's pinned route booked past its limit (D-111):
+    /// A thread-affinity reply's pinned route booked past its limit (D-113):
     /// counted against the bucket, and sent now.
     pub over_limit: bool,
 }
@@ -283,7 +283,7 @@ enum Check {
     /// check because it needs the day index, and before the reservation so a
     /// message turned away here never touches the row lock.
     PartialRamp,
-    /// (c″) D-111's per-segment rate. Last, because under `Reserve` it
+    /// (c″) D-111's per-segment rate (D-112). Last, because under `Reserve` it
     /// **writes**: it books a slot, and every check before it is read-only, so
     /// a route they eliminate never touches the rate row. Only the headroom
     /// step follows, and a refusal there gives the slot back. `Early` ignores
@@ -556,7 +556,7 @@ impl<'w, 'm> Walker<'w, 'm> {
     /// (c″) D-111. `Reserve` books under the row lock; `DryRun` reads the
     /// bucket and computes the same decision without writing; `Early` skips it.
     ///
-    /// A pinned reply (D-090) is never skipped here: it books past the limit,
+    /// A pinned reply (D-090, D-113) is never skipped here: it books past the limit,
     /// sending now and counted, the way `over_cap` reserves past the cap.
     async fn rate(&self, c: &mut Candidate<'w>) -> Result<Option<SkipReason>, QuotaError> {
         let Some(limit) = c.route.rate.as_ref() else {

@@ -397,6 +397,33 @@ ramps:
           mode: to_address               # to_address | to_domain
           window: { unit: daily, count: 1 }
           threshold: 3
+        # D-111 — a sending rate per domain group, beside the daily cap: messages
+        # per HOUR, indexed by the route's day like the warm-up schedule (the last
+        # value repeats; graduating jumps to it), with per-group overrides. Paced by
+        # GCRA, shared across every instance through the database.
+        #
+        # In this (synchronous) mode a rate limit can only STEER: a message with no
+        # slot inside `max_wait` goes to overflow-established, as above. It never
+        # queues. `max_wait` holds the client for a slot that is close — at most
+        # 60s, and with this route's downstream budget it must stay under
+        # server.timeouts.data, which the shipped timeouts above already exceed, so
+        # lower them before setting one. `on_limit: wait` is reserved for a
+        # deferred-delivery mode that is not built, and is refused. A route with a
+        # rate may never be last in a chain. Startup WARNs for each day the rate
+        # cannot carry the cap (per_hour x 24 + burst below it).
+        #
+        # rate:
+        #   schedule:
+        #     default: [4, 8, 15, 30, 55, 100, 200, 400]
+        #     overrides:
+        #       google: [2, 4, 8, 15, 30, 60, 120, 240]
+        #   burst: 5                      # back to back after an idle spell; default 1
+        #   on_limit: steer               # the only value built
+        #   max_wait: 0s                  # default 0s: no slot now means steer
+        #
+        # or a fixed rate, the only form an overflow route could use:
+        #
+        # rate: { per_hour: 600, burst: 20 }
 
       - name: overflow-established
         overflow: true                   # no warm-up, never quota-limited, must be last

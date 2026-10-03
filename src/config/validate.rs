@@ -1755,7 +1755,7 @@ fn check_rate(ramp: &Ramp, route: &Route, client_data: Duration, v: &mut Violati
     // Only a nonzero wait is judged. With max_wait 0 the rate adds no hold at
     // all, and the downstream budget alone is not this rule's business: by this
     // formula the shipped defaults (10 + 30×8 + 120 = 370s) already exceed the
-    // default 300s data timeout, which O-20 asks about (D-111).
+    // default 300s data timeout, which O-21 asks about (D-115).
     let budget = crate::quota::downstream_budget(route, 1);
     if !max_wait.is_zero() && max_wait + budget >= client_data {
         v.push(

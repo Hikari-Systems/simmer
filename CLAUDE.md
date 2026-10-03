@@ -267,7 +267,8 @@ src/rewrite/transfer.rs  quoted-printable and base64, each with a matching encod
 src/rewrite/charset.rs   four charsets, by hand. Anything else is "unknown" (D-044)
 src/rewrite/stability.rs §6.6's property; `validate.rs` runs it at startup. The
                          body half is `body::Rules::fixed_point_violation` (D-046)
-src/relay.rs             decide → reserve → rewrite → relay → commit/release (§7.4).
+src/relay.rs             decide → reserve → [wait for the rate slot] → rewrite → relay →
+                         commit/release (§7.4, D-111). The wait holds the reservation.
                          The session hands over an OWNED message (D-110). Not a spool:
                          nothing stores or reads one back
 src/preflight/mod.rs     §6.7 — the three checks, the registry, the interval loop.
@@ -279,6 +280,9 @@ src/frequency/sweeper.rs §7.3's eviction. Hourly; not started if nothing needs 
 src/quota/postgres.rs    the §7.4 protocol. The row lock is what makes it correct
                          `commit` also records §7.3's events, in ONE transaction
 src/quota/day.rs         §7.2 elapsed-duration day index; NEVER calendar arithmetic
+src/quota/rate.rs        D-111 — per-segment rate as GCRA with slot booking. PURE, `now`
+                         in: `decide` is the whole decision the stores make under the
+                         row lock. `unbook` gives a slot back ONLY if it is the last
 src/routing/domain_group.rs  §3.2 step 2 — literal, then MX suffix (D-100). DNS NEVER
                          defers: a failed or slow lookup is the catch-all. One shared
                          `Grouper` (Engine::groups) so walk, early check and dry run agree
@@ -288,7 +292,9 @@ src/routing/ramp_select.rs  §5.8 (D-099) — which ramp. PURE: the session, the
                          is stripped (§6.5) whatever became of it
 src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve are ONE op.
                          ONE ordered `CHECKS` list; the real walk, dry run and early
-                         check are `Mode`s of it (D-109). `now` comes from the caller
+                         check are `Mode`s of it (D-109). `now` comes from the caller.
+                         D-111's rate is the LAST check because it writes (books a
+                         slot); every non-commit outcome after it unbooks
 src/routing/thread.rs    §3.2 step 2a (D-090) — thread affinity. A REORDERING plus two
                          exemptions for the pinned route only: no §7.3 threshold, and
                          an ordinary reservation first, then `over_cap` past the cap
@@ -315,6 +321,7 @@ src/alloc_stats.rs       D-092 — jemalloc's counters to a file for the soak. B
                          `alloc-stats` feature, which NO published image enables
 src/models/recipient_event.rs  §7.3's rows. A key is 16 bytes and never plaintext
 src/models/instance_config.rs  §7.3's salt: insert-if-absent, then read (D-050)
+src/models/route_rate.rs  D-111's buckets: one `tat` per (ramp, route, domain_group)
 src/db/mod.rs            the backend switch: one per build, never both (D-084)
 src/db/postgres.rs       sqlx pool + migrations
 src/db/mssql.rs          tiberius over bb8. A connection is `broken` for the
@@ -364,6 +371,8 @@ tests/pool.rs            §8.3 counted from the DOWNSTREAM's side — accepted
 tests/ingress_tls.rs     §5.1/§5.3 end to end. Every handshake VERIFIES against a
                          per-test CA (support::TestPki); an unverified one proves little
 tests/partial_ramp.rs    D-091 through the real walk; dry run agrees per recipient
+tests/rate_limit.rs      D-111 through the walk and the relay: steer, hold, the
+                         schedule by day, every unbook path, the pinned reply
 tests/admin_api.rs       §9. Pins dry run against the REAL walk, step for step
 tests/metrics_endpoint.rs  §9.1. Its own binary — one global recorder per process
 tests/metrics_idle.rs    D-093's counter expiry. Its own binary, for the same reason

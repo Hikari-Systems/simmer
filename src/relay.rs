@@ -385,7 +385,7 @@ async fn reserve_relay_commit_inner(
 
     // -- D-111: wait for the booked rate slot -------------------------
     //
-    // After the reservation, not before it (D-111): the walk has already
+    // After the reservation, not before it (D-112): the walk has already
     // decided, under both row locks, that this route takes this message, and
     // holding the headroom through the wait is what stops a wait from ending
     // in "no headroom after all" — which would waste the slot and could not
@@ -586,7 +586,7 @@ async fn reserve_relay_commit_inner(
     // failure, decrement reserved and delete the reservation." `outcome.commit`
     // is the §10.1 table's answer, carried since phase 2.
     let store = Arc::clone(&engine.quota);
-    // D-111: a message that was not sent gives its rate slot back — with one
+    // D-114: a message that was not sent gives its rate slot back — with one
     // exception, §10.2's ambiguous final dot. The downstream may already have
     // the message, so the slot stays spent: over-counting a send only paces the
     // next message more conservatively, and under-counting one is the overshoot

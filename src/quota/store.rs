@@ -196,7 +196,7 @@ pub struct RateBookRequest {
     pub now: DateTime<Utc>,
     /// A slot later than `now + max_wait` is refused.
     pub max_wait: chrono::Duration,
-    /// Book even past `max_wait`, sending now (D-111's pinned reply).
+    /// Book even past `max_wait`, sending now (D-113's pinned reply).
     pub force: bool,
 }
 

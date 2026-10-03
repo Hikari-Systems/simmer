@@ -2479,7 +2479,7 @@ fn rejects_a_max_wait_that_overruns_the_clients_data_timeout() {
 
     // With the default downstream timeouts the budget alone is 370s, over the
     // 300s data timeout already. max_wait 0 adds no hold and is not refused
-    // for it (O-20); any wait at all is.
+    // for it (O-21); any wait at all is.
     load(&with_rate("      per_hour: 10\n")).expect("max_wait 0 adds nothing");
     rejected_for(
         &with_rate("      per_hour: 10\n      max_wait: 1s\n"),

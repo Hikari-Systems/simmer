@@ -396,6 +396,63 @@ above the traffic the share sits at the ceiling and every message is offered.
 `/ramps/{ramp}/routes` reports the share **per domain group** under `auto` (the cap it paces
 against is per group), and the route-level `today` is `null`.
 
+### Rate limits
+
+A cap says how many messages a route may send to a domain group in a day. It
+says nothing about *when*, and a provider judging a new sender watches the hourly
+shape as closely as the daily total. `rate` adds a pace per `(ramp, route,
+domain_group)` — the quota's own key — beside the cap (`DECISIONS.md` D-111):
+
+```yaml
+    rate:
+      schedule:
+        default: [4, 8, 15, 30, 55]     # messages per HOUR, by the route's day index
+        overrides:
+          yahoo: [2, 4, 8, 15, 30]      # keyed by domain group, like the caps
+      burst: 5                          # back to back after an idle spell; default 1
+      on_limit: steer                   # the default, and the only value built
+      max_wait: 0s                      # how long to hold the client for a slot
+```
+
+or a fixed `rate: { per_hour: 600, burst: 20 }`. The schedule behaves exactly as
+the caps do: indexed by the day index, the last value repeats past the end, and a
+graduated route uses the last value. An overflow route has no day index of its
+own (D-024), so it may only use `per_hour`.
+
+**In this synchronous mode a rate limit can only steer, or briefly hold a client.
+It never queues.** Simmer forwards while the client waits, so it has nowhere to
+keep a message until later. A message that finds no slot within `max_wait` goes
+down the chain to the next link, as a `recipient_frequency` steer does — counted
+as `simmer_route_skipped_total{reason="rate"}`. A slot that is close is waited
+for, with the client connected, up to `max_wait` (at most 60s; and `max_wait`
+plus the route's downstream budget must stay below `server.timeouts.data`, the
+same reasoning as the [timeout budget](#timeout-budget)). So the warming route
+sends at its pace and the rest of the traffic goes out under the established
+identity, which is what a ramp wants. `on_limit: wait` — hold the message until
+its slot, however far off — needs a deferred-delivery mode that does not exist,
+and startup refuses it.
+
+Two consequences follow, and §4.2 enforces both:
+
+- A route with a `rate` may not be **last** in a chain, for the partial ramp's
+  reason: every message it turned away would be a `451`.
+- A rate that cannot carry the cap is legal, but the cap is then decorative.
+  Startup logs a `WARN` naming each ramp, route, group and day where
+  `per_hour × 24 + burst` is below the day's cap.
+
+The pacing is GCRA: one instant per key in the database, so every instance
+shares one bucket. A slot booked for a message that is then not sent — no
+headroom, a downstream refusal, a storage error — is given back, if nothing was
+booked after it (`simmer_rate_slots_unbooked_total`). The one exception is an
+ambiguous final dot (§10.2): the provider may have the message, so its slot stays
+spent. `simmer_rate_wait_seconds` is how long messages were held for their slot.
+A thread-affinity reply on its pinned route is never steered for rate: it is
+counted against the bucket and sent at once, as it is counted past the cap.
+
+`/ramps/{ramp}/routes` reports, per domain group, `rate_per_hour` (today's),
+`rate_capacity` (`per_hour × 24 + burst`) and `next_slot_at`; the dry run reports
+each route's slot and how long the client would be held.
+
 ### Thread affinity
 
 Off by default. With it on, a reply the application sends into a conversation

@@ -75,7 +75,7 @@ pub enum RateBooked {
     Booked {
         send_at: DateTime<Utc>,
         booked_tat: DateTime<Utc>,
-        /// D-111: a thread-affinity reply's pinned route had no slot within
+        /// D-113: a thread-affinity reply's pinned route had no slot within
         /// `max_wait`, so one was booked anyway and the message goes now —
         /// counted against the bucket, as D-090's `over_cap` is against the cap.
         over_limit: bool,
@@ -133,7 +133,7 @@ pub fn book(
 
 /// The whole decision a store makes under its row lock: book if the slot is
 /// within `max_wait`, otherwise refuse — unless `force`, which books anyway and
-/// sends now (D-111's pinned reply). Returns the outcome and, when booked, the
+/// sends now (D-113's pinned reply). Returns the outcome and, when booked, the
 /// `tat` to write.
 pub fn decide(
     tat: Option<DateTime<Utc>>,

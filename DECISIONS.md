@@ -5241,6 +5241,152 @@ was); `routing::ramp_select::tests::an_owned_selection_resolves_to_the_same_choi
 Every end-to-end suite now runs through the owned path.
 
 
+### D-111 — Per-segment sending rates: GCRA per `(ramp, route, domain_group)`, steer-only in synchronous mode
+
+> Phase 1 of the segment rate-limit/spool plan, 2026-10-03. Config shape
+> settled by the spec's author (Q7: the rate has its own per-day schedule).
+> **A divergence from `SPEC.md` §2.3** — see O-20.
+
+**What.** An optional `rate` block on a route, beside `recipient_frequency`:
+`schedule: {default, overrides}` in messages per **hour**, or a fixed
+`per_hour`; `burst` (default 1); `on_limit` (default and only built value
+`steer`); `max_wait` (default `0s`). Every struct `deny_unknown_fields`. The key
+is the quota's (§7.1) without the day index — "segments" are §3.2 step 2's
+domain groups.
+
+**Schedule semantics mirror the caps exactly**: indexed by `quota::day::for_route`,
+the last value repeats past the end, a graduated route (§9.3) is at the last
+value, and a route not yet started is already `not_started` before the rate is
+consulted. An overflow route has no day index of its own (D-024), so it may use
+only `per_hour`; `schedule` there is a §4.2 violation.
+
+**Algorithm.** GCRA with slot booking, in `quota::rate`, pure over an explicit
+`now` (D-108): `interval = 3600 s / per_hour`; a message conforms at `t` if
+`t ≥ tat − (burst − 1)·interval` (so exactly `burst` after an idle spell — the
+task's `tat − burst·interval` would admit `burst + 1`, an off-by-one I corrected);
+booking sets `tat = max(tat, now) + interval` and the message is sent at
+`max(now, tat − (burst−1)·interval)`. `decide` is the whole decision; the stores
+wrap it in a row lock. Instants are truncated to microseconds so that what a
+store writes is what it reads back on both backends — `unbook` compares by
+equality, and `tests/store_conformance`'s round-trip test pins it.
+
+**Storage.** `route_rate (ramp, route, domain_group, tat, updated_at)`, PK on
+the first three, in `migrations/` and `migrations-mssql/` (NVARCHAR(128) BIN2
+keys, 768 bytes). `QuotaStore::book_rate_slot` creates-if-absent and locks
+(`ON CONFLICT DO UPDATE`; on SQL Server `UPDATE WITH (UPDLOCK, SERIALIZABLE)` +
+`IF @@ROWCOUNT = 0 INSERT`, never `MERGE`), decides, writes, commits — one short
+transaction, never held across a send. `unbook_rate_slot` locks an existing row
+and gives the slot back only if `tat` still equals the booked one.
+`rate_tats(ramp)` is an unlocked read for §9.2 and §9.4. Global across instances
+for the quota's reason: the limit is the provider's.
+
+Two deviations from the task's signatures, both small: the request carries a
+`force` flag (D-113), and `RateBooked::Booked` carries `over_limit`, so a caller
+can tell a forced booking from an ordinary one.
+
+**Validation** (`check_rate`, accumulating): exactly one of `schedule`/`per_hour`;
+every value ≥ 1 and arrays non-empty; override keys name a group; `burst ≥ 1`;
+`on_limit: wait` refused with "needs `delivery: spool`, which is not built";
+`max_wait ≤ 60s`; and a **nonzero** `max_wait` plus `quota::downstream_budget`
+(the expiry's budget without its margin, now its own function) must be below
+`server.timeouts.data` — see D-115 for why zero is exempt. `check_chain` refuses
+a rate-limited route last in a chain, for D-091's reason. A `WARN` names each
+(ramp, route, group, day) where `per_hour × 24 + burst < cap`.
+
+**Control plane and metrics.** `GroupWindow` gains `rate_per_hour`,
+`rate_capacity` and `next_slot_at` (computed by `quota::rate` from an unlocked
+read, so another session may take the slot first — the dry run's direction of
+error). No recipient anywhere; the no-`@` tests pass with a rate configured. The
+dry run's `StepView` gains `rate: {send_at, wait_seconds, over_limit}`.
+`simmer_rate_wait_seconds{ramp,route,domain_group}` (a real histogram, buckets
+0–60 s), `simmer_rate_slots_unbooked_total{ramp,route}`, and `rate` as a
+`route_skipped` reason, pinned in the label test.
+
+**Tested.** `quota::rate` unit tests (burst, strict pacing, idle refill capped
+at burst, queueing, `max_wait` boundary inclusive, forced booking, unbook
+ordering, microsecond round-trip). Nine conformance tests, including a two-pool
+warmed/barriered race over ten fresh keys that fails with the lock removed (16
+granted against a burst of 3 — checked by mutation). Ten `config_validation`
+tests. `tests/rate_limit.rs`: burst-then-steer and yahoo-vs-google through the
+relay; the client held and the downstream's `MAIL FROM`s a second apart; the
+schedule by day and repeating; dry run equal to the real walk step for step
+including the slot and the wait; every unbook path; the pinned reply.
+
+### D-112 — The rate is the last check; the relay waits for the slot after taking the reservation
+
+> Phase 1, 2026-10-03.
+
+**Position.** `Check::Rate` (c″) follows the partial ramp and precedes headroom.
+It is last because, under `Reserve`, it is the only check that **writes**: a
+route any earlier check eliminates never touches the rate row, so nothing needs
+giving back. `Mode::Early` ignores it, and errs only in the harmless direction
+because §4.2 forbids a rate-limited route last in a chain — a route it would
+turn away always has a later link. Reading the bucket at `RCPT TO` would also be
+a guess about a slot the final dot is not bound to.
+
+**Order of booking and waiting.** The walk books the slot, then reserves; the
+relay then **sleeps until `send_at` holding the reservation**, then rewrites and
+relays. The task suggested sleeping before reserving. I chose the other order,
+recorded here as "an equally safe order": waiting first means a message can wait
+out its slot and then find no headroom, wasting a slot that may no longer be
+givable back (another booking has queued behind it). Holding the reservation
+through the wait costs headroom for at most `max_wait` (≤ 60 s), and is
+accounted for: the reservation's expiry and §10.4's drain bound
+(`relay_drain_bound`) both add the route's `max_wait`, so neither the sweeper nor
+shutdown can cut a send that is still waiting. The sleep is `tokio::time`.
+
+The end-to-end timing tests use real time (about a second each), not a paused
+clock: with Simmer and the fake downstream talking over TCP, a paused runtime
+auto-advances whenever every task waits on I/O, which fires stage timeouts. The
+walk-level tests pass `now` and need no clock.
+
+### D-113 — A thread-affinity reply books past the rate limit, counted, and is never skipped for rate
+
+> Phase 1, 2026-10-03. The task's recommended option, taken.
+
+D-090 exempts a pinned reply from §7.3 and the share and reserves it past the
+cap, because a reply that changes identity mid-thread is the harm. The rate is
+the same kind of rule — "this route has sent enough for now" — so it gets the
+same treatment: the pinned route **books** (so the send is counted against the
+bucket and paces the messages after it) with `force: true`, which books past
+`TooLate` and sends **now** rather than at a far slot (holding a reply an hour
+would be worse than the burst). Within `max_wait`, force changes nothing — the
+reply waits for its slot like any other message. A forced booking is
+`over_limit` on the step, logged at INFO, and reported by the dry run. Pause,
+strict preflight and a future start still eliminate a pinned route, as before.
+
+### D-114 — Every outcome that does not commit gives the slot back — except §10.2's ambiguous final dot
+
+> Phase 1, 2026-10-03.
+
+`chain::unbook` is called on: no headroom (the walk, after booking), a
+reservation error (before §7.5 decides the reply), the internal "no compiled
+rewrite" error, and any downstream outcome whose §10.1 row does not commit.
+**Not** on `RelayError::Ambiguous`: the provider may have the message, and
+under-counting a send is the overshoot the limit exists to prevent, while
+over-counting one only paces the next message more conservatively. Unbook is
+best-effort — a failure logs and leaves the bucket one interval conservative
+until it drains — and gives the slot back only if nothing was booked after it,
+since moving `tat` back from under a later booking would let the next message
+jump the queue. `simmer_rate_slots_unbooked_total` counts the slots actually
+returned. Each path has a test in `tests/rate_limit.rs`.
+
+### D-115 — `max_wait: 0` is exempt from the client-budget rule
+
+> Phase 1, 2026-10-03. Raises O-21.
+
+The rule "`max_wait` + the route's downstream budget < `server.timeouts.data`"
+uses `quota::reservation_expiry`'s budget (connect + command × 8 + data). With
+the shipped and default timeouts that is 10 + 240 + 120 = **370 s, already above
+the default 300 s** data timeout, with no rate at all. Applied literally, every
+rate on a default-timeout route would be refused — including `max_wait: 0`, which
+adds no hold. So the rule judges only a nonzero `max_wait`: the rate is
+responsible for the time it adds, not for a pre-existing gap between the
+README's "Timeout budget" (which counts connect + command + data = 160 s) and the
+expiry's more conservative count. Whether the shipped defaults should change, or
+which budget the README means, is O-21.
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -5267,6 +5413,8 @@ the phase that depends on each.
 | O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment. *Deferred again, explicitly, by the 2026-09-24 amendment — see **D-099**.* |
 | ~~O-18~~ | *Settled 2026-09-23 by the spec's author: `554`, not configurable, and amend the spec. §5.5 (the end-of-data marker is `CRLF . CRLF` and nothing else, and the whole payload is refused), §9.1 (`simmer_ambiguous_terminator_total`) and §10.3 (the one permanent reply that is a statement about the message, and why §14.1's worked example does not reach it) now carry it — see **D-095**.* | | |
 | O-19 | What should `database.fail_closed: false` do? §7.5 defines only `true` (`451 4.3.0`, send nothing). The implementation answers a store failure under `false` as an exhausted chain — the ramp's `exhausted_chain_reply`, so `451 4.7.1` by default and **`550 5.7.1` if the ramp sets `"550"`**, which §14.1 would forbid for a transient failure. The old log line claimed the message was sent unenforced; it never was. Options: (a) true fail-open, relaying without a reservation; (b) keep refusing, but always `451` (4.3.0 or 4.7.1); (c) remove the key. | Behaviour unchanged; log and docs made truthful — see **D-107** | Before any phase that touches §7.5 or the reservation path |
+| O-20 | `SPEC.md` §2.3 says "no rate limiting beyond §5.5". D-111 adds per-segment sending rates on routes. Amend §2.3 (and §3.2 step 3 for check c″, §4.1/§4.2 for the `rate` block and its rules, §9.1 for `simmer_rate_wait_seconds`, `simmer_rate_slots_unbooked_total` and the `rate` skip reason, §9.2/§9.4 for the new fields, and §11 for `route_rate`)? | A divergence, recorded in D-111–D-115. `SPEC.md` is unchanged | Before the next spec amendment |
+| O-21 | Which downstream budget does the README's "Timeout budget" mean? It counts connect + command + data (160 s with the shipped timeouts); `quota::reservation_expiry` counts connect + command × 8 + data (370 s), which is above the default `server.timeouts.data` of 300 s. Should the shipped downstream timeouts, or the default data timeout, change? | D-115: the rate's client-budget rule uses the expiry's count but applies only to a nonzero `max_wait`, so a default-timeout route can carry a rate with `max_wait: 0` | Before any phase that holds a client longer (spool mode's `on_limit: wait` would) |
 
 
 ---
