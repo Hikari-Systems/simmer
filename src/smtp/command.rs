@@ -186,9 +186,16 @@ fn parse_rcpt(rest: &str) -> Result<Command, ParseError> {
 }
 
 /// Consume `KEYWORD` and its `:` from the front of `s`, case-insensitively.
+///
+/// The comparison is over **bytes**: `keyword.len()` need not fall on a char
+/// boundary of client input (`MAIL FRO€:`), and slicing the `&str` there panics
+/// the session task. `keyword` is ASCII, so a byte match means the split point
+/// *is* a boundary and the slice after it is safe.
 fn strip_keyword<'a>(s: &'a str, keyword: &str) -> Option<&'a str> {
+    debug_assert!(keyword.is_ascii());
     let s = s.trim_start();
-    if s.len() < keyword.len() || !s[..keyword.len()].eq_ignore_ascii_case(keyword) {
+    let head = s.as_bytes().get(..keyword.len())?;
+    if !head.eq_ignore_ascii_case(keyword.as_bytes()) {
         return None;
     }
     let after = s[keyword.len()..].trim_start();
@@ -572,6 +579,27 @@ mod tests {
                 initial: Some("AGNmYXBwAHB3".into())
             }
         );
+    }
+
+    #[test]
+    fn a_non_ascii_keyword_is_a_syntax_error_not_a_panic() {
+        // `€` is three bytes, so `FRO€` puts byte 4 inside a character: slicing
+        // the &str there panicked the session task. Every one of these must come
+        // back as a 501-class syntax error.
+        for line in [
+            "MAIL FRO€:<a@b>",
+            "MAIL F€:<a@b>",
+            "MAIL €:<a@b>",
+            "RCPT T€:<a@b>",
+            "RCPT €€€€:<a@b>",
+            "MAIL ÖÖ",
+            "RCPT é",
+        ] {
+            assert!(
+                matches!(parse(line), Err(ParseError::Syntax(_))),
+                "{line:?} should be a syntax error"
+            );
+        }
     }
 
     #[test]
