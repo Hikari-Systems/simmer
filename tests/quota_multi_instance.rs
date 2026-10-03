@@ -386,6 +386,7 @@ async fn send_through(
 
     let selected = match walked {
         Walk::Exhausted => return None,
+        Walk::Deferred { .. } => unreachable!("a synchronous walk never defers (D-118)"),
         Walk::Selected(s) => s,
     };
 

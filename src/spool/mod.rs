@@ -16,6 +16,8 @@
 //!   capture is written before the relay precisely so that it cannot know the
 //!   outcome; the spool exists to know it.
 
+pub mod body;
+pub mod object;
 pub mod store;
 
 pub use store::{

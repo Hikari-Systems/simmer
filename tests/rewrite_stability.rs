@@ -741,3 +741,97 @@ fn the_two_arrangements_of_the_cutover_invariant_agree() {
     );
     assert_eq!(a.envelope_from, b.envelope_from);
 }
+
+// ---------------------------------------------------------------------------
+// D-116 — §6.6 across attempts: a spooled message is rewritten on every
+// attempt, and every attempt must send the same bytes
+// ---------------------------------------------------------------------------
+
+/// One attempt at `raw`, as the dispatcher renders it: at the instant the
+/// message was received, with its seed's `{{uuid}}` sequence.
+fn attempt(route: &RouteRewrite, raw: &[u8], seed: uuid::Uuid) -> Rewritten {
+    let recipients = ["bob@example.net".to_string()];
+    let uuids = simmer::rewrite::seeded_uuids(seed);
+    rewrite(
+        route,
+        &Inbound {
+            raw,
+            envelope_from: Some("sender@oldbrand.com"),
+            recipients: &recipients,
+            route_name: "warming",
+            correlation_id: "fixed-correlation-id",
+            received: Received {
+                helo: "app.internal",
+                peer: "10.1.2.3",
+                by: "simmer.test",
+                authenticated: true,
+                tls: false,
+            },
+            now: chrono::DateTime::from_timestamp(1_767_225_600, 0).expect("valid instant"),
+            uuid: &uuids,
+        },
+    )
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Two attempts with one seed send identical bytes — volatile templates,
+    /// `Received:` and all — and a different seed changes the UUIDs.
+    #[test]
+    fn two_attempts_of_one_message_are_byte_identical(m in message()) {
+        let route = compile(SHIPPED);
+        let seed = uuid::Uuid::new_v4();
+        let first = attempt(&route, m.as_bytes(), seed);
+        let second = attempt(&route, m.as_bytes(), seed);
+        prop_assert_eq!(&first.raw, &second.raw);
+        prop_assert_eq!(&first.envelope_from, &second.envelope_from);
+
+        let other = attempt(&route, m.as_bytes(), uuid::Uuid::new_v4());
+        prop_assert_ne!(&first.raw, &other.raw, "a fresh seed is a fresh Message-ID");
+    }
+}
+
+#[test]
+fn seeded_uuids_are_distinct_per_occurrence_and_repeat_per_seed() {
+    let seed = uuid::Uuid::new_v4();
+    let a = simmer::rewrite::seeded_uuids(seed);
+    let b = simmer::rewrite::seeded_uuids(seed);
+    let first: Vec<String> = (0..3).map(|_| a()).collect();
+    let again: Vec<String> = (0..3).map(|_| b()).collect();
+    assert_eq!(first, again, "one seed, one sequence");
+    assert_ne!(
+        first[0], first[1],
+        "occurrences stay distinct, as fresh ones were"
+    );
+    for u in &first {
+        let parsed = uuid::Uuid::parse_str(u).expect("a UUID");
+        assert_eq!(parsed.get_version_num(), 4);
+    }
+}
+
+#[test]
+fn the_shipped_identity_names_two_distinct_uuids_in_one_attempt() {
+    // Message-ID and List-Unsubscribe each take a `{{uuid}}`; seeding must not
+    // collapse them into one value.
+    let route = compile(SHIPPED);
+    let out = attempt(
+        &route,
+        b"From: A <a@oldbrand.com>\r\nSubject: s\r\n\r\nbody\r\n",
+        uuid::Uuid::new_v4(),
+    );
+    let text = String::from_utf8_lossy(&out.raw);
+    let mid = text
+        .lines()
+        .find_map(|l| l.strip_prefix("Message-ID: <"))
+        .and_then(|l| l.split('@').next())
+        .expect("Message-ID")
+        .to_string();
+    let unsub = text
+        .lines()
+        .find_map(|l| l.split("/u/").nth(1))
+        .and_then(|l| l.strip_suffix('>'))
+        .expect("List-Unsubscribe")
+        .to_string();
+    assert_ne!(mid, unsub);
+}

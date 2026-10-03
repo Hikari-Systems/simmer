@@ -184,9 +184,30 @@ pub struct Selected<'a> {
 /// The result of walking a chain.
 pub enum Walk<'a> {
     Selected(Box<Selected<'a>>),
+    /// D-118 — spool mode only: a route with `on_limit: wait` booked a slot
+    /// later than now but inside the message's hold. **No reservation was
+    /// taken**; the dispatcher stores the booking and comes back at `until`,
+    /// when the deferred attempt uses this slot rather than booking another.
+    Deferred {
+        route: &'a Route,
+        domain_group: String,
+        booking: RateBooking,
+        until: DateTime<Utc>,
+    },
     /// §3.2 step 4 — nothing was eligible. §10.3 decides the reply, and its
     /// default is `451`.
     Exhausted,
+}
+
+/// D-118 — what a spooled attempt adds to [`Mode::Reserve`].
+#[derive(Debug, Clone, Copy)]
+pub struct SpoolWalk<'s> {
+    /// The end of the message's hold. A waiting route defers to a slot at or
+    /// before this, and steers past it.
+    pub hold_until: DateTime<Utc>,
+    /// The slot an earlier attempt booked, which this one uses instead of
+    /// booking again if the walk reaches that route in that group.
+    pub booked: Option<&'s crate::spool::BookedSlot>,
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +242,8 @@ enum Mode<'m> {
     Reserve {
         deps: Deps<'m>,
         correlation_id: &'m str,
+        /// D-118 — set by the spool's dispatcher, never by a session.
+        spool: Option<SpoolWalk<'m>>,
     },
     /// §9.4. Reads what `Reserve` reads, in the same order, plus the day's row
     /// unconditionally (it reports headroom without taking the lock). Reserves
@@ -375,6 +398,11 @@ struct Candidate<'r> {
 /// How a walk ended.
 enum Ended<'a> {
     Reserved(Box<Selected<'a>>),
+    Deferred {
+        route: &'a Route,
+        booking: RateBooking,
+        until: DateTime<Utc>,
+    },
     /// `DryRun` and `Early`: a route passed, nothing was taken.
     Eligible,
     Exhausted,
@@ -414,6 +442,24 @@ impl<'w, 'm> Walker<'w, 'm> {
                     self.skip_with(evaluation, name, reason, rate);
                     continue 'routes;
                 }
+            }
+
+            // D-118: a spooled message whose slot is later than now is deferred
+            // to it, holding the slot and no reservation.
+            if let Some(booking) = candidate
+                .booking
+                .as_ref()
+                .filter(|b| self.defers(candidate.route) && b.send_at > self.now)
+            {
+                evaluation.push(Step {
+                    rate: candidate.rate_step,
+                    ..step(name, Ok(()))
+                });
+                return Ok(Ended::Deferred {
+                    route: candidate.route,
+                    until: booking.send_at,
+                    booking: booking.clone(),
+                });
             }
 
             match self.headroom(candidate, evaluation).await? {
@@ -571,6 +617,34 @@ impl<'w, 'm> Walker<'w, 'm> {
             ramp: self.ramp.name.clone(),
             route: c.route.name.clone(),
             domain_group: self.group.clone(),
+        };
+
+        // D-118: an earlier attempt booked this slot; use it. The message is
+        // due, so it sends now.
+        if let Some(slot) = self
+            .spool()
+            .and_then(|s| s.booked)
+            .filter(|b| b.route == key.route && b.domain_group == key.domain_group)
+        {
+            c.rate_step = Some(RateStep {
+                send_at: self.now,
+                wait: chrono::Duration::zero(),
+                over_limit: false,
+            });
+            c.booking = Some(RateBooking {
+                key,
+                rate,
+                send_at: self.now,
+                booked_tat: slot.tat,
+                over_limit: false,
+            });
+            return Ok(None);
+        }
+        // D-118: a waiting route on a spooled message may book as far ahead as
+        // the message's hold.
+        let max_wait = match self.spool() {
+            Some(s) if self.defers(c.route) => (s.hold_until - self.now).max(max_wait),
+            _ => max_wait,
         };
 
         let outcome = match self.mode {
@@ -804,6 +878,22 @@ impl<'w, 'm> Walker<'w, 'm> {
         }
     }
 
+    fn spool(&self) -> Option<SpoolWalk<'m>> {
+        match self.mode {
+            Mode::Reserve { spool, .. } => spool,
+            _ => None,
+        }
+    }
+
+    /// D-118: whether this route defers rather than steers in this walk.
+    fn defers(&self, route: &Route) -> bool {
+        self.spool().is_some()
+            && route
+                .rate
+                .as_ref()
+                .is_some_and(|r| r.on_limit == crate::config::OnLimit::Wait)
+    }
+
     /// Record a skipped route, counting it only for a real walk.
     fn skip(&self, evaluation: &mut Vec<Step>, route: &str, reason: SkipReason) {
         self.skip_with(evaluation, route, reason, None);
@@ -866,6 +956,7 @@ pub async fn walk_and_reserve<'a>(
                 preflight,
             },
             correlation_id,
+            spool: None,
         },
         ramp,
         groups,
@@ -874,10 +965,69 @@ pub async fn walk_and_reserve<'a>(
         now,
     )
     .await?;
-    Ok(match walker.run(chain, pinned, evaluation).await? {
+    Ok(into_walk(
+        walker.run(chain, pinned, evaluation).await?,
+        &walker,
+    ))
+}
+
+fn into_walk<'w>(ended: Ended<'w>, walker: &Walker<'w, '_>) -> Walk<'w> {
+    match ended {
         Ended::Reserved(s) => Walk::Selected(s),
+        Ended::Deferred {
+            route,
+            booking,
+            until,
+        } => Walk::Deferred {
+            route,
+            domain_group: walker.group.clone(),
+            booking,
+            until,
+        },
         Ended::Eligible | Ended::Exhausted => Walk::Exhausted,
-    })
+    }
+}
+
+/// [`walk_and_reserve`] for a spooled attempt (D-118): a waiting route books a
+/// slot up to `spool.hold_until` ahead and defers to it, and a slot an earlier
+/// attempt booked is used rather than booked again.
+#[allow(clippy::too_many_arguments)]
+pub async fn walk_and_reserve_spooled<'a>(
+    ramp: &'a Ramp,
+    groups: &Grouper,
+    dot_insensitive_domains: &[String],
+    store: &Arc<dyn QuotaStore>,
+    frequency: &Frequency,
+    preflight: &crate::preflight::Registry,
+    chain: &[String],
+    pinned: Option<&str>,
+    recipients: &[String],
+    correlation_id: &str,
+    evaluation: &mut Vec<Step>,
+    now: DateTime<Utc>,
+    spool: SpoolWalk<'_>,
+) -> Result<Walk<'a>, QuotaError> {
+    let walker = Walker::new(
+        Mode::Reserve {
+            deps: Deps {
+                dot_insensitive_domains,
+                frequency,
+                preflight,
+            },
+            correlation_id,
+            spool: Some(spool),
+        },
+        ramp,
+        groups,
+        store,
+        recipients,
+        now,
+    )
+    .await?;
+    Ok(into_walk(
+        walker.run(chain, pinned, evaluation).await?,
+        &walker,
+    ))
 }
 
 /// §9.4 — walk a chain and report what *would* happen, reserving nothing.

@@ -514,6 +514,31 @@ fn sanitise_address(value: &str) -> String {
 /// Excluded from §12.3's byte-equivalence comparison by D-002, along with the
 /// `X-Simmer-*` headers — which, per the phase 4 decision, Simmer does not emit
 /// at all. One added header is the smallest honest cost of being in the path.
+/// D-116 — every `{{uuid}}` of one message, derived from one seed.
+///
+/// Each call yields the next value of a sequence fixed by `seed`, so the
+/// occurrences in one rendering stay distinct — as they were when each was
+/// drawn fresh — while a second rendering of the same message with the same
+/// seed yields the same values in the same order. That is what lets a spooled
+/// message's retries be byte-identical. Each value is a well-formed v4 UUID.
+pub fn seeded_uuids(seed: uuid::Uuid) -> impl Fn() -> String {
+    use sha2::{Digest as _, Sha256};
+    let next = std::cell::Cell::new(0u64);
+    move || {
+        let n = next.get();
+        next.set(n + 1);
+        let mut h = Sha256::new();
+        h.update(seed.as_bytes());
+        h.update(n.to_be_bytes());
+        let digest = h.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        uuid::Builder::from_random_bytes(bytes)
+            .into_uuid()
+            .to_string()
+    }
+}
+
 fn received_value(r: &Received<'_>, inbound: &Inbound<'_>) -> String {
     // RFC 3848: `ESMTP`, plus `S` for a TLS session and `A` for an
     // authenticated one — `ESMTPSA` when both. Neither names *who*

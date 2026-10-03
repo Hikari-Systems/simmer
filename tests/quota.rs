@@ -724,6 +724,7 @@ async fn walk(
             Some(s.route.name.clone())
         }
         Walk::Exhausted => None,
+        Walk::Deferred { .. } => unreachable!("a synchronous walk never defers (D-118)"),
     };
     (selected, chain::render(&evaluation))
 }
@@ -854,6 +855,7 @@ async fn an_exhausted_chain_with_no_overflow_selects_nothing(pool: PgPool) {
         match r {
             Walk::Selected(s) => store.commit(&s.reservation, &[]).await.unwrap(),
             Walk::Exhausted => panic!("should still have headroom"),
+            Walk::Deferred { .. } => unreachable!("a synchronous walk never defers (D-118)"),
         }
     }
 
@@ -1051,6 +1053,7 @@ async fn the_walk_is_evaluated_at_the_instant_it_is_given(pool: PgPool) {
                     )
                 }
                 Walk::Exhausted => panic!("overflow is uncapped"),
+                Walk::Deferred { .. } => unreachable!("a synchronous walk never defers (D-118)"),
             }
         }
     };

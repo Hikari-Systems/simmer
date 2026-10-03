@@ -234,6 +234,124 @@ fn quota_failure(cfg: &Config, ramp: &Ramp, e: quota::QuotaError, during: &str) 
     }
 }
 
+/// D-116 — the instants and identity one attempt is evaluated with.
+///
+/// A synchronous message has one instant for everything (D-108). A spooled
+/// message has two: the walk runs at the attempt — the day it is charged to is
+/// the day it is sent — while the rewrite uses the instant it was received, so
+/// that every attempt of one message produces the same bytes (§6.6 across
+/// attempts). `uuid_seed` is the other half of that: every `{{uuid}}` is
+/// derived from it rather than drawn fresh.
+pub struct AttemptCtx<'a> {
+    pub walk_now: chrono::DateTime<chrono::Utc>,
+    pub rewrite_now: chrono::DateTime<chrono::Utc>,
+    pub uuid_seed: uuid::Uuid,
+    pub spool: Option<SpoolCtx<'a>>,
+}
+
+impl AttemptCtx<'_> {
+    /// A synchronous message: one instant, a fresh seed.
+    pub fn synchronous(now: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            walk_now: now,
+            rewrite_now: now,
+            uuid_seed: uuid::Uuid::new_v4(),
+            spool: None,
+        }
+    }
+}
+
+/// D-116 — what a spooled attempt adds.
+pub struct SpoolCtx<'a> {
+    /// The end of the message's hold (Q4).
+    pub hold_until: chrono::DateTime<chrono::Utc>,
+    /// The slot an earlier attempt booked (D-118).
+    pub booked: Option<&'a crate::spool::BookedSlot>,
+    /// Q3 — the route of the first downstream attempt. Walked alone, unless it
+    /// is paused, not started or no longer configured.
+    pub pinned_route: Option<&'a str>,
+    /// Where the delivered row is completed, fenced by `token` (D-122).
+    pub store: &'a dyn crate::spool::SpoolStore,
+    pub id: uuid::Uuid,
+    pub token: uuid::Uuid,
+}
+
+/// D-116 — what one attempt came to, before the session turns it into a reply
+/// or the dispatcher into a spool transition.
+pub struct Attempt {
+    /// Exactly the reply a synchronous client has always been given.
+    pub reply: Reply,
+    pub kind: AttemptKind,
+}
+
+pub enum AttemptKind {
+    /// Sender policy, an exhausted chain, or §7.5.
+    NotSelected(SelectError),
+    /// D-118 — spool only. No reservation is held; the booking is.
+    Deferred {
+        route: String,
+        domain_group: String,
+        booking: chain::RateBooking,
+        until: chrono::DateTime<chrono::Utc>,
+    },
+    /// The downstream conversation ran, or was attempted.
+    Relayed(Relayed),
+    /// No compiled rewrite for the selected route — unreachable.
+    Internal,
+}
+
+pub struct Relayed {
+    pub route: String,
+    pub domain_group: String,
+    /// §10.1 row 1: a `2xx` on the final dot, and the quota committed.
+    pub delivered: bool,
+    pub failure: Option<Failure>,
+    /// Spool only: whether the token still held the row at completion (D-122).
+    pub lease_held: Option<bool>,
+}
+
+/// How a relay failed, as the dispatcher needs to know it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// §8.3 — the downstream was never reached. Not an attempt.
+    PoolExhausted,
+    /// §10.2 — the downstream may have the message.
+    Ambiguous,
+    /// A `5xx` about the recipient (`RCPT TO`): the one permanent verdict.
+    Rejected { code: u16, text: String },
+    /// Everything else: retry.
+    Transient { code: Option<u16>, text: String },
+}
+
+impl Failure {
+    fn of(err: &downstream::RelayError) -> Self {
+        use downstream::RelayError as E;
+        match err {
+            E::PoolExhausted => Failure::PoolExhausted,
+            E::Ambiguous => Failure::Ambiguous,
+            // D-008 for the spool: a 5xx at any other stage is a configuration
+            // fault, not a verdict on the recipient, so it is retried — and
+            // eventually expires — rather than dead-lettered (D-124).
+            E::Rejected { stage, code, text }
+                if *code >= 500 && *stage == downstream::Stage::RcptTo =>
+            {
+                Failure::Rejected {
+                    code: *code,
+                    text: text.clone(),
+                }
+            }
+            E::Rejected { code, text, .. } => Failure::Transient {
+                code: Some(*code),
+                text: text.clone(),
+            },
+            other => Failure::Transient {
+                code: None,
+                text: format!("{other:?}"),
+            },
+        }
+    }
+}
+
 /// The whole of step 2 and step 3: reserve, relay, then commit or release.
 ///
 /// `now` is the session's one clock read for this message (D-108).
@@ -249,10 +367,34 @@ pub async fn reserve_relay_commit(
     correlation_id: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Reply {
+    attempt(
+        engine,
+        selection,
+        senders,
+        message,
+        correlation_id,
+        &AttemptCtx::synchronous(now),
+    )
+    .await
+    .reply
+}
+
+/// One attempt at a message (D-116): the session's [`reserve_relay_commit`]
+/// and the spool's dispatcher both come through here, so both get the same
+/// walk, rewrite, relay and §7.4 resolution.
+pub async fn attempt(
+    engine: &Engine,
+    selection: &ramp_select::Selection<'_>,
+    senders: &Senders,
+    message: Message<'_>,
+    correlation_id: &str,
+    ctx: &AttemptCtx<'_>,
+) -> Attempt {
     // §9.6 (D-126) — the decision and its consequences as one span, with the
     // walk, the rewrite, the downstream conversation and the quota resolution
     // as its children. Every log line below lands inside it, which is what
     // gives the downstream outcome lines the `correlation_id` they never had.
+    // A spooled attempt (D-116) is the same span, marked `spooled`.
     let span = tracing::info_span!(
         "simmer.relay",
         otel.name = "simmer.relay",
@@ -260,6 +402,7 @@ pub async fn reserve_relay_commit(
         correlation_id,
         ramp = %selection.ramp.name,
         ramp_source = selection.source.as_str(),
+        spooled = ctx.spool.is_some(),
         route = Empty,
         domain_group = Empty,
         day_index = Empty,
@@ -268,29 +411,33 @@ pub async fn reserve_relay_commit(
         result = Empty,
         smtp.reply.code = Empty,
     );
-    let reply =
-        reserve_relay_commit_inner(engine, selection, senders, message, correlation_id, now)
-            .instrument(span.clone())
-            .await;
-    span.record("smtp.reply.code", reply.code);
-    if reply.code >= 400 {
+    let attempt = attempt_inner(engine, selection, senders, message, correlation_id, ctx)
+        .instrument(span.clone())
+        .await;
+    span.record("smtp.reply.code", attempt.reply.code);
+    if attempt.reply.code >= 400 {
         span.record("otel.status_code", "ERROR");
     }
-    reply
+    attempt
 }
 
-async fn reserve_relay_commit_inner(
+async fn attempt_inner(
     engine: &Engine,
     selection: &ramp_select::Selection<'_>,
     senders: &Senders,
     message: Message<'_>,
     correlation_id: &str,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Reply {
+    ctx: &AttemptCtx<'_>,
+) -> Attempt {
     let cfg = &engine.config;
     // §5.8 (D-099): chosen by the session before this runs. Everything below
     // is within this ramp.
     let ramp = selection.ramp;
+    let now = ctx.walk_now;
+    let not_selected = |e: SelectError| Attempt {
+        reply: e.to_reply(ramp),
+        kind: AttemptKind::NotSelected(e),
+    };
 
     let chain = match resolve_chain(ramp, senders) {
         Ok(c) => c,
@@ -302,23 +449,25 @@ async fn reserve_relay_commit_inner(
                 reason = ?e,
                 "no route selected"
             );
-            return e.to_reply(ramp);
+            return not_selected(e);
         }
     };
 
-    // -- §3.2 step 2a (D-090) -----------------------------------------
-    //
-    // A reply into a thread Simmer started walks the route that started it
-    // first, past its §7.3 threshold and, when it has none left, past its
-    // day's cap — counted, under the row lock, but not refused. Pause, strict
-    // preflight and a future start still apply: they say the route cannot
-    // send, not that it has sent enough.
-    let pin = thread::pin_for_message(ramp, chain, message.body);
-    let walk_order = thread::order(chain, &pin);
-    Span::current().record("thread_pin", pin.as_log());
+    // Q3 (D-124): a retry walks only the route of its first downstream
+    // attempt — unless that route is paused, not started or gone, which say
+    // it cannot send at all, and then the whole chain.
+    let pinned_chain;
+    let mut chains: Vec<&[String]> = Vec::with_capacity(2);
+    if let Some(p) = ctx.spool.as_ref().and_then(|s| s.pinned_route) {
+        pinned_chain = [p.to_string()];
+        chains.push(&pinned_chain);
+    }
+    chains.push(chain);
 
     // -- §7.4 phase 1 -------------------------------------------------
     let mut evaluation = Vec::new();
+    let mut pin = thread::pin_for_message(ramp, chain, message.body);
+    let mut walked = Ok(Walk::Exhausted);
     // §3.2 step 3 as its own span: the walk is where a message is steered, and
     // the rendered chain — every link with its skip reason — is the one
     // attribute that answers "why did it go there".
@@ -334,24 +483,95 @@ async fn reserve_relay_commit_inner(
         day_index = Empty,
         over_cap = Empty,
     );
-    let walk = chain::walk_and_reserve(
-        ramp,
-        &engine.groups,
-        &cfg.dot_insensitive_domains,
-        &engine.quota,
-        &engine.frequency,
-        &engine.preflight,
-        &walk_order,
-        pin.route(),
-        message.recipients,
-        correlation_id,
-        &mut evaluation,
-        now,
-    )
-    .instrument(walk_span.clone())
-    .await;
+    for (i, candidate_chain) in chains.iter().enumerate() {
+        // -- §3.2 step 2a (D-090) -------------------------------------
+        //
+        // A reply into a thread Simmer started walks the route that started
+        // it first, past its §7.3 threshold and, when it has none left, past
+        // its day's cap — counted, under the row lock, but not refused.
+        // Pause, strict preflight and a future start still apply: they say
+        // the route cannot send, not that it has sent enough.
+        pin = thread::pin_for_message(ramp, candidate_chain, message.body);
+        let walk_order = thread::order(candidate_chain, &pin);
+        evaluation.clear();
+        walked = match &ctx.spool {
+            None => {
+                chain::walk_and_reserve(
+                    ramp,
+                    &engine.groups,
+                    &cfg.dot_insensitive_domains,
+                    &engine.quota,
+                    &engine.frequency,
+                    &engine.preflight,
+                    &walk_order,
+                    pin.route(),
+                    message.recipients,
+                    correlation_id,
+                    &mut evaluation,
+                    now,
+                )
+                .instrument(walk_span.clone())
+                .await
+            }
+            Some(s) => {
+                chain::walk_and_reserve_spooled(
+                    ramp,
+                    &engine.groups,
+                    &cfg.dot_insensitive_domains,
+                    &engine.quota,
+                    &engine.frequency,
+                    &engine.preflight,
+                    &walk_order,
+                    pin.route(),
+                    message.recipients,
+                    correlation_id,
+                    &mut evaluation,
+                    now,
+                    chain::SpoolWalk {
+                        hold_until: s.hold_until,
+                        booked: s.booked,
+                    },
+                )
+                .instrument(walk_span.clone())
+                .await
+            }
+        };
+        let pinned_unusable = i + 1 < chains.len()
+            && matches!(walked, Ok(Walk::Exhausted))
+            && evaluation.iter().all(|st| {
+                matches!(
+                    st.outcome,
+                    Err(chain::SkipReason::Paused
+                        | chain::SkipReason::NotStarted
+                        | chain::SkipReason::Unknown)
+                )
+            });
+        if !pinned_unusable {
+            break;
+        }
+    }
+    Span::current().record("thread_pin", pin.as_log());
     walk_span.record("chain", chain::render(&evaluation).to_string());
-    let selected = match walk {
+
+    // D-118: a slot an earlier attempt booked that this walk did not use goes
+    // back, if nothing was booked after it.
+    if let Some(slot) = ctx.spool.as_ref().and_then(|s| s.booked) {
+        let used = match &walked {
+            Ok(Walk::Selected(s)) => s.rate.as_ref(),
+            Ok(Walk::Deferred { booking, .. }) => Some(booking),
+            _ => None,
+        }
+        .is_some_and(|b| {
+            b.key.route == slot.route
+                && b.key.domain_group == slot.domain_group
+                && b.booked_tat == slot.tat
+        });
+        if !used {
+            give_back_stored_slot(engine, ramp, slot, now).await;
+        }
+    }
+
+    let selected = match walked {
         Ok(Walk::Selected(s)) => {
             thread::observe(&ramp.name, &pin, Some(&s.route.name), s.over_cap);
             for span in [&walk_span, &Span::current()] {
@@ -361,6 +581,29 @@ async fn reserve_relay_commit_inner(
                 span.record("over_cap", s.over_cap);
             }
             s
+        }
+        Ok(Walk::Deferred {
+            route,
+            domain_group,
+            booking,
+            until,
+        }) => {
+            tracing::info!(
+                correlation_id,
+                route = %route.name,
+                domain_group = %domain_group,
+                until = %until.to_rfc3339(),
+                "deferred to the route's next rate slot (D-118)"
+            );
+            return Attempt {
+                reply: Reply::new(451, "4.7.1 deferred to a rate slot"),
+                kind: AttemptKind::Deferred {
+                    route: route.name.clone(),
+                    domain_group,
+                    booking,
+                    until,
+                },
+            };
         }
         Ok(Walk::Exhausted) => {
             thread::observe(&ramp.name, &pin, None, false);
@@ -373,11 +616,10 @@ async fn reserve_relay_commit_inner(
                 thread_pin = pin.as_log(),
                 "no eligible route in chain"
             );
-            return SelectError::ChainExhausted.to_reply(ramp);
+            return not_selected(SelectError::ChainExhausted);
         }
         Err(e) => {
-            let err = quota_failure(cfg, ramp, e, "reservation");
-            return err.to_reply(ramp);
+            return not_selected(quota_failure(cfg, ramp, e, "reservation"));
         }
     };
 
@@ -434,9 +676,13 @@ async fn reserve_relay_commit_inner(
         }
         let _ = engine.quota.release(&selected.reservation).await;
         engine.registry.remove(selected.reservation.id);
-        return Reply::new(451, "4.3.0 internal configuration error");
+        return Attempt {
+            reply: Reply::new(451, "4.3.0 internal configuration error"),
+            kind: AttemptKind::Internal,
+        };
     };
 
+    let uuids = rewrite::seeded_uuids(ctx.uuid_seed);
     let rewrite_span = tracing::info_span!(
         "simmer.rewrite",
         otel.name = "simmer.rewrite",
@@ -461,10 +707,12 @@ async fn reserve_relay_commit_inner(
                     authenticated: message.authenticated,
                     tls: message.tls,
                 },
-                // D-108 — the instant the walk was evaluated at, so the Date the
-                // rewrite writes and the day the quota was charged to agree.
-                now,
-                uuid: &|| uuid::Uuid::new_v4().to_string(),
+                // D-108 — for a synchronous message, the instant the walk was
+                // evaluated at, so the Date the rewrite writes and the day the
+                // quota was charged to agree. For a spooled one, the instant it
+                // was received, so every attempt writes the same bytes (D-116).
+                now: ctx.rewrite_now,
+                uuid: &uuids,
             },
         )
     });
@@ -605,15 +853,33 @@ async fn reserve_relay_commit_inner(
         committed = outcome.commit,
         reservation = %selected.reservation.id,
     );
+    let mut lease_held = None;
     let resolution = async {
         if outcome.commit {
             // §7.4 phase 3, both halves in one transaction: the count moves from
             // `reserved` to `committed` and this message's recipient-frequency
             // events are recorded. `recipient_keys` is empty unless the selected
-            // route declares a constraint.
-            store
-                .commit(&selected.reservation, &selected.recipient_keys)
-                .await
+            // route declares a constraint. A spooled message's row goes in the
+            // same transaction (D-122).
+            match &ctx.spool {
+                None => {
+                    store
+                        .commit(&selected.reservation, &selected.recipient_keys)
+                        .await
+                }
+                Some(s) => s
+                    .store
+                    .commit_and_complete(
+                        &selected.reservation,
+                        &selected.recipient_keys,
+                        s.id,
+                        s.token,
+                    )
+                    .await
+                    .map(|held| {
+                        lease_held = Some(held);
+                    }),
+            }
         } else {
             store.release(&selected.reservation).await
         }
@@ -640,10 +906,7 @@ async fn reserve_relay_commit_inner(
             "failed to resolve the quota reservation; ramp accounting may be short"
         );
     } else if outcome.commit {
-        // §9.1 gauges, from the row we just moved. A read of the row other
-        // instances are locking, on the client's time: its own span, so a trace
-        // shows it rather than a gap after `simmer.quota.resolve` — §18's
-        // slowest message spent 430 ms here (D-126).
+        // §9.1 gauges, from the row we just moved.
         if let Ok(usage) = store
             .usage(
                 &selected.reservation.ramp,
@@ -651,6 +914,9 @@ async fn reserve_relay_commit_inner(
                 &selected.reservation.domain_group,
                 selected.reservation.day_index,
             )
+            // A read of the row other instances are locking, on the client's
+            // time: its own span, so a trace shows it rather than a gap after
+            // `simmer.quota.resolve` (D-126).
             .instrument(tracing::info_span!(
                 "simmer.quota.usage",
                 otel.name = "simmer.quota.usage",
@@ -679,7 +945,51 @@ async fn reserve_relay_commit_inner(
         &selected.domain_group,
         outcome.result,
     );
-    outcome.reply
+    Attempt {
+        reply: outcome.reply,
+        kind: AttemptKind::Relayed(Relayed {
+            route: selected.route.name.clone(),
+            domain_group: selected.domain_group.clone(),
+            delivered: outcome.commit,
+            failure: result.as_ref().err().map(Failure::of),
+            lease_held,
+        }),
+    }
+}
+
+/// D-118 — give back a slot a spooled message booked on an earlier attempt and
+/// this attempt did not use. The rate is today's for that route and group.
+async fn give_back_stored_slot(
+    engine: &Engine,
+    ramp: &Ramp,
+    slot: &crate::spool::BookedSlot,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let Some(route) = ramp.route(&slot.route) else {
+        return;
+    };
+    let states = engine
+        .quota
+        .route_states(&ramp.name)
+        .await
+        .unwrap_or_default();
+    let state = states.get(&slot.route).copied().unwrap_or_default();
+    let day = quota::day::for_route(route, now);
+    let Some(rate) = quota::rate::rate_for(route, &slot.domain_group, day, state) else {
+        return;
+    };
+    let booking = chain::RateBooking {
+        key: quota::RateKey {
+            ramp: ramp.name.clone(),
+            route: slot.route.clone(),
+            domain_group: slot.domain_group.clone(),
+        },
+        rate,
+        send_at: now,
+        booked_tat: slot.tat,
+        over_limit: false,
+    };
+    chain::unbook(engine.quota.as_ref(), &booking, "spooled slot not used").await;
 }
 
 /// What to relay. Distinct from [`downstream::Message`] so the session does not

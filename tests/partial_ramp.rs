@@ -127,6 +127,7 @@ async fn walk(
     let selected = match walked {
         Walk::Selected(s) => Some(s.route.name.clone()),
         Walk::Exhausted => None,
+        Walk::Deferred { .. } => unreachable!("a synchronous walk never defers (D-118)"),
     };
     (selected, evaluation)
 }
