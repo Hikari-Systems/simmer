@@ -372,12 +372,14 @@ neither, since it is built from `--target runtime`.
 | `hmac` | 0.12.1 | `MIT OR Apache-2.0` |
 | `ipnet` | 2.12.1 | `MIT OR Apache-2.0` |
 | `metrics-exporter-prometheus` | 0.18.3 | `MIT` |
+| `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`, `opentelemetry-appender-tracing` | 0.33.0 | `Apache-2.0` (§10) |
 | `regex` | 1.13.1 | `MIT OR Apache-2.0` |
 | `serde` | 1.0.229 | `MIT OR Apache-2.0` |
 | `serde_json` | 1.0.151 | `MIT OR Apache-2.0` |
 | `serde_yaml_ng` | 0.10.0 | `MIT` |
 | `sha2` | 0.10.9 | `MIT OR Apache-2.0` |
 | `sqlx` | 0.8.6 | `MIT OR Apache-2.0` |
+| `tracing-opentelemetry` | 0.34.0 | `MIT` (§10) |
 | `subtle` | 2.6.1 | `BSD-3-Clause` |
 | `thiserror` | 2.0.19 | `MIT OR Apache-2.0` |
 | `tokio` | 1.53.1 | `MIT` |
@@ -525,6 +527,44 @@ Microsoft's new `mssql-tds` 0.1.0 was taken.
 **`argon2` gained its `std` feature** in the same change. It is not a new crate:
 `hash-password` had only ever compiled because sqlx's feature unification
 switched on `rand_core/getrandom`.
+
+## 10. D-101 — the OTLP telemetry export
+
+Compiled into both builds and used only when `telemetry:` is configured.
+Checked against crates.io 2026-10-02. `cargo deny check` passes for both
+feature sets, and `cargo tree -i aws-lc-rs` is empty in both.
+
+| Crate | Version | Licence | Why |
+|---|---|---|---|
+| `opentelemetry` | 0.33.0 | Apache-2.0 | the API: spans, instruments, log records |
+| `opentelemetry_sdk` | 0.33.0 | Apache-2.0 | providers, batch processors, periodic reader, sampler |
+| `opentelemetry-otlp` | 0.33.0 | Apache-2.0 | the OTLP/gRPC exporter |
+| `opentelemetry-proto` | 0.33.0 | Apache-2.0 | OTLP's protobuf types |
+| `tracing-opentelemetry` | 0.34.0 | MIT | `tracing` spans into the trace provider; built against otel 0.33 |
+| `opentelemetry-appender-tracing` | 0.33.0 | Apache-2.0 | `tracing` events into the log provider |
+| `tonic`, `tonic-prost`, `tonic-types` | 0.14.6 | MIT | the gRPC client |
+| `prost`, `prost-derive`, `prost-types` | 0.14.4 | Apache-2.0 | protobuf encoding |
+| `hyper-timeout` | 0.5.2 | MIT OR Apache-2.0 | tonic's connect timeout |
+| `pin-project`, `pin-project-internal`, `itertools`, `web-time` | — | MIT OR Apache-2.0 | transitive |
+
+`h2` (MIT), `tower` and `rustls` were already in the graph. `http` (MIT OR
+Apache-2.0) is now named directly, so that §4.2 parses endpoints and headers with
+the same types tonic is handed. It was already compiled, via axum.
+
+No AGPL, GPL or LGPL crate enters the graph.
+
+**Features, and why.** `opentelemetry-otlp` has `default-features = false`. Its
+defaults are the HTTP transport with a *blocking* `reqwest` client. With them
+off it takes `grpc-tonic`, `tls-ring` and `tls-roots`: ring and the platform
+root store, as §8.2 uses. `tls-aws-lc` would bring `aws-lc-rs` and a C
+toolchain into the builder, for the reason given in the `rustls` entry in
+`Cargo.toml`. `tracing-opentelemetry` also has its defaults off, which drops
+its separate metrics path and the `log` bridge. `internal-logs` on the SDK and
+exporter is what reports a failed export on stdout.
+
+**Rejected:** `metrics-exporter-opentelemetry` 0.2.1 (MIT). Its licence is fine,
+but it pins OpenTelemetry 0.31, which would put two OpenTelemetry versions in
+the graph. `src/telemetry/metrics.rs` is the replacement.
 
 ## How to re-check
 

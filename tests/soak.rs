@@ -26,6 +26,7 @@
 //! |---|---|
 //! | `SOAK_BACKEND=mssql` | D-084's SQL Server build, against SQL Server **Express** (`test/compose/mssql.yml`) |
 //! | `SIMMER_CAPTURE=on` | D-085's capture, on **both** instances (`test/compose/capture.yml` and the generated config twin). **Not soak-specific** — the same variable captures any tier whose config comes from the config volume |
+//! | `SIMMER_OTEL=on` | D-101's OTLP export to the dummy collector, on **both** instances (`test/compose/otel.yml` and the generated `.otel` twin). Not soak-specific either, and it combines with the capture |
 //!
 //! Neither is a §1 variant: V2, V3 and V4 all run unchanged under both. They
 //! change what the stack *is*, which is why they are four stacks rather than a
@@ -104,7 +105,7 @@ use std::time::{Duration, Instant};
 
 use compose::leak;
 use compose::reconcile::{self, Received, Sent};
-use compose::stack::{capture_on, Stack, SOAK, SOAK_MSSQL};
+use compose::stack::{capture_on, otel_on, Stack, SOAK, SOAK_MSSQL};
 use simmer::alloc_stats::Snapshot;
 
 const SOAK_CONFIG: &str = "test/config/simmer.soak.yaml";
@@ -139,7 +140,12 @@ fn stack_name() -> String {
     } else {
         "capture off"
     };
-    format!("{backend}, {capture}")
+    let otel = if otel_on() {
+        "OTLP export on"
+    } else {
+        "OTLP export off"
+    };
+    format!("{backend}, {capture}, {otel}")
 }
 
 /// Where samples land, on the host.
@@ -362,6 +368,9 @@ fn soak_run() {
     // Baseline before a single message: the return-to-baseline checks are all
     // relative to this, so it is taken after the instances are up and settled.
     thread::sleep(Duration::from_secs(5));
+    if otel_on() {
+        await_exporter_connections();
+    }
     for instance in INSTANCES {
         if let Some(sample) = sample_instance(instance) {
             append_sample(instance, 0.0, &sample);
@@ -1960,6 +1969,80 @@ fn drain_v4(started: Instant) -> bool {
         }
         thread::sleep(Duration::from_secs(10));
     }
+}
+
+/// One gRPC connection per exporter: traces, metrics and logs, all on in
+/// `test/config/telemetry.block.yaml`.
+const OTEL_EXPORTERS: usize = 3;
+
+/// The collector's port, as `/proc/net/tcp` writes it.
+const OTLP_PORT_HEX: &str = ":10DD";
+
+/// With `SIMMER_OTEL=on`, hold the baseline until every exporter has connected.
+///
+/// The exporters' channels connect lazily, on their first export, and
+/// [`recreate_instances`] has just started fresh processes: logs connect within
+/// a second, spans on the first span, metrics only after the first
+/// `metrics_interval` (60 s). A baseline taken before then lacks those sockets
+/// and the tasks that drive them, and `soak/rest/baseline` reports them at rest
+/// as a leak — which is what §18's hour did, two sockets and four tasks an
+/// instance, before this wait existed. A request to `/ramps` makes a span, so
+/// the wait is the metric interval's and no longer.
+fn await_exporter_connections() {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    for instance in INSTANCES {
+        let _ = stack()
+            .compose()
+            .args([
+                "exec",
+                "-T",
+                instance,
+                "bash",
+                "-c",
+                "exec 3<>/dev/tcp/127.0.0.1/8080; \
+                 printf 'GET /ramps HTTP/1.0\\r\\nAuthorization: Bearer %s\\r\\n\\r\\n' \
+                   \"$SIMMER_ADMIN_TOKEN\" >&3; cat <&3 >/dev/null",
+            ])
+            .output();
+    }
+    for instance in INSTANCES {
+        loop {
+            let open = exporter_connections(instance);
+            if open >= OTEL_EXPORTERS {
+                eprintln!("soak: {instance} has {open} exporter connections");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{instance} has {open} of {OTEL_EXPORTERS} exporter connections after two \
+                 minutes; the baseline would count the rest as leaks"
+            );
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
+}
+
+/// Established connections to the collector, from the instance's own view.
+fn exporter_connections(instance: &str) -> usize {
+    let out = stack()
+        .compose()
+        .args([
+            "exec",
+            "-T",
+            instance,
+            "cat",
+            "/proc/net/tcp",
+            "/proc/net/tcp6",
+        ])
+        .output();
+    let Ok(out) = out else { return 0 };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            f.len() > 3 && f[2].ends_with(OTLP_PORT_HEX) && f[3] == "01"
+        })
+        .count()
 }
 
 /// `/metrics` from inside the instance's own network namespace, so `app2` —

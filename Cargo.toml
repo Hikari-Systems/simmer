@@ -303,6 +303,51 @@ hyper-util = { version = "0.1", features = [
 ] }
 http-body-util = "0.1"
 
+# --- OpenTelemetry (D-101) -------------------------------------------------
+
+# Optional OTLP export of traces, metrics and logs, off unless `telemetry:` is
+# configured. The 0.33 line throughout: `tracing-opentelemetry` 0.34 is built
+# against it, so the graph carries exactly one OpenTelemetry version. Every crate
+# `Apache-2.0`, except `tracing-opentelemetry`, which is `MIT` (LICENSES.md §10).
+opentelemetry = { version = "0.33", default-features = false, features = [
+    "trace",
+    "metrics",
+    "logs",
+] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
+    "trace",
+    "metrics",
+    "logs",
+    "rt-tokio",
+    # The SDK's own warnings — a failed export above all — through `tracing`,
+    # so a dead collector is visible on stdout. Never re-exported: the OTel
+    # layers switch these targets off (`telemetry::NEVER_EXPORTED`).
+    "internal-logs",
+] }
+# gRPC on 4317. `default-features = false` is load-bearing: the defaults are the
+# HTTP transport with a *blocking* reqwest client. `tls-ring` keeps tonic on the
+# ring provider (§8.2, and `cargo tree -i aws-lc-rs` stays empty); `tls-roots` is
+# the platform root store, as for `required_verify` routes.
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+    "grpc-tonic",
+    "tls-ring",
+    "tls-roots",
+    "trace",
+    "metrics",
+    "logs",
+    "internal-logs",
+] }
+# Spans from `tracing` into the trace provider. Default features off: `metrics`
+# is a second, unrelated metrics path, and `tracing-log` bridges the `log` crate,
+# which nothing here uses.
+tracing-opentelemetry = { version = "0.34", default-features = false }
+# `tracing` events into the logs provider, with the current span's trace id.
+opentelemetry-appender-tracing = "0.33"
+# §4.2 for `telemetry:` — the endpoint is parsed as a `Uri` and each header as a
+# `HeaderName`/`HeaderValue`, by the same types tonic will hand them to, so
+# validation and the exporter cannot disagree. Already in the graph via axum.
+http = "1"
+
 [profile.release]
 strip = true
 lto = true
@@ -328,4 +373,13 @@ http-body-util = "0.1"
 # nothing in the repository is a private key and nothing expires in CI. `MIT OR
 # Apache-2.0`. `ring` rather than the default `aws-lc-rs`, for the reason the
 # rustls entry above gives.
+# D-101 — in-memory span, log and metric exporters, so tests/telemetry.rs can
+# assert on what would have been exported without a collector.
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
+    "trace",
+    "metrics",
+    "logs",
+    "testing",
+] }
+
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }

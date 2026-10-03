@@ -19,6 +19,7 @@ use ipnet::IpNet;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
+use tracing::Instrument;
 
 use crate::config::{IngressAuth, IngressTls};
 use crate::downstream::stream::Stream;
@@ -292,9 +293,26 @@ async fn accept_loop(
         let policy = Arc::clone(&policy);
         let shared = Arc::clone(&shared);
         let hard_stop = hard_stop.clone();
-        tokio::spawn(async move {
-            handle(stream, peer, policy, shared, hard_stop).await;
-        });
+        // §9.6 (D-101) — one span per connection, refused ones included: a
+        // CIDR or session-bound refusal is a connection that happened. The
+        // transaction spans are its children.
+        let span = tracing::info_span!(
+            "smtp.session",
+            otel.name = "smtp.session",
+            otel.kind = "server",
+            client.address = %peer.ip(),
+            client.port = peer.port(),
+            listener = %policy.address,
+            tls = policy.tls.as_str(),
+            username = tracing::field::Empty,
+            end = tracing::field::Empty,
+        );
+        tokio::spawn(
+            async move {
+                handle(stream, peer, policy, shared, hard_stop).await;
+            }
+            .instrument(span),
+        );
     }
 }
 
@@ -387,6 +405,7 @@ async fn handle(
     };
 
     session.close().await;
+    tracing::Span::current().record("end", tracing::field::debug(end));
     tracing::debug!(peer = %peer, ?end, "session ended");
 }
 

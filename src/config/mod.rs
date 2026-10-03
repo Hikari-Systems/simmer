@@ -50,6 +50,13 @@ pub struct Config {
     #[serde(default)]
     pub capture: Option<Capture>,
 
+    /// §9.6 (D-101) — optional OTLP export of traces, metrics and logs. Absent,
+    /// `enabled: false`, or an empty `endpoint` all mean nothing is exported and
+    /// no exporter is built; read it through [`Config::telemetry`], which is the
+    /// one place that rule lives.
+    #[serde(default)]
+    pub telemetry: Option<Telemetry>,
+
     /// §7.3. The spec defaults this to "the `google` group's domains", which
     /// couples behaviour to a configuration-defined group name that may not
     /// exist. Made explicit instead — see `DECISIONS.md` D-010.
@@ -1030,6 +1037,155 @@ impl CaptureOnError {
 }
 
 // ---------------------------------------------------------------------------
+// telemetry (§9.6, D-101)
+// ---------------------------------------------------------------------------
+
+/// §9.6 (D-101). OTLP/gRPC export of spans, the §9.1 metrics and log events.
+///
+/// Presence is the opt-in, like `capture` and `link_proxy`, and every key but
+/// `endpoint` has a default. Nothing here can change what Simmer emits on the
+/// wire: telemetry observes, and no trace context is propagated into relayed
+/// mail (§1.1) or link-proxy requests.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Telemetry {
+    /// Default `true` when the block exists. `false` keeps the block in the file
+    /// and exports nothing.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// The collector, `http://host:4317` or `https://host:4317`. Empty after
+    /// interpolation means off — see [`Config::telemetry`].
+    pub endpoint: String,
+
+    /// gRPC metadata sent with every export, typically a vendor's API key.
+    /// Redacted in `Debug`.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+
+    /// `service.name`. Default `simmer`.
+    #[serde(default = "default_telemetry_service_name")]
+    pub service_name: String,
+
+    /// Extra resource attributes, e.g. `deployment.environment: preview`.
+    #[serde(default)]
+    pub resource: BTreeMap<String, String>,
+
+    /// An `EnvFilter` directive for what is **exported** — spans and log
+    /// events. Separate from `logging.level`, and `RUST_LOG` does not reach it:
+    /// turning a container's stdout up to `debug` to diagnose it must not start
+    /// shipping debug lines to a vendor. Default `info,sqlx=warn,tiberius=warn`,
+    /// the published stdout guidance: both drivers log every transaction at
+    /// INFO, and the §18 soak exported four tiberius lines a message under a
+    /// bare `info` (D-101).
+    #[serde(default = "default_telemetry_level")]
+    pub level: String,
+
+    /// Export spans. Default `true`.
+    #[serde(default = "default_true")]
+    pub traces: bool,
+
+    /// The fraction of traces kept, by trace id. Default 1.0.
+    #[serde(default = "default_telemetry_sample_ratio")]
+    pub sample_ratio: f64,
+
+    /// Export the §9.1 metrics. Default `true`. Independent of `admin.metrics`,
+    /// which governs only the Prometheus `/metrics` endpoint.
+    #[serde(default = "default_true")]
+    pub metrics: bool,
+
+    /// How often metrics are exported, and the scrape-time gauges recomputed
+    /// for them. Default 60s.
+    #[serde(
+        default = "default_telemetry_metrics_interval",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub metrics_interval: Duration,
+
+    /// How metrics are reported: `delta` (default) or `cumulative`. See
+    /// [`MetricsTemporality`].
+    #[serde(default)]
+    pub metrics_temporality: MetricsTemporality,
+
+    /// Export log events, correlated with the span they happened in. Default
+    /// `true`.
+    #[serde(default = "default_true")]
+    pub logs: bool,
+
+    /// The per-export timeout. Default 10s.
+    #[serde(
+        default = "default_telemetry_timeout",
+        deserialize_with = "duration::deserialize"
+    )]
+    pub timeout: Duration,
+}
+
+impl fmt::Debug for Telemetry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Header values are credentials as often as not; their names are not.
+        let headers: Vec<&str> = self.headers.keys().map(String::as_str).collect();
+        f.debug_struct("Telemetry")
+            .field("enabled", &self.enabled)
+            .field("endpoint", &self.endpoint)
+            .field("headers", &format_args!("{headers:?} (values redacted)"))
+            .field("service_name", &self.service_name)
+            .field("resource", &self.resource)
+            .field("level", &self.level)
+            .field("traces", &self.traces)
+            .field("sample_ratio", &self.sample_ratio)
+            .field("metrics", &self.metrics)
+            .field("metrics_interval", &self.metrics_interval)
+            .field("metrics_temporality", &self.metrics_temporality)
+            .field("logs", &self.logs)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `telemetry.metrics_temporality` (D-101).
+///
+/// **`delta`** is the SDK's low-memory mix: counters and histograms report what
+/// happened since the last export, and their series are dropped once an export
+/// passes without them — so a client-controlled label (F7's unmatched-sender
+/// `domain`) costs memory only while it is live, which is what D-093's idle
+/// expiry gives `/metrics`. Gauges stay cumulative, so an unchanged gauge does
+/// not vanish from the export. Under `cumulative` the SDK keeps every series it
+/// has ever seen, up to its 2,000-per-instrument limit (§18 measured that
+/// growth). `cumulative` is for a backend that rejects delta sums — some
+/// Prometheus-compatible ones do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricsTemporality {
+    #[default]
+    Delta,
+    Cumulative,
+}
+
+fn default_telemetry_level() -> String {
+    "info,sqlx=warn,tiberius=warn".to_string()
+}
+
+fn default_telemetry_service_name() -> String {
+    "simmer".to_string()
+}
+
+fn default_telemetry_sample_ratio() -> f64 {
+    1.0
+}
+
+fn default_telemetry_metrics_interval() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn default_telemetry_timeout() -> Duration {
+    Duration::from_secs(10)
+}
+
+// ---------------------------------------------------------------------------
 // identity (the rewrite spec)
 // ---------------------------------------------------------------------------
 
@@ -1580,6 +1736,16 @@ impl Config {
     /// The ramp named `name`, if there is one.
     pub fn ramp(&self, name: &str) -> Option<&Ramp> {
         self.ramps.get(name)
+    }
+
+    /// §9.6 (D-101) — the telemetry block, if it asks for anything to be
+    /// exported. `None` when the block is absent, says `enabled: false`, or its
+    /// `endpoint` is empty — the last so that `endpoint: "${SIMMER_OTEL_ENDPOINT}"`
+    /// can be switched off per environment by leaving the variable empty.
+    pub fn telemetry(&self) -> Option<&Telemetry> {
+        self.telemetry
+            .as_ref()
+            .filter(|t| t.enabled && !t.endpoint.trim().is_empty())
     }
 
     /// The ramp named by `default_ramp`.

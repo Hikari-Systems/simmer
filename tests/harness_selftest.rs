@@ -471,6 +471,57 @@ fn the_capture_twin_of_every_tier_config_is_valid() {
     );
 }
 
+/// D-101's export twins, as `test/config/Dockerfile` generates them: every tier
+/// config plus `telemetry.block.yaml`, and the capture twin plus it too. The
+/// capture test's reasoning — nothing on the host would otherwise look at one —
+/// and one more: an export block that resolved to *off* would run a soak that
+/// exports nothing while its banner says "OTLP export on".
+#[test]
+fn the_otel_twins_of_every_tier_config_are_valid_and_export() {
+    let capture = std::fs::read_to_string("test/config/capture.block.yaml")
+        .expect("test/config/capture.block.yaml");
+    let otel = std::fs::read_to_string("test/config/telemetry.block.yaml")
+        .expect("test/config/telemetry.block.yaml");
+    let dir = std::env::temp_dir().join("simmer-otel-twins");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    let mut checked = 0;
+    for entry in std::fs::read_dir("test/config").expect("test/config") {
+        let path = entry.expect("dir entry").path();
+        let name = path
+            .file_name()
+            .expect("a name")
+            .to_string_lossy()
+            .into_owned();
+        if !name.starts_with("simmer.") || !name.ends_with(".yaml") {
+            continue;
+        }
+        let base = std::fs::read_to_string(&path).expect("a tier config");
+        for (suffix, text) in [
+            (".otel.yaml", format!("{base}\n{otel}")),
+            (".capture.otel.yaml", format!("{base}\n{capture}\n{otel}")),
+        ] {
+            let twin = dir.join(name.replace(".yaml", suffix));
+            std::fs::write(&twin, text).expect("write the twin");
+            let cfg = compose::configs::load(twin.to_str().expect("utf-8"));
+            let t = cfg
+                .telemetry()
+                .unwrap_or_else(|| panic!("{name}'s {suffix} twin exports nothing"));
+            assert_eq!(t.endpoint, "http://otel-collector:4317", "{name}{suffix}");
+            assert_eq!(
+                cfg.capture.is_some(),
+                suffix.contains("capture"),
+                "{name}{suffix}"
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked >= 2,
+        "only {checked} tier configs found; the glob is wrong"
+    );
+}
+
 const CAPTURE_DIR: &str = "/var/lib/simmer/capture";
 
 #[test]

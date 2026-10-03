@@ -103,6 +103,42 @@ pub enum RelayError {
     PoolExhausted,
 }
 
+impl RelayError {
+    /// The `class` label `simmer_downstream_errors_total` gives this error, and
+    /// the `outcome` §9.6's downstream span records (D-101). A `Rejected`
+    /// splits by code family, as [`failed`] does.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::Connect(_) => "connect",
+            Self::Tls(_) => "tls",
+            Self::Timeout(_) => "timeout",
+            Self::Protocol(..) => "protocol",
+            Self::Ambiguous => "ambiguous",
+            Self::MissingCapability(_) => "capability",
+            Self::PoolExhausted => "pool_exhausted",
+            Self::Rejected { code, .. } if *code >= 500 => "rejected",
+            Self::Rejected { .. } => "deferred",
+        }
+    }
+
+    /// The conversation stage it happened at, where there is one.
+    pub fn stage(&self) -> Option<Stage> {
+        match self {
+            Self::Timeout(s) | Self::Protocol(s, _) | Self::Rejected { stage: s, .. } => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// The downstream's reply code, when it gave one. Never its text, which can
+    /// quote the recipient back (§9.5).
+    pub fn code(&self) -> Option<u16> {
+        match self {
+            Self::Rejected { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+}
+
 /// A downstream `2xx` on the final dot.
 #[derive(Debug, Clone)]
 pub struct Delivered {
@@ -161,7 +197,7 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
             tracing::warn!(
                 route,
                 stage = stage.as_str(),
-                detail,
+                detail = %redact_addresses(detail),
                 "downstream protocol violation"
             );
             metrics::downstream_error(ramp, route, "protocol");
@@ -218,7 +254,7 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
                     route,
                     stage = stage.as_str(),
                     code,
-                    text,
+                    text = %redact_addresses(text),
                     "downstream rejected the recipient"
                 );
                 metrics::downstream_error(ramp, route, "rejected");
@@ -231,14 +267,20 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
                         route,
                         stage = stage.as_str(),
                         code,
-                        text,
+                        text = %redact_addresses(text),
                         "downstream returned 5xx at a stage that indicates a \
                          configuration fault, not a recipient fault; returning \
                          451 so the client does not suppress the recipient"
                     );
                     metrics::downstream_config_error(ramp, route, stage.as_str());
                 } else {
-                    tracing::warn!(route, stage = stage.as_str(), code, text, "downstream 5xx");
+                    tracing::warn!(
+                        route,
+                        stage = stage.as_str(),
+                        code,
+                        text = %redact_addresses(text),
+                        "downstream 5xx"
+                    );
                 }
                 metrics::downstream_error(ramp, route, "rejected");
                 reply::with_downstream(451, "4.0.0 deferred by downstream", *code, text)
@@ -246,7 +288,13 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
         }
 
         RelayError::Rejected { stage, code, text } => {
-            tracing::info!(route, stage = stage.as_str(), code, text, "downstream 4xx");
+            tracing::info!(
+                route,
+                stage = stage.as_str(),
+                code,
+                text = %redact_addresses(text),
+                "downstream 4xx"
+            );
             metrics::downstream_error(ramp, route, "deferred");
             reply::with_downstream(451, "4.0.0 deferred by downstream", *code, text)
         }
@@ -267,9 +315,55 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
     }
 }
 
+/// The downstream's reply text as it may be **logged**: every address's local
+/// part replaced by `*`, the domain kept.
+///
+/// §9.5 allows recipient addresses only at `DEBUG`, and a downstream's reply
+/// routinely quotes the recipient back — `550 5.1.1 <jane@example.com> unknown
+/// user` — so logging its text verbatim at `INFO` put the address in every
+/// log shipper and, since D-101, every telemetry backend. The domain stays: it
+/// is what an operator needs to tell one provider's refusals from another's,
+/// and domains are logged elsewhere at `WARN` already. The client's reply is
+/// not this: §10.1 quotes the text back to the client that sent the address,
+/// which is not a disclosure.
+pub fn redact_addresses(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (at, _) in text.match_indices('@') {
+        // RFC 5322 atext plus the dot, walked backwards from the `@`.
+        let start = bytes[..at]
+            .iter()
+            .rposition(|&b| !(b.is_ascii_alphanumeric() || b"!#$%&'*+/=?^_`{|}~.-".contains(&b)))
+            .map_or(0, |p| p + 1);
+        if start < at && start >= copied {
+            out.push_str(&text[copied..start]);
+            out.push('*');
+            copied = at;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logged_reply_text_keeps_the_domain_and_loses_the_local_part() {
+        assert_eq!(
+            redact_addresses("5.1.1 <jane.doe+x@example.com> unknown user"),
+            "5.1.1 <*@example.com> unknown user"
+        );
+        assert_eq!(
+            redact_addresses("a@b.com and c@d.com"),
+            "*@b.com and *@d.com"
+        );
+        assert_eq!(redact_addresses("4.2.2 mailbox full"), "4.2.2 mailbox full");
+        assert_eq!(redact_addresses("lone @ sign"), "lone @ sign");
+        assert_eq!(redact_addresses("@start"), "@start");
+    }
 
     fn rejected(stage: Stage, code: u16) -> RelayError {
         RelayError::Rejected {

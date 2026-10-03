@@ -21,7 +21,7 @@
 use std::sync::OnceLock;
 
 use metrics::counter;
-use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
 /// When the recorder was installed, as Unix seconds — `process_start_time_seconds`
 /// (D-075). Installation is the first thing `main` does after reading its config,
@@ -29,31 +29,62 @@ use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder, Promet
 /// `/proc/self/stat` against the boot time.
 static STARTED: OnceLock<f64> = OnceLock::new();
 
-/// Install the §9.1 Prometheus recorder and return the handle `GET /metrics`
-/// renders.
+/// Install the §9.1 Prometheus recorder alone and return the handle
+/// `GET /metrics` renders — [`install_with`] with no OTLP export.
 ///
 /// Fails only if a recorder is already installed, which in a process with one
 /// `main` means it has been called twice.
-pub fn install(idle_timeout: std::time::Duration) -> Result<PrometheusHandle, BuildError> {
-    let handle = PrometheusBuilder::new()
-        // D-093: a counter idle this long is dropped, which is what returns
-        // F7's memory — one series per unmatched sender domain, held for the
-        // life of the process until now. Counters only: gauges are recomputed
-        // at every scrape (D-056), and histograms are few and fixed.
-        .idle_timeout(metrics_util::MetricKindMask::COUNTER, Some(idle_timeout))
-        // §9.1 says histogram. The exporter's default rendering for a histogram
-        // is a summary with quantiles computed in-process, which cannot be
-        // aggregated across instances — declaring buckets is what makes it an
-        // actual Prometheus histogram.
-        .set_buckets_for_metric(
-            Matcher::Full("simmer_downstream_latency_seconds".to_string()),
-            LATENCY_BUCKETS,
-        )?
-        .set_buckets_for_metric(
-            Matcher::Full("simmer_link_proxy_duration_seconds".to_string()),
-            LINK_PROXY_BUCKETS,
-        )?
-        .install_recorder()?;
+pub fn install(idle_timeout: std::time::Duration) -> anyhow::Result<PrometheusHandle> {
+    install_with(Some(idle_timeout), None).map(|h| h.expect("a Prometheus recorder was asked for"))
+}
+
+/// Install the §9.1 recorder: Prometheus when `prometheus` carries D-093's idle
+/// timeout (`admin.metrics` is on), the OTLP bridge when `otel` is given
+/// (`telemetry.metrics` is on, D-101), both behind one fan-out when both are,
+/// and nothing at all when neither is — every `metrics::` call then stays the
+/// no-op D-093 promises.
+///
+/// Returns the Prometheus handle when there is one. Fails only if a recorder is
+/// already installed.
+pub fn install_with(
+    prometheus: Option<std::time::Duration>,
+    otel: Option<crate::telemetry::metrics::OtelRecorder>,
+) -> anyhow::Result<Option<PrometheusHandle>> {
+    let prometheus = match prometheus {
+        Some(idle_timeout) => {
+            let mut builder = PrometheusBuilder::new()
+                // D-093: a counter idle this long is dropped, which is what
+                // returns F7's memory — one series per unmatched sender domain,
+                // held for the life of the process until now. Counters only:
+                // gauges are recomputed at every scrape (D-056), and histograms
+                // are few and fixed.
+                .idle_timeout(metrics_util::MetricKindMask::COUNTER, Some(idle_timeout));
+            // §9.1 says histogram. The exporter's default rendering for a
+            // histogram is a summary with quantiles computed in-process, which
+            // cannot be aggregated across instances — declaring buckets is what
+            // makes it an actual Prometheus histogram.
+            for (name, buckets) in HISTOGRAM_BUCKETS {
+                builder =
+                    builder.set_buckets_for_metric(Matcher::Full((*name).to_string()), buckets)?;
+            }
+            Some(builder.build_recorder())
+        }
+        None => None,
+    };
+    let handle = prometheus.as_ref().map(|r| r.handle());
+
+    match (prometheus, otel) {
+        (None, None) => return Ok(None),
+        (Some(p), None) => metrics::set_global_recorder(p).map_err(already_installed)?,
+        (None, Some(o)) => metrics::set_global_recorder(o).map_err(already_installed)?,
+        (Some(p), Some(o)) => metrics::set_global_recorder(
+            metrics_util::layers::FanoutBuilder::default()
+                .add_recorder(p)
+                .add_recorder(o)
+                .build(),
+        )
+        .map_err(already_installed)?,
+    }
 
     describe();
     let _ = STARTED.set(
@@ -64,6 +95,17 @@ pub fn install(idle_timeout: std::time::Duration) -> Result<PrometheusHandle, Bu
     );
     Ok(handle)
 }
+
+fn already_installed<R>(_: metrics::SetRecorderError<R>) -> anyhow::Error {
+    anyhow::anyhow!("a metrics recorder is already installed")
+}
+
+/// Every histogram's explicit buckets, by name — one table for both exporters,
+/// so Prometheus and OTLP cannot disagree about a bucket edge.
+pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
+    ("simmer_downstream_latency_seconds", LATENCY_BUCKETS),
+    ("simmer_link_proxy_duration_seconds", LINK_PROXY_BUCKETS),
+];
 
 /// Buckets for `simmer_downstream_latency_seconds`.
 ///

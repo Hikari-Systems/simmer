@@ -302,6 +302,23 @@ link_proxy:
 Put **only** this port in the load balancer's target group — never an SMTP port —
 and health-check the admin port's `/health`.
 
+### OpenTelemetry (optional)
+
+OTLP/gRPC export of traces, metrics and logs. It is off unless configured, and
+also off when `endpoint` is empty:
+
+```yaml
+telemetry:
+  endpoint: "${SIMMER_OTEL_ENDPOINT}"       # e.g. http://otel-collector:4317
+  headers: { x-honeycomb-team: "${HONEYCOMB_KEY}" }   # optional
+```
+
+There is one trace per connection, with a span per message and its route
+decision, rewrite, downstream conversation and quota commit. The `/metrics`
+series and the log lines are exported too, correlated with the trace. It never
+adds a header to relayed mail, a dead collector never delays a message, and the
+same privacy rules as the logs apply: no bodies, no recipient addresses.
+
 ---
 
 ## Control plane

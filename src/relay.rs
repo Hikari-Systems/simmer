@@ -26,6 +26,9 @@
 
 use std::sync::Arc;
 
+use tracing::field::Empty;
+use tracing::{Instrument, Span};
+
 use crate::config::{Config, Ramp};
 use crate::downstream::{self, TlsConfigs};
 use crate::frequency::Frequency;
@@ -228,6 +231,42 @@ pub async fn reserve_relay_commit(
     message: Message<'_>,
     correlation_id: &str,
 ) -> Reply {
+    // §9.6 (D-101) — the decision and its consequences as one span, with the
+    // walk, the rewrite, the downstream conversation and the quota resolution
+    // as its children. Every log line below lands inside it, which is what
+    // gives the downstream outcome lines the `correlation_id` they never had.
+    let span = tracing::info_span!(
+        "simmer.relay",
+        otel.name = "simmer.relay",
+        otel.status_code = Empty,
+        correlation_id,
+        ramp = %selection.ramp.name,
+        ramp_source = selection.source.as_str(),
+        route = Empty,
+        domain_group = Empty,
+        day_index = Empty,
+        thread_pin = Empty,
+        over_cap = Empty,
+        result = Empty,
+        smtp.reply.code = Empty,
+    );
+    let reply = reserve_relay_commit_inner(engine, selection, senders, message, correlation_id)
+        .instrument(span.clone())
+        .await;
+    span.record("smtp.reply.code", reply.code);
+    if reply.code >= 400 {
+        span.record("otel.status_code", "ERROR");
+    }
+    reply
+}
+
+async fn reserve_relay_commit_inner(
+    engine: &Engine,
+    selection: &ramp_select::Selection<'_>,
+    senders: &Senders,
+    message: Message<'_>,
+    correlation_id: &str,
+) -> Reply {
     let cfg = &engine.config;
     // §5.8 (D-099): chosen by the session before this runs. Everything below
     // is within this ramp.
@@ -256,10 +295,26 @@ pub async fn reserve_relay_commit(
     // send, not that it has sent enough.
     let pin = thread::pin_for_message(ramp, chain, message.body);
     let walk_order = thread::order(chain, &pin);
+    Span::current().record("thread_pin", pin.as_log());
 
     // -- §7.4 phase 1 -------------------------------------------------
     let mut evaluation = Vec::new();
-    let selected = match chain::walk_and_reserve(
+    // §3.2 step 3 as its own span: the walk is where a message is steered, and
+    // the rendered chain — every link with its skip reason — is the one
+    // attribute that answers "why did it go there".
+    let walk_span = tracing::info_span!(
+        "simmer.route",
+        otel.name = "simmer.route",
+        // On every child too: stdout carries only the innermost span's
+        // fields, and §9.5 wants the id on every line (D-101).
+        correlation_id,
+        chain = Empty,
+        route = Empty,
+        domain_group = Empty,
+        day_index = Empty,
+        over_cap = Empty,
+    );
+    let walk = chain::walk_and_reserve(
         ramp,
         &engine.groups,
         &cfg.dot_insensitive_domains,
@@ -272,10 +327,18 @@ pub async fn reserve_relay_commit(
         correlation_id,
         &mut evaluation,
     )
-    .await
-    {
+    .instrument(walk_span.clone())
+    .await;
+    walk_span.record("chain", chain::render(&evaluation).to_string());
+    let selected = match walk {
         Ok(Walk::Selected(s)) => {
             thread::observe(&ramp.name, &pin, Some(&s.route.name), s.over_cap);
+            for span in [&walk_span, &Span::current()] {
+                span.record("route", s.route.name.as_str());
+                span.record("domain_group", s.domain_group.as_str());
+                span.record("day_index", s.day_index);
+                span.record("over_cap", s.over_cap);
+            }
             s
         }
         Ok(Walk::Exhausted) => {
@@ -322,25 +385,38 @@ pub async fn reserve_relay_commit(
         return Reply::new(451, "4.3.0 internal configuration error");
     };
 
-    let rewritten = rewrite::rewrite(
-        rewriter,
-        &rewrite::Inbound {
-            raw: message.body,
-            envelope_from: message.mail_from,
-            recipients: message.recipients,
-            route_name: &selected.route.name,
-            correlation_id,
-            received: rewrite::Received {
-                helo: message.helo,
-                peer: message.peer,
-                by: &cfg.server.hostname,
-                authenticated: message.authenticated,
-                tls: message.tls,
-            },
-            now: chrono::Utc::now(),
-            uuid: &|| uuid::Uuid::new_v4().to_string(),
-        },
+    let rewrite_span = tracing::info_span!(
+        "simmer.rewrite",
+        otel.name = "simmer.rewrite",
+        correlation_id,
+        route = %selected.route.name,
+        skipped_parts = Empty,
+        skipped_headers = Empty,
     );
+    let rewritten = rewrite_span.in_scope(|| {
+        rewrite::rewrite(
+            rewriter,
+            &rewrite::Inbound {
+                raw: message.body,
+                envelope_from: message.mail_from,
+                recipients: message.recipients,
+                route_name: &selected.route.name,
+                correlation_id,
+                received: rewrite::Received {
+                    helo: message.helo,
+                    peer: message.peer,
+                    by: &cfg.server.hostname,
+                    authenticated: message.authenticated,
+                    tls: message.tls,
+                },
+                now: chrono::Utc::now(),
+                uuid: &|| uuid::Uuid::new_v4().to_string(),
+            },
+        )
+    });
+    rewrite_span.record("skipped_parts", rewritten.skipped_parts.len());
+    rewrite_span.record("skipped_headers", rewritten.skipped_headers.len());
+    drop(rewrite_span);
 
     // §6.4 — a `text/*` part the route's `body_rewrites` did not reach. The
     // engine has already logged each one; this is the counter §9.1 asks for.
@@ -379,6 +455,23 @@ pub async fn reserve_relay_commit(
     );
 
     // -- §7.4 phase 2 -------------------------------------------------
+    // The outbound conversation. A client span to the downstream's address;
+    // its reply code and outcome class, never its reply text, which can quote
+    // the recipient back (§9.5). The D-068 retry is an event inside it.
+    let downstream_span = tracing::info_span!(
+        "smtp.downstream",
+        otel.name = "smtp.downstream",
+        correlation_id,
+        otel.kind = "client",
+        otel.status_code = Empty,
+        route = %selected.route.name,
+        server.address = %selected.route.downstream.host,
+        server.port = selected.route.downstream.port,
+        smtp.response.code = Empty,
+        smtp.stage = Empty,
+        outcome = Empty,
+        retried = Empty,
+    );
     let started = std::time::Instant::now();
     let result = downstream::relay(
         selected.route,
@@ -394,6 +487,7 @@ pub async fn reserve_relay_commit(
             assume_8bitmime: selected.route.downstream.assume_8bitmime,
         },
     )
+    .instrument(downstream_span.clone())
     .await;
     let elapsed = started.elapsed();
     metrics::downstream_latency(
@@ -402,8 +496,11 @@ pub async fn reserve_relay_commit(
         elapsed.as_secs_f64(),
     );
 
-    let outcome = match &result {
+    let outcome = downstream_span.in_scope(|| match &result {
         Ok(d) => {
+            let span = Span::current();
+            span.record("smtp.response.code", d.code);
+            span.record("outcome", "delivered");
             tracing::info!(
                 correlation_id,
                 route = %selected.route.name,
@@ -413,8 +510,21 @@ pub async fn reserve_relay_commit(
             );
             downstream::outcome::delivered(&selected.route.name, d)
         }
-        Err(e) => downstream::outcome::failed(&selected.route.ramp, &selected.route.name, e),
-    };
+        Err(e) => {
+            let span = Span::current();
+            span.record("otel.status_code", "ERROR");
+            span.record("outcome", e.class());
+            if let Some(code) = e.code() {
+                span.record("smtp.response.code", code);
+            }
+            if let Some(stage) = e.stage() {
+                span.record("smtp.stage", stage.as_str());
+            }
+            downstream::outcome::failed(&selected.route.ramp, &selected.route.name, e)
+        }
+    });
+    drop(downstream_span);
+    Span::current().record("result", outcome.result.as_str());
 
     // -- §7.4 phase 3 -------------------------------------------------
     //
@@ -422,18 +532,34 @@ pub async fn reserve_relay_commit(
     // failure, decrement reserved and delete the reservation." `outcome.commit`
     // is the §10.1 table's answer, carried since phase 2.
     let store = Arc::clone(&engine.quota);
-    let resolution = if outcome.commit {
-        // §7.4 phase 3, both halves in one transaction: the count moves from
-        // `reserved` to `committed` and this message's recipient-frequency
-        // events are recorded. `recipient_keys` is empty unless the selected
-        // route declares a constraint.
-        store
-            .commit(&selected.reservation, &selected.recipient_keys)
-            .await
-    } else {
-        store.release(&selected.reservation).await
-    };
+    let resolve_span = tracing::info_span!(
+        "simmer.quota.resolve",
+        otel.name = "simmer.quota.resolve",
+        correlation_id,
+        otel.status_code = Empty,
+        committed = outcome.commit,
+        reservation = %selected.reservation.id,
+    );
+    let resolution = async {
+        if outcome.commit {
+            // §7.4 phase 3, both halves in one transaction: the count moves from
+            // `reserved` to `committed` and this message's recipient-frequency
+            // events are recorded. `recipient_keys` is empty unless the selected
+            // route declares a constraint.
+            store
+                .commit(&selected.reservation, &selected.recipient_keys)
+                .await
+        } else {
+            store.release(&selected.reservation).await
+        }
+    }
+    .instrument(resolve_span.clone())
+    .await;
     engine.registry.remove(selected.reservation.id);
+    if resolution.is_err() {
+        resolve_span.record("otel.status_code", "ERROR");
+    }
+    drop(resolve_span);
 
     if let Err(e) = resolution {
         // The message's fate is already decided and already correct; only the
@@ -449,7 +575,10 @@ pub async fn reserve_relay_commit(
             "failed to resolve the quota reservation; ramp accounting may be short"
         );
     } else if outcome.commit {
-        // §9.1 gauges, from the row we just moved.
+        // §9.1 gauges, from the row we just moved. A read of the row other
+        // instances are locking, on the client's time: its own span, so a trace
+        // shows it rather than a gap after `simmer.quota.resolve` — §18's
+        // slowest message spent 430 ms here (D-101).
         if let Ok(usage) = store
             .usage(
                 &selected.reservation.ramp,
@@ -457,6 +586,11 @@ pub async fn reserve_relay_commit(
                 &selected.reservation.domain_group,
                 selected.reservation.day_index,
             )
+            .instrument(tracing::info_span!(
+                "simmer.quota.usage",
+                otel.name = "simmer.quota.usage",
+                correlation_id,
+            ))
             .await
         {
             metrics::quota_committed(

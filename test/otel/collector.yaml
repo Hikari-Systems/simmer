@@ -1,0 +1,68 @@
+# D-101 — the acceptance stack's dummy OTLP collector. It receives what Simmer
+# exports over gRPC and writes it to files, one OTLP JSON request per line, so
+# `tests/telemetry_compose.rs` can read back exactly what left the process:
+#
+#   /otel/traces.jsonl   /otel/metrics.jsonl   /otel/logs.jsonl
+#
+# The `debug` exporter also prints a one-line summary per batch, so
+# `docker compose logs otel-collector` shows traffic arriving without reading
+# the files. Nothing is forwarded anywhere.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 1s
+
+exporters:
+  # Rotation bounds the files for the soak (docs/SOAK.md §18): an hour of two
+  # instances' spans is hundreds of MiB of JSON. Rotated files are kept beside
+  # the current one, so the acceptance test, which reads only the current file
+  # and writes a few KiB, is unaffected.
+  file/traces:
+    path: /otel/traces.jsonl
+    flush_interval: 1s
+    rotation: &rotation
+      max_megabytes: 256
+      max_backups: 2
+  file/metrics:
+    path: /otel/metrics.jsonl
+    flush_interval: 1s
+    rotation: *rotation
+  file/logs:
+    path: /otel/logs.jsonl
+    flush_interval: 1s
+    rotation: *rotation
+  debug:
+    verbosity: basic
+
+service:
+  # The collector's own counters — accepted and refused spans, log records and
+  # metric points per receiver — on :8888 of the compose network, not published
+  # to the host. What a soak with export on reads to account for what arrived.
+  telemetry:
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/traces, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/metrics, debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/logs, debug]

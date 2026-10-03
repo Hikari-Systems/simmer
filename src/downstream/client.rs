@@ -157,6 +157,8 @@ pub async fn relay(
             "pooled connection was dead on reuse; retrying once on a fresh connection"
         );
         metrics::pool_retry(&route.ramp, &route.name);
+        // §9.6 — on the caller's `smtp.downstream` span, when there is one.
+        tracing::Span::current().record("retried", true);
         checkout.reopen(route, tls, hostname).await?;
         result = checkout.conn().deliver(message, budget).await;
     }

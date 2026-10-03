@@ -42,10 +42,14 @@ jobs:
         run: docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance build
 
       - name: Bring up the acceptance stack
-        run: docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance up -d --wait app trap-warming trap-overflow
+        run: docker compose -f docker-compose.yml -f test/compose/acceptance.yml --profile acceptance up -d --wait app trap-warming trap-overflow otel-collector
 
       - name: Run the acceptance suite
         run: cargo test --locked --test acceptance -- --ignored --test-threads=1
+
+      # D-101 — the OTLP export, read back from the dummy collector's files.
+      - name: Run the telemetry export test
+        run: cargo test --locked --test telemetry_compose -- --ignored --test-threads=1
 
       - name: Compose logs
         if: failure()

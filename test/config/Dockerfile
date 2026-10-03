@@ -17,10 +17,16 @@ COPY test/config/ /files/
 # captured run a different shape from its uncaptured twin — and because the
 # capture belongs to no particular tier. `SIMMER_CAPTURE=on` points `app` at the
 # twin; see tests/compose/stack.rs.
+#
+# D-101's export works the same way: `<name>.otel.yaml` appends
+# telemetry.block.yaml, and `<name>.capture.otel.yaml` appends both, so
+# `SIMMER_CAPTURE=on` and `SIMMER_OTEL=on` combine freely.
 RUN set -e; \
     for f in /files/simmer.*.yaml; do \
-        case "$f" in *.capture.yaml) continue ;; esac; \
-        { cat "$f"; echo; cat /files/capture.block.yaml; } > "${f%.yaml}.capture.yaml"; \
+        b="${f%.yaml}"; \
+        { cat "$f"; echo; cat /files/capture.block.yaml; } > "$b.capture.yaml"; \
+        { cat "$f"; echo; cat /files/telemetry.block.yaml; } > "$b.otel.yaml"; \
+        { cat "$b.capture.yaml"; echo; cat /files/telemetry.block.yaml; } > "$b.capture.otel.yaml"; \
     done
 
 # One-shot: replace the volume's contents with this build's files, readable by

@@ -36,6 +36,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tracing::field::Empty;
+use tracing::{Instrument, Span};
 
 use super::acl::Acl;
 use super::auth::{self, AuthState, AuthStep, Verifier, VerifyLimit};
@@ -105,6 +107,10 @@ pub struct Session {
     /// D-081 — when `timeouts.session` runs out. Every wait on the client is
     /// capped by it; a relay in flight never is.
     deadline: tokio::time::Instant,
+    /// §9.6 (D-101) — the connection's `smtp.session` span, which the caller
+    /// has entered. Held so that `username` can be recorded on it from inside a
+    /// transaction, where it is not the current span.
+    session_span: Span,
 }
 
 /// State between `MAIL FROM` and the final dot.
@@ -112,6 +118,10 @@ struct Transaction {
     mail_from: Option<String>,
     params: MailParams,
     recipients: Vec<String>,
+    /// §9.6 (D-101) — `smtp.transaction`, from the accepted `MAIL FROM` to its
+    /// final reply. Every command of the transaction runs inside it, and
+    /// dropping it with the transaction is what ends it.
+    span: Span,
 }
 
 /// Why a session ended. The caller logs it; nothing else depends on it.
@@ -157,6 +167,7 @@ impl Session {
             transaction: None,
             correlation_id: new_correlation_id(),
             deadline,
+            session_span: Span::current(),
         }
     }
 
@@ -243,7 +254,14 @@ impl Session {
                 }
             }
 
-            match self.handle_line(&line).await {
+            // Inside the transaction's span when there is one, so that what
+            // RCPT TO and DATA log — and the relay below them — is attributed
+            // to the message rather than only to the connection.
+            let span = self
+                .transaction
+                .as_ref()
+                .map_or_else(Span::none, |t| t.span.clone());
+            match self.handle_line(&line).instrument(span).await {
                 Ok(Some(end)) => return end,
                 Ok(None) => continue,
                 Err(()) => return SessionEnd::IoError,
@@ -495,6 +513,7 @@ impl Session {
 
             AuthStep::BadEncoding => {
                 self.auth_state = None;
+                tracing::info!(peer = %self.peer, "AUTH payload was not valid base64; refused");
                 // A malformed payload is not a failed password: it does not
                 // count toward the three-strike budget, because a client with a
                 // broken encoder would otherwise be disconnected rather than
@@ -532,6 +551,7 @@ impl Session {
                         tls = self.encrypted(),
                         "authenticated"
                     );
+                    self.session_span.record("username", username.as_str());
                     self.user = Some(username);
                     self.reply(reply::auth_succeeded()).await
                 } else {
@@ -565,6 +585,10 @@ impl Session {
             return self.reply(reply::bad_sequence()).await;
         }
         if self.policy.auth == IngressAuth::Required && self.user.is_none() {
+            tracing::info!(
+                peer = %self.peer,
+                "MAIL FROM before AUTH on an auth: required listener; refused"
+            );
             return self.reply(reply::auth_required()).await;
         }
         if self.transaction.is_some() {
@@ -580,6 +604,12 @@ impl Session {
         // which is the entire reason SIZE is advertised.
         if let Some(size) = params.size {
             if size > self.config().server.max_message_bytes {
+                tracing::info!(
+                    peer = %self.peer,
+                    size,
+                    max = self.config().server.max_message_bytes,
+                    "MAIL FROM declared a SIZE above max_message_bytes; refused"
+                );
                 return self.reply(reply::message_too_large()).await;
             }
         }
@@ -609,10 +639,21 @@ impl Session {
         }
 
         self.correlation_id = new_correlation_id();
+        // A child of the session span, which is current here: MAIL FROM is
+        // handled outside any transaction, since there is none yet.
+        let span = tracing::info_span!(
+            "smtp.transaction",
+            otel.name = "smtp.transaction",
+            otel.status_code = Empty,
+            correlation_id = %self.correlation_id,
+            smtp.reply.code = Empty,
+            bytes = Empty,
+        );
         self.transaction = Some(Transaction {
             mail_from: from,
             params,
             recipients: Vec::new(),
+            span,
         });
         self.reply(reply::ok()).await
     }
@@ -639,6 +680,10 @@ impl Session {
         // §5.5's `max_recipients` is subsumed: no value of it is reachable past
         // the first recipient. §4.2 warns when it is set above 1.
         if !tx.recipients.is_empty() {
+            tracing::info!(
+                correlation_id = %self.correlation_id,
+                "second RCPT TO in one transaction; refused 452 (D-047)"
+            );
             return self.reply(reply::multiple_recipients_not_permitted()).await;
         }
 
@@ -713,20 +758,30 @@ impl Session {
                 // staying in step would mean reading and discarding an unbounded
                 // remainder, which is the denial of service the limit exists to
                 // prevent. See DECISIONS.md D-020.
-                self.reset_transaction();
-                self.send(&reply::message_too_large())
-                    .await
-                    .map_err(|_| ())?;
+                tracing::info!(
+                    correlation_id = %self.correlation_id,
+                    max,
+                    "DATA exceeded max_message_bytes; refused and closing (D-020)"
+                );
+                let r = reply::message_too_large();
+                self.finish_transaction(&r);
+                self.send(&r).await.map_err(|_| ())?;
                 return Ok(Some(SessionEnd::ProtocolAbuse));
             }
             Err(DataError::Timeout) => {
-                self.reset_transaction();
-                let _ = self.send(&reply::data_timeout()).await;
+                tracing::info!(
+                    correlation_id = %self.correlation_id,
+                    "DATA timed out mid-transfer; nothing relayed"
+                );
+                let r = reply::data_timeout();
+                self.finish_transaction(&r);
+                let _ = self.send(&r).await;
                 return Ok(Some(SessionEnd::CommandTimeout));
             }
             Err(DataError::SessionTimeout) => {
-                self.reset_transaction();
-                let _ = self.send(&reply::session_timeout()).await;
+                let r = reply::session_timeout();
+                self.finish_transaction(&r);
+                let _ = self.send(&r).await;
                 return Ok(Some(SessionEnd::SessionTimeout));
             }
             Err(DataError::AmbiguousTerminator) => {
@@ -738,18 +793,20 @@ impl Session {
                     correlation_id = %self.correlation_id,
                     "DATA held an end-of-data marker with a bare line ending; message refused"
                 );
-                self.reset_transaction();
-                self.send(&reply::ambiguous_terminator())
-                    .await
-                    .map_err(|_| ())?;
+                let r = reply::ambiguous_terminator();
+                self.finish_transaction(&r);
+                self.send(&r).await.map_err(|_| ())?;
                 return Ok(None);
             }
             Err(DataError::Closed) => return Ok(Some(SessionEnd::ClientClosed)),
             Err(DataError::Io) => return Err(()),
         }
 
+        if let Some(tx) = &self.transaction {
+            tx.span.record("bytes", body.len());
+        }
         let outcome_reply = self.route_and_relay(&mut body).await;
-        self.reset_transaction();
+        self.finish_transaction(&outcome_reply);
         self.send(&outcome_reply).await.map_err(|_| ())?;
         Ok(None)
     }
@@ -1138,6 +1195,19 @@ impl Session {
 
     fn reset_transaction(&mut self) {
         self.transaction = None;
+    }
+
+    /// End the transaction with its final reply: §9.6's `smtp.transaction`
+    /// records the code — a status of `ERROR` for anything but `2xx` — and ends
+    /// as the transaction is dropped.
+    fn finish_transaction(&mut self, r: &Reply) {
+        if let Some(tx) = &self.transaction {
+            tx.span.record("smtp.reply.code", r.code);
+            if r.code >= 400 {
+                tx.span.record("otel.status_code", "ERROR");
+            }
+        }
+        self.reset_transaction();
     }
 
     /// Emit a final reply on a session being terminated from outside — §10.4's

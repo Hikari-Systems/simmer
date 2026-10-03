@@ -278,6 +278,50 @@ services:
     healthcheck:
       disable: true
 
+  # D-101 — a dummy OTLP collector for the acceptance stack, which
+  # `simmer.acceptance.yaml` exports to. It writes everything it receives to the
+  # `otel-out` volume as JSON lines (test/otel/collector.yaml), and
+  # tests/telemetry_compose.rs reads them back through the loadgen, which mounts
+  # the volume read-only. Nothing is forwarded anywhere.
+  #
+  # Not a dependency of `app`, deliberately: telemetry must never be able to
+  # stop Simmer starting, and the export connects lazily, so `app` does not care
+  # which comes up first.
+  otel-collector:
+    profiles: ["acceptance"]
+    # Pinned by digest, like the traps: the test reads the file exporter's JSON.
+    # v0.161.0.
+    image: otel/opentelemetry-collector-contrib@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1
+    command: ["--config=/etc/otelcol/collector.yaml"]
+    # UID 1000, the loadgen's, so the files it writes (0600) are readable there.
+    user: "1000:1000"
+    volumes:
+      - ./test/otel/collector.yaml:/etc/otelcol/collector.yaml:ro
+      - otel-out:/otel
+    depends_on:
+      otel-init:
+        condition: service_completed_successfully
+
+  # A fresh named volume is root-owned; the collector runs as UID 1000. The
+  # `capture-init` precedent (test/compose/capture.yml).
+  #
+  # **It does not empty the files.** `up` re-runs this one-shot without
+  # re-creating a collector that is already running, and that collector holds
+  # its current files open at an offset: deleting them left it writing to
+  # unlinked inodes, and truncating them left a hole of NULs in front of its
+  # next line (both found while writing docs/SOAK.md §18). So the files
+  # accumulate, bounded by the exporter's rotation, and tests/telemetry_compose.rs
+  # reads only what was exported after it started.
+  otel-init:
+    profiles: ["acceptance"]
+    image: alpine:3.20
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        chown 1000:1000 /otel
+    volumes:
+      - otel-out:/otel
+
   # Built from the Dockerfile's `acceptance` stage, which adds the loadgen binary
   # on top of the runtime image. Never started by `up`: the host test invokes it
   # with `docker compose run --rm loadgen …` and reads its stdout.
@@ -292,6 +336,9 @@ services:
       # For `--starttls`: the CA the loadgen verifies Simmer's certificate
       # against.
       - acceptance-tls:/tls:ro
+      # D-101 — what the dummy collector received, for tests/telemetry_compose.rs
+      # to `cat`.
+      - otel-out:/otel:ro
     depends_on:
       app:
         condition: service_healthy
@@ -307,3 +354,5 @@ volumes:
   # a plain `docker compose up`, where tls-init never runs, would give `app` an
   # empty root store and break every real `required_verify` route.
   test-trust:
+  # D-101 — the dummy collector's output. Acceptance only.
+  otel-out:

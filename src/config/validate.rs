@@ -176,6 +176,7 @@ pub fn validate(cfg: &Config) -> ViolationList {
     check_ramps(cfg, &mut v);
     check_link_proxy(cfg, &mut v);
     check_capture(cfg, &mut v);
+    check_telemetry(cfg, &mut v);
     check_storage(cfg, &mut v);
 
     v
@@ -284,6 +285,34 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
                 c.retention.as_secs() / 3600
             ),
         });
+    }
+
+    // D-101 — vendor API keys travel as gRPC metadata. Over a plain `http://`
+    // endpoint off this host they cross the network in the clear: the link
+    // proxy's `http://` warning, for the same reason. Loopback is a sidecar
+    // collector, which is the usual and safe arrangement.
+    if let Some(t) = cfg.telemetry() {
+        if !t.headers.is_empty() && plaintext_off_host(&t.endpoint) {
+            out.push(Warning {
+                path: "telemetry.endpoint".to_string(),
+                message: "is http:// to a host other than loopback, so telemetry.headers — \
+                          typically a vendor API key — cross the network unencrypted"
+                    .to_string(),
+            });
+        }
+    }
+    if let Some(t) = &cfg.telemetry {
+        if cfg.telemetry().is_none() {
+            out.push(Warning {
+                path: "telemetry".to_string(),
+                message: if t.enabled {
+                    "is present but its endpoint is empty, so nothing is exported (D-101)"
+                } else {
+                    "is present but enabled: false, so nothing is exported (D-101)"
+                }
+                .to_string(),
+            });
+        }
     }
 
     // §9.3's write API can pause a route or set an allowance of zero, and either
@@ -916,6 +945,139 @@ fn upstream_problem(upstream: &str) -> Option<&'static str> {
 /// §5.1's certificate, loaded exactly as the listener will load it, so a file
 /// that is missing, unreadable, unparseable or paired with the wrong key is a
 /// startup violation rather than a listener that fails its first handshake.
+/// §4.2 for §9.6's `telemetry` (D-101). Checked whenever the block is present,
+/// enabled or not, so switching it on later surfaces nothing new — the
+/// `admin.metrics` precedent. Only the endpoint is skipped when empty, since
+/// empty is how it is switched off.
+fn check_telemetry(cfg: &Config, v: &mut ViolationList) {
+    let Some(t) = &cfg.telemetry else { return };
+
+    if !t.endpoint.trim().is_empty() {
+        if let Some(problem) = telemetry_endpoint_problem(&t.endpoint) {
+            v.push("telemetry.endpoint", problem);
+        }
+    }
+
+    for (name, value) in &t.headers {
+        let path = format!("telemetry.headers.{name}");
+        match http::HeaderName::from_bytes(name.as_bytes()) {
+            Err(_) => v.push(&path, "is not a valid gRPC metadata key".to_string()),
+            Ok(h) => {
+                let n = h.as_str();
+                if n == "content-type" || n == "te" || n.starts_with("grpc-") {
+                    v.push(
+                        &path,
+                        "is reserved by gRPC and cannot be set as metadata".to_string(),
+                    );
+                } else if n.ends_with("-bin") {
+                    v.push(
+                        &path,
+                        "names a binary metadata key; only ASCII values are supported".to_string(),
+                    );
+                }
+            }
+        }
+        if http::HeaderValue::from_str(value).is_err() {
+            // The value is very likely a credential: say what is wrong with
+            // it, never what it is.
+            v.push(
+                &path,
+                "has a value that is not visible ASCII, so it cannot be sent as gRPC metadata"
+                    .to_string(),
+            );
+        }
+    }
+
+    if t.service_name.trim().is_empty() {
+        v.push("telemetry.service_name", "must not be empty".to_string());
+    }
+    for key in t.resource.keys() {
+        if key.trim().is_empty() {
+            v.push(
+                "telemetry.resource",
+                "has an empty attribute name".to_string(),
+            );
+        }
+    }
+
+    if let Err(e) = tracing_subscriber::EnvFilter::try_new(&t.level) {
+        v.push(
+            "telemetry.level",
+            format!("is not a valid filter directive: {e}"),
+        );
+    }
+
+    if !(0.0..=1.0).contains(&t.sample_ratio) {
+        v.push(
+            "telemetry.sample_ratio",
+            format!("is {}; it must be between 0 and 1", t.sample_ratio),
+        );
+    }
+    if t.metrics_interval < Duration::from_secs(1) {
+        v.push(
+            "telemetry.metrics_interval",
+            format!("is {:?}; it must be at least 1s", t.metrics_interval),
+        );
+    }
+    if t.timeout.is_zero() {
+        v.push("telemetry.timeout", "must be greater than zero".to_string());
+    }
+    if !(t.traces || t.metrics || t.logs) {
+        v.push(
+            "telemetry",
+            "turns off traces, metrics and logs alike, so it would export nothing; use \
+             enabled: false to keep the block and switch it off"
+                .to_string(),
+        );
+    }
+}
+
+/// Why `endpoint` cannot be a gRPC collector address, if it cannot.
+fn telemetry_endpoint_problem(endpoint: &str) -> Option<String> {
+    let uri: http::Uri = match endpoint.parse() {
+        Ok(u) => u,
+        Err(e) => return Some(format!("'{endpoint}' is not a valid URL: {e}")),
+    };
+    match uri.scheme_str() {
+        Some("http" | "https") => {}
+        _ => return Some(format!("'{endpoint}' must start with http:// or https://")),
+    }
+    if uri.host().is_none_or(str::is_empty) {
+        return Some(format!("'{endpoint}' names no host"));
+    }
+    if uri.port_u16().is_none() {
+        return Some(format!(
+            "'{endpoint}' names no port; OTLP/gRPC is conventionally 4317"
+        ));
+    }
+    if uri
+        .path_and_query()
+        .is_some_and(|p| p.as_str() != "/" && !p.as_str().is_empty())
+    {
+        return Some(format!(
+            "'{endpoint}' has a path; a gRPC endpoint is a scheme, host and port only"
+        ));
+    }
+    None
+}
+
+/// `http://` to anything but loopback. An endpoint that does not parse is
+/// §4.2's business, not this warning's.
+fn plaintext_off_host(endpoint: &str) -> bool {
+    let Ok(uri) = endpoint.parse::<http::Uri>() else {
+        return false;
+    };
+    if uri.scheme_str() != Some("http") {
+        return false;
+    }
+    let host = uri.host().unwrap_or_default().trim_matches(['[', ']']);
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    !loopback
+}
+
 fn check_server_tls(cfg: &Config, v: &mut ViolationList) {
     let Some(tls) = &cfg.server.tls else {
         return;

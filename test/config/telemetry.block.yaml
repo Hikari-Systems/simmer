@@ -1,0 +1,21 @@
+# D-101's OTLP export, as a fragment appended to every tier config by
+# test/config/Dockerfile — the capture.block.yaml pattern. An absent
+# `telemetry:` block is the off switch and YAML has no conditional block, so
+# each config gets a `<name>.otel.yaml` twin (and `<name>.capture.otel.yaml`)
+# built from this one file.
+#
+# **It is not the soak's.** `SIMMER_OTEL=on` makes the harness layer
+# test/compose/otel.yml onto whatever stack is running — which supplies the
+# endpoint and the instance name below — and point `app` at the twin.
+#
+# The values are the documented defaults wherever there is one, deliberately:
+# what an operator who read README "OpenTelemetry" and set only an endpoint would
+# get. In particular `metrics_interval` is the default 60s, not the acceptance
+# stack's 5s, so a soak measures the export an operator would actually run.
+telemetry:
+  endpoint: "${SIMMER_OTEL_ENDPOINT}"
+  resource:
+    deployment.environment: test-tier
+    # app or app2: the A/B pair is told apart in the collector by this, since
+    # service.instance.id is a fresh uuid per process.
+    simmer.instance: "${SIMMER_OTEL_INSTANCE}"

@@ -352,6 +352,21 @@ link_proxy:                            # optional; absent => no listener (§5.7)
     upstream_response: 30s             # to response headers; 504 after
     idle: 60s
 
+telemetry:                             # optional; absent => nothing exported (§9.6)
+  enabled: true                        # default true; false keeps the block, exports nothing
+  endpoint: "${SIMMER_OTEL_ENDPOINT}"  # OTLP/gRPC, http(s)://host:port; "" => off
+  headers: { x-honeycomb-team: "${HONEYCOMB_KEY}" }   # gRPC metadata; default none
+  service_name: simmer                 # default simmer
+  resource: { deployment.environment: production }   # extra resource attributes
+  level: "info,sqlx=warn,tiberius=warn"  # the default; filter for what is EXPORTED, RUST_LOG does not reach it
+  traces: true                         # each defaults true
+  metrics: true
+  logs: true
+  sample_ratio: 1.0                    # fraction of traces kept, by trace id
+  metrics_interval: 60s
+  metrics_temporality: delta           # default; or cumulative
+  timeout: 10s                         # per export
+
 default_ramp: main                     # required; the ramp for a session with no affinity
                                        # and no usable header (§5.8)
 ramps:                                 # each is a complete, isolated routing profile (§3.4)
@@ -571,6 +586,15 @@ this inverts: plaintext AUTH is now refused unless allowed. The rest are new. Se
   - `listen` is not a valid address, or it duplicates `admin.listen` or an SMTP listener.
   - `allowed_cidrs` is empty or contains an invalid block.
   - `max_connections`, `max_request_bytes` or any timeout is zero.
+- `telemetry` is present — enabled or not — and any of the following hold *(added, see
+  `DECISIONS.md` D-101)*:
+  - `endpoint` is non-empty and is not an `http` or `https` URI with a host and a port and no
+    path.
+  - A `headers` name is not a valid gRPC metadata key, is reserved (`content-type`, `te`,
+    `grpc-*`) or binary (`-bin`), or its value is not visible ASCII.
+  - `sample_ratio` is outside [0, 1]; `metrics_interval` is under 1s; `timeout` is zero;
+    `level` is not a valid filter directive; `service_name` is empty.
+  - `traces`, `metrics` and `logs` are all `false`.
 
 **Note on `envelope_from`, added after implementation.** The example in §4.1 originally read
 `bounce+{{original.envelope_from.local}}@newbrand.com`. That is a *relative transformation* —
@@ -1339,6 +1363,14 @@ See `DECISIONS.md` D-099.)*
 added; see D-090. The two `simmer_ramp_*` metrics and the `ramp` label are added; see D-099.
 `simmer_mx_lookups_total` is added; see D-100.)*
 
+When §9.6's `telemetry.metrics` is on, **the same series are also exported over OTLP**, under
+the same names and labels, from the same call sites; `admin.metrics` and `telemetry.metrics` are
+independent, and neither on means no recorder at all. The gauges this section says are read at
+scrape time are then also recomputed every `telemetry.metrics_interval`, since an OTLP-only
+deployment has no scrape. Counters and histograms are exported as deltas unless
+`telemetry.metrics_temporality` is `cumulative`, so a series idle for a whole interval is not
+held; gauges are always cumulative. *(Added. See `DECISIONS.md` D-101.)*
+
 ### 9.2 Read API
 
 - `GET /health` — liveness; includes database reachability.
@@ -1421,6 +1453,47 @@ and total latency. Message bodies are never logged; recipient addresses are logg
 A link proxy request (§5.7) is logged with its method, path, status and latency only. The query
 string, cookies and body are never logged, because a tracking token identifies a recipient.
 *(Added. See `DECISIONS.md` D-083.)*
+
+A downstream's reply text is logged with the local part of every address in it replaced by `*`
+— `550 5.1.1 <*@example.com> unknown user` — because a downstream routinely quotes the recipient
+back, and that put recipient addresses in `INFO` and `WARN` lines. The client's reply (§10.1) is
+unchanged. *(Added. See `DECISIONS.md` D-101.)*
+
+### 9.6 Telemetry export
+
+Optional, off unless `telemetry` is configured with a non-empty `endpoint` and not
+`enabled: false`. When on, Simmer exports over **OTLP/gRPC**:
+
+- **Traces.** One `smtp.session` span per inbound connection (refused ones included); under it
+  one `smtp.transaction` per message, from the accepted `MAIL FROM` to its final reply, carrying
+  `correlation_id` and the final reply code; under that `simmer.relay`, carrying the ramp, its
+  §5.8 source, the selected route, domain group, day index and thread pin, with children
+  `simmer.route` (the chain walk and every link's skip reason), `simmer.rewrite`,
+  `smtp.downstream` (a client span: the downstream's reply code, stage and outcome class, and
+  whether §8.3's one retry happened) `simmer.quota.resolve` (§7.4 phase 3) and, after a commit, `simmer.quota.usage` (the row read
+back for §9.1's gauges). A `4xx` or `5xx`
+  final reply marks the transaction and relay spans as errors. Also: one `simmer.preflight` span
+  per §6.7 pass, one `admin.request` per §9.2–§9.4 request except `/health`, `/healthcheck`
+  and `/metrics`, and one `link_proxy.request` per §5.7 request.
+- **Metrics.** §9.1's, as described there.
+- **Logs.** Every §9.5 log event, correlated with the span it was emitted in.
+
+What is exported is filtered by `telemetry.level`, which `RUST_LOG` does not reach, so turning a
+container's own logging up to `debug` does not ship debug lines to a telemetry backend. Every
+rule of §9.5 holds for the export as it does for stdout: no body, no recipient address, no link
+proxy query string. The exporter's own diagnostics — a failed export above all — are logged to
+stdout and never exported.
+
+**Telemetry observes and never alters.** No trace context is propagated into relayed mail or
+into link-proxy upstream requests: a `traceparent` header on an outbound message is output no
+application-side configuration produces (§1.1). A collector that is unreachable, slow or absent
+costs dropped telemetry and nothing else — the connection is made lazily, exports run off the
+message path, and neither startup nor any reply waits on it. A `telemetry` block whose exporter
+cannot be built at all is a startup failure, like any other invalid configuration.
+
+The resource is `service.name`, `service.version`, a per-process `service.instance.id`,
+`simmer.backend` and `telemetry.resource`, and the YAML is its only source: `OTEL_SERVICE_NAME`
+and `OTEL_RESOURCE_ATTRIBUTES` are not read. *(Added. See `DECISIONS.md` D-101.)*
 
 ---
 
@@ -1546,7 +1619,10 @@ established client), `serde`/`serde_yaml`, `regex`, `argon2`, `hickory-resolver`
 `axum` for the admin listener, `metrics`/`prometheus`, and a MIME parsing/building library.
 For §5.7, `axum-reverse-proxy` with default features off (its default TLS stack is `aws-lc-rs`)
 over a `hyper-rustls` connector built on the same ring provider and platform roots as §8.2.
-*(Added. See `DECISIONS.md` D-083 and `LICENSES.md` §8.)*
+*(Added. See `DECISIONS.md` D-083 and `LICENSES.md` §8.)* For §9.6, `opentelemetry`,
+`opentelemetry_sdk` and `opentelemetry-otlp` (gRPC over `tonic`, ring and the platform roots),
+`tracing-opentelemetry` and `opentelemetry-appender-tracing`, all on one OpenTelemetry release.
+*(Added. See `DECISIONS.md` D-101 and `LICENSES.md` §10.)*
 
 **Licence check required before adopting any parsing crate.** Several of the well-known mail
 crates in the Rust ecosystem are AGPL-licensed or have changed licence between versions.
@@ -1575,6 +1651,10 @@ default.
   boundaries by manipulating `warmup.started`; verifying fall-through to overflow at
   exhaustion; verifying the cutover invariant by sending the same logical message under both
   arrangements of §1.1 and asserting byte-equivalent downstream output.
+- **Telemetry** — §9.6 against in-memory exporters (the span tree, the reply codes, and that no
+  recipient address is exported), and against a dummy OTLP collector in the acceptance compose
+  stack that writes what it receives to files the suite reads back. *(Added. See `DECISIONS.md`
+  D-101.)*
 
 ---
 
@@ -1602,6 +1682,7 @@ Each phase should end in a working, testable artefact.
 13. Named ramps (§3.4, §5.8): the ramps-only schema, storage keyed by ramp with legacy
     adoption, the control plane per ramp, then selection by listener and header.
     *(Added. See `DECISIONS.md` D-099.)*
+14. The optional OTLP telemetry export (§9.6). *(Added. See `DECISIONS.md` D-101.)*
 
 ---
 

@@ -2142,3 +2142,167 @@ fn warnings_inside_a_ramp_name_the_ramp() {
         "{warnings:?}"
     );
 }
+
+// -- §9.6, D-101: telemetry -----------------------------------------------
+
+fn with_telemetry(block: &str) -> String {
+    format!("{BASE}telemetry:\n{block}")
+}
+
+#[test]
+fn telemetry_is_off_when_the_block_is_absent() {
+    let cfg = load(BASE).unwrap();
+    assert!(cfg.telemetry.is_none());
+    assert!(cfg.telemetry().is_none());
+}
+
+#[test]
+fn a_telemetry_block_needs_only_an_endpoint_and_defaults_the_rest() {
+    let cfg = load(&with_telemetry("  endpoint: \"http://collector:4317\"\n")).unwrap();
+    let t = cfg.telemetry().expect("on");
+    assert!(t.enabled && t.traces && t.metrics && t.logs);
+    assert_eq!(t.service_name, "simmer");
+    // The published stdout guidance, not a bare `info`: both drivers log every
+    // transaction at INFO (D-101, docs/SOAK.md §18).
+    assert_eq!(t.level, "info,sqlx=warn,tiberius=warn");
+    assert_eq!(t.sample_ratio, 1.0);
+    assert_eq!(t.metrics_interval, std::time::Duration::from_secs(60));
+    assert_eq!(t.metrics_temporality, config::MetricsTemporality::Delta);
+    assert_eq!(t.timeout, std::time::Duration::from_secs(10));
+    assert!(t.headers.is_empty() && t.resource.is_empty());
+}
+
+#[test]
+fn telemetry_metrics_temporality_is_delta_or_cumulative_and_nothing_else() {
+    let cumulative = load(&with_telemetry(
+        "  endpoint: \"http://collector:4317\"\n  metrics_temporality: cumulative\n",
+    ))
+    .unwrap();
+    assert_eq!(
+        cumulative.telemetry().expect("on").metrics_temporality,
+        config::MetricsTemporality::Cumulative
+    );
+    // `lowmemory` is the SDK's name for what `delta` means here; it is not a
+    // value of ours.
+    let err = load(&with_telemetry(
+        "  endpoint: \"http://collector:4317\"\n  metrics_temporality: lowmemory\n",
+    ))
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("expected `delta` or `cumulative`"), "{err}");
+}
+
+#[test]
+fn telemetry_is_off_when_disabled_or_its_endpoint_is_empty() {
+    let disabled = load(&with_telemetry(
+        "  enabled: false\n  endpoint: \"http://collector:4317\"\n",
+    ))
+    .unwrap();
+    assert!(disabled.telemetry.is_some() && disabled.telemetry().is_none());
+
+    // What `endpoint: "${SIMMER_OTEL_ENDPOINT}"` becomes with the variable empty.
+    let empty = load(&with_telemetry("  endpoint: \"\"\n")).unwrap();
+    assert!(empty.telemetry().is_none());
+
+    for cfg in [&disabled, &empty] {
+        assert!(
+            config::validate::warnings(cfg)
+                .iter()
+                .any(|w| w.path == "telemetry" && w.message.contains("nothing is exported")),
+            "a present-but-off block should say so"
+        );
+    }
+}
+
+#[test]
+fn rejects_telemetry_endpoints_that_are_not_a_grpc_address() {
+    for (endpoint, needle) in [
+        ("collector:4317", "telemetry.endpoint"),
+        ("ftp://collector:4317", "http:// or https://"),
+        ("http://collector", "names no port"),
+        ("http://collector:4317/v1/traces", "has a path"),
+        ("http://", "telemetry.endpoint"),
+    ] {
+        rejected_for(
+            &with_telemetry(&format!("  endpoint: \"{endpoint}\"\n")),
+            needle,
+        );
+    }
+}
+
+#[test]
+fn rejects_unusable_telemetry_settings() {
+    let ep = "  endpoint: \"https://collector:4317\"\n";
+    for (extra, needle) in [
+        ("  sample_ratio: 1.5\n", "telemetry.sample_ratio"),
+        ("  sample_ratio: -0.1\n", "telemetry.sample_ratio"),
+        ("  metrics_interval: 500ms\n", "telemetry.metrics_interval"),
+        ("  timeout: 0s\n", "telemetry.timeout"),
+        ("  service_name: \"\"\n", "telemetry.service_name"),
+        ("  level: \"info,[\"\n", "telemetry.level"),
+        (
+            "  traces: false\n  metrics: false\n  logs: false\n",
+            "would export nothing",
+        ),
+        (
+            "  headers: { \"bad header\": x }\n",
+            "telemetry.headers.bad header",
+        ),
+        ("  headers: { grpc-timeout: x }\n", "reserved by gRPC"),
+        ("  headers: { auth-bin: x }\n", "binary metadata"),
+        (
+            "  headers: { api-key: \"line\\nbreak\" }\n",
+            "not visible ASCII",
+        ),
+    ] {
+        rejected_for(&with_telemetry(&format!("{ep}{extra}")), needle);
+    }
+}
+
+#[test]
+fn a_disabled_telemetry_block_is_still_validated() {
+    // The admin.metrics precedent: switching it on later surfaces nothing new.
+    rejected_for(
+        &with_telemetry("  enabled: false\n  endpoint: \"\"\n  sample_ratio: 2\n"),
+        "telemetry.sample_ratio",
+    );
+}
+
+#[test]
+fn rejects_unknown_telemetry_keys() {
+    assert!(matches!(
+        load(&with_telemetry(
+            "  endpoint: \"http://c:4317\"\n  protocol: http\n"
+        )),
+        Err(LoadError::Parse { .. })
+    ));
+}
+
+#[test]
+fn telemetry_header_values_are_redacted_in_debug() {
+    let cfg = load(&with_telemetry(
+        "  endpoint: \"https://api.honeycomb.io:443\"\n  headers: { x-honeycomb-team: \"s3cr3t-key\" }\n",
+    ))
+    .unwrap();
+    let shown = format!("{cfg:?}");
+    assert!(shown.contains("x-honeycomb-team"));
+    assert!(!shown.contains("s3cr3t-key"), "{shown}");
+}
+
+#[test]
+fn warns_when_telemetry_headers_would_cross_the_network_in_plaintext() {
+    let warned = |endpoint: &str| {
+        let cfg = load(&with_telemetry(&format!(
+            "  endpoint: \"{endpoint}\"\n  headers: {{ api-key: k }}\n"
+        )))
+        .unwrap();
+        config::validate::warnings(&cfg)
+            .iter()
+            .any(|w| w.path == "telemetry.endpoint")
+    };
+    assert!(warned("http://collector.example.net:4317"));
+    assert!(!warned("https://collector.example.net:4317"));
+    assert!(!warned("http://localhost:4317"));
+    assert!(!warned("http://127.0.0.1:4317"));
+    assert!(!warned("http://[::1]:4317"));
+}

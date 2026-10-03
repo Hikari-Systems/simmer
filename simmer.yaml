@@ -131,6 +131,31 @@ logging:
 #     upstream_response: 30s         # to response headers; 504 after
 #     idle: 60s
 
+# §9.6 (D-101) — optional OTLP/gRPC export of traces, metrics and logs. Absent
+# means nothing is exported and no exporter is built; so does `enabled: false`,
+# and so does an empty `endpoint`, which lets `${SIMMER_OTEL_ENDPOINT}` switch it
+# per environment. It observes only: no header is added to relayed mail, and a
+# collector that is down costs dropped telemetry, never a delayed message.
+#
+# What is exported follows `level`, not `logging.level`, and RUST_LOG does not
+# reach it. §9.5's rules hold: no bodies, no recipient addresses. The OTEL_*
+# environment variables are not read for the endpoint, timeout or resource —
+# this block is the configuration.
+#
+# telemetry:
+#   endpoint: "${SIMMER_OTEL_ENDPOINT}"   # http(s)://host:4317
+#   headers: { x-honeycomb-team: "${HONEYCOMB_KEY}" }   # gRPC metadata; optional
+#   service_name: simmer
+#   resource: { deployment.environment: production }
+#   level: "info,sqlx=warn,tiberius=warn"   # the default; both drivers log every transaction at INFO
+#   traces: true
+#   metrics: true                    # the §9.1 series; independent of admin.metrics
+#   logs: true
+#   sample_ratio: 1.0
+#   metrics_interval: 60s
+#   metrics_temporality: delta       # or cumulative, for a backend that rejects delta sums
+#   timeout: 10s
+
 # D-085 — an optional debugging capture of every accepted message. Absent means
 # nothing is written and no task is started, which is how it should normally be.
 #

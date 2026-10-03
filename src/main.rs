@@ -75,7 +75,22 @@ async fn run() -> anyhow::Result<()> {
     // be skipped later.
     let config = Arc::new(config::load(&path)?);
 
-    logging::init(&config.logging.level, config.logging.format);
+    // §9.6 (D-101) — the OTLP export, when configured. Built before the
+    // subscriber, which takes its span and log layers from it, and inside the
+    // runtime, where tonic spawns its channel. A configured export that cannot
+    // be built refuses to start, like a configured capture: running with an
+    // export that silently sends nothing is the worst outcome available. A
+    // collector that is merely down is not this — the channel connects lazily.
+    let telemetry = match config.telemetry() {
+        Some(t) => Some(simmer::telemetry::init(t, db::BACKEND)?),
+        None => None,
+    };
+
+    logging::init(
+        &config.logging.level,
+        config.logging.format,
+        telemetry.as_ref(),
+    );
 
     // §9.1 — install the Prometheus recorder before anything that counts. Every
     // `metrics::` call before this point is a no-op against a null recorder
@@ -87,18 +102,42 @@ async fn run() -> anyhow::Result<()> {
     // D-093: only when `admin.metrics` enables it. Otherwise no recorder is
     // installed, every `metrics::` call stays a no-op, nothing is held for a
     // scrape that will never come, and `/metrics` is not served.
-    let metrics_handle = if !config.admin.metrics().enabled {
-        info!("admin.metrics is off: no recorder, and /metrics is not served (D-093)");
+    //
+    // D-101: the OTLP metric export is a second recorder beside it, fanned out
+    // from the same facade, and independent of `admin.metrics`. Neither on
+    // still means no recorder at all.
+    let otel_recorder = telemetry.as_ref().and_then(|t| t.recorder());
+    if !config.admin.metrics().enabled {
+        info!("admin.metrics is off: no Prometheus recorder, and /metrics is not served (D-093)");
+    }
+    let prometheus = config
+        .admin
+        .metrics()
+        .enabled
+        .then(|| config.admin.metrics().idle_timeout);
+    let metrics_handle = if prometheus.is_none() && otel_recorder.is_none() {
         None
     } else {
-        match simmer::metrics::install(config.admin.metrics().idle_timeout) {
-            Ok(handle) => Some(handle),
+        match simmer::metrics::install_with(prometheus, otel_recorder) {
+            Ok(handle) => handle,
             Err(e) => {
-                warn!(error = %e, "could not install the Prometheus recorder; /metrics will be empty");
+                warn!(error = %e, "could not install the metrics recorder; /metrics and the OTLP metric export will be empty");
                 None
             }
         }
     };
+
+    if let Some(t) = config.telemetry() {
+        info!(
+            endpoint = %t.endpoint,
+            traces = t.traces,
+            metrics = t.metrics,
+            logs = t.logs,
+            sample_ratio = t.sample_ratio,
+            level = %t.level,
+            "OTLP telemetry export enabled (§9.6)"
+        );
+    }
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -433,6 +472,31 @@ async fn run() -> anyhow::Result<()> {
         })
     });
 
+    // D-101 — the scrape-time gauges, recomputed on the export interval when
+    // nothing else would: `/metrics` refreshes them per scrape, and an
+    // OTLP-only deployment has no scrape.
+    let gauge_task = telemetry
+        .as_ref()
+        .and_then(|t| t.gauge_interval())
+        .map(|interval| {
+            let state = admin_state.clone();
+            let stop = stop_accepting.clone();
+            tokio::spawn(async move {
+                let mut every = tokio::time::interval(interval);
+                every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        _ = every.tick() => {
+                            if let Err(e) = admin::refresh_gauges(&state).await {
+                                warn!(error = %e, "could not refresh quota gauges for the OTLP export");
+                            }
+                        }
+                    }
+                }
+            })
+        });
+
     // D-092 — the soak tier's allocator counters. Off unless the build has
     // `alloc-stats` AND the environment names a file; neither is true of any
     // published image.
@@ -520,6 +584,9 @@ async fn run() -> anyhow::Result<()> {
     if let Some(task) = alloc_stats_task {
         let _ = task.await;
     }
+    if let Some(task) = gauge_task {
+        let _ = task.await;
+    }
     let _ = admin_task.await;
 
     // D-085 — the capture writer outlives every session on purpose: a session
@@ -544,8 +611,31 @@ async fn run() -> anyhow::Result<()> {
     }
 
     info!("shutdown complete");
+
+    // D-101 — last, so the spans and log lines of everything above, the final
+    // drained sessions included, are in the final export. Blocking (each
+    // provider waits for its last export), hence `spawn_blocking`, and bounded,
+    // since a collector that has gone away must not hold up a shutdown that
+    // has otherwise finished.
+    if let Some(t) = telemetry {
+        let flush = tokio::task::spawn_blocking(move || t.shutdown());
+        if tokio::time::timeout(TELEMETRY_FLUSH_GRACE, flush)
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "simmer: the telemetry export did not flush within {}s; the last spans may be missing",
+                TELEMETRY_FLUSH_GRACE.as_secs()
+            );
+        }
+    }
     Ok(())
 }
+
+/// D-101 — how long the final telemetry flush may take. A backstop against a
+/// collector that accepts connections and never answers; the export timeout
+/// already bounds each individual call.
+const TELEMETRY_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// §10.4 — "allow in-flight sessions to complete up to a grace period (default
 /// 30s)". Not in the §4.1 schema, so not configurable.

@@ -110,7 +110,31 @@ impl Proxy {
     }
 
     /// Forward one request from `peer` and return what the client should see.
-    pub async fn handle(&self, mut req: Request<Body>, peer: SocketAddr) -> Response<Body> {
+    pub async fn handle(&self, req: Request<Body>, peer: SocketAddr) -> Response<Body> {
+        // §9.6 (D-101) — the path only, by the rule above: a tracking token in
+        // the query identifies a recipient. And nothing is injected into the
+        // forwarded request — no `traceparent` — because the upstream sees what
+        // it would without Simmer (§1.1).
+        let span = tracing::info_span!(
+            "link_proxy.request",
+            otel.name = format!("{} link_proxy", req.method()),
+            otel.kind = "server",
+            otel.status_code = tracing::field::Empty,
+            http.request.method = %req.method(),
+            url.path = req.uri().path(),
+            http.response.status_code = tracing::field::Empty,
+            origin = tracing::field::Empty,
+        );
+        let resp = tracing::Instrument::instrument(self.forward(req, peer), span.clone()).await;
+        let status = resp.status().as_u16();
+        span.record("http.response.status_code", status);
+        if status >= 500 {
+            span.record("otel.status_code", "ERROR");
+        }
+        resp
+    }
+
+    async fn forward(&self, mut req: Request<Body>, peer: SocketAddr) -> Response<Body> {
         let started = Instant::now();
         let method = req.method().clone();
         // The path only: see the module comment on logging.
@@ -141,6 +165,7 @@ impl Proxy {
             "upstream"
         };
 
+        tracing::Span::current().record("origin", origin);
         let status = resp.status().as_u16();
         let seconds = started.elapsed().as_secs_f64();
         metrics::link_proxy_request(status, origin, seconds);

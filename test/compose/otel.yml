@@ -1,0 +1,33 @@
+# D-101's OTLP export, turned on for both instances of whatever stack is running
+# (docs/SOAK.md §18). The capture.yml pattern: an overlay of its own because the
+# export is orthogonal to the tier and the backend, and it pairs with the
+# generated `<name>.otel.yaml` config twin (test/config/telemetry.block.yaml).
+# `SIMMER_OTEL=on` makes tests/compose/stack.rs layer both; never assemble the
+# command by hand for a run whose result you intend to cite (D-042).
+#
+# The collector is the acceptance stack's dummy one (`otel-collector`, in the
+# base file), which every tier that reads the config volume already has through
+# the `acceptance` profile.
+#
+# **On both instances**, for capture.yml's reason: V2's asymmetry is that `app`
+# is scraped and `app2` is not, and export on one only would put a second
+# difference between them and cost the tier its one controlled comparison.
+
+services:
+  app: &exported
+    environment:
+      SIMMER_OTEL_ENDPOINT: "http://otel-collector:4317"
+      SIMMER_OTEL_INSTANCE: "app"
+    # A dependency here, unlike in the base file: not because Simmer needs it —
+    # the export connects lazily and a collector that is down is not a startup
+    # failure — but so a measured run exports from its first second rather than
+    # from whenever the collector happened to come up.
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  app2:
+    <<: *exported
+    environment:
+      SIMMER_OTEL_ENDPOINT: "http://otel-collector:4317"
+      SIMMER_OTEL_INSTANCE: "app2"

@@ -35,6 +35,16 @@ pub fn capture_on() -> bool {
     std::env::var("SIMMER_CAPTURE").is_ok_and(|v| v == "on")
 }
 
+/// D-101's export overlay: `SIMMER_OTEL_ENDPOINT` and the instance names.
+/// Layered onto any stack when `SIMMER_OTEL=on`.
+const OTEL_OVERRIDE: &str = "test/compose/otel.yml";
+
+/// Is OTLP export on for this run? The capture's twin: it belongs to no tier,
+/// and it combines with the capture freely.
+pub fn otel_on() -> bool {
+    std::env::var("SIMMER_OTEL").is_ok_and(|v| v == "on")
+}
+
 /// The SA login the `mssql` stacks use. Local development only — never a real
 /// credential; `docker-compose.yml`'s `simmer-mssql-db` carries the same literal.
 const MSSQL_SA_PASSWORD: &str = "Simmer-dev-1!";
@@ -160,21 +170,27 @@ impl Stack {
     /// saying so is much better than running without the capture that was asked
     /// for — D-085's rule that a capture configured and silently not writing is
     /// the worst outcome available, applied to the harness.
+    ///
+    /// D-101's export is the same mechanism with `telemetry.block.yaml`, and
+    /// the two combine: `<name>.capture.otel.yaml` carries both blocks.
     fn config_path(&self) -> String {
-        if !capture_on() {
+        if !capture_on() && !otel_on() {
             return self.config.to_string();
         }
         assert!(
             self.config.starts_with("/config/"),
-            "SIMMER_CAPTURE=on, but this stack reads {} from the image rather than \
-             the config volume, so it has no generated capture twin. Only the tiers \
-             served by test/config/Dockerfile can be captured this way.",
+            "SIMMER_CAPTURE=on or SIMMER_OTEL=on, but this stack reads {} from the \
+             image rather than the config volume, so it has no generated twin. Only \
+             the tiers served by test/config/Dockerfile can be run this way.",
             self.config
         );
-        self.config
+        let base = self
+            .config
             .strip_suffix(".yaml")
-            .map(|base| format!("{base}.capture.yaml"))
-            .expect("a tier config ends in .yaml")
+            .expect("a tier config ends in .yaml");
+        let capture = if capture_on() { ".capture" } else { "" };
+        let otel = if otel_on() { ".otel" } else { "" };
+        format!("{base}{capture}{otel}.yaml")
     }
 
     /// `docker compose` with this stack's files, profiles and environment.
@@ -194,6 +210,9 @@ impl Stack {
             }
             if capture_on() {
                 c.args(["-f", CAPTURE_OVERRIDE]);
+            }
+            if otel_on() {
+                c.args(["-f", OTEL_OVERRIDE]);
             }
         }
         for profile in self.profiles {

@@ -64,7 +64,10 @@ services:
       target: runtime
       args:
         # D-084's flags, exactly as the published `-mssql` image is built.
-        CARGO_FEATURES: "--no-default-features --features mssql"
+        # Plus SIMMER_CARGO_FEATURES, which is how D-092's `alloc-stats` reaches
+        # this build as it does stress.yml's (cargo takes `--features` more than
+        # once). Empty by default, so the default is exactly the published flags.
+        CARGO_FEATURES: "--no-default-features --features mssql ${SIMMER_CARGO_FEATURES:-}"
     # Its own tag, so the default stack's `simmer-app` image is not overwritten by
     # a build of the other backend. Switching stacks then costs a container
     # re-creation and not a recompile.

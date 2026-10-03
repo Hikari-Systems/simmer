@@ -357,12 +357,29 @@ pub async fn check_route(plan: &Plan, resolver: &dyn TxtResolver) -> RouteReport
 
 /// One pass over every planned route, updating the registry and the gauges.
 pub async fn check_once(plans: &[Plan], resolver: &dyn TxtResolver, registry: &Registry) {
+    // §9.6 (D-101) — one span per pass, at startup and on the interval. A
+    // failing check is a WARN event inside it.
+    let span = tracing::info_span!(
+        "simmer.preflight",
+        otel.name = "simmer.preflight",
+        routes = plans.len(),
+        failed = tracing::field::Empty,
+    );
+    let failed =
+        tracing::Instrument::instrument(check_all(plans, resolver, registry), span.clone()).await;
+    span.record("failed", failed);
+}
+
+/// [`check_once`]'s body. Returns how many checks failed.
+async fn check_all(plans: &[Plan], resolver: &dyn TxtResolver, registry: &Registry) -> usize {
+    let mut failed = 0;
     for plan in plans {
         let report = check_route(plan, resolver).await;
 
         for c in &report.checks {
             metrics::preflight_ok(&plan.ramp, &plan.route, c.check.as_str(), c.ok);
             if !c.ok {
+                failed += 1;
                 // WARN, not ERROR: on a non-strict route nothing has stopped, and
                 // §6.5 is explicit that this is the failure nothing else in the
                 // mail flow reveals — so it has to be visible without being an
@@ -379,6 +396,7 @@ pub async fn check_once(plans: &[Plan], resolver: &dyn TxtResolver, registry: &R
 
         registry.put(&plan.ramp, &plan.route, report);
     }
+    failed
 }
 
 /// Run until `shutdown` fires. `quota::sweeper::run`'s shape, on the same token.

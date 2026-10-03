@@ -31,7 +31,10 @@ simmer's live heap is 1.5–2.0 MiB while `anon` swings across 60, so the anon g
 has been judging the allocator. Its one real growth is F7, measured at about 204
 bytes per unmatched-sender series, which D-093 now expires. With `/metrics` off
 (§14), simmer's live heap was flat over 30 minutes and F7 passed for the first
-time.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
+time. With D-101's OTLP export on (§18), on SQL Server, the first
+hour found a latency tail, F7 again on the export side and a baseline the harness
+measured too early; after the fixes, 20 minutes matched the export-off control to
+within 14 ms of p99.** A one-page summary is at the end of `DECISIONS.md`, "Test programme
 step 5 summary". This document records what
 the soak tier is, what ten runs have established, and — at least as usefully —
 what they have *not* established. `tests/soak.rs` is the build; `test/config/simmer.soak.yaml` is the
@@ -1987,3 +1990,149 @@ and the stack reset with `-v`. 2026-09-29, 11:42–12:40 UTC.
   It is worth doing before trusting a gate on `je_allocated` if §13's
   open question makes it one.
 - **Two ramps under load, and the SQL Server build.** As in §16.
+
+## 18. OTLP export on (D-101) — SQL Server, an hour, then a control and a fix
+
+### What was run
+
+D-101's export on both instances, to the acceptance stack's dummy collector, on
+the SQL Server build against Express, with jemalloc's counters. Three runs, each
+from a stack reset with `-v`, images built from the working tree
+(`feat/opentelemetry`, uncommitted; `alloc-stats` on, **not a published
+build**):
+
+| | run | image | scripts in `target/soak-runs/` |
+|---|---|---|---|
+| A | an hour, export on, 2026-10-03 11:19–12:42 UTC | `3f40b770…` | `2026-10-03-mssql-otel-je-hour` |
+| B | 20 minutes, export **off**, the same image as A | `3f40b770…` | `2026-10-03-mssql-je-20m-otel-off` |
+| C | 20 minutes, export on, after the fixes below | `146829e1…` | `2026-10-03-mssql-otel-je-20m-fixed` |
+
+```sh
+export SOAK_BACKEND=mssql SIMMER_OTEL=on
+export SIMMER_CARGO_FEATURES="--features alloc-stats" SIMMER_ALLOC_STATS_FILE=/tmp/simmer-alloc-stats
+```
+
+`SIMMER_OTEL=on` is new, and the capture's twin (§11): `tests/compose/stack.rs`
+layers `test/compose/otel.yml`, which gives both instances
+`SIMMER_OTEL_ENDPOINT` and an instance name, and points them at the `.otel`
+config twin. `test/config/Dockerfile` generates that twin by appending
+`test/config/telemetry.block.yaml`. The block sets only the endpoint and
+resource. Everything else is the documented default, including the 60 s
+`metrics_interval`: what an operator would run. It combines with the capture
+(`.capture.otel.yaml`). Three other changes were needed:
+
+- `test/compose/mssql.yml` now appends `SIMMER_CARGO_FEATURES` to its build
+  flags. Before, D-092's counters could not reach the SQL Server build.
+- The collector's file exporters rotate at 256 MiB with two backups, because
+  an hour is about 900 MiB of JSON.
+- The collector's own counters are on `otel-collector:8888`. That is what
+  accounts for what arrived.
+- `otel-init` no longer empties the files: re-run under a collector that was
+  already running, deleting them left it writing to unlinked inodes. D-101 has
+  the detail. `tests/telemetry_compose.rs` now reads only what was exported
+  after it started.
+
+### Hour A: correct, export complete, and three problems
+
+- **Correctness.** 36,010 of 36,010 accepted per instance, none deferred,
+  refused or failed in transport. V4 as always: 220 accepted and 11 cut per
+  instance, none at the dot, 0 reservations in flight after the drain.
+- **The export was complete.** The collector accepted 441,986 spans, 449,748
+  log records and 120,546 metric points, and refused or failed none. Neither
+  instance logged an SDK warning or error. The span count is about what
+  72,000 messages, the sessions and V4 should produce.
+- **Memory, descriptors and threads passed** on both instances.
+
+**Problem 1: the latency tail.** p99 was 208 and 222 ms, against §11's 76 and
+73 ms on the same backend. 424 and 510 messages took over 200 ms, against 2.
+The tail was not spread over the hour. Both instances had 25–35 slow messages a
+minute for sixteen minutes, then it stopped abruptly: 421 and 509 of them came
+in the first 20 minutes. 93% were the first message of a session.
+
+The export is what showed where the time went. The slowest message (574 ms,
+`soak-app-9621`, kept as `slow-trace-soak-app-9621.jsonl`) spent 113 ms in
+`simmer.quota.resolve`, the SQL Server commit, and then **430 ms after it with
+no span at all**. That gap is the post-commit read of the quota row for §9.1's
+gauges (`relay.rs`), which has existed since phase 3 and had never been traced.
+It now has a span, `simmer.quota.usage`.
+
+**Problem 2: F7, a second time.** The SDK's cumulative temporality held and
+re-exported every unmatched-sender series it had ever seen: 1,801 per instance
+at the end, each in every 60 s export. D-093's idle expiry covers `/metrics`
+only. `je_allocated` crept about 2 MiB/h, against §17's 0.5–0.64, which is the
+size of that. It is bounded only by the SDK's 2,000-series-per-instrument limit.
+
+**Problem 3: tiberius exported.** `test/compose/mssql.yml`'s `tiberius=warn`
+(§11) reaches stdout only. The export filter, `telemetry.level`, defaulted to
+`info`, and `RUST_LOG` deliberately does not reach it. So the export carried
+tiberius's `Begin transaction` and `Commit transaction`: four lines a message,
+the majority of the 449,748 records.
+
+**A gate failure that was the harness.** `soak/rest/baseline` reported 4 tasks
+and 2 unpooled sockets per instance at rest that were not there before the first
+message. Both sockets were live, `ESTABLISHED` connections to the collector:
+three per instance at rest, one per exporter, flat all hour. The baseline missed
+two of them because `soak_run` re-creates the instances just before sampling it.
+The exporters' channels connect lazily, so the fresh processes had connected
+for logs, which come at startup, but not yet for spans or metrics. The run
+script's own warm-up had connected the processes that were then replaced.
+
+### Control B: the same image, export off
+
+| 20 min | p50 | p99 | max | over 200 ms | CPU, one core | `je_allocated` |
+|---|---|---|---|---|---|---|
+| B, export off | 22.1 / 22.7 ms | 65.0 / 61.1 ms | 152 / 153 ms | 0 / 0 | 7.4% | 1.5–2.2 MiB |
+| A, its first 20 min | — | — | 574 / 562 ms | 421 / 509 | 11.3% (the hour) | 5.9–28.2 MiB |
+
+So the tail came with the export. The baseline checks passed: threads 3 → 3,
+tasks 12 → 12, 0 unaccounted descriptors.
+
+### The fixes, and run C
+
+- **`telemetry.metrics_temporality`, default `delta`** (the SDK's `LowMemory`):
+  an idle counter series is dropped after an export, and gauges stay cumulative.
+  `cumulative` is available for backends that reject delta sums.
+- **The export filter defaults to `info,sqlx=warn,tiberius=warn`**, the
+  published stdout guidance.
+- **`simmer.quota.usage`**, the span over the post-commit read.
+- **`soak_run` waits for the exporters before its baseline** when
+  `SIMMER_OTEL=on`. It makes an admin request, which produces a span, then
+  waits for three `ESTABLISHED` connections to :4317 per instance, failing
+  after two minutes rather than measuring a wrong baseline.
+
+| 20 min | p50 | p99 | max | over 200 ms | CPU, one core | `je_allocated`, median |
+|---|---|---|---|---|---|---|
+| C, export on, fixed | 26.6 / 28.8 ms | 79.0 / 70.3 ms | 177 / 160 ms | 0 / 0 | 7.7% | 6.9 MiB |
+| B, export off | 22.1 / 22.7 ms | 65.0 / 61.1 ms | 152 / 153 ms | 0 / 0 | 7.4% | 1.6 MiB |
+
+**The tail is gone.** Against B, the export's CPU cost fell from 3.9 percentage
+points of a core to 0.3. Exported log records fell to about a third (53,190 in
+20 minutes) and metric points to about a fifteenth. The baseline checks passed:
+tasks 22 → 22, 0 unaccounted descriptors, threads 7 → 6. With the export on, the
+process has three or four more threads (the SDK's batch and reader threads) and
+ten more tasks, from before its first message.
+
+**The export's steady cost:** about 4–5 MiB of live heap (median 6.9 against
+1.6 MiB), 0.3 points of CPU, and 9–14 ms on p99.
+
+### What these runs did not establish
+
+- **Which fix removed the tail.** The two fixes that change behaviour, the filter
+  and the temporality, went in together. The trace places the time in SQL Server
+  (the commit, and the read waiting behind it), not in the export path. Exporting
+  four tiberius records from inside each transaction is the likeliest link, but
+  it was not isolated. **Why the tail stopped at minute sixteen** is not
+  explained either. A collector writing about 1 GB of JSON an hour, on a host
+  disk at 98% used, competing with SQL Server's log flushes, is a candidate that
+  was not tested.
+- **A leak verdict with the export on.** B and C are 20 minutes, with too few
+  floors. Hour A's memory, descriptor and thread gates passed, but on the code
+  before the fixes.
+- **Whether delta bounds F7 over hours.** The unit test shows an idle series is
+  dropped. V3 mints a new domain for every message, so each series sees one
+  increment and is idle from the next interval. An hour with the fixes would
+  show the creep gone.
+- **The ~18 MiB step of §17.** It appeared on both instances in A, on `app`
+  only in C (6.2–21.0 MiB), and not in B. That is not enough runs to tie it to
+  the export, and it stays unexplained.
+- **The stress tier, a TLS endpoint, a real vendor.**

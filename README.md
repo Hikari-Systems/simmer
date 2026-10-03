@@ -560,6 +560,65 @@ group, never an SMTP port, and point the target group's health check at the
 admin port's `/health`. The proxy reserves no path of its own. At cutover,
 repoint the public name at the upstream directly and remove the block.
 
+### OpenTelemetry
+
+Optional OTLP/gRPC export of traces, metrics and logs (`SPEC.md` §9.6,
+`DECISIONS.md` D-101). It is off when the block is absent, when it says
+`enabled: false`, or when `endpoint` is empty:
+
+```yaml
+telemetry:
+  endpoint: "${SIMMER_OTEL_ENDPOINT}"     # http(s)://collector:4317; "" => off
+  headers: { x-honeycomb-team: "${HONEYCOMB_KEY}" }   # optional gRPC metadata
+  resource: { deployment.environment: production }    # optional
+  # defaults: service_name simmer, level "info,sqlx=warn,tiberius=warn",
+  # traces/metrics/logs true, sample_ratio 1.0, metrics_interval 60s,
+  # metrics_temporality delta, timeout 10s
+```
+
+- **Traces.**
+  - `smtp.session` covers each connection.
+  - Under it, `smtp.transaction` covers each message: `correlation_id` and the
+    final reply code.
+  - Under that, `simmer.relay` carries the ramp, route, domain group, day
+    index and result. Its children are:
+    - `simmer.route`: the chain, with every skip reason;
+    - `simmer.rewrite`;
+    - `smtp.downstream`: the downstream's code, stage and outcome, and whether
+      the pooled-connection retry happened;
+    - `simmer.quota.resolve`, and after a commit `simmer.quota.usage`, the
+      row read back for the quota gauges.
+  - Also `simmer.preflight`, `admin.request` and `link_proxy.request` spans.
+  - A deferred or rejected message is an error span.
+- **Metrics.** The same §9.1 series as `/metrics`, same names and labels, sent
+  every `metrics_interval`. This is independent of `admin.metrics`, so either,
+  both or neither can be on. Counters and histograms are sent as **deltas** by
+  default, so a series that stops changing is dropped from memory after the
+  next export — the export's equivalent of `/metrics`' idle expiry. Gauges are
+  always cumulative. Set `metrics_temporality: cumulative` for a backend that
+  rejects delta sums; the SDK then keeps every series it has seen, up to 2,000
+  per metric.
+- **Logs.** Every log event, carrying the trace and span it happened in.
+
+What is exported is filtered by `telemetry.level`, not `logging.level`, and
+`RUST_LOG` does not reach it. The privacy rules that apply to stdout apply to
+the export: no bodies, no recipient addresses, no link-proxy query strings.
+
+**It observes only.** No trace header is added to relayed mail, so the cutover
+invariant holds. A collector that is down or slow costs dropped telemetry, never
+mail: the exporter connects lazily, exports run off the message path, and
+failed exports are logged to stdout as warnings. The `OTEL_*` environment
+variables are not the configuration; the YAML is.
+
+Two things changed for everyone, telemetry on or off:
+- JSON log lines now include the fields of the span they were logged in, which
+  puts `correlation_id` on the downstream outcome lines;
+- a downstream's reply text is logged with the local part of any address
+  replaced by `*`, since downstreams quote the recipient back.
+
+To see it locally, the acceptance stack includes a dummy collector that writes
+what it receives to the `otel-out` volume. See Development.
+
 ### Database: Postgres or SQL Server
 
 Every release ships two images of the same code, differing only in where quota
@@ -861,6 +920,16 @@ of the cutover invariant (§1.1) produce byte-equal output. It also submits over
 for each run. `docs/ACCEPTANCE.md`
 explains the topology; `DECISIONS.md` D-042 explains what will bite.
 
+The same stack runs a dummy OpenTelemetry collector (`otel-collector`, D-101)
+that `simmer.acceptance.yaml` exports to. It writes every trace, metric and log
+it receives to the `otel-out` volume as OTLP JSON lines, and one more test reads
+them back:
+
+```sh
+cargo test --test telemetry_compose -- --ignored --test-threads=1
+docker compose --profile acceptance logs otel-collector    # a line per batch received
+```
+
 `DATABASE_URL` is needed only by `tests/quota*.rs`, which use `#[sqlx::test]` to
 get a fresh database per test. Faking Postgres there would defeat the point:
 §12.3's overshoot test is a claim about what two transactions do to one row at the
@@ -906,6 +975,7 @@ src/capture/    D-085's debugging capture and D-086's `server replay`.
                 outcome, which is what keeps it from being a spool
 src/relay.rs    decide -> reserve -> rewrite -> relay -> commit/release
 src/metrics.rs  §9.1 counters and the Prometheus recorder, installed only with admin.metrics
+src/telemetry/  §9.6 the optional OTLP export: providers, and the §9.1 metrics bridge
 src/alloc_stats.rs  D-092: jemalloc's counters to a file, soak build only (alloc-stats)
 src/admin/      the §9 control plane: reads, writes, dry run, /metrics
   view.rs         §9.2's projections, as pure functions. D-026's drift flag

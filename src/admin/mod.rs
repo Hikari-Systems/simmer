@@ -123,7 +123,43 @@ pub fn router(state: AdminState) -> Router {
     } else {
         router
     };
-    router.with_state(state)
+    router
+        .layer(axum::middleware::from_fn(request_span))
+        .with_state(state)
+}
+
+/// §9.6 (D-101) — one span per admin request, so a mutation's audit line and
+/// any auth refusal arrive attached to the request that caused them.
+///
+/// The route **template** (`/ramps/{ramp}/routes/{name}/pause`), never the raw
+/// path, and nothing from the headers: the bearer token is in one. The probe
+/// and scrape paths get no span — a load balancer's health check every few
+/// seconds is not an event of significance, and would bury the ones that are.
+async fn request_span(
+    matched: Option<axum::extract::MatchedPath>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let route = matched.as_ref().map_or("unmatched", |m| m.as_str());
+    if matches!(route, "/health" | "/healthcheck" | "/metrics") {
+        return next.run(req).await;
+    }
+    let span = tracing::info_span!(
+        "admin.request",
+        otel.name = format!("{} {route}", req.method()),
+        otel.kind = "server",
+        otel.status_code = tracing::field::Empty,
+        http.request.method = %req.method(),
+        http.route = route,
+        http.response.status_code = tracing::field::Empty,
+    );
+    let resp = tracing::Instrument::instrument(next.run(req), span.clone()).await;
+    let status = resp.status().as_u16();
+    span.record("http.response.status_code", status);
+    if status >= 500 {
+        span.record("otel.status_code", "ERROR");
+    }
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -212,10 +248,7 @@ async fn metrics_endpoint(State(state): State<AdminState>) -> Response {
     // update on the latency path of every message to say something a scrape can
     // read straight off the pool. A route nothing has sent through publishes
     // `0`, which is the answer — not silence.
-    refresh_pool_gauges(&state);
-    refresh_runtime_gauges(&state);
-
-    if let Err(e) = refresh_quota_gauges(&state).await {
+    if let Err(e) = refresh_gauges(&state).await {
         tracing::warn!(error = %e, "could not refresh quota gauges for /metrics");
     }
 
@@ -242,6 +275,20 @@ async fn metrics_endpoint(State(state): State<AdminState>) -> Response {
         )
         .into_response(),
     }
+}
+
+/// Recompute every gauge §9.1 reads at scrape time (D-056, D-075): the pools,
+/// the process and runtime, and the quota projection. Called by `/metrics` and,
+/// when §9.6's metric export is on, by `main`'s gauge task on the export
+/// interval — without which an OTLP-only deployment would export whatever the
+/// last relayed message happened to set, which is D-056's bug again (D-101).
+///
+/// Only the quota half touches storage, and only it can fail; the other two
+/// are refreshed whatever it does.
+pub async fn refresh_gauges(state: &AdminState) -> Result<(), quota::QuotaError> {
+    refresh_pool_gauges(state);
+    refresh_runtime_gauges(state);
+    refresh_quota_gauges(state).await
 }
 
 /// D-075 — the process, the session bound, the §10.4 registry, the Postgres

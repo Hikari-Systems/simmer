@@ -4675,6 +4675,233 @@ cannot reach its traps), gave the day-0 result over real SMTP: 5 in
 jail, and a dry run against a deployed instance.
 
 
+## OpenTelemetry (2026-10-02)
+
+### D-101 — Optional OTLP export of traces, metrics and logs (§9.6)
+
+> **Settled 2026-10-02 by the spec's author, who asked for it; the spec is
+> amended (§4.1, §4.2, §9.1, §9.5, §9.6 (new), §12.1, §12.3, §13).** The
+> author's calls: all three signals; OTLP over **gRPC**; configured "in the same
+> method as all the other configuration"; **disabled by default or if
+> unconfigured**; and a dummy collector in the test compose stack to verify it.
+
+**The problem.** Simmer had no spans at all. Every log line was a flat event
+with `correlation_id` threaded by hand, and about half the message path never
+had it: every line in `downstream/outcome.rs`, the rewrite warnings, the pool
+and AUTH lines. The §9.1 metrics reached only a Prometheus scrape. An operator
+whose platform is an OpenTelemetry backend had no way to see a message's path
+as one thing.
+
+**What it does.**
+
+- **Config.** An optional top-level `telemetry:` block, in the shape of
+  `capture:` and `link_proxy:`: presence opts in, every key but `endpoint` has a
+  default, `${ENV}` interpolation applies, and §4.2 validates it (enabled or not,
+  the `admin.metrics` precedent). It is **off** when absent, when
+  `enabled: false`, or when `endpoint` is empty. The last exists so that
+  `endpoint: "${SIMMER_OTEL_ENDPOINT}"` can be switched off per environment by
+  leaving the variable empty, since a bool cannot be interpolated.
+  `Config::telemetry()` is the one place that rule lives. Header values are
+  redacted in `Debug`.
+- **Traces.**
+  - `smtp.session` spans the connection, refused ones included.
+  - `smtp.transaction` runs from the accepted `MAIL FROM` to its final reply,
+    with `correlation_id` and the reply code. It is held on the `Transaction`,
+    and every command of the transaction runs inside it.
+  - `simmer.relay` spans `reserve_relay_commit` and carries ramp, source, route,
+    group, day, pin and result. Its children are `simmer.route`, which carries
+    the rendered chain with skip reasons, `simmer.rewrite`, `smtp.downstream`,
+    `simmer.quota.resolve` and, after a commit, `simmer.quota.usage` (added
+    after the §18 soak found 430 ms untraced there).
+  - `smtp.downstream` is a client span. It records the reply code, stage and
+    outcome class (`RelayError::class`, the same strings as
+    `simmer_downstream_errors_total`), and marks D-068's retry with
+    `retried=true`.
+  - `simmer.preflight` covers each pass, `admin.request` each admin request,
+    and `link_proxy.request` each link-proxy request.
+  - `4xx` and `5xx` replies set an error status.
+  - The existing ~100 log lines become span events with no change to them.
+- **Metrics.** A second `metrics::Recorder` (`telemetry/metrics.rs`) beside the
+  Prometheus one, fanned out from the same facade (`metrics::install_with`),
+  so the §9.1 names, labels and call sites are unchanged.
+  - Gauges keep one cell per series, because the facade's
+    `increment`/`decrement` are relative and an OTel gauge is not. F17's
+    two-writer `simmer_capture_disk_bytes` depends on that.
+  - Histograms take their buckets from one table shared with Prometheus.
+  - The scrape-time gauges (D-056, D-075) are recomputed on the export interval
+    by a task that `admin::refresh_gauges` shares with `/metrics`. Without it,
+    an OTLP-only deployment would export whatever the last message set, which
+    is D-056's bug again.
+- **Logs.** `opentelemetry-appender-tracing` exports every event with the
+  active span's trace id.
+- **Filtering.** Per-layer filters. Stdout keeps `logging.level` and
+  `RUST_LOG`. The exporters use `telemetry.level`, which `RUST_LOG` cannot
+  reach, so a container turned up to `debug` for diagnosis does not start
+  shipping debug lines to a vendor. The exporter's own targets (`opentelemetry*`,
+  `tonic`, `h2`, `hyper`, `tower`) are never exported, since an export failure
+  exported as a log record is a feedback loop. They do reach stdout, through the
+  SDK's `internal-logs`, which is where an operator diagnosing a dead collector
+  looks.
+
+**Two changes that apply whether or not telemetry is on.**
+
+1. **JSON log lines carry the innermost span's fields** (`with_span_list(false)`).
+   That puts `correlation_id` on the downstream outcome lines that never had it,
+   which §9.5 asked for from the start. Every child of `simmer.relay` carries
+   `correlation_id` itself for this reason. Lines before `MAIL FROM` carry the
+   session's fields instead.
+2. **A downstream's reply text is logged with address local parts redacted**
+   (`outcome::redact_addresses`: `<*@example.com>`). `tests/telemetry.rs`'s
+   privacy test found this on its first run. A `550 5.1.1 <jane@…> unknown user`
+   was logged verbatim at `INFO`, and so was every 5xx and 4xx text. That was
+   already a §9.5 breach on stdout, and the export would have widened it to
+   every telemetry backend. The domain is kept, because it is what tells one
+   provider's refusals from another's. The client's reply still quotes the text
+   in full: §10.1 returns it to the client that sent the address, which
+   discloses nothing.
+
+New `INFO` events for refusals that were silent:
+- a second `RCPT TO` (`452`, D-047);
+- `SIZE` above `max_message_bytes`;
+- `DATA` over the limit;
+- `DATA` timed out;
+- `MAIL FROM` before `AUTH` on a `required` listener;
+- an AUTH payload that is not base64.
+
+None of them carries a recipient.
+
+**Choices, and why.**
+
+- **Observe, never alter (§1.1).** No `traceparent` goes into relayed mail or
+  link-proxy requests. Either would be output no application-side
+  configuration produces. There is no inbound propagation either: SMTP has no
+  trace header.
+- **Delivery isolation (§14.1's spirit).** The tonic channel connects lazily,
+  exports run on the SDK's batch threads, and nothing on the message path waits
+  on them. Measured: with the collector stopped, 25 messages through the
+  acceptance stack all got `250` at the usual 2–4 ms downstream latency. A
+  restart with the collector absent came up healthy. Each failed batch logged
+  one `WARN` and one `ERROR` from the SDK.
+- **A configured export that cannot be built refuses to start.** This is
+  D-085's rule that configured-but-silent is the worst outcome. An unreachable
+  collector is not this case.
+- **The YAML is the configuration.** The resource is built empty, so
+  `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` cannot relabel an instance
+  behind its config. Endpoint and timeout are set explicitly, which the SDK
+  ranks above its environment variables.
+  - *Residual:* the SDK still **adds** `OTEL_EXPORTER_OTLP_HEADERS` to the
+    metadata, and still honours `OTEL_EXPORTER_OTLP_COMPRESSION` and `…_INSECURE`
+    if they are set. Closing that would mean building the tonic channel by hand.
+    Nothing in the shipped image sets them.
+- **gRPC over tonic, with ring and the platform roots** (`tls-ring`, `tls-roots`,
+  `with_native_roots()`): §8.2's provider and trust, and `cargo tree -i
+  aws-lc-rs` stays empty in both builds. TLS applies only to an `https://`
+  endpoint.
+- **Default batch processors, not the async-runtime ones.** The risk planned for
+  was that tonic needs a reactor and the SDK's processors run on their own
+  threads. The channel's worker is spawned on the runtime at build time, so the
+  dedicated threads only wait on it. This was verified against the real
+  collector.
+- **Sampling** is by trace id (`TraceIdRatioBased`), since there is never a
+  remote parent.
+- **Temporality is delta by default** (`telemetry.metrics_temporality`), which
+  is the SDK's `LowMemory`: counters and histograms report deltas, and a series
+  that saw nothing in an interval is dropped, while gauges stay cumulative so an
+  unchanged gauge is not missing from an export. This was cumulative at first.
+  The SQL Server soak (docs/SOAK.md §18) measured the cost: the SDK held and
+  re-exported every unmatched-sender series it had ever seen, 1,801 an instance
+  after an hour, so F7's client-chosen label was bounded only by the SDK's
+  2,000-per-instrument limit. D-093 had already removed that problem from the
+  Prometheus side with idle expiry. Delta is the export's equivalent.
+  `cumulative` stays available for a backend that rejects delta sums, which
+  some Prometheus-compatible ones do; silently losing metrics there would be
+  worse than the memory.
+- **The export filter defaults to `info,sqlx=warn,tiberius=warn`**, the
+  published stdout guidance, and not a bare `info`. Both drivers log every
+  transaction at INFO. `RUST_LOG` deliberately does not reach the export
+  filter, so `test/compose/mssql.yml`'s `tiberius=warn` silenced them on stdout
+  only. §18's hour exported about four tiberius lines a message, the majority
+  of its 450,000 log records.
+- **No spans for the sweepers or the probe paths**, because an idle tick or a
+  health check every few seconds would bury the events that matter. Their log
+  lines still export.
+- **Metric names are §9.1's, unchanged**, `_total` included. A metric has one
+  spelling in this crate, and that holds across both exporters.
+
+**Alternatives, rejected.**
+
+- *OTLP over HTTP/protobuf.* This was the author's choice between the two. The
+  hyper client the exporter offers is plaintext only.
+- *`metrics-exporter-opentelemetry`.* It pins OpenTelemetry 0.31 and would put a
+  second OpenTelemetry in the graph beside the 0.33 everything else uses. The
+  bridge is ~150 lines instead.
+- *Honouring the `OTEL_*` environment.* The author asked for the same method as
+  everything else, and that is the YAML with `${…}`.
+- *`with_span_list(true)`.* It puts the full ancestry on every line, repeating
+  the transaction's fields on every relay line. Copying `correlation_id` onto
+  each child is one field.
+
+**Test compose.** The acceptance profile gains:
+- `otel-collector`: contrib v0.161.0, pinned by digest like the traps;
+- `otel-init`: an alpine one-shot that chowns the volume.
+
+The collector writes each signal to `/otel/*.jsonl` on the `otel-out` volume,
+which the loadgen mounts read-only so a test can read it, since the collector
+image is distroless. **Nothing empties the files.** `up` re-runs `otel-init`
+without re-creating a collector that is already running, and that collector
+holds its files open at an offset. Deleting them, as `otel-init` first did, left
+it writing to unlinked inodes. Truncating them left a run of NULs before its next
+line. Both were found while writing docs/SOAK.md §18. So the files accumulate,
+bounded by rotation at 256 MiB, and `tests/telemetry_compose.rs` reads the last
+300 export requests and keeps only spans and metric collections timed after it
+started, and log records in its trace. That also stops it passing on an earlier
+run's data, which emptying never fully prevented. `simmer.acceptance.yaml` exports to it with
+`metrics_interval: 5s`. It is deliberately not a dependency of `app`: telemetry
+must never stop Simmer starting.
+
+**Tested:**
+- `src/telemetry/metrics.rs`: counter, gauge (`increment`, `decrement` and
+  `set`, F17's shape) and histogram buckets, against an in-memory reader.
+- `tests/config_validation.rs`: defaults, the three ways of being off, every
+  violation, the plaintext-headers warning, and redaction in `Debug`.
+- `src/downstream/outcome.rs`: `redact_addresses`.
+- `tests/telemetry.rs`: its own binary, with the real layers over in-memory
+  exporters. It checks:
+  - the session → transaction → relay → {route, rewrite, downstream, quota}
+    tree;
+  - that `correlation_id` equals the outbound `X-Simmer-Correlation-Id` and is
+    on every relay child;
+  - error status and outcome on a `452`;
+  - the correlated "downstream accepted" log record;
+  - `simmer_messages_total{result="delivered"}` over OTLP;
+  - that no exported attribute, event or log record carries the recipient,
+    including when the downstream quotes it back.
+- `tests/telemetry_compose.rs` (`--ignored`, acceptance stack), the same claims
+  read back from the real collector's files:
+  - the span tree, the resource attributes and log correlation;
+  - the §9.1 counter and a scrape-time gauge;
+  - that no loadgen recipient reached the collector.
+- The collector-down resilience run above.
+- `src/telemetry/metrics.rs`: under the default temporality, a counter series
+  idle for an interval is not exported and an unchanged gauge still is.
+- The T4 soak with export on, SQL Server Express, both instances, jemalloc's
+  counters (`SIMMER_OTEL=on`, docs/SOAK.md §18): an hour, a 20-minute control
+  with export off, and 20 minutes after the fixes above.
+- `cargo test`, `clippy -D warnings` and `cargo deny check` for both builds.
+  The SQL Server build's clippy, lib, telemetry and config tests ran in a
+  `rust:1-bookworm` container, for its OpenSSL headers.
+- The full §12.3 acceptance suite, unchanged and passing with the collector in
+  the stack and `simmer.acceptance.yaml` exporting to it. That includes the
+  byte-equivalence test, which is the evidence that telemetry altered no
+  output.
+
+**Not run:**
+- An hour with the fixes in. The 20-minute run after them has too few floors
+  for a leak verdict.
+- The stress tier (T3) with export on.
+- An export to a TLS endpoint or a real vendor.
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
