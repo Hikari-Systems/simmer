@@ -4932,6 +4932,38 @@ session slot, a peer that pipelines EHLOs and reads nothing; the slot is free
 again within the budget. It failed (slot held past 8 s) before the change.
 
 
+### D-102 — `From : x` is a From field: whitespace before the colon names the field
+
+> Phase 0 (groundwork) of the segment rate-limit/spool plan, 2026-10-03.
+
+**The problem.** `rewrite::headers::name_of` accepted a field name only when the
+byte before the colon was part of the name, so RFC 5322 §4.5.3's obsolete
+`From : jane@oldbrand.com` was not a field to the rewrite engine: it was taken as
+a continuation of the field above it. mail-parser, which §5.4 routes on, reads
+the same line as the From field. The consequences: `set_headers: From` found no
+From and *appended* one, so the message left with two and the original identity
+leaked (§1.1); and §6.5's unconditional strip missed `DKIM-Signature :` and
+`X-Simmer-Ramp :`, so a signature for the old domain and Simmer's own control
+header could both reach a downstream.
+
+**The rule.** Trailing SP/HTAB between the name and the colon is accepted and
+trimmed *for matching only*. The field keeps its original bytes (D-039): an
+untouched `Subject : x` leaves exactly as it came. Whitespace alone before the
+colon is still not a name, and a space *inside* a name (`Subject line: x`) still
+makes the line not a field.
+
+**Not changed:** `header_rules.rs`'s config-side name check, which validates
+names an operator writes, not names a message carries.
+
+**Tested:** `rewrite::headers::tests::obsolete_whitespace_before_the_colon_still_names_the_field`,
+`rewrite::tests::obsolete_spacing_before_the_colon_does_not_smuggle_a_header_past_the_rewrite`,
+and the proptest `tests/rewrite_stability.rs` `an_obsolete_from_is_replaced_not_joined`
+(exactly one From, no old identity, no artefact, stable under a second pass);
+the generator's extra headers now include obsolete-spaced `Subject`,
+`DKIM-Signature` and `X-Simmer-Ramp`. All three failed before the change — the
+proptest's minimal case was `"From : jane@oldbrand.com\r\n\r\n"`.
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

@@ -311,14 +311,26 @@ fn lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
 /// The field name of a header line, if it has one.
 ///
 /// RFC 5322 `field-name` is printable ASCII excluding colon, so a line whose
-/// text before the colon contains a space or a non-ASCII byte is not a header
-/// field however much it looks like one.
+/// text before the colon contains a space *inside* the name, or a non-ASCII
+/// byte, is not a header field however much it looks like one.
+///
+/// Whitespace **between** the name and the colon is accepted and trimmed
+/// (D-102): RFC 5322 §4.5.3's obsolete `From : x` is still a From field, and
+/// mail-parser — which §5.4 routes on — reads it as one. Refusing it here made
+/// it a continuation of the field above, so `set_headers` appended a second
+/// `From:` and the old identity left with it, and §6.5's strip missed
+/// `DKIM-Signature :`. Only the *name* is trimmed; the field keeps its original
+/// bytes (D-039).
 fn name_of(line: &[u8]) -> Option<&str> {
     let colon = line.iter().position(|b| *b == b':')?;
-    if colon == 0 {
+    let mut end = colon;
+    while end > 0 && matches!(line[end - 1], b' ' | b'\t') {
+        end -= 1;
+    }
+    let name = &line[..end];
+    if name.is_empty() {
         return None;
     }
-    let name = &line[..colon];
     if !name.iter().all(|b| (33..=126).contains(b) && *b != b':') {
         return None;
     }
@@ -569,6 +581,30 @@ mod tests {
         // Malformed input, but throwing bytes away is worse than carrying them.
         let odd: &[u8] = b"not a header at all\r\nFrom: a@b\r\n\r\nbody\r\n";
         assert_eq!(rendered(&split(odd)), odd);
+    }
+
+    #[test]
+    fn obsolete_whitespace_before_the_colon_still_names_the_field() {
+        // RFC 5322 §4.5.3 obs-optional: `From : x` is a From field, and
+        // mail-parser — which §5.4 routes on — reads it as one. Treating it as a
+        // continuation of the field above meant `set_headers` appended a second
+        // From: and the original identity left alongside it.
+        let raw: &[u8] = b"To: b@c\r\nFrom : a@old\r\nDKIM-Signature\t: v=1\r\n\r\n";
+        let mut m = split(raw);
+        assert_eq!(m.headers.names(), ["To", "From", "DKIM-Signature"]);
+        assert_eq!(m.headers.get("from").as_deref(), Some("a@old"));
+        // Untouched, the original bytes are kept — the space included.
+        assert_eq!(rendered(&m), raw);
+
+        m.headers.set("From", "x@new");
+        assert_eq!(m.headers.get_all("From"), ["x@new"]);
+        assert_eq!(m.headers.remove("DKIM-Signature"), 1);
+    }
+
+    #[test]
+    fn whitespace_alone_before_the_colon_is_not_a_name() {
+        let m = split(b"From: a@b\r\n : value\r\n\r\n");
+        assert_eq!(m.headers.names(), ["From"]);
     }
 
     #[test]

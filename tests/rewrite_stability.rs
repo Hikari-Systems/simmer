@@ -171,7 +171,22 @@ fn extra_header() -> impl Strategy<Value = String> {
         // re-serialiser would silently repair.
         Just("x-lower: value\r\n".to_string()),
         Just("X-Tight:value\r\n".to_string()),
+        // RFC 5322 §4.5.3's obsolete whitespace before the colon (D-102).
+        Just("Subject : spaced\r\n".to_string()),
+        Just("DKIM-Signature\t: v=1; d=oldbrand.com\r\n".to_string()),
+        Just("X-Simmer-Ramp : partner\r\n".to_string()),
     ]
+}
+
+/// A `From:` spelt with obsolete whitespace before the colon (D-102). mail-parser
+/// reads it as the From field, so the rewrite must too.
+fn obsolete_from_header() -> impl Strategy<Value = String> {
+    (
+        prop_oneof![Just(" "), Just("\t"), Just("  "), Just(" \t")],
+        prop_oneof![Just("From"), Just("from"), Just("FROM")],
+        prop_oneof![Just("jane@oldbrand.com"), Just("Jane <jane@oldbrand.com>")],
+    )
+        .prop_map(|(ws, name, value)| format!("{name}{ws}: {value}\r\n"))
 }
 
 fn body() -> impl Strategy<Value = String> {
@@ -359,6 +374,17 @@ prop_compose! {
     }
 }
 
+prop_compose! {
+    fn message_with_obsolete_from()(
+        before in prop::collection::vec(extra_header(), 0..3),
+        from in obsolete_from_header(),
+        after in prop::collection::vec(extra_header(), 0..3),
+        body in body(),
+    ) -> String {
+        format!("{}{from}{}\r\n{body}", before.concat(), after.concat())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // the properties
 // ---------------------------------------------------------------------------
@@ -392,6 +418,36 @@ unstable_headers: ["Reply-To"]
 /// Pass-through: §1.1's "degenerate case where the target identity already
 /// equals the incoming one".
 const PASS_THROUGH: &str = r#"envelope_from: "sender@oldbrand.com""#;
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    #[test]
+    fn an_obsolete_from_is_replaced_not_joined(m in message_with_obsolete_from()) {
+        // D-102. Before it, `From : x` was not a field to the rewrite, so the
+        // shipped set_headers appended a second From: and the old identity left
+        // beside it — while §5.4, through mail-parser, had routed on it.
+        let route = compile(SHIPPED);
+        let out = pass(&route, m.as_bytes(), Some("sender@oldbrand.com"));
+        let text = String::from_utf8_lossy(&out.raw).to_string();
+        let head = text.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or(&text);
+        let froms = head
+            .split("\r\n")
+            .filter(|l| {
+                let l = l.to_ascii_lowercase();
+                l.starts_with("from:") || l.starts_with("from ") || l.starts_with("from\t")
+            })
+            .count();
+        prop_assert_eq!(froms, 1, "{}", text);
+        let lower = head.to_ascii_lowercase();
+        prop_assert!(!lower.contains("jane@oldbrand.com"), "{}", text);
+        prop_assert!(!lower.contains("dkim-signature"), "{}", text);
+        prop_assert!(!lower.contains("x-simmer-ramp"), "{}", text);
+        if let Err(why) = is_stable(&route, &m) {
+            return Err(TestCaseError::fail(format!("{why}\n--- input ---\n{m}")));
+        }
+    }
+}
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]

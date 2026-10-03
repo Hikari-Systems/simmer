@@ -703,6 +703,37 @@ set_headers:
     }
 
     #[test]
+    fn obsolete_spacing_before_the_colon_does_not_smuggle_a_header_past_the_rewrite() {
+        // `From :` is a From field to mail-parser (and so to §5.4), so it has to
+        // be one to the rewrite too: otherwise set_headers appends a second
+        // From: and the old identity leaks, and §6.5's strip misses the
+        // signature and the control header.
+        let route = compile(
+            r#"
+envelope_from: "b@new.com"
+set_headers:
+  From: "<sales@new.com>"
+"#,
+        );
+        let raw: &[u8] = b"DKIM-Signature : v=1; d=oldbrand.com\r\n\
+                           X-Simmer-Ramp\t: partner\r\n\
+                           From : jane@oldbrand.com\r\n\
+                           Subject : kept as it came\r\n\
+                           \r\n\
+                           body\r\n";
+        let out = text(&run(&route, raw, Some("jane@oldbrand.com")));
+        let (head, _) = out.split_once("\r\n\r\n").expect("a header block");
+        let lower = head.to_ascii_lowercase();
+        assert!(!lower.contains("oldbrand"), "{out}");
+        assert!(!lower.contains("dkim-signature"), "{out}");
+        assert!(!lower.contains("x-simmer-ramp"), "{out}");
+        assert_eq!(lower.matches("\r\nfrom").count(), 1, "{out}");
+        assert!(head.contains("From: <sales@new.com>"), "{out}");
+        // A header the route does not name keeps its bytes, odd spacing and all.
+        assert!(out.contains("\r\nSubject : kept as it came\r\n"), "{out}");
+    }
+
+    #[test]
     fn every_instance_of_an_artefact_is_stripped() {
         // Mail that has crossed two signing hops carries two signatures.
         let route = compile(r#"envelope_from: "b@new.com""#);
