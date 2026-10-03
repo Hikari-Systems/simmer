@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use super::domain_group::Grouper;
 use super::partial;
@@ -131,6 +131,10 @@ pub enum Walk<'a> {
 /// strict preflight and a future `warmup.started` still eliminate it — those
 /// say the route cannot send, not that it has sent enough.
 ///
+/// `now` is the caller's single clock read (D-108): the day index, §7.3's window,
+/// D-097's pacing and the reservation's expiry all use it, and so does the
+/// caller's rewrite, so one message is evaluated at one instant.
+///
 /// `smtp::mod::handle`'s precedent on the argument count. The four collaborators
 /// — store, frequency, preflight, and the evaluation buffer — are passed
 /// explicitly rather than bundled because that is what lets a test drive the walk
@@ -150,8 +154,8 @@ pub async fn walk_and_reserve<'a>(
     recipients: &[String],
     correlation_id: &str,
     evaluation: &mut Vec<Step>,
+    now: DateTime<Utc>,
 ) -> Result<Walk<'a>, QuotaError> {
-    let now = Utc::now();
     let states = store.route_states(&ramp.name).await?;
 
     // §3.2: "Quota is decremented per message, by the recipient count, not per
@@ -405,7 +409,7 @@ pub async fn dry_walk(
     chain: &[String],
     pinned: Option<&str>,
     recipient: &str,
-    now: chrono::DateTime<Utc>,
+    now: DateTime<Utc>,
 ) -> Result<Vec<Step>, QuotaError> {
     let states = store.route_states(&ramp.name).await?;
     let group = groups.group_name(ramp, recipient).await;
@@ -540,8 +544,8 @@ pub async fn any_eligible(
     store: &Arc<dyn QuotaStore>,
     chain: &[String],
     recipient: &str,
+    now: DateTime<Utc>,
 ) -> Result<bool, QuotaError> {
-    let now = Utc::now();
     let states = store.route_states(&ramp.name).await?;
     let group = groups.group_name(ramp, recipient).await;
 

@@ -623,6 +623,7 @@ async fn a_paused_route_is_skipped_by_the_real_chain_walk(pool: PgPool) {
         &["someone@gmail.com".to_string()],
         "test",
         &mut evaluation,
+        chrono::Utc::now(),
     )
     .await
     .expect("walk");
@@ -1272,6 +1273,9 @@ async fn compare_pinned_walks(
     };
     let chain =
         simmer::routing::thread::order(&["warming".to_string(), "overflow".to_string()], &pin);
+    // D-108 — both walks at one instant, so a day boundary between the two calls
+    // cannot make them disagree.
+    let now = Utc::now();
 
     let dry = simmer::routing::chain::dry_walk(
         cfg.default_ramp(),
@@ -1283,7 +1287,7 @@ async fn compare_pinned_walks(
         &chain,
         pinned,
         recipient,
-        Utc::now(),
+        now,
     )
     .await
     .expect("dry walk");
@@ -1301,6 +1305,7 @@ async fn compare_pinned_walks(
         &[recipient.to_string()],
         "compare",
         &mut evaluation,
+        now,
     )
     .await
     .expect("real walk");
@@ -1683,6 +1688,7 @@ async fn dry_run_agrees_with_the_real_walk_on_a_pinned_route_over_its_frequency(
         &["bob@example.com".to_string()],
         "first",
         &mut ev,
+        chrono::Utc::now(),
     )
     .await
     .expect("walk") else {

@@ -120,6 +120,7 @@ async fn walk(
         &[recipient.to_string()],
         "test-correlation",
         &mut evaluation,
+        chrono::Utc::now(),
     )
     .await
     .expect("walk");

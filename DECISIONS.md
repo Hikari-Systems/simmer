@@ -5129,6 +5129,41 @@ for a transient Simmer failure — exactly what §14.1 forbids — reachable onl
 two non-default settings together. Recorded, not changed.
 
 
+### D-108 — The message path reads the clock once, at its outermost caller
+
+> Phase 0 (groundwork) of the segment rate-limit/spool plan, 2026-10-03.
+> A refactor: no reply, metric or stored value changes.
+
+**Why now.** The planned segment rate limits and any later deferred hand-off
+evaluate a message at an instant that is not "whenever this line ran". A walk that
+calls `Utc::now()` internally cannot be asked "what would you have done at T",
+and one message read the clock up to three times (capture `at`, walk, rewrite
+`Date`/`Received`) — microseconds apart, but across a day boundary those could
+name different days.
+
+**The change.** Free functions take `now: DateTime<Utc>`; no trait, no global:
+- `routing::chain::walk_and_reserve` and `any_eligible` take `now` as their last
+  argument (`dry_walk` already did).
+- `relay::check_early` and `relay::reserve_relay_commit` take `now` and pass it
+  through; the rewrite's `Inbound::now` is that same instant.
+- `smtp::session` reads the clock once in `route_and_relay` (final dot: capture
+  `at`, walk, rewrite) and once per `RCPT TO` early check.
+- `admin::dryrun` already read it once per request and passed it down; unchanged.
+
+**What did change, slightly:** the rewrite's `Date:`/`Received:` timestamps are
+now the final-dot instant rather than the instant after the reservation — earlier
+by one quota round trip. Both were "now" to a reader; §6.3 does not specify which.
+
+**Not changed:** clock reads off the message path — `admin` read views and
+mutations, preflight, sweepers, capture rotation, `config::validate`.
+
+**Tested:** `tests/quota.rs` `the_walk_is_evaluated_at_the_instant_it_is_given`
+(two instants five days apart charge day 0 and day 5; an instant before
+`warmup.started` gives `warming=not_started`; `any_eligible` likewise). The
+dry-run/real-walk agreement helper in `tests/admin_api.rs` now evaluates both at
+one instant. Every existing walk test passes `Utc::now()` explicitly.
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

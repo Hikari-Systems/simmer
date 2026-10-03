@@ -379,6 +379,7 @@ async fn send_through(
         &[recipient.to_string()],
         "multi-instance-test",
         &mut evaluation,
+        chrono::Utc::now(),
     )
     .await
     .expect("walk");

@@ -185,10 +185,11 @@ pub async fn check_early(
     ramp: &Ramp,
     senders: &Senders,
     recipient: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), SelectError> {
     let chain = resolve_chain(ramp, senders)?;
 
-    match chain::any_eligible(ramp, &engine.groups, &engine.quota, chain, recipient).await {
+    match chain::any_eligible(ramp, &engine.groups, &engine.quota, chain, recipient, now).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(SelectError::ChainExhausted),
         Err(e) => Err(quota_failure(
@@ -229,6 +230,8 @@ fn quota_failure(cfg: &Config, ramp: &Ramp, e: quota::QuotaError, during: &str) 
 
 /// The whole of step 2 and step 3: reserve, relay, then commit or release.
 ///
+/// `now` is the session's one clock read for this message (D-108).
+///
 /// Returns the reply for the client. Every path through this function resolves
 /// the reservation exactly once — that is the invariant §7.4 rests on, and it is
 /// why commit and release are not exposed separately to the session.
@@ -238,6 +241,7 @@ pub async fn reserve_relay_commit(
     senders: &Senders,
     message: Message<'_>,
     correlation_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Reply {
     // §9.6 (D-126) — the decision and its consequences as one span, with the
     // walk, the rewrite, the downstream conversation and the quota resolution
@@ -258,9 +262,10 @@ pub async fn reserve_relay_commit(
         result = Empty,
         smtp.reply.code = Empty,
     );
-    let reply = reserve_relay_commit_inner(engine, selection, senders, message, correlation_id)
-        .instrument(span.clone())
-        .await;
+    let reply =
+        reserve_relay_commit_inner(engine, selection, senders, message, correlation_id, now)
+            .instrument(span.clone())
+            .await;
     span.record("smtp.reply.code", reply.code);
     if reply.code >= 400 {
         span.record("otel.status_code", "ERROR");
@@ -274,6 +279,7 @@ async fn reserve_relay_commit_inner(
     senders: &Senders,
     message: Message<'_>,
     correlation_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Reply {
     let cfg = &engine.config;
     // §5.8 (D-099): chosen by the session before this runs. Everything below
@@ -334,6 +340,7 @@ async fn reserve_relay_commit_inner(
         message.recipients,
         correlation_id,
         &mut evaluation,
+        now,
     )
     .instrument(walk_span.clone())
     .await;
@@ -417,7 +424,9 @@ async fn reserve_relay_commit_inner(
                     authenticated: message.authenticated,
                     tls: message.tls,
                 },
-                now: chrono::Utc::now(),
+                // D-108 — the instant the walk was evaluated at, so the Date the
+                // rewrite writes and the day the quota was charged to agree.
+                now,
                 uuid: &|| uuid::Uuid::new_v4().to_string(),
             },
         )

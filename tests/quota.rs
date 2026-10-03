@@ -713,6 +713,7 @@ async fn walk(
         &[recipient.to_string()],
         "test-correlation",
         &mut evaluation,
+        chrono::Utc::now(),
     )
     .await
     .expect("walk");
@@ -846,6 +847,7 @@ async fn an_exhausted_chain_with_no_overflow_selects_nothing(pool: PgPool) {
             &["bob@example.com".to_string()],
             "c",
             &mut Vec::new(),
+            chrono::Utc::now(),
         )
         .await
         .unwrap();
@@ -867,6 +869,7 @@ async fn an_exhausted_chain_with_no_overflow_selects_nothing(pool: PgPool) {
         &["bob@example.com".to_string()],
         "c",
         &mut evaluation,
+        chrono::Utc::now(),
     )
     .await
     .unwrap();
@@ -913,7 +916,8 @@ async fn the_early_check_sees_an_exhausted_chain_without_reserving(pool: PgPool)
         &simmer::routing::domain_group::Grouper::literal(),
         &store,
         &chain,
-        "bob@example.com"
+        "bob@example.com",
+        chrono::Utc::now()
     )
     .await
     .unwrap());
@@ -941,6 +945,7 @@ async fn the_early_check_sees_an_exhausted_chain_without_reserving(pool: PgPool)
             &["bob@example.com".to_string()],
             "c",
             &mut ev,
+            chrono::Utc::now(),
         )
         .await
         .unwrap()
@@ -954,7 +959,8 @@ async fn the_early_check_sees_an_exhausted_chain_without_reserving(pool: PgPool)
         &simmer::routing::domain_group::Grouper::literal(),
         &store,
         &chain,
-        "bob@example.com"
+        "bob@example.com",
+        chrono::Utc::now()
     )
     .await
     .unwrap());
@@ -980,6 +986,7 @@ async fn the_early_check_always_passes_a_chain_ending_in_overflow(pool: PgPool) 
             &["bob@example.com".to_string()],
             "c",
             &mut ev,
+            chrono::Utc::now(),
         )
         .await
         .unwrap()
@@ -994,10 +1001,87 @@ async fn the_early_check_always_passes_a_chain_ending_in_overflow(pool: PgPool) 
             &simmer::routing::domain_group::Grouper::literal(),
             &store,
             &chain,
-            "bob@example.com"
+            "bob@example.com",
+            chrono::Utc::now()
         )
         .await
         .unwrap(),
         "an overflow route is never exhausted, so the chain never is"
     );
+}
+
+#[sqlx::test]
+async fn the_walk_is_evaluated_at_the_instant_it_is_given(pool: PgPool) {
+    // D-108: the walk reads no clock of its own. Two instants a day apart charge
+    // two different day indexes, and an instant before `warmup.started` finds
+    // the warming route not yet begun — which only holds if `now` is the
+    // caller's and not `Utc::now()`.
+    let cfg = config();
+    let store = store(pool);
+    let chain = vec!["warming".to_string(), "overflow".to_string()];
+    let started: chrono::DateTime<Utc> = "2020-01-01T00:00:00Z".parse().unwrap();
+
+    let walk_at = |now: chrono::DateTime<Utc>| {
+        let (cfg, store, chain) = (&cfg, &store, &chain);
+        async move {
+            let mut evaluation = Vec::new();
+            let walked = chain::walk_and_reserve(
+                cfg.default_ramp(),
+                &simmer::routing::domain_group::Grouper::literal(),
+                &cfg.dot_insensitive_domains,
+                store,
+                &frequency(),
+                &simmer::preflight::Registry::new(),
+                chain,
+                None,
+                &["bob@example.com".to_string()],
+                "clock",
+                &mut evaluation,
+                now,
+            )
+            .await
+            .expect("walk");
+            match walked {
+                Walk::Selected(s) => {
+                    store.release(&s.reservation).await.expect("release");
+                    (
+                        s.route.name.clone(),
+                        s.day_index,
+                        chain::render(&evaluation),
+                    )
+                }
+                Walk::Exhausted => panic!("overflow is uncapped"),
+            }
+        }
+    };
+
+    let (route, day, _) = walk_at(started + Duration::hours(1)).await;
+    assert_eq!((route.as_str(), day), ("warming", 0));
+    let (route, day, _) = walk_at(started + Duration::days(5) + Duration::hours(1)).await;
+    assert_eq!((route.as_str(), day), ("warming", 5));
+    let (route, _, rendered) = walk_at(started - Duration::days(1)).await;
+    assert_eq!(route, "overflow");
+    assert!(rendered.starts_with("warming=not_started"), "{rendered}");
+
+    // The early check takes the same instant.
+    assert!(chain::any_eligible(
+        cfg.default_ramp(),
+        &simmer::routing::domain_group::Grouper::literal(),
+        &store,
+        &["warming".to_string()],
+        "bob@example.com",
+        started + Duration::hours(1),
+    )
+    .await
+    .unwrap());
+    assert!(!chain::any_eligible(
+        cfg.default_ramp(),
+        &simmer::routing::domain_group::Grouper::literal(),
+        &store,
+        &["warming".to_string()],
+        "bob@example.com",
+        started - Duration::days(1),
+    )
+    .await
+    .unwrap());
 }

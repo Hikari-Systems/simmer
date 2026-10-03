@@ -742,7 +742,9 @@ impl Session {
                 .ramps
                 .get(&ramp_name)
                 .expect("fixed_at_rcpt returns a configured ramp");
-            if let Err(e) = relay::check_early(&engine, ramp, &senders, &to).await {
+            // D-108 — the one clock read for this check.
+            let now = chrono::Utc::now();
+            if let Err(e) = relay::check_early(&engine, ramp, &senders, &to, now).await {
                 let r = e.to_reply(ramp);
                 tracing::info!(
                     correlation_id = %self.correlation_id,
@@ -849,6 +851,10 @@ impl Session {
     /// reserve quota, relay, map the reply.
     async fn route_and_relay(&mut self, body: &mut MessageBuffer) -> Reply {
         let tx = self.transaction.as_ref().expect("checked by caller");
+        // D-108 — the one clock read for this message, taken at the final dot:
+        // the capture's `at`, the walk's day index and the rewrite's `Date` all
+        // use it, so they describe one instant.
+        let now = chrono::Utc::now();
 
         // §5.4 — the From: header, from the head of the buffer only. A spilled
         // 25 MiB message must not be read back whole to answer this.
@@ -930,7 +936,7 @@ impl Session {
             let record = capture::Record::build(
                 capture::Ingress {
                     correlation_id: &self.correlation_id,
-                    at: chrono::Utc::now(),
+                    at: now,
                     peer: self.peer,
                     listener: &self.policy.address,
                     helo: self.greeted.as_deref().unwrap_or_default(),
@@ -1009,6 +1015,7 @@ impl Session {
                 tls: self.encrypted(),
             },
             &self.correlation_id,
+            now,
         )
         .await
     }

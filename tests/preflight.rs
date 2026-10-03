@@ -155,6 +155,7 @@ async fn walk(
         &["someone@example.com".to_string()],
         "preflight-test",
         &mut evaluation,
+        chrono::Utc::now(),
     )
     .await
     .expect("walk");
