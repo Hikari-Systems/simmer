@@ -5593,6 +5593,16 @@ follows its concurrent round with sequential claims until nothing is due, and
 asserts both properties over the total. Removing the locks still yields
 duplicates in the concurrent round.
 
+**Then it lost rows, which was a real bug.** The next CI run claimed 9 of 20
+even after the sequential claims. The SQL Server claim was two statements: the
+`UPDATE` that leased the rows, writing their ids to a table variable, then a
+`SELECT` that re-read them from the table. The `UPDATE` autocommits, so when the
+`SELECT` was the deadlock victim the leases stood and the caller saw only an
+error — and the retry then found those rows leased. They would have come back
+when the lease ran out, so mail was delayed rather than lost. The claim is now
+one statement that returns its rows through `OUTPUT`, as Postgres's
+`UPDATE … RETURNING` always did.
+
 **Departure 1: `commit_and_complete` after a lost lease commits, and deletes.**
 The plan said a token mismatch rolls back everything. But a holder that reaches
 `commit_and_complete` was told `2xx` by the downstream: the message has been

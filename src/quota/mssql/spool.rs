@@ -13,8 +13,10 @@
 //!   CI's SQL Server, never locally — is retried: the statement was rolled
 //!   back whole, so nothing was claimed.
 //! - **Fenced writes** report `@@ROWCOUNT` as a row, the house pattern here.
-//! - `RETURNING` becomes `OUTPUT … INTO @table` and a `SELECT`, with the table
-//!   variable's strings in the binary collation (see `sweep_expired`).
+//! - `RETURNING` becomes `OUTPUT … INTO @table` and a `SELECT` of the table
+//!   variable, with its strings in the binary collation (see `sweep_expired`)
+//!   — except the claim, which returns `OUTPUT` straight to the client, so
+//!   that leasing and reporting are one statement.
 
 use std::collections::{HashMap, HashSet};
 
@@ -168,10 +170,20 @@ impl SpoolStore for MssqlQuotaStore {
     }
 
     async fn claim_due(&self, req: &ClaimRequest) -> Result<Vec<Claimed>, QuotaError> {
+        // One statement: the rows come back through `OUTPUT`, from the
+        // `UPDATE` that leased them. An earlier version wrote the ids to a
+        // table variable and then re-read the table in a second statement;
+        // the `UPDATE` autocommits, so a deadlock on that second read left
+        // rows leased and returned to no one until their lease ran out, and
+        // the retry below could not see them (CI, D-122).
+        let output = COLUMNS
+            .split(',')
+            .map(|c| format!("inserted.{}", c.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
-            "DECLARE @claimed TABLE (id UNIQUEIDENTIFIER); \
-             WITH due AS ( \
-                 SELECT TOP (@P2) m.state, m.lease_owner, m.lease_until, m.lease_token, m.id \
+            "WITH due AS ( \
+                 SELECT TOP (@P2) {COLUMNS}, state, lease_owner \
                    FROM dbo.spool_message m \
                         WITH (UPDLOCK, READPAST, ROWLOCK, INDEX(spool_message_next)) \
                   WHERE m.next_attempt_at <= @P1 \
@@ -181,10 +193,7 @@ impl SpoolStore for MssqlQuotaStore {
                   ORDER BY m.next_attempt_at, m.id) \
              UPDATE due SET state = N'leased', lease_owner = @P3, lease_until = @P4, \
                             lease_token = NEWID() \
-             OUTPUT inserted.id INTO @claimed; \
-             SELECT {COLUMNS} FROM dbo.spool_message \
-              WHERE id IN (SELECT id FROM @claimed) \
-              ORDER BY next_attempt_at, id;"
+             OUTPUT {output};"
         );
         let until = (req.now + req.lease).naive_utc();
         let mut attempt = 0;
@@ -210,8 +219,10 @@ impl SpoolStore for MssqlQuotaStore {
             .await;
             match result {
                 Ok(rows) => {
-                    let out = rows.iter().map(claimed).collect::<Result<Vec<_>, _>>()?;
+                    let mut out = rows.iter().map(claimed).collect::<Result<Vec<_>, _>>()?;
                     conn.broken = false;
+                    // `OUTPUT` keeps no order.
+                    out.sort_by_key(|c| (c.next_attempt_at, c.id));
                     return Ok(out);
                 }
                 // Claimants updating the same few rows' index entries can
