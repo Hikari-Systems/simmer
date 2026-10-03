@@ -335,7 +335,12 @@ async fn handle(
         tracing::warn!(peer = %peer, "connection from outside allowed_cidrs");
         metrics::connection_refused("cidr");
         if !implicit {
-            let _ = write_and_close(&mut stream, &reply::access_denied()).await;
+            let _ = write_and_close(
+                &mut stream,
+                &reply::access_denied(),
+                shared.engine.config.server.timeouts.command,
+            )
+            .await;
         }
         return;
     }
@@ -345,7 +350,12 @@ async fn handle(
         tracing::warn!(peer = %peer, "refused: max_concurrent_sessions reached");
         metrics::connection_refused("max_sessions");
         if !implicit {
-            let _ = write_and_close(&mut stream, &reply::too_many_connections()).await;
+            let _ = write_and_close(
+                &mut stream,
+                &reply::too_many_connections(),
+                shared.engine.config.server.timeouts.command,
+            )
+            .await;
         }
         return;
     };
@@ -413,11 +423,28 @@ fn is_allowed(ip: IpAddr, allowed: &[IpNet]) -> bool {
     allowed.iter().any(|net| net.contains(&ip))
 }
 
-async fn write_and_close(stream: &mut TcpStream, reply: &reply::Reply) -> std::io::Result<()> {
+/// A refusal before any session exists, bounded by `budget` (`timeouts.command`)
+/// like every session write: a peer that never reads must not keep this task
+/// alive (D-101).
+async fn write_and_close(
+    stream: &mut TcpStream,
+    reply: &reply::Reply,
+    budget: std::time::Duration,
+) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
-    stream.write_all(reply.to_wire().as_bytes()).await?;
-    stream.flush().await?;
-    stream.shutdown().await
+    let write = async {
+        stream.write_all(reply.to_wire().as_bytes()).await?;
+        stream.flush().await?;
+        stream.shutdown().await
+    };
+    tokio::time::timeout(budget, write)
+        .await
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "refusal write timed out",
+            ))
+        })
 }
 
 #[cfg(test)]

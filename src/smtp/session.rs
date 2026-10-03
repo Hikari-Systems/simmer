@@ -1184,13 +1184,30 @@ impl Session {
         }
     }
 
+    /// Write one reply, bounded by `timeouts.command`.
+    ///
+    /// Unbounded, a peer that stops reading blocks `write_all` forever once the
+    /// socket buffers fill, and the session holds its `max_concurrent_sessions`
+    /// permit for as long (D-101). Expiry is reported as an I/O error, which ends
+    /// the session: nothing useful can be said to a peer that is not listening.
     async fn send(&mut self, reply: &Reply) -> std::io::Result<()> {
         tracing::trace!(peer = %self.peer, reply = %reply, "-->");
-        self.io
-            .get_mut()
-            .write_all(reply.to_wire().as_bytes())
-            .await?;
-        self.io.get_mut().flush().await
+        let budget = self.config().server.timeouts.command;
+        let io = self.io.get_mut();
+        let write = async {
+            io.write_all(reply.to_wire().as_bytes()).await?;
+            io.flush().await
+        };
+        match tokio::time::timeout(budget, write).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::info!(peer = %self.peer, "client stopped reading; reply write timed out");
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "reply write timed out",
+                ))
+            }
+        }
     }
 
     fn reset_transaction(&mut self) {
@@ -1212,7 +1229,7 @@ impl Session {
 
     /// Emit a final reply on a session being terminated from outside — §10.4's
     /// hard stop. Best-effort: the peer may already be gone, and there is nothing
-    /// useful to do if it is.
+    /// useful to do if it is. Bounded like every other write, by [`Self::send`].
     pub async fn refuse(&mut self, r: &Reply) {
         let _ = self.send(r).await;
     }

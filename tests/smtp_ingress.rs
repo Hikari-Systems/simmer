@@ -1131,3 +1131,65 @@ async fn a_route_declared_8bit_clean_relays_an_8bit_body_without_the_parameter()
     );
     assert_eq!(support::without_received(&got.body), EIGHT_BIT_BODY);
 }
+
+// ---------------------------------------------------------------------------
+// A client that never reads (the write side of §8.4)
+// ---------------------------------------------------------------------------
+
+/// Connect with a tiny receive buffer and pipeline `EHLO`s without ever reading
+/// a reply, until Simmer's replies have filled both socket buffers and its
+/// `write_all` cannot complete. Returns the stream so it stays open.
+async fn a_client_that_never_reads(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut stream = socket.connect(addr).await.unwrap();
+    // Each EHLO is 18 bytes in and several hundred out, so a few hundred KiB of
+    // commands is several MiB of replies nobody collects. Bounded so that once
+    // Simmer stops reading too, this side's own buffers filling cannot hang the
+    // test.
+    let batch = "EHLO client.test\r\n".repeat(1024);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        for _ in 0..512 {
+            if stream.write_all(batch.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
+    stream
+}
+
+#[tokio::test]
+async fn a_client_that_never_reads_does_not_hold_its_session_permit_forever() {
+    // `send` had no timeout: a peer that stops reading blocked `write_all`
+    // forever, holding one of `max_concurrent_sessions` with it. With one slot,
+    // that is every slot. The write is now bounded by `timeouts.command`.
+    let down = FakeDownstream::start(Script::default()).await;
+    let cfg = config_for(down.addr, "")
+        .replace("max_concurrent_sessions: 16", "max_concurrent_sessions: 1")
+        .replace(
+            "timeouts: { command: 5s, data: 5s, session: 60s }",
+            "timeouts: { command: 1s, data: 5s, session: 60s }",
+        );
+    let simmer = Simmer::start(&cfg).await;
+
+    let _stuck = a_client_that_never_reads(simmer.addr).await;
+
+    // The write budget is one second, from whenever the write blocked; give it
+    // generous slack, then the slot must be free again.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let mut c = simmer.connect().await;
+        let r = c.read_reply().await;
+        if r.code == 220 {
+            break;
+        }
+        assert_eq!(r.code, 421, "{r:?}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stuck session still holds the only permit"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}

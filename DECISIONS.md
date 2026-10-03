@@ -4902,6 +4902,35 @@ must never stop Simmer starting.
 - The stress tier (T3) with export on.
 - An export to a TLS endpoint or a real vendor.
 
+### D-101 — Every write to a client is bounded by `timeouts.command`
+
+> Phase 0 (groundwork) of the segment rate-limit/spool plan, 2026-10-03.
+
+**The problem.** `Session::send` awaited `write_all` and `flush` with no bound, as
+did `refuse` (through it) and the pre-session `write_and_close` in `smtp/mod.rs`.
+A client that pipelines commands and never reads fills both socket buffers; the
+next `write_all` then never completes, and the session holds its
+`max_concurrent_sessions` permit indefinitely. §8.4's timeouts bounded every
+*read* of the client and no *write*, so one such peer per slot denies service.
+
+**The rule.** Each reply write (write plus flush, and for `write_and_close` the
+shutdown too) gets `timeouts.command`. Expiry is an I/O error, so the session ends
+as `SessionEnd::IoError` and `close` (already bounded by its own two seconds) runs.
+No `421` is attempted after it — the peer is not reading, which is the problem.
+
+**Why `timeouts.command` and not the session deadline.** The command budget is
+already "how long Simmer waits on this peer for one step"; a reply write is one
+step. The session deadline (D-081) still applies to every read, and a write that
+waited up to it would let one stuck reply hold a slot for `timeouts.session`.
+
+**Not changed:** a write never cuts a relay in flight — the relay has finished by
+the time its reply is written, and its commit/release has already happened.
+
+**Tested:** `tests/smtp_ingress.rs`
+`a_client_that_never_reads_does_not_hold_its_session_permit_forever` — one
+session slot, a peer that pipelines EHLOs and reads nothing; the slot is free
+again within the budget. It failed (slot held past 8 s) before the change.
+
 
 ## Still open — to settle at the start of the phase that needs them
 
