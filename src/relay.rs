@@ -13,6 +13,12 @@
 //! 4. **Relay, then commit or release** — §7.4 phases 2 and 3, with the §10.1
 //!    mapping deciding which.
 //!
+//! D-111 puts one more thing between 2 and 3: a route with a `rate` booked a
+//! slot during the walk, and when that slot is in the future (at most the
+//! route's `max_wait` away) the relay **waits for it, holding the
+//! reservation**, before rewriting. Every outcome that does not commit gives
+//! the slot back.
+//!
 //! §3.3 governs the seam between 2 and 4: **no failover**. A route that reserved
 //! and then failed downstream releases and reports. It does not fall through to
 //! the next link, because that would emit under the wrong identity and corrupt
@@ -377,6 +383,34 @@ async fn reserve_relay_commit_inner(
 
     engine.registry.insert(&selected.reservation);
 
+    // -- D-111: wait for the booked rate slot -------------------------
+    //
+    // After the reservation, not before it (D-111): the walk has already
+    // decided, under both row locks, that this route takes this message, and
+    // holding the headroom through the wait is what stops a wait from ending
+    // in "no headroom after all" — which would waste the slot and could not
+    // always give it back. The reservation's expiry and §10.4's drain bound
+    // both include `max_wait`. Tokio's clock, so a test can pause it.
+    if let Some(b) = &selected.rate {
+        let wait = (b.send_at - now).to_std().unwrap_or_default();
+        metrics::rate_wait(
+            &selected.route.ramp,
+            &selected.route.name,
+            &selected.domain_group,
+            wait.as_secs_f64(),
+        );
+        if !wait.is_zero() {
+            tracing::debug!(
+                correlation_id,
+                route = %selected.route.name,
+                domain_group = %selected.domain_group,
+                wait_ms = wait.as_millis() as u64,
+                "holding the client for the route's next rate slot (D-111)"
+            );
+            tokio::time::sleep(wait).await;
+        }
+    }
+
     // -- §6.1 steps 2 and 4–10 -----------------------------------------
     //
     // The identity is known only now, because it belongs to the route the walk
@@ -395,6 +429,9 @@ async fn reserve_relay_commit_inner(
             route = %selected.route.name,
             "no compiled rewrite for the selected route"
         );
+        if let Some(b) = &selected.rate {
+            chain::unbook(engine.quota.as_ref(), b, "internal configuration error").await;
+        }
         let _ = engine.quota.release(&selected.reservation).await;
         engine.registry.remove(selected.reservation.id);
         return Reply::new(451, "4.3.0 internal configuration error");
@@ -549,6 +586,17 @@ async fn reserve_relay_commit_inner(
     // failure, decrement reserved and delete the reservation." `outcome.commit`
     // is the §10.1 table's answer, carried since phase 2.
     let store = Arc::clone(&engine.quota);
+    // D-111: a message that was not sent gives its rate slot back — with one
+    // exception, §10.2's ambiguous final dot. The downstream may already have
+    // the message, so the slot stays spent: over-counting a send only paces the
+    // next message more conservatively, and under-counting one is the overshoot
+    // the limit exists to prevent.
+    if let Some(b) = &selected.rate {
+        let maybe_sent = matches!(result, Err(downstream::RelayError::Ambiguous));
+        if !outcome.commit && !maybe_sent {
+            chain::unbook(store.as_ref(), b, "downstream failure").await;
+        }
+    }
     let resolve_span = tracing::info_span!(
         "simmer.quota.resolve",
         otel.name = "simmer.quota.resolve",

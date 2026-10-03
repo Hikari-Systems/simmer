@@ -346,6 +346,7 @@ async fn refresh_ramp_quota_gauges(
         .store()
         .usage_many(&ramp.name, &keys_for(ramp, now))
         .await?;
+    let rate_tats = state.store().rate_tats(&ramp.name).await?;
 
     for route in &ramp.routes {
         let projected = view::project_route(
@@ -353,6 +354,7 @@ async fn refresh_ramp_quota_gauges(
             route,
             states.get(&route.name).copied().unwrap_or_default(),
             &usage,
+            &rate_tats,
             &state.engine.preflight,
             &state.engine.pools,
             now,
@@ -521,11 +523,13 @@ async fn routes(
         .store()
         .usage_many(&ramp.name, &keys_for(ramp, now))
         .await?;
+    let rate_tats = state.store().rate_tats(&ramp.name).await?;
 
     Ok(Json(view::project_routes(
         ramp,
         &states,
         &usage,
+        &rate_tats,
         &state.engine.preflight,
         &state.engine.pools,
         now,
@@ -557,12 +561,14 @@ async fn route_by_name(
         })
         .collect();
     let usage = state.store().usage_many(&ramp.name, &keys).await?;
+    let rate_tats = state.store().rate_tats(&ramp.name).await?;
 
     Ok(Json(view::project_route(
         ramp,
         route,
         states.get(&name).copied().unwrap_or_default(),
         &usage,
+        &rate_tats,
         &state.engine.preflight,
         &state.engine.pools,
         now,
@@ -616,10 +622,12 @@ async fn quota_detail(
         .store()
         .usage_many(&ramp.name, &keys_for(ramp, now))
         .await?;
+    let rate_tats = state.store().rate_tats(&ramp.name).await?;
     let projected = view::project_routes(
         ramp,
         &states,
         &usage,
+        &rate_tats,
         &state.engine.preflight,
         &state.engine.pools,
         now,

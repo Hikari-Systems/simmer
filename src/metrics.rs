@@ -105,6 +105,7 @@ fn already_installed<R>(_: metrics::SetRecorderError<R>) -> anyhow::Error {
 pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
     ("simmer_downstream_latency_seconds", LATENCY_BUCKETS),
     ("simmer_link_proxy_duration_seconds", LINK_PROXY_BUCKETS),
+    ("simmer_rate_wait_seconds", RATE_WAIT_BUCKETS),
 ];
 
 /// Buckets for `simmer_downstream_latency_seconds`.
@@ -123,6 +124,10 @@ const LATENCY_BUCKETS: &[f64] = &[
 const LINK_PROXY_BUCKETS: &[f64] = &[
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
+
+/// Buckets for `simmer_rate_wait_seconds` (D-111). The first bucket is a send
+/// that did not wait at all; the top is `rate.max_wait`'s ceiling of 60 s.
+const RATE_WAIT_BUCKETS: &[f64] = &[0.0, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0];
 
 /// Register a description for every metric §9.1 asks for.
 ///
@@ -182,6 +187,19 @@ fn describe() {
          it carried the reply past its day's cap; ineligible — it was paused, failing strict \
          preflight or not yet started, and the ordinary walk decided; unmatched — no route in \
          the chain emitted any ID referred to (route is \"-\")"
+    );
+    describe_histogram!(
+        "simmer_rate_wait_seconds",
+        Unit::Seconds,
+        "How long a message on a rate-limited route was held for its booked slot before the \
+         downstream conversation began (D-111), by ramp, route and domain group. 0 is a slot \
+         that was free at once; the ceiling is the route's rate.max_wait"
+    );
+    describe_counter!(
+        "simmer_rate_slots_unbooked_total",
+        "Rate slots given back because the message they were booked for was not sent — no \
+         headroom, a downstream failure, a storage error (D-111). A slot is given back only \
+         if nothing was booked after it"
     );
     describe_histogram!(
         "simmer_downstream_latency_seconds",
@@ -861,9 +879,28 @@ pub fn route_paused(ramp: &str, route: &str, paused: bool) {
     });
 }
 
+/// D-111 — `simmer_rate_wait_seconds{ramp,route,domain_group}`.
+pub fn rate_wait(ramp: &str, route: &str, domain_group: &str, seconds: f64) {
+    metrics::histogram!(
+        "simmer_rate_wait_seconds",
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
+        "domain_group" => domain_group.to_string(),
+    )
+    .record(seconds);
+}
+
+/// D-111 — `simmer_rate_slots_unbooked_total{ramp,route}`.
+pub fn rate_slot_unbooked(ramp: &str, route: &str) {
+    counter!(
+        "simmer_rate_slots_unbooked_total",
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
+    )
+    .increment(1);
+}
+
 /// §9.1 `simmer_route_skipped_total{route,reason}` — reason: `quota`,
-/// `frequency`, `paused`, `preflight`, `not_started`, and `partial_ramp` (D-091;
-/// see `chain::SkipReason`).
+/// `frequency`, `paused`, `preflight`, `not_started`, `partial_ramp` (D-091),
+/// and `rate` (D-111; see `chain::SkipReason`).
 pub fn route_skipped(ramp: &str, route: &str, reason: &str) {
     counter!(
         "simmer_route_skipped_total",

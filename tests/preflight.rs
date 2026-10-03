@@ -396,6 +396,7 @@ async fn the_route_view_reports_the_checks_and_whether_they_block() {
         &cfg.default_ramp().routes[0],
         Default::default(),
         &simmer::admin::view::UsageByRoute::new(),
+        &simmer::admin::view::RateTats::new(),
         &registry,
         &simmer::downstream::Pool::build(&cfg),
         chrono::Utc::now(),
@@ -422,6 +423,7 @@ async fn a_route_that_was_never_checked_reports_null_rather_than_a_pass() {
         &cfg.default_ramp().routes[1], // overflow: no preflight block at all
         Default::default(),
         &simmer::admin::view::UsageByRoute::new(),
+        &simmer::admin::view::RateTats::new(),
         &registry_after(&cfg, &healthy_dns()).await,
         &simmer::downstream::Pool::build(&cfg),
         chrono::Utc::now(),
@@ -445,6 +447,7 @@ async fn no_read_endpoint_leaks_a_recipient_through_the_preflight_block() {
         cfg.default_ramp(),
         &Default::default(),
         &simmer::admin::view::UsageByRoute::new(),
+        &simmer::admin::view::RateTats::new(),
         &registry,
         &simmer::downstream::Pool::build(&cfg),
         chrono::Utc::now(),

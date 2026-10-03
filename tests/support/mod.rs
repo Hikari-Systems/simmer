@@ -903,9 +903,16 @@ pub struct GrantAllQuota {
     rate: Arc<Mutex<RateRows>>,
     /// D-111 — every slot given back, in order.
     unbooked: Arc<Mutex<Vec<simmer::quota::RateKey>>>,
+    /// Make every `reserve` fail as a storage error, for the walk's error path.
+    fail_reserve: Arc<AtomicUsize>,
 }
 
 impl GrantAllQuota {
+    /// Make every later `reserve` fail as a storage error (§7.5).
+    pub fn fail_reserves(&self) {
+        self.fail_reserve.store(1, Ordering::SeqCst);
+    }
+
     /// D-111 — the slots given back so far.
     pub fn unbooked(&self) -> Vec<simmer::quota::RateKey> {
         self.unbooked.lock().expect("not poisoned").clone()
@@ -950,6 +957,9 @@ impl GrantAllQuota {
 #[async_trait::async_trait]
 impl QuotaStore for GrantAllQuota {
     async fn reserve(&self, req: &ReserveRequest) -> Result<Reserved, QuotaError> {
+        if self.fail_reserve.load(Ordering::SeqCst) != 0 {
+            return Err(QuotaError::Storage("injected reserve failure".into()));
+        }
         Ok(Reserved::Taken(Reservation {
             ramp: req.ramp.clone(),
             id: uuid::Uuid::new_v4(),

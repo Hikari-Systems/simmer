@@ -7,6 +7,8 @@
 //!      at or over threshold within the window, skip. Evaluated **first**.
 //!   c′. If the route's `schedule.share` is below 1 today and this message is
 //!      not in it, skip (D-091).
+//!   c″. If the route has a `rate` and its next slot for this domain group is
+//!      later than `now + max_wait`, skip (D-111). Otherwise the slot is booked.
 //!   c. If the route is warming and has no remaining headroom for this domain
 //!      group today, skip.
 //!   d. Otherwise, attempt reservation (§7.4).
@@ -37,7 +39,8 @@ use crate::frequency::{self, Frequency};
 use crate::metrics;
 use crate::quota::{
     self,
-    store::{QuotaError, QuotaStore, ReserveRequest, Reserved, Usage},
+    rate::{Rate, RateBooked},
+    store::{QuotaError, QuotaStore, RateBookRequest, RateKey, ReserveRequest, Reserved, Usage},
     Allowance, Reservation,
 };
 
@@ -62,6 +65,10 @@ pub enum SkipReason {
     /// message is not in it. Not `quota`: the route has headroom, and
     /// is being given less traffic on purpose.
     PartialRamp,
+    /// §3.2 step 3c″ (D-111) — the route's next sending slot for this domain
+    /// group is later than `now + rate.max_wait`. Not `quota`: the route has
+    /// headroom today, and is being paced.
+    Rate,
     /// The chain names a route that does not exist. §4.2 rejects this at
     /// startup, so it is unreachable; skipping rather than panicking keeps a
     /// configuration mistake from taking the process down.
@@ -77,6 +84,7 @@ impl SkipReason {
             SkipReason::Frequency => "frequency",
             SkipReason::Preflight => "preflight",
             SkipReason::PartialRamp => "partial_ramp",
+            SkipReason::Rate => "rate",
             SkipReason::Unknown => "unknown_route",
         }
     }
@@ -91,6 +99,61 @@ pub struct Step {
     /// with no headroom left, so the reservation was taken past the cap. Only
     /// ever true on an `Ok` step.
     pub over_cap: bool,
+    /// D-111 — the rate slot this route was (or, in a dry run, would be)
+    /// given. `None` for a route with no `rate`, and on every skip but
+    /// [`SkipReason::Rate`], where it carries the earliest slot.
+    pub rate: Option<RateStep>,
+}
+
+/// D-111 — what the rate check decided for one route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateStep {
+    /// When the message would go: `now` or up to `max_wait` after it. For a
+    /// [`SkipReason::Rate`] skip, the earliest slot there was.
+    pub send_at: DateTime<Utc>,
+    /// `send_at − now`, never negative.
+    pub wait: chrono::Duration,
+    /// A thread-affinity reply's pinned route booked past its limit (D-111):
+    /// counted against the bucket, and sent now.
+    pub over_limit: bool,
+}
+
+/// D-111 — a booked rate slot, held by a [`Selected`]. Exactly as with the
+/// reservation, holding one is an obligation: a message that is not sent gives
+/// the slot back through [`unbook`].
+#[derive(Debug, Clone)]
+pub struct RateBooking {
+    pub key: RateKey,
+    pub rate: Rate,
+    pub send_at: DateTime<Utc>,
+    pub booked_tat: DateTime<Utc>,
+    pub over_limit: bool,
+}
+
+/// Give a booked slot back, if nothing has been booked after it (D-111).
+/// Best-effort: a failure leaves the bucket one interval conservative until it
+/// drains, which is the safe direction, and is logged.
+pub async fn unbook(store: &dyn QuotaStore, booking: &RateBooking, why: &str) {
+    match store
+        .unbook_rate_slot(&booking.key, booking.rate, booking.booked_tat)
+        .await
+    {
+        Ok(true) => metrics::rate_slot_unbooked(&booking.key.ramp, &booking.key.route),
+        Ok(false) => tracing::debug!(
+            route = %booking.key.route,
+            domain_group = %booking.key.domain_group,
+            why,
+            "rate slot not given back: a later slot was booked after it (D-111)"
+        ),
+        Err(e) => tracing::warn!(
+            route = %booking.key.route,
+            domain_group = %booking.key.domain_group,
+            why,
+            error = %e,
+            "could not give a rate slot back; the bucket runs one interval conservative \
+             until it drains (D-111)"
+        ),
+    }
 }
 
 /// A route selected and its quota reserved.
@@ -112,6 +175,10 @@ pub struct Selected<'a> {
     /// §3.2 step 2a (D-090): the reservation was taken past the day's cap,
     /// because this is a thread-affinity reply on its pinned route.
     pub over_cap: bool,
+    /// D-111 — the rate slot booked for this message, when the route has a
+    /// `rate`. The relay waits for `send_at` before relaying, and gives the
+    /// slot back on any outcome that does not commit.
+    pub rate: Option<RateBooking>,
 }
 
 /// The result of walking a chain.
@@ -168,7 +235,12 @@ enum Mode<'m> {
     /// - §6.7 preflight and §7.3 frequency: it has no `Deps`, so cannot run them;
     /// - D-091's partial ramp: a route it turns away always has a later link
     ///   (§4.2), so counting it eligible only errs in the harmless direction;
-    /// - and an **unlimited** route is eligible without reading its row.
+    /// - and an **unlimited** route is eligible without reading its row;
+    /// - D-111's rate: §4.2 refuses a rate-limited route last in a chain, so a
+    ///   route it would turn away always has a later link, and counting it
+    ///   eligible errs only in the harmless direction. Reading the bucket here
+    ///   would also be a guess: the slot free at `RCPT TO` is not the one the
+    ///   final dot will be offered.
     ///
     /// Counts nothing, and is never given a pinned route.
     Early,
@@ -211,18 +283,25 @@ enum Check {
     /// check because it needs the day index, and before the reservation so a
     /// message turned away here never touches the row lock.
     PartialRamp,
+    /// (c″) D-111's per-segment rate. Last, because under `Reserve` it
+    /// **writes**: it books a slot, and every check before it is read-only, so
+    /// a route they eliminate never touches the rate row. Only the headroom
+    /// step follows, and a refusal there gives the slot back. `Early` ignores
+    /// it (see [`Mode::Early`]).
+    Rate,
 }
 
 /// The order is the product: a dry run that evaluated these differently would
 /// report a different reason for the same route, and "why did this not go via
 /// the warming route" is the question §9.4 exists to answer. Headroom — (c) and
 /// (d), one operation under the row lock for `Reserve` — follows the list.
-const CHECKS: [Check; 5] = [
+const CHECKS: [Check; 6] = [
     Check::Paused,
     Check::Preflight,
     Check::Frequency,
     Check::Started,
     Check::PartialRamp,
+    Check::Rate,
 ];
 
 /// What every check reads, fixed for one walk. `'w` is the ramp's lifetime —
@@ -286,6 +365,11 @@ struct Candidate<'r> {
     /// §7.3's keys, kept by `Reserve` for commit. Empty for a route with no
     /// `recipient_frequency`: keys are mode-specific to the route.
     recipient_keys: Vec<frequency::Key>,
+    /// D-111 — the slot `Reserve` booked, to be held by the [`Selected`] or
+    /// given back.
+    booking: Option<RateBooking>,
+    /// D-111 — the slot this route was or would be given, for its [`Step`].
+    rate_step: Option<RateStep>,
 }
 
 /// How a walk ended.
@@ -320,11 +404,14 @@ impl<'w, 'm> Walker<'w, 'm> {
                 allowance: quota::allowance_for(route, &self.group, day_index, state),
                 usage: None,
                 recipient_keys: Vec::new(),
+                booking: None,
+                rate_step: None,
             };
 
             for check in CHECKS {
                 if let Some(reason) = self.apply(check, &mut candidate).await? {
-                    self.skip(evaluation, name, reason);
+                    let rate = candidate.rate_step.filter(|_| reason == SkipReason::Rate);
+                    self.skip_with(evaluation, name, reason, rate);
                     continue 'routes;
                 }
             }
@@ -461,6 +548,91 @@ impl<'w, 'm> Walker<'w, 'm> {
                 ))
                 .then_some(SkipReason::PartialRamp))
             }
+
+            Check::Rate => self.rate(c).await,
+        }
+    }
+
+    /// (c″) D-111. `Reserve` books under the row lock; `DryRun` reads the
+    /// bucket and computes the same decision without writing; `Early` skips it.
+    ///
+    /// A pinned reply (D-090) is never skipped here: it books past the limit,
+    /// sending now and counted, the way `over_cap` reserves past the cap.
+    async fn rate(&self, c: &mut Candidate<'w>) -> Result<Option<SkipReason>, QuotaError> {
+        let Some(limit) = c.route.rate.as_ref() else {
+            return Ok(None);
+        };
+        let Some(rate) = quota::rate::rate_for(c.route, &self.group, c.day_index, c.state) else {
+            return Ok(None);
+        };
+        let max_wait = chrono::Duration::from_std(limit.max_wait())
+            .unwrap_or_else(|_| chrono::Duration::zero());
+        let key = RateKey {
+            ramp: self.ramp.name.clone(),
+            route: c.route.name.clone(),
+            domain_group: self.group.clone(),
+        };
+
+        let outcome = match self.mode {
+            Mode::Early => return Ok(None),
+            Mode::DryRun { .. } => {
+                let tat = self
+                    .store
+                    .rate_tats(&self.ramp.name)
+                    .await?
+                    .get(&(key.route.clone(), key.domain_group.clone()))
+                    .copied();
+                quota::rate::decide(tat, rate, self.now, max_wait, c.pinned)
+            }
+            Mode::Reserve { .. } => {
+                self.store
+                    .book_rate_slot(&RateBookRequest {
+                        key: key.clone(),
+                        rate,
+                        now: self.now,
+                        max_wait,
+                        force: c.pinned,
+                    })
+                    .await?
+            }
+        };
+
+        match outcome {
+            RateBooked::Booked {
+                send_at,
+                booked_tat,
+                over_limit,
+            } => {
+                c.rate_step = Some(RateStep {
+                    send_at,
+                    wait: (send_at - self.now).max(chrono::Duration::zero()),
+                    over_limit,
+                });
+                if matches!(self.mode, Mode::Reserve { .. }) {
+                    c.booking = Some(RateBooking {
+                        key,
+                        rate,
+                        send_at,
+                        booked_tat,
+                        over_limit,
+                    });
+                }
+                Ok(None)
+            }
+            RateBooked::TooLate { earliest } => {
+                tracing::debug!(
+                    route = %c.route.name,
+                    domain_group = %self.group,
+                    earliest = %earliest.to_rfc3339(),
+                    "route's next rate slot is past max_wait (D-111)"
+                );
+                c.rate_step = Some(RateStep {
+                    send_at: earliest,
+                    wait: (earliest - self.now).max(chrono::Duration::zero()),
+                    over_limit: false,
+                });
+                Ok(Some(SkipReason::Rate))
+            }
         }
     }
 
@@ -494,12 +666,16 @@ impl<'w, 'm> Walker<'w, 'm> {
                     ..usage
                 };
                 if effective.has_headroom_for(1) {
-                    evaluation.push(step(name, Ok(())));
+                    evaluation.push(Step {
+                        rate: c.rate_step,
+                        ..step(name, Ok(()))
+                    });
                     return Ok(Ended::Eligible);
                 }
                 if c.pinned {
                     evaluation.push(Step {
                         over_cap: true,
+                        rate: c.rate_step,
                         ..step(name, Ok(()))
                     });
                     return Ok(Ended::Eligible);
@@ -522,11 +698,18 @@ impl<'w, 'm> Walker<'w, 'm> {
             allowance: c.allowance.as_column(),
             count,
             correlation_id: correlation_id.to_string(),
+            // D-111: the relay may hold the reservation for up to `max_wait`
+            // before the downstream conversation starts, so the expiry covers
+            // that too — or the sweeper could release a send still waiting.
             expires_at: self.now
-                + chrono::Duration::from_std(quota::reservation_expiry(
-                    c.route,
-                    self.recipients.len(),
-                ))
+                + chrono::Duration::from_std(
+                    quota::reservation_expiry(c.route, self.recipients.len())
+                        + c.route
+                            .rate
+                            .as_ref()
+                            .map(|r| r.max_wait())
+                            .unwrap_or_default(),
+                )
                 .unwrap_or_else(|_| chrono::Duration::seconds(600)),
             over_cap: false,
         };
@@ -536,8 +719,8 @@ impl<'w, 'm> Walker<'w, 'm> {
         // `simmer_thread_affinity_total{outcome="over_cap"}` counts. Only a
         // refusal is retried, and the retry cannot be refused.
         let mut over_cap = false;
-        let mut reserved = self.store.reserve(&request).await?;
-        if c.pinned && matches!(reserved, Reserved::NoHeadroom { .. }) {
+        let mut reserved = self.store.reserve(&request).await;
+        if c.pinned && matches!(reserved, Ok(Reserved::NoHeadroom { .. })) {
             over_cap = true;
             reserved = self
                 .store
@@ -545,8 +728,19 @@ impl<'w, 'm> Walker<'w, 'm> {
                     over_cap: true,
                     ..request
                 })
-                .await?;
+                .await;
         }
+        // D-111: a storage failure after the slot was booked gives it back
+        // before §7.5 decides the reply.
+        let reserved = match reserved {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(b) = &c.booking {
+                    unbook(self.store.as_ref(), b, "reservation error").await;
+                }
+                return Err(e);
+            }
+        };
 
         match reserved {
             Reserved::Taken(reservation) => {
@@ -559,10 +753,19 @@ impl<'w, 'm> Walker<'w, 'm> {
                         "thread-affinity reply reserved past the day's cap (D-090)"
                     );
                 }
+                if c.booking.as_ref().is_some_and(|b| b.over_limit) {
+                    tracing::info!(
+                        route = %name,
+                        domain_group = %self.group,
+                        correlation_id,
+                        "thread-affinity reply booked a rate slot past the limit (D-111)"
+                    );
+                }
                 evaluation.push(Step {
                     route: name.to_string(),
                     outcome: Ok(()),
                     over_cap,
+                    rate: c.rate_step,
                 });
                 metrics::warmup_day(&self.ramp.name, name, c.day_index);
                 if let Allowance::Limited(a) = c.allowance {
@@ -577,6 +780,7 @@ impl<'w, 'm> Walker<'w, 'm> {
                     reservation,
                     recipient_keys: c.recipient_keys,
                     over_cap,
+                    rate: c.booking,
                 })))
             }
             Reserved::NoHeadroom { usage } => {
@@ -589,6 +793,11 @@ impl<'w, 'm> Walker<'w, 'm> {
                     reserved = usage.reserved,
                     "route has no headroom today"
                 );
+                // D-111: the slot was booked for a message this route will not
+                // send. Give it back, if nothing was booked after it.
+                if let Some(b) = &c.booking {
+                    unbook(self.store.as_ref(), b, "no headroom").await;
+                }
                 self.skip(evaluation, name, SkipReason::Quota);
                 Ok(Ended::Exhausted)
             }
@@ -597,10 +806,24 @@ impl<'w, 'm> Walker<'w, 'm> {
 
     /// Record a skipped route, counting it only for a real walk.
     fn skip(&self, evaluation: &mut Vec<Step>, route: &str, reason: SkipReason) {
+        self.skip_with(evaluation, route, reason, None);
+    }
+
+    /// [`Self::skip`], carrying a [`SkipReason::Rate`] skip's earliest slot.
+    fn skip_with(
+        &self,
+        evaluation: &mut Vec<Step>,
+        route: &str,
+        reason: SkipReason,
+        rate: Option<RateStep>,
+    ) {
         if self.mode.counts_skips() {
             metrics::route_skipped(&self.ramp.name, route, reason.as_str());
         }
-        evaluation.push(step(route, Err(reason)));
+        evaluation.push(Step {
+            rate,
+            ..step(route, Err(reason))
+        });
     }
 }
 
@@ -716,6 +939,7 @@ fn step(route: &str, outcome: Result<(), SkipReason>) -> Step {
         route: route.to_string(),
         outcome,
         over_cap: false,
+        rate: None,
     }
 }
 
@@ -775,6 +999,7 @@ mod tests {
         assert_eq!(SkipReason::Preflight.as_str(), "preflight");
         assert_eq!(SkipReason::NotStarted.as_str(), "not_started");
         assert_eq!(SkipReason::PartialRamp.as_str(), "partial_ramp");
+        assert_eq!(SkipReason::Rate.as_str(), "rate");
     }
 
     #[test]
@@ -790,6 +1015,7 @@ mod tests {
                 Check::Frequency,
                 Check::Started,
                 Check::PartialRamp,
+                Check::Rate,
             ]
         );
     }
@@ -807,11 +1033,13 @@ mod tests {
                 route: "warming".into(),
                 outcome: Err(SkipReason::Quota),
                 over_cap: false,
+                rate: None,
             },
             Step {
                 route: "overflow".into(),
                 outcome: Ok(()),
                 over_cap: false,
+                rate: None,
             },
         ];
         assert_eq!(render(&steps), "warming=quota,overflow=selected");
@@ -824,11 +1052,13 @@ mod tests {
                 route: "a".into(),
                 outcome: Err(SkipReason::Paused),
                 over_cap: false,
+                rate: None,
             },
             Step {
                 route: "b".into(),
                 outcome: Err(SkipReason::NotStarted),
                 over_cap: false,
+                rate: None,
             },
         ];
         assert_eq!(render(&steps), "a=paused,b=not_started");

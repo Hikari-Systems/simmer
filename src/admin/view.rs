@@ -62,6 +62,17 @@ pub struct GroupWindow {
     /// Computed by the function the walk calls, so §9's control plane cannot
     /// describe a decision the walk did not make.
     pub partial_ramp_share: Option<f64>,
+    /// D-111 — today's rate for this window in messages per hour, or `null`
+    /// for a route with no `rate` (or not yet started). Resolved by the
+    /// function the walk calls (`quota::rate::rate_for`).
+    pub rate_per_hour: Option<i64>,
+    /// D-111 — `rate_per_hour × 24 + burst`: the most the rate lets through
+    /// today. Below `allowance`, the cap cannot be reached today.
+    pub rate_capacity: Option<i64>,
+    /// D-111 — when the next message could go without waiting: the bucket's
+    /// earliest slot as of this read, `now` for a full bucket. `null` with no
+    /// rate. Read without the lock, so another session may take it first.
+    pub next_slot_at: Option<DateTime<Utc>>,
     /// False means nothing has been sent on this route and group today, so the
     /// numbers above are what the first message will create rather than what is
     /// stored.
@@ -227,13 +238,19 @@ fn preflight_view(route: &Route, registry: &crate::preflight::Registry) -> Optio
 /// Everything the projection needs from storage, keyed the way it is read.
 pub type UsageByRoute = HashMap<(String, String), Usage>;
 
+/// D-111 — each rate bucket's `tat`, keyed `(route, domain_group)` as
+/// `QuotaStore::rate_tats` returns it.
+pub type RateTats = HashMap<(String, String), DateTime<Utc>>;
+
 /// Project one route. `usage` is keyed `(route, domain_group)` so one query can
 /// feed every route.
+#[allow(clippy::too_many_arguments)]
 pub fn project_route(
     ramp: &Ramp,
     route: &Route,
     state: RouteState,
     usage: &UsageByRoute,
+    rate_tats: &RateTats,
     preflight: &crate::preflight::Registry,
     pools: &crate::downstream::Pool,
     now: DateTime<Utc>,
@@ -258,7 +275,18 @@ pub fn project_route(
             let share = crate::routing::partial::share_for_group(
                 route, day_index, state, now, scheduled, usage,
             );
-            project_group(group, scheduled, usage, share)
+            let rate = quota::rate::rate_for(route, &group.name, day_index, state);
+            GroupWindow {
+                rate_per_hour: rate.map(|r| r.per_hour),
+                rate_capacity: rate.map(|r| r.daily_capacity()),
+                next_slot_at: rate.map(|r| {
+                    let tat = rate_tats
+                        .get(&(route.name.clone(), group.name.clone()))
+                        .copied();
+                    quota::rate::earliest_slot(tat, r, now)
+                }),
+                ..project_group(group, scheduled, usage, share)
+            }
         })
         .collect();
 
@@ -335,6 +363,9 @@ pub fn project_group(
             headroom: scheduled_column,
             drift: false,
             partial_ramp_share,
+            rate_per_hour: None,
+            rate_capacity: None,
+            next_slot_at: None,
             row_exists: false,
         },
         Some(u) => GroupWindow {
@@ -350,6 +381,9 @@ pub fn project_group(
             // whereas drift is something that happened to them.
             drift: u.allowance != scheduled_column,
             partial_ramp_share,
+            rate_per_hour: None,
+            rate_capacity: None,
+            next_slot_at: None,
             row_exists: true,
         },
     }
@@ -360,6 +394,7 @@ pub fn project_routes(
     ramp: &Ramp,
     states: &HashMap<String, RouteState>,
     usage: &UsageByRoute,
+    rate_tats: &RateTats,
     preflight: &crate::preflight::Registry,
     pools: &crate::downstream::Pool,
     now: DateTime<Utc>,
@@ -371,7 +406,7 @@ pub fn project_routes(
             .iter()
             .map(|route| {
                 let state = states.get(&route.name).copied().unwrap_or_default();
-                project_route(ramp, route, state, usage, preflight, pools, now)
+                project_route(ramp, route, state, usage, rate_tats, preflight, pools, now)
             })
             .collect(),
     }
@@ -441,6 +476,7 @@ ramps:
       pool: { max_connections: 1, idle_ttl: 60s, max_messages_per_connection: 10 }
     identity: { envelope_from: "b@newbrand.com" }
     recipient_frequency: { mode: to_address, window: { unit: daily, count: 1 }, threshold: 2 }
+    rate: { schedule: { default: [4, 8, 15], overrides: { google: [2] } }, burst: 3 }
     warmup:
       started: "2026-08-01T09:00:00Z"
       schedule:
@@ -480,6 +516,7 @@ ramps:
             cfg.default_ramp().route(route).unwrap(),
             state,
             usage,
+            &RateTats::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(cfg),
             now(),
@@ -649,6 +686,7 @@ ramps:
             cfg.default_ramp().route("warming").unwrap(),
             RouteState::default(),
             &UsageByRoute::new(),
+            &RateTats::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             earlier,
@@ -671,6 +709,7 @@ ramps:
                 graduated: false,
             },
             &UsageByRoute::new(),
+            &RateTats::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             earlier,
@@ -693,6 +732,7 @@ ramps:
             cfg.default_ramp().route("warming").unwrap(),
             state,
             &UsageByRoute::new(),
+            &RateTats::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             earlier,
@@ -802,10 +842,18 @@ ramps:
             },
         );
 
+        // D-111: a booked rate bucket too, so its fields are in the document.
+        let mut tats = RateTats::new();
+        tats.insert(
+            ("warming".into(), "google".into()),
+            now() + chrono::Duration::minutes(45),
+        );
+
         let json = serde_json::to_string(&project_routes(
             cfg.default_ramp(),
             &states,
             &usage,
+            &tats,
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             now(),
@@ -880,6 +928,7 @@ ramps:
             cfg.default_ramp(),
             &HashMap::new(),
             &UsageByRoute::new(),
+            &RateTats::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             now(),
@@ -895,6 +944,7 @@ ramps:
             cfg.default_ramp(),
             &HashMap::new(),
             &UsageByRoute::new(),
+            &RateTats::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             now(),
@@ -998,6 +1048,69 @@ ramps:
         let v = view(&cfg, "warming", RouteState::default(), &UsageByRoute::new());
         assert!(v.partial_ramp.is_none());
         assert_eq!(window(&v, "catchall").partial_ramp_share, None);
+    }
+
+    #[test]
+    fn a_rate_limited_window_reports_todays_rate_capacity_and_next_slot() {
+        // D-111. Day 2: catchall's schedule says 15/h, google's override has
+        // ended at its last value, 2/h. Burst 3.
+        let cfg = config();
+        let mut tats = RateTats::new();
+        // google's interval is 30 min, tolerance 2 × 30 = 60 min: a tat 90 min
+        // ahead puts the next slot 30 min out.
+        tats.insert(
+            ("warming".into(), "google".into()),
+            now() + chrono::Duration::minutes(90),
+        );
+        let v = project_route(
+            cfg.default_ramp(),
+            cfg.default_ramp().route("warming").unwrap(),
+            RouteState::default(),
+            &UsageByRoute::new(),
+            &tats,
+            &crate::preflight::Registry::new(),
+            &crate::downstream::Pool::build(&cfg),
+            now(),
+        );
+        let google = window(&v, "google");
+        assert_eq!(google.rate_per_hour, Some(2));
+        assert_eq!(google.rate_capacity, Some(2 * 24 + 3));
+        assert_eq!(
+            google.next_slot_at,
+            Some(now() + chrono::Duration::minutes(30))
+        );
+        let catchall = window(&v, "catchall");
+        assert_eq!(catchall.rate_per_hour, Some(15));
+        assert_eq!(catchall.next_slot_at, Some(now()), "never booked: free now");
+
+        // No rate: all three null.
+        let over = view(
+            &cfg,
+            "overflow",
+            RouteState::default(),
+            &UsageByRoute::new(),
+        );
+        let w = window(&over, "google");
+        assert_eq!(
+            (w.rate_per_hour, w.rate_capacity, w.next_slot_at),
+            (None, None, None)
+        );
+
+        // Graduated: the schedule's last value, like the caps.
+        let grad = project_route(
+            cfg.default_ramp(),
+            cfg.default_ramp().route("warming").unwrap(),
+            RouteState {
+                paused: false,
+                graduated: true,
+            },
+            &UsageByRoute::new(),
+            &RateTats::new(),
+            &crate::preflight::Registry::new(),
+            &crate::downstream::Pool::build(&cfg),
+            now(),
+        );
+        assert_eq!(window(&grad, "catchall").rate_per_hour, Some(15));
     }
 
     #[test]

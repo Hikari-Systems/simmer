@@ -317,8 +317,13 @@ impl Sessions {
 /// wait and the connect (each `connect`), one command and the data stage —
 /// plus a margin for the quota statements either side. Not a tuning knob.
 pub fn relay_drain_bound(cfg: &crate::config::Config) -> Duration {
+    // D-111: a relay may first wait up to its route's `rate.max_wait` for its
+    // booked slot, holding the reservation, before the conversation starts.
     cfg.all_routes()
-        .map(crate::downstream::client::conversation_budget)
+        .map(|r| {
+            crate::downstream::client::conversation_budget(r)
+                + r.rate.as_ref().map(|l| l.max_wait()).unwrap_or_default()
+        })
         .max()
         .unwrap_or_default()
         + RELAY_DRAIN_MARGIN

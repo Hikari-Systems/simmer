@@ -199,6 +199,22 @@ pub struct StepView {
     /// for opposite responses and the difference is the whole answer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explanation: Option<&'static str>,
+    /// D-111 — the route's rate step: the slot the message would be given and
+    /// how long the client would be held for it, or, on a `rate` skip, the
+    /// earliest slot there was. Absent for a route with no `rate`. Computed
+    /// from the bucket as it is now, without booking (it reserves nothing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<RateView>,
+}
+
+/// D-111's step, as §9.4 reports it.
+#[derive(Debug, Serialize)]
+pub struct RateView {
+    pub send_at: chrono::DateTime<Utc>,
+    pub wait_seconds: f64,
+    /// A thread-affinity reply's pinned route, past its limit: it would book
+    /// anyway, counted, and go now.
+    pub over_limit: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -655,6 +671,17 @@ fn split_message(raw: &[u8]) -> (Vec<Header>, Vec<u8>) {
 }
 
 fn step_view(step: &chain::Step) -> StepView {
+    StepView {
+        rate: step.rate.map(|r| RateView {
+            send_at: r.send_at,
+            wait_seconds: r.wait.num_milliseconds() as f64 / 1000.0,
+            over_limit: r.over_limit,
+        }),
+        ..step_outcome(step)
+    }
+}
+
+fn step_outcome(step: &chain::Step) -> StepView {
     match step.outcome {
         Ok(()) if step.over_cap => StepView {
             route: step.route.clone(),
@@ -665,18 +692,21 @@ fn step_view(step: &chain::Step) -> StepView {
                  this domain group today: it would be reserved and counted past the cap \
                  (§3.2 step 2a, D-090)",
             ),
+            rate: None,
         },
         Ok(()) => StepView {
             route: step.route.clone(),
             outcome: "selected",
             reason: None,
             explanation: None,
+            rate: None,
         },
         Err(reason) => StepView {
             route: step.route.clone(),
             outcome: "skipped",
             reason: Some(reason.as_str()),
             explanation: Some(explain(reason)),
+            rate: None,
         },
     }
 }
@@ -703,6 +733,12 @@ fn explain(reason: SkipReason) -> &'static str {
              purpose. Under a share list that ends when the list does; under share: auto \
              the share moves with how full the day's cap is and how far through the day \
              it is, so /routes is where to read what it is now (D-097)"
+        }
+        SkipReason::Rate => {
+            "the route's next sending slot for this domain group is later than its \
+             rate.max_wait allows (§3.2 step 3c″, D-111). The route has headroom; it is being \
+             paced, and the message steers to the next link. `rate.send_at` is the earliest \
+             slot there was"
         }
         SkipReason::Unknown => {
             "the chain names a route that is not defined. §4.2 refuses to start on this, \
@@ -818,6 +854,8 @@ mod tests {
             SkipReason::Quota,
             SkipReason::Frequency,
             SkipReason::Preflight,
+            SkipReason::PartialRamp,
+            SkipReason::Rate,
             SkipReason::Unknown,
         ] {
             assert!(!explain(reason).is_empty(), "{reason:?}");
@@ -830,6 +868,7 @@ mod tests {
             route: "overflow".into(),
             outcome: Ok(()),
             over_cap: false,
+            rate: None,
         });
         assert_eq!(selected.outcome, "selected");
         assert_eq!(selected.reason, None);
@@ -838,6 +877,7 @@ mod tests {
             route: "warming".into(),
             outcome: Err(SkipReason::Quota),
             over_cap: false,
+            rate: None,
         });
         assert_eq!(skipped.outcome, "skipped");
         assert_eq!(skipped.reason, Some("quota"));
@@ -847,6 +887,7 @@ mod tests {
             route: "warming".into(),
             outcome: Ok(()),
             over_cap: true,
+            rate: None,
         });
         assert_eq!(over.outcome, "selected", "past the cap is still selected");
         assert_eq!(over.reason, Some("over_cap"));
