@@ -60,16 +60,18 @@ pub fn digest(bytes: &[u8]) -> Vec<u8> {
 #[derive(Debug, Clone)]
 pub enum BodyStore {
     Volume(Volume),
-    Object(super::object::ObjectStore),
+    Object(Box<super::object::ObjectStore>),
 }
 
 impl BodyStore {
     /// Open the configured store: create a volume's directory (`0700`), or
     /// build an object store's client. Startup refuses on failure.
-    pub fn open(cfg: &BodyStoreConfig) -> anyhow::Result<Self> {
+    pub fn open(cfg: &BodyStoreConfig, tls: rustls::ClientConfig) -> anyhow::Result<Self> {
         match cfg {
             BodyStoreConfig::Volume { path } => Ok(Self::Volume(Volume::open(Path::new(path))?)),
-            BodyStoreConfig::Object(o) => Ok(Self::Object(super::object::ObjectStore::new(o)?)),
+            BodyStoreConfig::Object(o) => Ok(Self::Object(Box::new(
+                super::object::ObjectStore::with_tls(o, tls)?,
+            ))),
         }
     }
 
@@ -106,6 +108,23 @@ impl BodyStore {
             Self::Volume(v) => v.delete(body_ref).await,
             Self::Object(o) => o.delete(body_ref).await,
         }
+    }
+
+    /// Write, read back and delete one body: the whole of what the store does,
+    /// so wrong credentials, a missing bucket or a read-only mount refuse
+    /// startup rather than the first `250 queued` (D-117).
+    pub async fn probe(&self) -> anyhow::Result<()> {
+        let id = Uuid::new_v4();
+        let bytes = format!("simmer spool probe {id}\r\n").into_bytes();
+        let stored = self
+            .put(id, &bytes)
+            .await
+            .map_err(|e| anyhow::anyhow!("spool body store probe: writing: {e}"))?;
+        let back = self.get(&stored.body_ref, &stored.sha256).await;
+        let deleted = self.delete(&stored.body_ref).await;
+        back.map_err(|e| anyhow::anyhow!("spool body store probe: reading back: {e}"))?;
+        deleted.map_err(|e| anyhow::anyhow!("spool body store probe: deleting: {e}"))?;
+        Ok(())
     }
 
     /// Every stored body last written before `cutoff`, for the orphan sweep.

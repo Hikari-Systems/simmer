@@ -348,6 +348,7 @@ async fn run() -> anyhow::Result<()> {
                 (*tls.verifying()).clone(),
                 &config.server.hostname,
             )?;
+            s.body.probe().await?;
             info!(owner = %s.owner, body_store = ?s.body, "spool opened (D-116)");
             Some(Arc::new(s))
         }

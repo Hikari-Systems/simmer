@@ -51,7 +51,7 @@ impl Spool {
         tls: rustls::ClientConfig,
         hostname: &str,
     ) -> anyhow::Result<Self> {
-        let body = body::BodyStore::open(&cfg.body_store)?;
+        let body = body::BodyStore::open(&cfg.body_store, tls.clone())?;
         let webhook = cfg
             .dead_letter
             .webhook

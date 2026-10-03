@@ -5616,6 +5616,101 @@ run also fixed `migrations_are_idempotent_and_recorded`, which still expected
 four migrations: Phase 1's `route_rate` had already made it five, and the SQL
 Server suites had not been run since.
 
+### D-123 — The object stores are hand-written: S3 SigV4 and Azure Shared Key over the existing hyper-rustls client
+
+> Phase 2, 2026-10-03. `docs/SPOOL_PLAN.md` §3.4 allowed this if no crate
+> qualified.
+
+**No crate qualified.** `object_store` (Apache Arrow; MIT/Apache-2.0) is the one
+maintained crate covering both providers, and both its `aws` and `azure`
+features enable `aws-lc-rs`; this crate builds TLS and signing on `ring` only,
+and a second crypto provider is not a Cargo.toml line. It would also bring
+reqwest — a second HTTP client beside the hyper-util one the link proxy already
+uses — and quick-xml. Four operations are needed per provider (put, get, delete,
+list), and the graph already holds every part: hyper-util's client,
+hyper-rustls on `ring`, `sha2`, `hmac`, `base64`. So `src/spool/object/` speaks
+both directly through one small client (`spool/http.rs`, the link proxy's
+connector) that the dead-letter webhook shares. No dependency was added.
+
+**Tested against the source of truth for each.** SigV4 reproduces the three
+worked examples in the S3 documentation byte for byte — GET Object with a
+`Range`, PUT Object with `x-amz-storage-class`, and the bucket listing's
+canonical query. Shared Key has no published vectors, so its string-to-sign is
+checked against the documented layout written out by hand. Then both run
+end to end (`tests/spool_object.rs`, skipped unless the environment names a
+server): S3 against SeaweedFS's gateway with an identity configured, Azure
+against Azurite — put, get, list by age, delete twice, a missing get, and a
+**wrong secret refused**, which is what shows the signature is actually being
+checked. MinIO was the plan's S3 target; its Docker Hub and quay.io images both
+refused anonymous pulls here.
+
+**Shape.** Path-style addressing for an explicit `endpoint`, virtual-hosted for
+AWS itself; Azurite's account-in-the-path works because the canonicalised
+resource is the account plus the path as sent. Credentials come from the config,
+else `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` or
+`AZURE_STORAGE_KEY`; instance roles, SSO and SAS tokens are not spoken. A
+listing is read with a few lines of tag matching, not an XML parser: the
+documents are the providers' own and the values are keys and timestamps.
+Responses are read whole up to 64 MiB, above any permitted message.
+
+**Startup probe.** `BodyStore::probe` writes, reads back and deletes one body
+before the listeners bind, for every kind: wrong credentials, a missing bucket
+or a read-only mount refuse startup rather than the first `250 queued`. The
+server never creates a bucket or container (`create_container` exists for
+first-time setup and the tests).
+
+### D-124 — Dispatch semantics: two clocks, a seeded `{{uuid}}`, Q3's pin, which `5xx` is final, and the backoff
+
+> Phase 2, 2026-10-03.
+
+**Two clocks, one seed.** A spooled attempt walks at the attempt — the day it
+is charged to is the day it is sent, and §7.3's window and the rate are now's —
+and rewrites at `received_at`, so `{{now.*}}`, `Received:`'s date and `Date:`
+are the same on every attempt. Every `{{uuid}}` is derived from the row's
+`uuid_seed` (SHA-256 of the seed and a counter, shaped as a v4 UUID), so the
+occurrences in one rendering stay distinct — the shipped identity uses two —
+while a retry repeats them. A synchronous message gets a fresh seed per
+message, which is indistinguishable from the fresh draws it had before.
+`tests/rewrite_stability.rs` checks two attempts are byte-identical over
+generated messages; `tests/spool.rs` checks it on the wire, `Received:`
+included. The cost: a message held across midnight carries yesterday's
+`{{now.date}}` — and by default (Q4) none is.
+
+**Q3's pin.** The route of the first downstream attempt is stored on the row,
+and a later attempt walks it alone. Only if that walk finds it paused, not
+started or no longer configured — "cannot send", not "has sent enough" — does
+the attempt walk the whole chain. A pinned route with no headroom, no slot or
+over a §7.3 threshold reschedules until the hold runs out; it does not fall
+through, because the next link would emit under another identity, which is
+exactly what §3.3 forbids for a synchronous message.
+
+**Which `5xx` is final.** Only a `5xx` at `RCPT TO` dead-letters the message
+`rejected`. A `5xx` at `EHLO`, `AUTH`, `MAIL FROM`, `DATA` or the final dot is
+D-008's configuration fault, which a synchronous client is told as `451`; the
+spool treats it the same way and retries until the hold ends, then expires it.
+A content rejection at the final dot is therefore retried — wasteful, but the
+alternative is guessing which final-dot `5xx` is about content and which about
+the route's identity, and D-008 exists because that guess was wrong.
+
+**Everything else.** A message whose ramp has been removed from the
+configuration, or whose sender policy now refuses it, is dead-lettered
+`rejected` with that text: no later attempt could route it. A missing or
+changed body is `corrupt`. An exhausted chain or a store outage reschedules.
+An exhausted pool requeues a second later and is not an attempt.
+
+**Backoff.** `initial × factor^(n−1)`, capped at `max`, with **equal** jitter
+(half the step fixed, half random) rather than the plan's full jitter: full
+jitter can draw a near-zero delay and turn a failing downstream into a tight
+retry loop. Every next attempt is capped at the message's `expires_at`, so an
+expiring message is claimed at its expiry and dead-lettered then rather than
+whenever its backoff would have ended.
+
+**The lease** is the slowest route's whole downstream budget (§10.4's drain
+bound, `max_wait` included) plus a minute, renewed at half of that. The
+admission forecast (D-119) counts only a route that would *queue*: the chain's
+first route, if it has `on_limit: wait`. A first route that steers or has no
+rate takes what a waiting route behind it cannot, so nothing queues.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
