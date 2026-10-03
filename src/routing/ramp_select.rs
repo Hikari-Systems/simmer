@@ -122,6 +122,40 @@ pub struct Selection<'a> {
     pub header: HeaderUse,
 }
 
+impl Selection<'_> {
+    /// The same choice with no borrow of the config (D-110).
+    pub fn to_owned_selection(&self) -> OwnedSelection {
+        OwnedSelection {
+            ramp: self.ramp.name.clone(),
+            source: self.source,
+            header: self.header.clone(),
+        }
+    }
+}
+
+/// A [`Selection`] that names its ramp instead of borrowing it (D-110), so it
+/// can outlive the config reference it was made from. It records a choice
+/// already made at the final dot; [`OwnedSelection::resolve`] looks the ramp up
+/// again and never re-selects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedSelection {
+    pub ramp: String,
+    pub source: Source,
+    pub header: HeaderUse,
+}
+
+impl OwnedSelection {
+    /// The borrowed form against `cfg`. `None` only if `cfg` has no ramp of this
+    /// name — impossible while the config cannot change under a running process.
+    pub fn resolve<'a>(&self, cfg: &'a Config) -> Option<Selection<'a>> {
+        Some(Selection {
+            ramp: cfg.ramps.get(&self.ramp)?,
+            source: self.source,
+            header: self.header.clone(),
+        })
+    }
+}
+
 /// §5.8. `header_values` is every `X-Simmer-Ramp` field in the message, unfolded,
 /// in order; empty when there is none.
 ///
@@ -338,6 +372,38 @@ ramps:
     fn pick(cfg: &Config, ingress: Ingress<'_>, headers: &[&str]) -> (String, Source, String) {
         let s = select(cfg, &ingress, &h(headers));
         (s.ramp.name.clone(), s.source, s.header.as_str().to_string())
+    }
+
+    // -- D-110: the owned form -------------------------------------------
+
+    #[test]
+    fn an_owned_selection_resolves_to_the_same_choice_without_reselecting() {
+        let cfg = config();
+        let permitted = grants(&["partner"]);
+        let ingress = Ingress {
+            permitted: &permitted,
+            ..Ingress::default()
+        };
+        let chosen = select(&cfg, &ingress, &h(&["partner"]));
+        let owned = chosen.to_owned_selection();
+        assert_eq!(owned.ramp, "partner");
+        assert_eq!(owned.source, Source::Header);
+
+        let back = owned.resolve(&cfg).expect("the ramp exists");
+        assert!(
+            std::ptr::eq(back.ramp, chosen.ramp),
+            "the same configured ramp"
+        );
+        assert_eq!(back.source, chosen.source);
+        assert_eq!(back.header, chosen.header);
+
+        // A name the config does not have resolves to nothing, never to a
+        // different ramp: the choice is recorded, not re-made.
+        let missing = OwnedSelection {
+            ramp: "gone".into(),
+            ..owned
+        };
+        assert!(missing.resolve(&cfg).is_none());
     }
 
     // -- the four rules ---------------------------------------------------

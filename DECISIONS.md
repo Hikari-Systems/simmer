@@ -5206,6 +5206,41 @@ instant, D-108). New unit tests pin `CHECKS`'s order and that only `Reserve`
 counts skips.
 
 
+### D-110 — An owned hand-off at the final dot: `relay::OwnedMessage` and `ramp_select::OwnedSelection`
+
+> Phase 0 (groundwork) of the segment rate-limit/spool plan, 2026-10-03.
+> A refactor: no reply, metric or stored value changes. **Not a spool.**
+
+**Why.** `relay::Message` and `ramp_select::Selection` borrow from the session and
+the config, so a message cannot leave the session's stack frame. Any later phase
+that hands a message across a task boundary needs an owned form; adding it now,
+on the live path, means that phase changes *where* it is handed rather than
+*what*.
+
+**The shape.**
+- `relay::OwnedMessage` — `OwnedEnvelope` (`mail_from`, `recipients`, `smtputf8`,
+  `body_8bitmime`), `body: Vec<u8>`, `helo`, `peer: IpAddr`, `auth:
+  Option<String>`, `tls`, `received_at` (D-108's instant) and `correlation_id`.
+  `as_message` lends the borrowed `Message` the relay path still takes.
+- `ramp_select::OwnedSelection` — the ramp's **name**, the `Source` and the
+  `HeaderUse`. `resolve(cfg)` looks the ramp up again and never re-selects: §5.8's
+  choice is made once, at the final dot, and recorded.
+- `relay::reserve_relay_commit_owned` — resolves, then calls
+  `reserve_relay_commit` unchanged. `session::route_and_relay` builds both owned
+  forms (the body is moved, not copied) and calls it. The borrowed path stays
+  public and is what every test that drives the walk directly still uses.
+
+**What it is not.** Nothing stores an `OwnedMessage`, nothing reads one back, and
+it carries no outcome, retry count or state. CLAUDE.md's first and eighth rules
+hold unchanged; whether a later phase may persist one is an open question for
+that phase, not settled here.
+
+**Tested:** `relay::tests::an_owned_message_lends_exactly_what_the_session_used_to_pass`
+(field for field, including `peer` rendered as `SocketAddr::ip().to_string()`
+was); `routing::ramp_select::tests::an_owned_selection_resolves_to_the_same_choice_without_reselecting`.
+Every end-to-end suite now runs through the owned path.
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

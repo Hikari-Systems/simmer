@@ -267,7 +267,9 @@ src/rewrite/transfer.rs  quoted-printable and base64, each with a matching encod
 src/rewrite/charset.rs   four charsets, by hand. Anything else is "unknown" (D-044)
 src/rewrite/stability.rs §6.6's property; `validate.rs` runs it at startup. The
                          body half is `body::Rules::fixed_point_violation` (D-046)
-src/relay.rs             decide → reserve → rewrite → relay → commit/release (§7.4)
+src/relay.rs             decide → reserve → rewrite → relay → commit/release (§7.4).
+                         The session hands over an OWNED message (D-110). Not a spool:
+                         nothing stores or reads one back
 src/preflight/mod.rs     §6.7 — the three checks, the registry, the interval loop.
                          A route with NO report is eligible: fail open (D-064)
 src/preflight/resolver.rs  the DNS leg, behind a trait. A TXT record's strings are

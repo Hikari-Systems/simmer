@@ -983,11 +983,6 @@ impl Session {
         // reservation is taken inside, immediately before the conversation, and
         // resolved on every path out (O-1, §3.3's no-failover rule).
         let engine = self.engine.clone();
-        // §6.1 step 8's raw material. `greeted` is `Some` by here — §5.2 rejects
-        // `MAIL FROM` before a greeting — but a missing one is not worth failing
-        // an accepted message over.
-        let helo = self.greeted.clone().unwrap_or_default();
-        let peer = self.peer.ip().to_string();
 
         // §5.8 — chosen here, at the final dot, and nowhere else.
         let ingress = ramp_select::ingress(
@@ -999,23 +994,33 @@ impl Session {
         let selection = ramp_select::select(&engine.config, &ingress, &ramp_header);
         ramp_select::record(&selection, &self.correlation_id);
 
-        relay::reserve_relay_commit(
-            &engine,
-            &selection,
-            &senders,
-            relay::Message {
-                mail_from: tx.mail_from.as_deref(),
-                recipients: &tx.recipients,
-                body: &bytes,
+        // D-110 — the owned hand-off: everything the relay needs, moved out of
+        // the session. The body is moved, not copied. Relayed at once; nothing
+        // keeps it.
+        let message = relay::OwnedMessage {
+            envelope: relay::OwnedEnvelope {
+                mail_from: tx.mail_from.clone(),
+                recipients: tx.recipients.clone(),
                 smtputf8: tx.params.smtputf8,
                 body_8bitmime: tx.params.body_8bitmime,
-                helo: &helo,
-                peer: &peer,
-                authenticated: self.user.is_some(),
-                tls: self.encrypted(),
             },
-            &self.correlation_id,
-            now,
+            body: bytes,
+            // §6.1 step 8's raw material. `greeted` is `Some` by here — §5.2
+            // rejects `MAIL FROM` before a greeting — but a missing one is not
+            // worth failing an accepted message over.
+            helo: self.greeted.clone().unwrap_or_default(),
+            peer: self.peer.ip(),
+            auth: self.user.clone(),
+            tls: self.encrypted(),
+            received_at: now,
+            correlation_id: self.correlation_id.clone(),
+        };
+
+        relay::reserve_relay_commit_owned(
+            &engine,
+            &selection.to_owned_selection(),
+            &senders,
+            &message,
         )
         .await
     }

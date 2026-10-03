@@ -652,6 +652,94 @@ pub struct Message<'a> {
     pub tls: bool,
 }
 
+/// A message as the session hands it over at the final dot, owning everything it
+/// needs (D-110).
+///
+/// [`Message`] borrows from the session, so it cannot outlive the session's
+/// stack frame. This is the same data with nothing borrowed — the shape a future
+/// hand-off across a task boundary needs. Today it is built at the final dot and
+/// relayed at once through [`reserve_relay_commit_owned`]; it is **not** stored
+/// anywhere, and nothing reads one back (CLAUDE.md's first rule).
+#[derive(Debug, Clone)]
+pub struct OwnedMessage {
+    pub envelope: OwnedEnvelope,
+    /// The `DATA` payload, unstuffed and CRLF-normalised, as received.
+    pub body: Vec<u8>,
+    /// §6.1 step 8 — what the client said in `EHLO`/`HELO`.
+    pub helo: String,
+    /// §6.1 step 8 — the client's address, as the listener saw it.
+    pub peer: std::net::IpAddr,
+    /// The authenticated username, if any (§5.3). RFC 3848's `ESMTPA` when set.
+    pub auth: Option<String>,
+    /// §6.1 step 8 — RFC 3848's `S`, for a session that was encrypted (D-070).
+    pub tls: bool,
+    /// The final dot: the instant the walk and the rewrite use (D-108).
+    pub received_at: chrono::DateTime<chrono::Utc>,
+    /// §9.5's id for this message.
+    pub correlation_id: String,
+}
+
+/// The envelope half of an [`OwnedMessage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedEnvelope {
+    pub mail_from: Option<String>,
+    /// Exactly one in every message that arrives over SMTP (D-047).
+    pub recipients: Vec<String>,
+    pub smtputf8: bool,
+    pub body_8bitmime: bool,
+}
+
+impl OwnedMessage {
+    /// The borrowed view the relay path takes. `peer` is rendered as the
+    /// session always rendered it, into `peer_buf`, so the view can borrow it.
+    pub fn as_message<'a>(&'a self, peer_buf: &'a mut String) -> Message<'a> {
+        *peer_buf = self.peer.to_string();
+        Message {
+            mail_from: self.envelope.mail_from.as_deref(),
+            recipients: &self.envelope.recipients,
+            body: &self.body,
+            smtputf8: self.envelope.smtputf8,
+            body_8bitmime: self.envelope.body_8bitmime,
+            helo: &self.helo,
+            peer: peer_buf,
+            authenticated: self.auth.is_some(),
+            tls: self.tls,
+        }
+    }
+}
+
+/// [`reserve_relay_commit`] over the owned forms (D-110): the session's entry
+/// point since phase 0 of the segment work. Resolves the recorded ramp choice —
+/// it never re-selects — and relays at `message.received_at`.
+pub async fn reserve_relay_commit_owned(
+    engine: &Engine,
+    selection: &ramp_select::OwnedSelection,
+    senders: &Senders,
+    message: &OwnedMessage,
+) -> Reply {
+    let Some(selection) = selection.resolve(&engine.config) else {
+        // Unreachable while the config is fixed for the life of the process;
+        // answered rather than panicked because the message is accepted, and
+        // §14.1 makes the answer temporary.
+        tracing::error!(
+            correlation_id = %message.correlation_id,
+            ramp = %selection.ramp,
+            "the selected ramp is not in the configuration"
+        );
+        return Reply::new(451, "4.3.0 internal configuration error");
+    };
+    let mut peer = String::new();
+    reserve_relay_commit(
+        engine,
+        &selection,
+        senders,
+        message.as_message(&mut peer),
+        &message.correlation_id,
+        message.received_at,
+    )
+    .await
+}
+
 /// §10.4 — release whatever this process is still holding.
 pub async fn release_outstanding(engine: &Engine) {
     let outstanding = engine.registry.drain();
@@ -727,6 +815,46 @@ ramps:
             yaml.push_str(&format!("  {k}: {v}\n"));
         }
         crate::config::from_str(&yaml, "test").expect("fixture is valid")
+    }
+
+    #[test]
+    fn an_owned_message_lends_exactly_what_the_session_used_to_pass() {
+        // D-110: the borrowed view of an owned message is field for field the
+        // `Message` the session built before the owned hand-off existed.
+        let owned = OwnedMessage {
+            envelope: OwnedEnvelope {
+                mail_from: Some("a@oldbrand.com".into()),
+                recipients: vec!["b@example.com".into()],
+                smtputf8: true,
+                body_8bitmime: true,
+            },
+            body: b"Subject: x\r\n\r\nbody\r\n".to_vec(),
+            helo: "app.internal".into(),
+            peer: "10.1.2.3".parse().unwrap(),
+            auth: Some("cfapp".into()),
+            tls: true,
+            received_at: chrono::DateTime::from_timestamp(1_767_225_600, 0).unwrap(),
+            correlation_id: "cid".into(),
+        };
+        let mut peer = String::new();
+        let m = owned.as_message(&mut peer);
+        assert_eq!(m.mail_from, Some("a@oldbrand.com"));
+        assert_eq!(m.recipients, ["b@example.com".to_string()]);
+        assert_eq!(m.body, owned.body.as_slice());
+        assert!(m.smtputf8 && m.body_8bitmime && m.authenticated && m.tls);
+        assert_eq!(m.helo, "app.internal");
+        // `SocketAddr::ip().to_string()`, as `session.rs` rendered it.
+        assert_eq!(m.peer, "10.1.2.3");
+
+        let anonymous = OwnedMessage {
+            auth: None,
+            peer: "::1".parse().unwrap(),
+            ..owned.clone()
+        };
+        let mut peer = String::new();
+        let m = anonymous.as_message(&mut peer);
+        assert!(!m.authenticated);
+        assert_eq!(m.peer, "::1");
     }
 
     #[test]
