@@ -356,6 +356,13 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
 fn ramp_warnings(ramp: &Ramp) -> Vec<Warning> {
     let mut out = Vec::new();
 
+    // D-111: a rate that cannot carry the day's cap. Not a violation — a slow
+    // rate under a high cap may be exactly what is wanted — but the cap is then
+    // decorative, and an operator reading the schedule would not know it.
+    for route in &ramp.routes {
+        out.extend(rate_cap_warnings(ramp, route));
+    }
+
     // §7.3 is a *steering* rule: over threshold means "try the next link". A
     // constraint on the last link of a chain has no next link to steer to, so it
     // stops steering and starts refusing — the message gets §10.3's `451` instead
@@ -1314,7 +1321,7 @@ fn check_ramps(cfg: &Config, v: &mut ViolationList) {
         let mut inner = ViolationList::default();
         check_domain_groups(ramp, &mut inner);
         check_route_uniqueness(ramp, &mut inner);
-        check_routes(ramp, &mut inner);
+        check_routes(ramp, cfg.server.timeouts.data, &mut inner);
         check_chains(ramp, &mut inner);
         check_default_chain(ramp, &mut inner);
         check_thread_affinity(ramp, &mut inner);
@@ -1535,8 +1542,10 @@ fn check_storage(cfg: &Config, v: &mut ViolationList) {
     }
 }
 
-fn check_routes(ramp: &Ramp, v: &mut ViolationList) {
+fn check_routes(ramp: &Ramp, client_data: Duration, v: &mut ViolationList) {
     for route in &ramp.routes {
+        check_rate(ramp, route, client_data, v);
+
         let at = |suffix: &str| format!("routes.{}.{suffix}", route.name);
 
         // §4.2: "An overflow route carries a warmup block, or a non-overflow
@@ -1606,6 +1615,178 @@ fn check_routes(ramp: &Ramp, v: &mut ViolationList) {
             if rf.window.count == 0 {
                 v.push(at("recipient_frequency.window.count"), "must be at least 1");
             }
+        }
+    }
+}
+
+/// D-111 — every day index at which `per_hour × 24 + burst` is below the cap
+/// for a group, one warning per (group, day). Days are checked through the
+/// longer of the two schedules; past both ends nothing changes.
+fn rate_cap_warnings(ramp: &Ramp, route: &Route) -> Vec<Warning> {
+    let (Some(rate), Some(warmup)) = (&route.rate, &route.warmup) else {
+        return Vec::new();
+    };
+    let longest = |default: usize, overrides: &mut dyn Iterator<Item = usize>| {
+        overrides.fold(default, usize::max)
+    };
+    let cap_days = longest(
+        warmup.schedule.default.len(),
+        &mut warmup.schedule.overrides.values().map(Vec::len),
+    );
+    let rate_days = rate.schedule.as_ref().map_or(1, |s| {
+        longest(s.default.len(), &mut s.overrides.values().map(Vec::len))
+    });
+
+    let mut out = Vec::new();
+    for group in &ramp.domain_groups {
+        for day in 0..cap_days.max(rate_days) as u64 {
+            let (Some(cap), Some(per_hour)) = (
+                warmup.schedule.allowance_for(&group.name, day),
+                rate.per_hour_for(&group.name, day),
+            ) else {
+                continue;
+            };
+            let capacity = crate::quota::rate::Rate::new(per_hour, rate.burst).daily_capacity();
+            if per_hour >= 1 && rate.burst >= 1 && (capacity as u64) < cap {
+                out.push(Warning {
+                    path: format!("routes.{}.rate", route.name),
+                    message: format!(
+                        "in ramp '{}', route '{}', domain group '{}', day {day}: {per_hour}/h × \
+                         24 + burst {} = {capacity}, below the day's cap of {cap}, so the cap \
+                         cannot be reached that day (D-111)",
+                        ramp.name, route.name, group.name, rate.burst
+                    ),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// D-111's longest permitted `rate.max_wait`. A held client is a held
+/// connection and a held session slot; a minute is already generous.
+pub const MAX_RATE_WAIT: Duration = Duration::from_secs(60);
+
+/// §4.2 for D-111's `rate` block. Where a rate-limited route may sit in a chain
+/// is [`check_chain`]'s business; the unreachable-cap warning is
+/// [`ramp_warnings`]'s.
+fn check_rate(ramp: &Ramp, route: &Route, client_data: Duration, v: &mut ViolationList) {
+    let Some(rate) = &route.rate else {
+        return;
+    };
+    let at = |suffix: &str| format!("routes.{}.rate.{suffix}", route.name);
+
+    match (&rate.schedule, rate.per_hour) {
+        (Some(_), Some(_)) => v.push(
+            at("per_hour"),
+            "is set alongside rate.schedule; give exactly one — a schedule indexed by the \
+             route's day, or a fixed per_hour (D-111)",
+        ),
+        (None, None) => v.push(
+            format!("routes.{}.rate", route.name),
+            "needs exactly one of schedule or per_hour (D-111)",
+        ),
+        _ => {}
+    }
+
+    if let Some(n) = rate.per_hour {
+        if n < 1 {
+            v.push(
+                at("per_hour"),
+                format!("is {n}; a rate must be at least 1 message per hour. To send nothing, pause the route (§9.3)"),
+            );
+        }
+    }
+
+    if let Some(schedule) = &rate.schedule {
+        // D-024: an overflow route has no warm-up and so no day of its own to
+        // index a schedule by. A fixed per_hour means the same thing every day.
+        if route.overflow {
+            v.push(
+                at("schedule"),
+                "is not allowed on an overflow route, which has no warm-up day to index it \
+                 by (D-024); use a fixed rate.per_hour (D-111)",
+            );
+        }
+        check_rate_series(&schedule.default, &at("schedule.default"), v);
+        for (group, series) in &schedule.overrides {
+            if ramp.domain_group(group).is_none() {
+                v.push(
+                    at(&format!("schedule.overrides.{group}")),
+                    format!("names domain group '{group}', which is not defined"),
+                );
+            }
+            check_rate_series(series, &at(&format!("schedule.overrides.{group}")), v);
+        }
+    }
+
+    if rate.burst < 1 {
+        v.push(
+            at("burst"),
+            format!("is {}; burst must be at least 1 (D-111)", rate.burst),
+        );
+    }
+
+    if rate.on_limit == super::OnLimit::Wait {
+        v.push(
+            at("on_limit"),
+            "is `wait`, which needs `delivery: spool` — deferred delivery, which is not built. \
+             In synchronous mode a rate limit can only steer (or hold a client for max_wait); \
+             use on_limit: steer (D-111)",
+        );
+    }
+
+    let max_wait = rate.max_wait();
+    if max_wait > MAX_RATE_WAIT {
+        v.push(
+            at("max_wait"),
+            format!(
+                "is {}s; at most {}s. A held client holds a connection and a session slot \
+                 (D-111)",
+                max_wait.as_secs(),
+                MAX_RATE_WAIT.as_secs()
+            ),
+        );
+    }
+    // The README's "Timeout budget": the client is held for the wait and then
+    // for the whole downstream conversation, and has to hear Simmer's reply
+    // before its own data timeout gives up on it.
+    //
+    // Only a nonzero wait is judged. With max_wait 0 the rate adds no hold at
+    // all, and the downstream budget alone is not this rule's business: by this
+    // formula the shipped defaults (10 + 30×8 + 120 = 370s) already exceed the
+    // default 300s data timeout, which O-20 asks about (D-111).
+    let budget = crate::quota::downstream_budget(route, 1);
+    if !max_wait.is_zero() && max_wait + budget >= client_data {
+        v.push(
+            at("max_wait"),
+            format!(
+                "is {}s, and with the route's downstream budget of {}s the client could be \
+                 held {}s — not below server.timeouts.data ({}s), so a client could give up \
+                 before Simmer answers it. Lower max_wait or the downstream timeouts (D-111)",
+                max_wait.as_secs(),
+                budget.as_secs(),
+                (max_wait + budget).as_secs(),
+                client_data.as_secs()
+            ),
+        );
+    }
+}
+
+fn check_rate_series(series: &[i64], path: &str, v: &mut ViolationList) {
+    if series.is_empty() {
+        v.push(path, "must not be empty");
+        return;
+    }
+    for (i, value) in series.iter().enumerate() {
+        if *value < 1 {
+            v.push(
+                format!("{path}[{i}]"),
+                format!(
+                    "is {value}; a rate must be at least 1 message per hour. To send nothing, \
+                     pause the route (§9.3)"
+                ),
+            );
         }
     }
 }
@@ -1994,6 +2175,18 @@ fn check_chain(ramp: &Ramp, chain: &[String], path: &str, v: &mut ViolationList)
             .warmup
             .as_ref()
             .is_some_and(|w| w.schedule.has_partial_ramp());
+        // D-111, for D-091's reason: a rate-limited route turns messages away
+        // while it still has headroom, and last in a chain each is a `451`.
+        if route.rate.is_some() && i == chain.len() - 1 {
+            v.push(
+                path,
+                format!(
+                    "route '{name}' has a rate limit and is last in the chain, so every \
+                     message it turns away for its rate would be answered 451. Put another \
+                     route after it (§4.2, D-111)"
+                ),
+            );
+        }
         if partial && i == chain.len() - 1 {
             v.push(
                 path,

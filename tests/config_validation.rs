@@ -2306,3 +2306,223 @@ fn warns_when_telemetry_headers_would_cross_the_network_in_plaintext() {
     assert!(!warned("http://127.0.0.1:4317"));
     assert!(!warned("http://[::1]:4317"));
 }
+
+// -- §4.2: rate (D-111) -----------------------------------------------------
+
+/// `BASE` with `rate` on the warming route (indented as a route key).
+fn with_rate(rate: &str) -> String {
+    BASE.replace(
+        "    warmup:\n      started: \"2020-01-01T09:00:00Z\"",
+        &format!("    rate:\n{rate}    warmup:\n      started: \"2020-01-01T09:00:00Z\""),
+    )
+}
+
+/// `BASE` with `rate` on the overflow route.
+fn with_overflow_rate(rate: &str) -> String {
+    BASE.replace(
+        "  - name: overflow\n    overflow: true\n",
+        &format!("  - name: overflow\n    overflow: true\n    rate:\n{rate}"),
+    )
+}
+
+#[test]
+fn accepts_a_rate_schedule_with_overrides_and_its_defaults() {
+    let cfg = load(&with_rate(
+        "      schedule:\n        default: [4, 8, 15]\n        overrides:\n          google: [2, 4]\n",
+    ))
+    .expect("valid");
+    let rate = cfg
+        .default_ramp()
+        .route("warming")
+        .unwrap()
+        .rate
+        .clone()
+        .unwrap();
+    assert_eq!(rate.burst, 1, "burst defaults to 1");
+    assert_eq!(
+        rate.on_limit,
+        config::OnLimit::Steer,
+        "on_limit defaults to steer"
+    );
+    assert_eq!(
+        rate.max_wait(),
+        std::time::Duration::ZERO,
+        "max_wait defaults to 0"
+    );
+    // Mirrors the caps: indexed by day, the last value repeats.
+    assert_eq!(rate.per_hour_for("catchall", 0), Some(4));
+    assert_eq!(rate.per_hour_for("catchall", 2), Some(15));
+    assert_eq!(rate.per_hour_for("catchall", 999), Some(15));
+    assert_eq!(rate.per_hour_for("google", 1), Some(4));
+    assert_eq!(rate.per_hour_for("google", 9), Some(4));
+}
+
+#[test]
+fn accepts_a_fixed_rate_on_any_route_including_overflow() {
+    // An overflow route is always last (§3.1), so a rate on it is always
+    // refused by the chain-position rule — but only by that rule: the fixed
+    // form itself parses and passes every other check.
+    let yaml = with_overflow_rate("      per_hour: 600\n      burst: 20\n");
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            assert!(
+                v.mentions("has a rate limit and is last in the chain"),
+                "{v}"
+            );
+            assert!(!v.mentions("per_hour"), "{v}");
+            assert!(!v.mentions("schedule"), "{v}");
+        }
+        other => panic!("expected the chain-position violation, got {other:?}"),
+    }
+    let cfg = load(&with_rate("      per_hour: 600\n      burst: 20\n")).expect("valid");
+    let rate = cfg
+        .default_ramp()
+        .route("warming")
+        .unwrap()
+        .rate
+        .clone()
+        .unwrap();
+    assert_eq!(rate.per_hour_for("google", 0), Some(600));
+    assert_eq!(rate.per_hour_for("google", 1_000), Some(600));
+}
+
+#[test]
+fn rejects_both_or_neither_of_schedule_and_per_hour() {
+    rejected_for(
+        &with_rate("      per_hour: 10\n      schedule: { default: [4] }\n"),
+        "give exactly one",
+    );
+    rejected_for(
+        &with_rate("      burst: 3\n"),
+        "needs exactly one of schedule or per_hour",
+    );
+}
+
+#[test]
+fn rejects_a_rate_schedule_on_an_overflow_route() {
+    rejected_for(
+        &with_overflow_rate("      schedule: { default: [4] }\n"),
+        "not allowed on an overflow route",
+    );
+}
+
+#[test]
+fn rejects_bad_rate_values_and_reports_them_all() {
+    let yaml = with_rate(
+        "      schedule:\n        default: [4, 0, -1]\n        overrides:\n          nosuch: []\n      burst: 0\n",
+    );
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            for needle in [
+                "rate.schedule.default[1]",
+                "rate.schedule.default[2]",
+                "names domain group 'nosuch'",
+                "rate.schedule.overrides.nosuch",
+                "burst must be at least 1",
+            ] {
+                assert!(v.mentions(needle), "missing {needle}:\n{v}");
+            }
+        }
+        other => panic!("expected violations, got {other:?}"),
+    }
+    rejected_for(
+        &with_rate("      per_hour: 0\n"),
+        "at least 1 message per hour",
+    );
+    rejected_for(
+        &with_rate("      schedule: { default: [] }\n"),
+        "must not be empty",
+    );
+}
+
+#[test]
+fn rejects_on_limit_wait_until_spool_mode_exists() {
+    rejected_for(
+        &with_rate("      per_hour: 10\n      on_limit: wait\n"),
+        "needs `delivery: spool`",
+    );
+    load(&with_rate("      per_hour: 10\n      on_limit: steer\n")).expect("steer is valid");
+}
+
+/// [`with_rate`], with downstream timeouts on the warming route small enough
+/// that a nonzero `max_wait` fits under the base fixture's 300s data timeout:
+/// 5 + 10×8 + 60 = 145s.
+fn with_rate_and_budget(rate: &str) -> String {
+    with_rate(rate).replace(
+        "      tls: required_verify\n",
+        "      tls: required_verify\n      timeouts: { connect: 5s, command: 10s, data: 60s }\n",
+    )
+}
+
+#[test]
+fn rejects_a_max_wait_over_a_minute() {
+    rejected_for(
+        &with_rate_and_budget("      per_hour: 10\n      max_wait: 61s\n"),
+        "at most 60s",
+    );
+    load(&with_rate_and_budget(
+        "      per_hour: 10\n      max_wait: 60s\n",
+    ))
+    .expect("60s is the limit");
+}
+
+#[test]
+fn rejects_a_max_wait_that_overruns_the_clients_data_timeout() {
+    // The route's default budget is 10 + 30×8 + 120 = 370s, already above the
+    // base fixture's 300s data timeout — so any rate on it is refused until the
+    // budget is lowered. Lower it, then let max_wait push it over.
+    let yaml = with_rate_and_budget("      per_hour: 10\n      max_wait: 30s\n");
+    // 145 + 30 = 175 < 300: fine.
+    load(&yaml).expect("inside the budget");
+    let tight = yaml.replace("data: 300s, session", "data: 175s, session");
+    rejected_for(&tight, "not below server.timeouts.data");
+
+    // With the default downstream timeouts the budget alone is 370s, over the
+    // 300s data timeout already. max_wait 0 adds no hold and is not refused
+    // for it (O-20); any wait at all is.
+    load(&with_rate("      per_hour: 10\n")).expect("max_wait 0 adds nothing");
+    rejected_for(
+        &with_rate("      per_hour: 10\n      max_wait: 1s\n"),
+        "not below server.timeouts.data",
+    );
+}
+
+#[test]
+fn rejects_a_rate_limited_route_last_in_a_chain() {
+    let yaml =
+        with_rate("      per_hour: 10\n").replace("chain: [warming, overflow]", "chain: [warming]");
+    rejected_for(&yaml, "has a rate limit and is last in the chain");
+}
+
+#[test]
+fn warns_for_each_day_the_rate_cannot_reach_the_cap() {
+    // Caps [50, 100, 200] (google [20, 50, 100]); rate [1, 2, 4]/h, burst 2:
+    // capacities 26, 50, 98. catchall: 26<50, 50<100, 98<200 — all three days;
+    // google: 26≥20 no, 50≥50 no, 98<100 yes.
+    let cfg = load(&with_rate(
+        "      schedule: { default: [1, 2, 4] }\n      burst: 2\n",
+    ))
+    .expect("a warning, not a violation");
+    let warnings: Vec<String> = config::validate::warnings(&cfg)
+        .into_iter()
+        .map(|w| w.to_string())
+        .filter(|w| w.contains("D-111"))
+        .collect();
+    let has = |group: &str, day: u32| {
+        warnings
+            .iter()
+            .any(|w| w.contains(&format!("domain group '{group}', day {day}:")))
+    };
+    assert!(
+        has("catchall", 0) && has("catchall", 1) && has("catchall", 2),
+        "{warnings:#?}"
+    );
+    assert!(
+        !has("google", 0) && !has("google", 1) && has("google", 2),
+        "{warnings:#?}"
+    );
+    assert_eq!(warnings.len(), 4, "{warnings:#?}");
+    assert!(warnings
+        .iter()
+        .all(|w| w.contains("ramp 'main', route 'warming'")));
+}
