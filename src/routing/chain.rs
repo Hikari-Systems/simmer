@@ -13,6 +13,9 @@
 //!   e. First route to reserve successfully is selected.
 //! ```
 //!
+//! The checks exist once, as `CHECKS`, and the real walk, §9.4's dry run and
+//! §5.4's early check each run that list under a `Mode` (D-109).
+//!
 //! Steps (c) and (d) are one operation here, not two. Checking headroom and then
 //! reserving would reintroduce the race §7.4 exists to close — the check has to
 //! happen *inside* the transaction that holds the row lock, so `reserve` returns
@@ -119,28 +122,504 @@ pub enum Walk<'a> {
     Exhausted,
 }
 
+// ---------------------------------------------------------------------------
+// The one walk (D-109)
+// ---------------------------------------------------------------------------
+//
+// §3.2 step 3's eligibility checks exist exactly once, as `CHECKS`, and all three
+// callers — the real walk, §9.4's dry run and §5.4's early check — run that list
+// under a `Mode`. Before D-109 each had its own copy of the loop, kept in step by
+// a comment and by `tests/admin_api.rs`'s agreement test; the test remains, and
+// now checks a single implementation against itself through two modes.
+
+/// The collaborators the §6.7, §7.3 and D-091 checks need.
+///
+/// [`Mode::Early`] has none, which is how those three checks are omitted from
+/// it *by construction* rather than by a branch someone could forget.
+#[derive(Clone, Copy)]
+struct Deps<'d> {
+    dot_insensitive_domains: &'d [String],
+    frequency: &'d Frequency,
+    preflight: &'d crate::preflight::Registry,
+}
+
+/// How a walk is run. Every mode applies [`CHECKS`] in [`CHECKS`]'s order; a
+/// mode decides only which checks it can run (those needing [`Deps`]), what it
+/// does once a route passes them, and whether a skip is counted.
+#[derive(Clone, Copy)]
+enum Mode<'m> {
+    /// §3.2 step 3 for real. A route that passes is reserved (§7.4 phase 1),
+    /// under the row lock, and the first reservation ends the walk. Every skip
+    /// increments `simmer_route_skipped_total`. Keeps §7.3's keys for commit.
+    Reserve {
+        deps: Deps<'m>,
+        correlation_id: &'m str,
+    },
+    /// §9.4. Reads what `Reserve` reads, in the same order, plus the day's row
+    /// unconditionally (it reports headroom without taking the lock). Reserves
+    /// nothing and **counts nothing**: `simmer_route_skipped_total` measures
+    /// steered messages, and an operator's dry run steered none. It also never
+    /// asks for the §7.3 keyer on behalf of a pinned route, since it neither
+    /// tests nor keeps that route's keys.
+    DryRun { deps: Deps<'m> },
+    /// §5.4's early check at `RCPT TO`. Deliberately omits three checks, each in
+    /// the harmless direction — it may say "eligible" for a chain the final dot
+    /// finds exhausted, never the reverse:
+    /// - §6.7 preflight and §7.3 frequency: it has no `Deps`, so cannot run them;
+    /// - D-091's partial ramp: a route it turns away always has a later link
+    ///   (§4.2), so counting it eligible only errs in the harmless direction;
+    /// - and an **unlimited** route is eligible without reading its row.
+    ///
+    /// Counts nothing, and is never given a pinned route.
+    Early,
+}
+
+impl<'m> Mode<'m> {
+    fn deps(&self) -> Option<&Deps<'m>> {
+        match self {
+            Mode::Reserve { deps, .. } | Mode::DryRun { deps } => Some(deps),
+            Mode::Early => None,
+        }
+    }
+
+    fn counts_skips(&self) -> bool {
+        matches!(self, Mode::Reserve { .. })
+    }
+}
+
+/// One §3.2 step 3 eligibility check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// (a) `POST /routes/{name}/pause`.
+    Paused,
+    /// (a2) §6.7 with `strict: true`. An in-memory read of the last interval's
+    /// result, so it sits above §7.3's indexed database read — the cheapest
+    /// check that can eliminate a route goes first. §3.2 3b calls frequency
+    /// "evaluated first", which this displaces by one position; the two never
+    /// disagree, because a route eliminated here is eliminated whatever §7.3
+    /// would have said (D-065). Non-strict routes never reach `blocks`, and a
+    /// route with no report fails open (D-064).
+    Preflight,
+    /// (b) §7.3. First among the *eligibility* checks per §3.2 3b — "it can
+    /// eliminate routes outright" — hence above the quota check. Over threshold
+    /// makes the route ineligible and nothing more: the message falls through,
+    /// and a chain with nothing left is §10.3's `451`, never a drop.
+    Frequency,
+    /// §7.2 — `warmup.started` is in the future.
+    Started,
+    /// (c′) D-091's partial ramp and D-097's computed share. After the start
+    /// check because it needs the day index, and before the reservation so a
+    /// message turned away here never touches the row lock.
+    PartialRamp,
+}
+
+/// The order is the product: a dry run that evaluated these differently would
+/// report a different reason for the same route, and "why did this not go via
+/// the warming route" is the question §9.4 exists to answer. Headroom — (c) and
+/// (d), one operation under the row lock for `Reserve` — follows the list.
+const CHECKS: [Check; 5] = [
+    Check::Paused,
+    Check::Preflight,
+    Check::Frequency,
+    Check::Started,
+    Check::PartialRamp,
+];
+
+/// What every check reads, fixed for one walk. `'w` is the ramp's lifetime —
+/// the one a [`Selected`] borrows — and `'m` everything else's.
+struct Walker<'w, 'm> {
+    mode: Mode<'m>,
+    ramp: &'w Ramp,
+    store: &'m Arc<dyn QuotaStore>,
+    recipients: &'m [String],
+    states: std::collections::HashMap<String, quota::store::RouteState>,
+    group: String,
+    now: DateTime<Utc>,
+}
+
+impl<'w, 'm> Walker<'w, 'm> {
+    /// The route states, then §3.2 step 2's group — that order, as every walk
+    /// has always read them: a store failure costs no DNS lookup.
+    async fn new(
+        mode: Mode<'m>,
+        ramp: &'w Ramp,
+        groups: &Grouper,
+        store: &'m Arc<dyn QuotaStore>,
+        recipients: &'m [String],
+        now: DateTime<Utc>,
+    ) -> Result<Walker<'w, 'm>, QuotaError> {
+        let states = store.route_states(&ramp.name).await?;
+        // One recipient per transaction (D-047), so there is one domain group
+        // and no question of a transaction spanning two.
+        let group = match recipients.first() {
+            Some(r) => groups.group_name(ramp, r).await,
+            None => ramp
+                .catchall_group()
+                .map(|g| g.name.clone())
+                .unwrap_or_else(|| "catchall".to_string()),
+        };
+        Ok(Walker {
+            mode,
+            ramp,
+            store,
+            recipients,
+            states,
+            group,
+            now,
+        })
+    }
+}
+
+/// One route as the checks see it.
+struct Candidate<'r> {
+    route: &'r Route,
+    state: quota::store::RouteState,
+    /// §3.2 step 2a (D-090): exempt from §7.3's threshold and D-091's share, and
+    /// reserved past the cap rather than skipped. Pause, strict preflight and a
+    /// future start still eliminate it — they say the route cannot send, not
+    /// that it has sent enough.
+    pinned: bool,
+    day_index: i64,
+    allowance: Allowance,
+    /// The day's row, when a check has read it.
+    usage: Option<Usage>,
+    /// §7.3's keys, kept by `Reserve` for commit. Empty for a route with no
+    /// `recipient_frequency`: keys are mode-specific to the route.
+    recipient_keys: Vec<frequency::Key>,
+}
+
+/// How a walk ended.
+enum Ended<'a> {
+    Reserved(Box<Selected<'a>>),
+    /// `DryRun` and `Early`: a route passed, nothing was taken.
+    Eligible,
+    Exhausted,
+}
+
+impl<'w, 'm> Walker<'w, 'm> {
+    async fn run(
+        &self,
+        chain: &[String],
+        pinned: Option<&str>,
+        evaluation: &mut Vec<Step>,
+    ) -> Result<Ended<'w>, QuotaError> {
+        'routes: for name in chain {
+            let Some(route) = self.ramp.route(name) else {
+                self.skip(evaluation, name, SkipReason::Unknown);
+                continue;
+            };
+            let state = self.states.get(name).copied().unwrap_or_default();
+            // Both pure: computing them before the checks that use them changes
+            // nothing a caller can observe.
+            let day_index = quota::day::for_route(route, self.now);
+            let mut candidate = Candidate {
+                route,
+                state,
+                pinned: pinned == Some(name.as_str()),
+                day_index,
+                allowance: quota::allowance_for(route, &self.group, day_index, state),
+                usage: None,
+                recipient_keys: Vec::new(),
+            };
+
+            for check in CHECKS {
+                if let Some(reason) = self.apply(check, &mut candidate).await? {
+                    self.skip(evaluation, name, reason);
+                    continue 'routes;
+                }
+            }
+
+            match self.headroom(candidate, evaluation).await? {
+                Ended::Exhausted => continue,
+                ended => return Ok(ended),
+            }
+        }
+
+        Ok(Ended::Exhausted)
+    }
+
+    /// Run one check. `Some` is the reason the route is skipped.
+    async fn apply(
+        &self,
+        check: Check,
+        c: &mut Candidate<'w>,
+    ) -> Result<Option<SkipReason>, QuotaError> {
+        let route = c.route;
+        let name = &route.name;
+        match check {
+            Check::Paused => Ok(c.state.paused.then_some(SkipReason::Paused)),
+
+            Check::Preflight => Ok(self
+                .mode
+                .deps()
+                .is_some_and(|d| d.preflight.blocks(route))
+                .then_some(SkipReason::Preflight)),
+
+            Check::Frequency => {
+                let (Some(deps), Some(constraint)) =
+                    (self.mode.deps(), route.recipient_frequency.as_ref())
+                else {
+                    return Ok(None);
+                };
+                let keeps_keys = matches!(self.mode, Mode::Reserve { .. });
+                if c.pinned && !keeps_keys {
+                    return Ok(None);
+                }
+                let keyer = deps.frequency.keyer(self.store.as_ref()).await?;
+                let keys: Vec<_> = self
+                    .recipients
+                    .iter()
+                    .map(|r| keyer.key_for(r, constraint.mode, deps.dot_insensitive_domains))
+                    .collect();
+
+                // D-090: a reply the recipient prompted by replying is not the
+                // over-mailing §7.3 steers away from, so a pinned route skips the
+                // threshold — and still records the event on commit, so the
+                // window stays true for the next message that is not a reply.
+                let since = frequency::window_start(constraint, self.now);
+                let mut over = false;
+                for key in keys.iter().filter(|_| !c.pinned) {
+                    let seen = self
+                        .store
+                        .recipient_event_count(&self.ramp.name, name, key, since)
+                        .await?;
+                    if seen >= i64::from(constraint.threshold) {
+                        // No recipient in the log line, and no recipient label on
+                        // the metric: §7.3 hashes precisely so that the container
+                        // does not accumulate a record of who was mailed.
+                        tracing::debug!(
+                            route = %name,
+                            seen,
+                            threshold = constraint.threshold,
+                            window_start = %since.to_rfc3339(),
+                            "route is over its recipient-frequency threshold"
+                        );
+                        over = true;
+                        break;
+                    }
+                }
+                if keeps_keys {
+                    c.recipient_keys = keys;
+                }
+                Ok(over.then_some(SkipReason::Frequency))
+            }
+
+            Check::Started => {
+                Ok((c.allowance == Allowance::NotStarted).then_some(SkipReason::NotStarted))
+            }
+
+            Check::PartialRamp => {
+                let Some(deps) = self.mode.deps() else {
+                    return Ok(None);
+                };
+                // D-097 paces against how full the day's cap is, so the row is
+                // read here — without the lock, since nothing here writes. The
+                // real walk reads it only when the share needs it; the dry run
+                // reads it regardless, since it reports headroom without
+                // reserving, pinned or not.
+                let read = match self.mode {
+                    Mode::DryRun { .. } => true,
+                    Mode::Reserve { .. } => !c.pinned && partial::needs_usage(route, c.state),
+                    Mode::Early => false,
+                };
+                if read {
+                    c.usage = Some(
+                        self.store
+                            .usage(&self.ramp.name, name, &self.group, c.day_index)
+                            .await?,
+                    );
+                }
+                // A pinned reply is exempt: a reply that changed identity on the
+                // hash's say-so is what D-090 exists to prevent.
+                if c.pinned {
+                    return Ok(None);
+                }
+                let Some(share) = partial::share_for_group(
+                    route,
+                    c.day_index,
+                    c.state,
+                    self.now,
+                    c.allowance,
+                    c.usage.as_ref(),
+                ) else {
+                    return Ok(None);
+                };
+                let keyer = deps.frequency.keyer(self.store.as_ref()).await?;
+                let recipient = self
+                    .recipients
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                Ok((!partial::offered(
+                    keyer,
+                    &self.ramp.name,
+                    name,
+                    recipient,
+                    c.day_index,
+                    share,
+                    deps.dot_insensitive_domains,
+                ))
+                .then_some(SkipReason::PartialRamp))
+            }
+        }
+    }
+
+    /// (c) and (d): headroom, and for `Reserve` the reservation, as one step.
+    async fn headroom(
+        &self,
+        c: Candidate<'w>,
+        evaluation: &mut Vec<Step>,
+    ) -> Result<Ended<'w>, QuotaError> {
+        let name = &c.route.name;
+        let correlation_id = match self.mode {
+            Mode::Reserve { correlation_id, .. } => correlation_id,
+            Mode::DryRun { .. } | Mode::Early => {
+                // `Early`'s fourth omission — see `Mode::Early`.
+                if matches!(self.mode, Mode::Early) && c.allowance == Allowance::Unlimited {
+                    evaluation.push(step(name, Ok(())));
+                    return Ok(Ended::Eligible);
+                }
+                let usage = match c.usage {
+                    Some(u) => u,
+                    None => {
+                        self.store
+                            .usage(&self.ramp.name, name, &self.group, c.day_index)
+                            .await?
+                    }
+                };
+                // An absent row reads as all-zero, so a fresh day is eligible
+                // against the schedule's ceiling — what a reservation would write.
+                let effective = Usage {
+                    allowance: usage.allowance.or(c.allowance.as_column()),
+                    ..usage
+                };
+                if effective.has_headroom_for(1) {
+                    evaluation.push(step(name, Ok(())));
+                    return Ok(Ended::Eligible);
+                }
+                if c.pinned {
+                    evaluation.push(Step {
+                        over_cap: true,
+                        ..step(name, Ok(()))
+                    });
+                    return Ok(Ended::Eligible);
+                }
+                self.skip(evaluation, name, SkipReason::Quota);
+                return Ok(Ended::Exhausted);
+            }
+        };
+
+        // §3.2: "Quota is decremented per message, by the recipient count, not
+        // per recipient" — one reservation of this magnitude (O-7). D-047 makes
+        // that count 1 for every message that arrives over SMTP; the arithmetic
+        // stays because the walk is callable with any slice.
+        let count = self.recipients.len().max(1) as i64;
+        let request = ReserveRequest {
+            ramp: self.ramp.name.clone(),
+            route: name.clone(),
+            domain_group: self.group.clone(),
+            day_index: c.day_index,
+            allowance: c.allowance.as_column(),
+            count,
+            correlation_id: correlation_id.to_string(),
+            expires_at: self.now
+                + chrono::Duration::from_std(quota::reservation_expiry(
+                    c.route,
+                    self.recipients.len(),
+                ))
+                .unwrap_or_else(|_| chrono::Duration::seconds(600)),
+            over_cap: false,
+        };
+
+        // D-090: the ordinary reservation first, even for a pinned route, so
+        // that "past the cap" is known rather than assumed — it is what
+        // `simmer_thread_affinity_total{outcome="over_cap"}` counts. Only a
+        // refusal is retried, and the retry cannot be refused.
+        let mut over_cap = false;
+        let mut reserved = self.store.reserve(&request).await?;
+        if c.pinned && matches!(reserved, Reserved::NoHeadroom { .. }) {
+            over_cap = true;
+            reserved = self
+                .store
+                .reserve(&ReserveRequest {
+                    over_cap: true,
+                    ..request
+                })
+                .await?;
+        }
+
+        match reserved {
+            Reserved::Taken(reservation) => {
+                if over_cap {
+                    tracing::info!(
+                        route = %name,
+                        domain_group = %self.group,
+                        day_index = c.day_index,
+                        correlation_id,
+                        "thread-affinity reply reserved past the day's cap (D-090)"
+                    );
+                }
+                evaluation.push(Step {
+                    route: name.to_string(),
+                    outcome: Ok(()),
+                    over_cap,
+                });
+                metrics::warmup_day(&self.ramp.name, name, c.day_index);
+                if let Allowance::Limited(a) = c.allowance {
+                    metrics::quota_allowance(&self.ramp.name, name, &self.group, a as f64);
+                } else {
+                    metrics::quota_allowance(&self.ramp.name, name, &self.group, f64::INFINITY);
+                }
+                Ok(Ended::Reserved(Box::new(Selected {
+                    route: c.route,
+                    domain_group: self.group.clone(),
+                    day_index: c.day_index,
+                    reservation,
+                    recipient_keys: c.recipient_keys,
+                    over_cap,
+                })))
+            }
+            Reserved::NoHeadroom { usage } => {
+                tracing::debug!(
+                    route = %name,
+                    domain_group = %self.group,
+                    day_index = c.day_index,
+                    allowance = ?usage.effective_allowance(),
+                    committed = usage.committed,
+                    reserved = usage.reserved,
+                    "route has no headroom today"
+                );
+                self.skip(evaluation, name, SkipReason::Quota);
+                Ok(Ended::Exhausted)
+            }
+        }
+    }
+
+    /// Record a skipped route, counting it only for a real walk.
+    fn skip(&self, evaluation: &mut Vec<Step>, route: &str, reason: SkipReason) {
+        if self.mode.counts_skips() {
+            metrics::route_skipped(&self.ramp.name, route, reason.as_str());
+        }
+        evaluation.push(step(route, Err(reason)));
+    }
+}
+
 /// §3.2 step 3, for real: walk and reserve.
 ///
 /// `chain` is walked in the order given, which for a thread-affinity reply is
 /// §3.2 step 2a's order with `pinned` first (`thread::order`). The pinned route
 /// is treated differently in exactly three ways (D-090): §7.3's threshold is not
 /// applied to it, though its events are still recorded on commit; D-091's
-/// partial ramp is not applied to it, since a reply that changed identity on
-/// the hash's say-so is what D-090 exists to prevent; and when it has no
-/// headroom it is reserved **past the cap** rather than skipped. Pause,
-/// strict preflight and a future `warmup.started` still eliminate it — those
-/// say the route cannot send, not that it has sent enough.
+/// partial ramp is not applied to it; and when it has no headroom it is reserved
+/// **past the cap** rather than skipped. See [`Mode::Reserve`] and [`CHECKS`].
 ///
 /// `now` is the caller's single clock read (D-108): the day index, §7.3's window,
 /// D-097's pacing and the reservation's expiry all use it, and so does the
 /// caller's rewrite, so one message is evaluated at one instant.
 ///
-/// `smtp::mod::handle`'s precedent on the argument count. The four collaborators
-/// — store, frequency, preflight, and the evaluation buffer — are passed
-/// explicitly rather than bundled because that is what lets a test drive the walk
-/// with a real store and a synthetic registry, which is most of how §6.7 and §7.3
-/// are tested at all. A `Deps` struct would move the same four values behind one
-/// name and buy nothing.
+/// `smtp::mod::handle`'s precedent on the argument count. The collaborators are
+/// passed explicitly because that is what lets a test drive the walk with a real
+/// store and a synthetic registry, which is most of how §6.7 and §7.3 are tested.
 #[allow(clippy::too_many_arguments)]
 pub async fn walk_and_reserve<'a>(
     ramp: &'a Ramp,
@@ -156,248 +635,42 @@ pub async fn walk_and_reserve<'a>(
     evaluation: &mut Vec<Step>,
     now: DateTime<Utc>,
 ) -> Result<Walk<'a>, QuotaError> {
-    let states = store.route_states(&ramp.name).await?;
-
-    // §3.2: "Quota is decremented per message, by the recipient count, not per
-    // recipient" — one reservation of this magnitude (O-7). D-047 makes that
-    // count 1 for every message that arrives over SMTP; the arithmetic stays
-    // because the walk is callable with any slice and the spec's rule is about
-    // magnitude, not about how many recipients a transaction may hold.
-    let count = recipients.len().max(1) as i64;
-
-    // §3.2 step 2. One recipient per transaction (D-047), so there is one domain
-    // group and no question of a transaction spanning two.
-    let group = match recipients.first() {
-        Some(r) => groups.group_name(ramp, r).await,
-        None => ramp
-            .catchall_group()
-            .map(|g| g.name.clone())
-            .unwrap_or_else(|| "catchall".to_string()),
-    };
-
-    for name in chain {
-        let Some(route) = ramp.route(name) else {
-            record(evaluation, &ramp.name, name, Err(SkipReason::Unknown));
-            continue;
-        };
-        let state = states.get(name).copied().unwrap_or_default();
-        let is_pinned = pinned == Some(name.as_str());
-
-        // (a) paused.
-        if state.paused {
-            record(evaluation, &ramp.name, name, Err(SkipReason::Paused));
-            continue;
-        }
-
-        // (a2) §6.7 preflight, when `strict: true`. An in-memory read of the last
-        // interval's result, so it sits above §7.3's indexed database read — the
-        // cheapest check that can eliminate a route goes first. §3.2 3b calls
-        // frequency "evaluated first", which this displaces by one position; the
-        // two never disagree, because a route eliminated here is eliminated
-        // whatever §7.3 would have said (D-065).
-        //
-        // Non-strict routes never reach `blocks`, and a route with no report
-        // fails open — a slow resolver at boot must not empty a chain.
-        if preflight.blocks(route) {
-            record(evaluation, &ramp.name, name, Err(SkipReason::Preflight));
-            continue;
-        }
-
-        // (b) §7.3 recipient frequency. Evaluated first among the *eligibility*
-        // checks per §3.2 3b — "Evaluated **first** — it can eliminate routes
-        // outright" — hence its position above the quota check rather than below
-        // it. Being over threshold makes this route ineligible and nothing more:
-        // the message falls through to the next link, and a chain with no link
-        // left is §10.3's `451`, never a drop.
-        let recipient_keys = match &route.recipient_frequency {
-            None => Vec::new(),
-            Some(constraint) => {
-                let keyer = frequency.keyer(store.as_ref()).await?;
-                let keys: Vec<_> = recipients
-                    .iter()
-                    .map(|r| keyer.key_for(r, constraint.mode, dot_insensitive_domains))
-                    .collect();
-
-                // D-090: a reply the recipient prompted by replying is not the
-                // over-mailing §7.3 steers away from, so a pinned route skips
-                // the threshold — and still records the event, so the window
-                // stays true for the next message that is not a reply.
-                let since = frequency::window_start(constraint, now);
-                let mut over = false;
-                for key in keys.iter().filter(|_| !is_pinned) {
-                    let seen = store
-                        .recipient_event_count(&ramp.name, name, key, since)
-                        .await?;
-                    if seen >= i64::from(constraint.threshold) {
-                        // No recipient in the log line, and no recipient label on
-                        // the metric: §7.3 hashes precisely so that the container
-                        // does not accumulate a record of who was mailed, and a
-                        // log line would be that record by another route.
-                        tracing::debug!(
-                            route = %name,
-                            seen,
-                            threshold = constraint.threshold,
-                            window_start = %since.to_rfc3339(),
-                            "route is over its recipient-frequency threshold"
-                        );
-                        over = true;
-                        break;
-                    }
-                }
-
-                if over {
-                    record(evaluation, &ramp.name, name, Err(SkipReason::Frequency));
-                    continue;
-                }
-                keys
-            }
-        };
-
-        let day_index = quota::day::for_route(route, now);
-        let allowance = quota::allowance_for(route, &group, day_index, state);
-
-        if allowance == Allowance::NotStarted {
-            record(evaluation, &ramp.name, name, Err(SkipReason::NotStarted));
-            continue;
-        }
-
-        // (c′) D-091's partial ramp, and D-097's computed share. After the start
-        // check because it needs the day index, and before the reservation so
-        // that a message turned away here never touches the row lock. A pinned
-        // reply is exempt.
-        if !is_pinned {
-            // D-097 paces against how full the day's cap is, so the row is read
-            // first — without the lock, since nothing here writes. A listed
-            // share, and every route with no ramp at all, still read nothing.
-            let usage = if partial::needs_usage(route, state) {
-                Some(store.usage(&ramp.name, name, &group, day_index).await?)
-            } else {
-                None
-            };
-            if let Some(share) =
-                partial::share_for_group(route, day_index, state, now, allowance, usage.as_ref())
-            {
-                let keyer = frequency.keyer(store.as_ref()).await?;
-                let recipient = recipients.first().map(String::as_str).unwrap_or_default();
-                if !partial::offered(
-                    keyer,
-                    &ramp.name,
-                    name,
-                    recipient,
-                    day_index,
-                    share,
-                    dot_insensitive_domains,
-                ) {
-                    record(evaluation, &ramp.name, name, Err(SkipReason::PartialRamp));
-                    continue;
-                }
-            }
-        }
-
-        // (c) + (d) together, under one row lock.
-        let request = ReserveRequest {
-            ramp: ramp.name.clone(),
-            route: name.clone(),
-            domain_group: group.clone(),
-            day_index,
-            allowance: allowance.as_column(),
-            count,
-            correlation_id: correlation_id.to_string(),
-            expires_at: now
-                + chrono::Duration::from_std(quota::reservation_expiry(route, recipients.len()))
-                    .unwrap_or_else(|_| chrono::Duration::seconds(600)),
-            over_cap: false,
-        };
-
-        // D-090: the ordinary reservation first, even for a pinned route, so
-        // that "past the cap" is known rather than assumed — it is what
-        // `simmer_thread_affinity_total{outcome="over_cap"}` counts. Only a
-        // refusal is retried, and the retry cannot be refused.
-        let mut over_cap = false;
-        let mut reserved = store.reserve(&request).await?;
-        if is_pinned && matches!(reserved, Reserved::NoHeadroom { .. }) {
-            over_cap = true;
-            reserved = store
-                .reserve(&ReserveRequest {
-                    over_cap: true,
-                    ..request
-                })
-                .await?;
-        }
-
-        match reserved {
-            Reserved::Taken(reservation) => {
-                if over_cap {
-                    tracing::info!(
-                        route = %name,
-                        domain_group = %group,
-                        day_index,
-                        correlation_id,
-                        "thread-affinity reply reserved past the day's cap (D-090)"
-                    );
-                }
-                evaluation.push(Step {
-                    route: name.to_string(),
-                    outcome: Ok(()),
-                    over_cap,
-                });
-                metrics::warmup_day(&ramp.name, name, day_index);
-                if let Allowance::Limited(a) = allowance {
-                    metrics::quota_allowance(&ramp.name, name, &group, a as f64);
-                } else {
-                    metrics::quota_allowance(&ramp.name, name, &group, f64::INFINITY);
-                }
-                return Ok(Walk::Selected(Box::new(Selected {
-                    route,
-                    domain_group: group,
-                    day_index,
-                    reservation,
-                    recipient_keys,
-                    over_cap,
-                })));
-            }
-            Reserved::NoHeadroom { usage } => {
-                tracing::debug!(
-                    route = %name,
-                    domain_group = %group,
-                    day_index,
-                    allowance = ?usage.effective_allowance(),
-                    committed = usage.committed,
-                    reserved = usage.reserved,
-                    "route has no headroom today"
-                );
-                record(evaluation, &ramp.name, name, Err(SkipReason::Quota));
-            }
-        }
-    }
-
-    Ok(Walk::Exhausted)
+    let walker = Walker::new(
+        Mode::Reserve {
+            deps: Deps {
+                dot_insensitive_domains,
+                frequency,
+                preflight,
+            },
+            correlation_id,
+        },
+        ramp,
+        groups,
+        store,
+        recipients,
+        now,
+    )
+    .await?;
+    Ok(match walker.run(chain, pinned, evaluation).await? {
+        Ended::Reserved(s) => Walk::Selected(s),
+        Ended::Eligible | Ended::Exhausted => Walk::Exhausted,
+    })
 }
 
 /// §9.4 — walk a chain and report what *would* happen, reserving nothing.
 ///
-/// The order of the checks below is `walk_and_reserve`'s order, deliberately and
-/// fragilely: paused, then §6.7 preflight, then §7.3 frequency, then §7.2's start
-/// instant, then D-091's partial ramp, then headroom. A dry run that evaluated them in a different order would report a
-/// different reason for the same route, and the reason is the entire product —
-/// "why did this message not go via the warming route" is the question the
-/// endpoint exists to answer. `tests/admin_api.rs` asserts the two agree rather
-/// than trusting this comment.
-///
-/// `pinned` is `walk_and_reserve`'s, with its three exceptions reproduced: no
-/// §7.3 threshold, no partial ramp, and no headroom means selected past the cap
-/// (D-090, D-091).
+/// The same [`CHECKS`] as [`walk_and_reserve`], in the same order, under
+/// [`Mode::DryRun`] — so the same reason for the same route, which is the entire
+/// product. `tests/admin_api.rs` still asserts the two agree.
 ///
 /// It stops at the first eligible route, as the real walk does, so the routes
-/// after the selected one are absent rather than reported — they would not have
-/// been consulted either.
+/// after the selected one are absent rather than reported.
 ///
 /// The one thing it cannot reproduce is the race: the real walk checks headroom
 /// *inside* the transaction that takes the row lock, and this reads outside any
 /// transaction. So it can say "eligible" for a route that another session
-/// empties a millisecond later. That is the same direction of error the §5.4
-/// early check makes, and harmless for the same reason — nothing acts on it.
-/// `walk_and_reserve`'s argument list, for the same reason (D-090 added `pinned`).
+/// empties a millisecond later — the same direction of error the §5.4 early
+/// check makes, and harmless for the same reason: nothing acts on it.
 #[allow(clippy::too_many_arguments)]
 pub async fn dry_walk(
     ramp: &Ramp,
@@ -411,107 +684,30 @@ pub async fn dry_walk(
     recipient: &str,
     now: DateTime<Utc>,
 ) -> Result<Vec<Step>, QuotaError> {
-    let states = store.route_states(&ramp.name).await?;
-    let group = groups.group_name(ramp, recipient).await;
-
+    let recipients = [recipient.to_string()];
+    let walker = Walker::new(
+        Mode::DryRun {
+            deps: Deps {
+                dot_insensitive_domains,
+                frequency,
+                preflight,
+            },
+        },
+        ramp,
+        groups,
+        store,
+        &recipients,
+        now,
+    )
+    .await?;
     let mut evaluation = Vec::new();
-
-    for name in chain {
-        let Some(route) = ramp.route(name) else {
-            evaluation.push(step(name, Err(SkipReason::Unknown)));
-            continue;
-        };
-        let state = states.get(name).copied().unwrap_or_default();
-        let is_pinned = pinned == Some(name.as_str());
-
-        if state.paused {
-            evaluation.push(step(name, Err(SkipReason::Paused)));
-            continue;
-        }
-
-        // §6.7, in `walk_and_reserve`'s position. See that function's (a2).
-        if preflight.blocks(route) {
-            evaluation.push(step(name, Err(SkipReason::Preflight)));
-            continue;
-        }
-
-        if let Some(constraint) = route.recipient_frequency.as_ref().filter(|_| !is_pinned) {
-            let keyer = frequency.keyer(store.as_ref()).await?;
-            let key = keyer.key_for(recipient, constraint.mode, dot_insensitive_domains);
-            let since = frequency::window_start(constraint, now);
-            if store
-                .recipient_event_count(&ramp.name, name, &key, since)
-                .await?
-                >= i64::from(constraint.threshold)
-            {
-                evaluation.push(step(name, Err(SkipReason::Frequency)));
-                continue;
-            }
-        }
-
-        let day_index = quota::day::for_route(route, now);
-        let allowance = quota::allowance_for(route, &group, day_index, state);
-        if allowance == Allowance::NotStarted {
-            evaluation.push(step(name, Err(SkipReason::NotStarted)));
-            continue;
-        }
-
-        // Read once, and before the partial ramp, because D-097's share is paced
-        // against this row. `walk_and_reserve` reads it only when the ramp needs
-        // it and then takes the lock; the dry run needs it regardless, since it
-        // reports headroom below without reserving anything.
-        let usage = store.usage(&ramp.name, name, &group, day_index).await?;
-
-        // D-091 and D-097, in `walk_and_reserve`'s position. The hash and the
-        // arithmetic are the real walk's, so this is its answer and not an
-        // estimate of it.
-        if !is_pinned {
-            if let Some(share) =
-                partial::share_for_group(route, day_index, state, now, allowance, Some(&usage))
-            {
-                let keyer = frequency.keyer(store.as_ref()).await?;
-                if !partial::offered(
-                    keyer,
-                    &ramp.name,
-                    name,
-                    recipient,
-                    day_index,
-                    share,
-                    dot_insensitive_domains,
-                ) {
-                    evaluation.push(step(name, Err(SkipReason::PartialRamp)));
-                    continue;
-                }
-            }
-        }
-
-        // An absent row reads as all-zero, so a fresh day is eligible against the
-        // schedule's ceiling — which is what the reservation would write.
-        let effective = Usage {
-            allowance: usage.allowance.or(allowance.as_column()),
-            ..usage
-        };
-        if effective.has_headroom_for(1) {
-            evaluation.push(step(name, Ok(())));
-            return Ok(evaluation);
-        }
-        if is_pinned {
-            evaluation.push(Step {
-                over_cap: true,
-                ..step(name, Ok(()))
-            });
-            return Ok(evaluation);
-        }
-
-        evaluation.push(step(name, Err(SkipReason::Quota)));
-    }
-
+    walker.run(chain, pinned, &mut evaluation).await?;
     Ok(evaluation)
 }
 
 /// A [`Step`] with no metric increment.
 ///
-/// `record` counts `simmer_route_skipped_total`, and a dry run must not: the
+/// `Walker::skip` counts `simmer_route_skipped_total` only for a real walk: the
 /// counter measures messages that were steered, and an operator testing a
 /// configuration has steered nothing. Inflating it would corrupt exactly the
 /// series someone would use to decide whether the ramp is working.
@@ -531,13 +727,10 @@ fn step(route: &str, outcome: Result<(), SkipReason>) -> Step {
 /// transfer."
 ///
 /// It can be wrong in one direction only — it may say "eligible" for a chain
-/// that is exhausted by the time the body arrives, because another session took
-/// the last slot in between. That is harmless: the authoritative check is the
-/// reservation, and the message is refused at the final dot instead. It must
-/// never be wrong the other way, which is why it asks for headroom of 1 rather
-/// than for a guess at the eventual recipient count — and why it ignores D-091's
-/// partial ramp: a route turned away by it always has a later link (§4.2), so
-/// counting it eligible can only err in the harmless direction.
+/// that is exhausted by the time the body arrives. That is harmless: the
+/// authoritative check is the reservation. It must never be wrong the other
+/// way, which is why it asks for headroom of 1, and why [`Mode::Early`] omits
+/// exactly the checks whose omission errs in the harmless direction.
 pub async fn any_eligible(
     ramp: &Ramp,
     groups: &Grouper,
@@ -546,46 +739,13 @@ pub async fn any_eligible(
     recipient: &str,
     now: DateTime<Utc>,
 ) -> Result<bool, QuotaError> {
-    let states = store.route_states(&ramp.name).await?;
-    let group = groups.group_name(ramp, recipient).await;
-
-    for name in chain {
-        let Some(route) = ramp.route(name) else {
-            continue;
-        };
-        let state = states.get(name).copied().unwrap_or_default();
-        if state.paused {
-            continue;
-        }
-
-        let day_index = quota::day::for_route(route, now);
-        match quota::allowance_for(route, &group, day_index, state) {
-            Allowance::NotStarted => continue,
-            Allowance::Unlimited => return Ok(true),
-            Allowance::Limited(a) => {
-                let usage = store.usage(&ramp.name, name, &group, day_index).await?;
-                // A row that does not exist yet reads as all-zero, so a fresh
-                // day is eligible without a write.
-                let effective = usage.effective_allowance().unwrap_or(a);
-                if effective - usage.committed - usage.reserved >= 1 {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-
-    Ok(false)
-}
-
-fn record(evaluation: &mut Vec<Step>, ramp: &str, route: &str, outcome: Result<(), SkipReason>) {
-    if let Err(reason) = outcome {
-        metrics::route_skipped(ramp, route, reason.as_str());
-    }
-    evaluation.push(Step {
-        route: route.to_string(),
-        outcome,
-        over_cap: false,
-    });
+    let recipients = [recipient.to_string()];
+    let walker = Walker::new(Mode::Early, ramp, groups, store, &recipients, now).await?;
+    let mut evaluation = Vec::new();
+    Ok(matches!(
+        walker.run(chain, None, &mut evaluation).await?,
+        Ended::Eligible
+    ))
 }
 
 /// Render a chain evaluation for §9.5's log line.
@@ -615,6 +775,29 @@ mod tests {
         assert_eq!(SkipReason::Preflight.as_str(), "preflight");
         assert_eq!(SkipReason::NotStarted.as_str(), "not_started");
         assert_eq!(SkipReason::PartialRamp.as_str(), "partial_ramp");
+    }
+
+    #[test]
+    fn the_checks_run_in_section_3_2_order() {
+        // D-109: the one list every mode walks. Reordering it changes the reason
+        // the real walk counts and the dry run reports for the same route, so a
+        // change here is a decision, not a refactor (D-065 placed preflight).
+        assert_eq!(
+            CHECKS,
+            [
+                Check::Paused,
+                Check::Preflight,
+                Check::Frequency,
+                Check::Started,
+                Check::PartialRamp,
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_real_walk_counts_skips_and_the_early_check_has_no_deps() {
+        assert!(!Mode::Early.counts_skips());
+        assert!(Mode::Early.deps().is_none());
     }
 
     #[test]

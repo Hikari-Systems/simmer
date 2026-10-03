@@ -5164,6 +5164,48 @@ dry-run/real-walk agreement helper in `tests/admin_api.rs` now evaluates both at
 one instant. Every existing walk test passes `Utc::now()` explicitly.
 
 
+### D-109 — One walk: §3.2 step 3's checks exist once, run under a mode
+
+> Phase 0 (groundwork) of the segment rate-limit/spool plan, 2026-10-03.
+> A refactor: no reply, metric, stored value or skip reason changes.
+
+**Why.** `walk_and_reserve`, `dry_walk` and `any_eligible` each carried their own
+copy of the eligibility loop, kept in step by a comment ("deliberately and
+fragilely") and by `tests/admin_api.rs`'s agreement test. The planned segment
+rate limit is a new check; a fourth hand-copied position is how the dry run and
+the real walk would start to disagree.
+
+**The shape.** In `routing/chain.rs`:
+- `CHECKS` — the ordered list: paused, §6.7 preflight, §7.3 frequency, §7.2
+  start, D-091/D-097 partial ramp. Headroom/reservation follows it.
+- `Mode::{Reserve, DryRun, Early}` — what a mode does once a route passes, which
+  checks it can run, and whether a skip is counted. A mode never reorders.
+- `Walker` runs the list; the three public functions keep their signatures and
+  are thin constructors over it. Route states are read before the domain group,
+  as before, so a store failure still costs no DNS lookup.
+
+**Behaviour preserved, each documented on its `Mode`:**
+- `Reserve` counts every skip (`simmer_route_skipped_total`), keeps §7.3's keys
+  for commit (fetching the keyer for a pinned route too, as before), reads the
+  day's row before the partial ramp only when D-097 needs it, and reserves under
+  the lock, retrying past the cap for a pinned route (D-090).
+- `DryRun` counts nothing, never fetches the keyer for a pinned route's
+  frequency, reads the day's row unconditionally, and reports a pinned route
+  without headroom as `over_cap`.
+- `Early` has no preflight/frequency collaborators, so it cannot run those two
+  checks — omitted by construction — skips the partial ramp, treats an unlimited
+  route as eligible without reading its row, and counts nothing. These are the
+  same omissions `any_eligible` always made, each in the harmless direction.
+
+**One cosmetic difference:** the dry run now emits the frequency check's
+`debug!` line ("over its recipient-frequency threshold") as the real walk does.
+
+**Tested:** every existing walk, dry-run and early-check test passes unchanged,
+including `tests/admin_api.rs`'s dry-run/real-walk agreement tests (now at one
+instant, D-108). New unit tests pin `CHECKS`'s order and that only `Reserve`
+counts skips.
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

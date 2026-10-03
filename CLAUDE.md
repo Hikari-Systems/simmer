@@ -284,7 +284,9 @@ src/routing/ramp_select.rs  §5.8 (D-099) — which ramp. PURE: the session, the
                          early check and the dry run all call `select`. An unusable
                          header is IGNORED and counted, never a refusal; the header
                          is stripped (§6.5) whatever became of it
-src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve are ONE op
+src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve are ONE op.
+                         ONE ordered `CHECKS` list; the real walk, dry run and early
+                         check are `Mode`s of it (D-109). `now` comes from the caller
 src/routing/thread.rs    §3.2 step 2a (D-090) — thread affinity. A REORDERING plus two
                          exemptions for the pinned route only: no §7.3 threshold, and
                          an ordinary reservation first, then `over_cap` past the cap
