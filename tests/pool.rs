@@ -14,7 +14,7 @@ mod support;
 
 use std::time::Duration;
 
-use support::{config_for, Act, FakeDownstream, Script, Simmer};
+use support::{config_for, Act, FakeDownstream, Script, Simmer, Turn};
 
 /// A route with the given pool block and a short connect budget, so a test that
 /// means to exhaust the pool does not sit for ten seconds waiting to find out.
@@ -298,6 +298,188 @@ async fn the_retry_does_not_resend_past_the_final_dot() {
         "and the body was offered exactly once: {:?}",
         down.commands()
     );
+}
+
+/// Message 2 starts here: the arrival time of the second `MAIL FROM` the
+/// downstream saw, on any connection.
+fn second_mail_from(down: &FakeDownstream) -> std::time::Instant {
+    down.timed_commands()
+        .iter()
+        .filter(|c| c.line.to_ascii_uppercase().starts_with("MAIL FROM"))
+        .nth(1)
+        .expect("a second MAIL FROM")
+        .at
+}
+
+/// How many times `verb` reached the downstream from `since` on, any connection.
+fn count_since(down: &FakeDownstream, verb: &str, since: std::time::Instant) -> usize {
+    down.timed_commands()
+        .iter()
+        .filter(|c| c.at >= since && c.line.to_ascii_uppercase().starts_with(verb))
+        .count()
+}
+
+#[tokio::test]
+async fn a_drop_after_the_final_dot_on_a_reused_connection_is_not_retried() {
+    // The test above runs on a FRESH connection, where no retry is considered
+    // at all, so it cannot see D-068's third condition. This one reuses: message
+    // 1 succeeds, and message 2 — the second transaction on the same socket —
+    // loses its connection after the terminating dot. A fresh connection would
+    // accept it, so a retry would "succeed" and deliver it twice.
+    let down = FakeDownstream::start(Script::with(|s| {
+        s.transactions = vec![
+            Turn::default(),
+            Turn {
+                final_dot: Some(Act::Drop),
+                ..Turn::default()
+            },
+        ];
+    }))
+    .await;
+    let simmer = Simmer::start(&config_with_pool(
+        down.addr,
+        "pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }",
+    ))
+    .await;
+
+    let mut client = simmer.connect().await;
+    client.hello().await;
+    let r = client
+        .deliver("a@oldbrand.com", "b@example.com", "Subject: 1\r\n\r\nb\r\n")
+        .await;
+    assert_eq!(r.code, 250, "message 1: {r:?}");
+
+    let r = client
+        .deliver("a@oldbrand.com", "b@example.com", "Subject: 2\r\n\r\nb\r\n")
+        .await;
+    assert_eq!(r.code, 451, "{r:?}");
+    assert!(r.contains("delivery unknown"), "§10.2's wording: {r:?}");
+
+    let since = second_mail_from(&down);
+    assert_eq!(
+        count_since(&down, "DATA", since),
+        1,
+        "message 2's body was offered exactly once: {:?}",
+        down.commands()
+    );
+    assert_eq!(
+        down.connections(),
+        1,
+        "and no fresh connection was opened for it"
+    );
+}
+
+#[tokio::test]
+async fn a_body_write_failure_on_a_reused_connection_is_not_retried() {
+    // The case D-068's `!= FinalDot` condition actually decides. A drop after the
+    // dot is read as §10.2's ambiguity before the retry is ever considered; a
+    // connection that dies while the BODY is being written surfaces as a
+    // protocol error at `Stage::FinalDot`, which is otherwise exactly the shape
+    // the retry is for. The downstream may have read and kept a prefix — or, for
+    // all Simmer can tell, the whole message — so it must not be sent again.
+    //
+    // The body is far larger than the socket buffers, so the write is still in
+    // progress when the downstream reads 16 bytes and closes: the write, not the
+    // reply read, is what fails.
+    let down = FakeDownstream::start(Script::with(|s| {
+        s.transactions = vec![
+            Turn::default(),
+            Turn {
+                drop_mid_data: Some(true),
+                ..Turn::default()
+            },
+        ];
+    }))
+    .await;
+    let cfg = config_with_pool(
+        down.addr,
+        "pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }",
+    )
+    .replace("max_message_bytes: 100000", "max_message_bytes: 33554432");
+    let simmer = Simmer::start(&cfg).await;
+
+    let mut client = simmer.connect().await;
+    client.hello().await;
+    let r = client
+        .deliver("a@oldbrand.com", "b@example.com", "Subject: 1\r\n\r\nb\r\n")
+        .await;
+    assert_eq!(r.code, 250, "message 1: {r:?}");
+
+    let line = format!("{}\r\n", "x".repeat(70));
+    let big = format!("Subject: 2\r\n\r\n{}", line.repeat(16 * 1024 * 1024 / 72));
+    let r = client
+        .deliver("a@oldbrand.com", "b@example.com", &big)
+        .await;
+    assert_eq!(r.code, 451, "never a 250 from a second attempt: {r:?}");
+
+    let since = second_mail_from(&down);
+    assert_eq!(
+        count_since(&down, "DATA", since),
+        1,
+        "message 2's body was offered exactly once: {:?}",
+        down.commands()
+            .iter()
+            .filter(|c| c.len() < 80)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(down.connections(), 1, "no retry connection was opened");
+    assert_eq!(
+        down.messages().len(),
+        1,
+        "only message 1 was ever delivered"
+    );
+}
+
+#[tokio::test]
+async fn a_timeout_on_a_reused_connection_is_not_retried() {
+    // D-068's second condition, on the connection where the retry is actually
+    // considered. A downstream slow enough to blow a stage budget is slow, not
+    // stale; retrying spends the budget twice and, on a fresh connection that
+    // answers promptly, would turn the slowness into a delivery the client was
+    // never going to get in time.
+    let down = FakeDownstream::start(Script::with(|s| {
+        s.transactions = vec![
+            Turn::default(),
+            Turn {
+                rcpt_to: Some(Act::Stall),
+                ..Turn::default()
+            },
+        ];
+    }))
+    .await;
+    let simmer = Simmer::start(&config_with_pool(
+        down.addr,
+        "pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }",
+    ))
+    .await;
+
+    let mut client = simmer.connect().await;
+    client.hello().await;
+    let r = client
+        .deliver("a@oldbrand.com", "b@example.com", "Subject: 1\r\n\r\nb\r\n")
+        .await;
+    assert_eq!(r.code, 250, "message 1: {r:?}");
+
+    client.send("MAIL FROM:<a@oldbrand.com>").await;
+    client.send("RCPT TO:<b@example.com>").await;
+    client.send("DATA").await;
+    assert_eq!(client.read_reply().await.code, 250);
+    assert_eq!(client.read_reply().await.code, 250);
+    assert_eq!(client.read_reply().await.code, 354);
+    client.send_raw(b"Subject: 2\r\n\r\nb\r\n.\r\n").await;
+    let r = client.read_reply().await;
+    assert_eq!(r.code, 451, "{r:?}");
+    assert!(r.contains("4.4.2"), "a timeout, reported as one: {r:?}");
+
+    let since = second_mail_from(&down);
+    assert_eq!(
+        count_since(&down, "MAIL FROM", since),
+        1,
+        "message 2 was attempted once: {:?}",
+        down.commands()
+    );
+    assert_eq!(down.connections(), 1, "no retry connection was opened");
+    assert_eq!(down.messages().len(), 1);
 }
 
 #[tokio::test]

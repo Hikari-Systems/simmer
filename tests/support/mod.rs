@@ -84,6 +84,24 @@ pub struct Script {
     /// late. It also holds the connection busy, which is what the pool-bound tests
     /// need to make concurrency observable from this side.
     pub final_dot_delay: Option<Duration>,
+    /// Per-transaction overrides, indexed by the transaction's position **on its
+    /// own connection** (0 is the first `MAIL FROM` a connection sees). A field
+    /// left `None` falls back to the connection-wide setting above.
+    ///
+    /// Per connection, not global, on purpose: it is what lets a test fail the
+    /// second message on a *reused* connection while the fresh connection a
+    /// retry would open behaves normally — the shape D-068's retry is about.
+    pub transactions: Vec<Turn>,
+}
+
+/// One transaction's overrides; see [`Script::transactions`].
+#[derive(Clone, Debug, Default)]
+pub struct Turn {
+    pub mail_from: Option<Act>,
+    pub rcpt_to: Option<Act>,
+    pub data: Option<Act>,
+    pub final_dot: Option<Act>,
+    pub drop_mid_data: Option<bool>,
 }
 
 impl Default for Script {
@@ -105,6 +123,7 @@ impl Default for Script {
             drop_mid_data: false,
             close_after_rset: false,
             final_dot_delay: None,
+            transactions: Vec::new(),
         }
     }
 }
@@ -129,14 +148,25 @@ pub struct Received {
     pub auth_seen: bool,
 }
 
+/// One command line as the downstream received it.
+#[derive(Clone, Debug)]
+pub struct Seen {
+    /// When the line was read.
+    pub at: std::time::Instant,
+    /// Which accepted connection it arrived on, numbered from 0 in accept order.
+    pub connection: usize,
+    pub line: String,
+}
+
 pub struct FakeDownstream {
     pub addr: SocketAddr,
     received: Arc<Mutex<Vec<Received>>>,
     /// TCP connections accepted, ever. §8.3's pool is only observable from the
     /// downstream's side as the difference between this and the message count.
     connections: Arc<Mutex<usize>>,
-    /// Every command line, across every connection, in order.
-    commands: Arc<Mutex<Vec<String>>>,
+    /// Every command line, across every connection, in order, with when and
+    /// on which connection it arrived.
+    commands: Arc<Mutex<Vec<Seen>>>,
     /// Connections open right now, and the most ever open at once. §8.3's bound
     /// is a claim about *concurrent* connections, which the lifetime count above
     /// cannot see.
@@ -164,7 +194,11 @@ impl FakeDownstream {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
-                *counter.lock().expect("not poisoned") += 1;
+                let id = {
+                    let mut n = counter.lock().expect("not poisoned");
+                    *n += 1;
+                    *n - 1
+                };
                 let now = open.fetch_add(1, Ordering::SeqCst) + 1;
                 most.fetch_max(now, Ordering::SeqCst);
                 let script = script.clone();
@@ -172,7 +206,7 @@ impl FakeDownstream {
                 let log = Arc::clone(&log);
                 let open = Arc::clone(&open);
                 tokio::spawn(async move {
-                    let _ = serve_one(stream, script, sink, log).await;
+                    let _ = serve_one(stream, id, script, sink, log).await;
                     open.fetch_sub(1, Ordering::SeqCst);
                 });
             }
@@ -205,7 +239,21 @@ impl FakeDownstream {
 
     /// Every command line seen, across every connection.
     pub fn commands(&self) -> Vec<String> {
+        self.timed_commands().into_iter().map(|c| c.line).collect()
+    }
+
+    /// Every command line seen, with its arrival time and connection.
+    pub fn timed_commands(&self) -> Vec<Seen> {
         self.commands.lock().expect("not poisoned").clone()
+    }
+
+    /// The command lines seen on one connection (0 is the first accepted).
+    pub fn commands_on(&self, connection: usize) -> Vec<String> {
+        self.timed_commands()
+            .into_iter()
+            .filter(|c| c.connection == connection)
+            .map(|c| c.line)
+            .collect()
     }
 
     pub fn command_count(&self, verb: &str) -> usize {
@@ -235,12 +283,20 @@ impl FakeDownstream {
 
 async fn serve_one(
     stream: TcpStream,
+    connection: usize,
     script: Script,
     sink: Arc<Mutex<Vec<Received>>>,
-    log: Arc<Mutex<Vec<String>>>,
+    log: Arc<Mutex<Vec<Seen>>>,
 ) -> std::io::Result<()> {
     let mut io = BufReader::new(stream);
     let mut seen = Received::default();
+    // Which transaction on this connection is in progress: bumped at each
+    // `MAIL FROM`, so the first is 0. See `Script::transactions`.
+    let mut transaction: Option<usize> = None;
+    let turn = |t: Option<usize>| -> Turn {
+        t.and_then(|i| script.transactions.get(i).cloned())
+            .unwrap_or_default()
+    };
 
     macro_rules! act {
         ($a:expr, $default:expr) => {
@@ -265,7 +321,11 @@ async fn serve_one(
         }
         let line = line.trim_end_matches(['\r', '\n']).to_string();
         let upper = line.to_ascii_uppercase();
-        log.lock().expect("not poisoned").push(line.clone());
+        log.lock().expect("not poisoned").push(Seen {
+            at: std::time::Instant::now(),
+            connection,
+            line: line.clone(),
+        });
 
         if upper.starts_with("EHLO") {
             seen.ehlo_seen = true;
@@ -309,14 +369,22 @@ async fn serve_one(
                 .split_once('>')
                 .map(|(_, t)| t.trim().to_string())
                 .unwrap_or_default();
-            act!(script.mail_from, "250 2.1.0 sender ok\r\n");
+            transaction = Some(transaction.map_or(0, |t| t + 1));
+            let a = turn(transaction)
+                .mail_from
+                .unwrap_or(script.mail_from.clone());
+            act!(a, "250 2.1.0 sender ok\r\n");
         } else if upper.starts_with("RCPT TO") {
             if let Some(r) = between(&line, '<', '>') {
                 seen.recipients.push(r);
             }
-            act!(script.rcpt_to, "250 2.1.5 recipient ok\r\n");
+            let a = turn(transaction).rcpt_to.unwrap_or(script.rcpt_to.clone());
+            act!(a, "250 2.1.5 recipient ok\r\n");
         } else if upper.starts_with("DATA") {
-            match &script.data {
+            let t = turn(transaction);
+            let final_dot = t.final_dot.unwrap_or(script.final_dot.clone());
+            let drop_mid_data = t.drop_mid_data.unwrap_or(script.drop_mid_data);
+            match &t.data.unwrap_or(script.data.clone()) {
                 Act::Ok => write(&mut io, "354 send it\r\n").await?,
                 other => {
                     act!(other, "");
@@ -324,7 +392,7 @@ async fn serve_one(
                 }
             }
 
-            if script.drop_mid_data {
+            if drop_mid_data {
                 // Read a little, then vanish — §12.3's "drop mid-DATA".
                 let mut scratch = [0u8; 16];
                 let _ = io.read(&mut scratch).await;
@@ -349,13 +417,13 @@ async fn serve_one(
             // Record *before* replying. Simmer answers its own client as soon as
             // this reply lands, so a test that asserts on `messages()` right
             // after a 250 would otherwise race the push and flake.
-            if matches!(script.final_dot, Act::Ok) {
+            if matches!(final_dot, Act::Ok) {
                 sink.lock().expect("not poisoned").push(seen.clone());
             }
             if let Some(delay) = script.final_dot_delay {
                 tokio::time::sleep(delay).await;
             }
-            act!(script.final_dot, "250 2.0.0 queued as ABC123\r\n");
+            act!(final_dot, "250 2.0.0 queued as ABC123\r\n");
             seen = Received::default();
         } else if upper.starts_with("QUIT") {
             write(&mut io, "221 2.0.0 bye\r\n").await?;

@@ -4964,6 +4964,42 @@ the generator's extra headers now include obsolete-spaced `Subject`,
 proptest's minimal case was `"From : jane@oldbrand.com\r\n\r\n"`.
 
 
+### D-103 — D-068's retry conditions, tested where the retry is actually considered
+
+> Phase 0 (groundwork) of the segment rate-limit/spool plan, 2026-10-03.
+> Tests and harness only; no behaviour change.
+
+**The gap.** `tests/pool.rs` `the_retry_does_not_resend_past_the_final_dot` runs on
+a *fresh* connection, where `client::relay` never considers a retry, so it passed
+whatever `is_stale_connection` said. The "never at `FinalDot`" and "not a timeout"
+conditions had no test that could fail.
+
+**What was found on the way.** A drop *after* the terminating dot does not reach
+the retry at all: `Connection::deliver` maps a protocol error or timeout on the
+final-dot read to `RelayError::Ambiguous` first, and `Ambiguous` is not a
+`Protocol` error. The case the `!= FinalDot` condition decides is a connection
+that dies while the **body is being written** (`write_bytes(.., Stage::FinalDot,
+..)`): that surfaces as `Protocol(FinalDot, _)`, and without the condition it
+would be retried — a downstream that read part or all of the body sees it twice.
+Both are now pinned, and the comment in `relay` stays accurate.
+
+**Harness.** `tests/support::Script::transactions` scripts each transaction by its
+position *on its own connection* (`Turn`), so a test can fail message 2 on a reused
+socket while the fresh socket a retry would open behaves normally. Every command
+line is recorded with its arrival `Instant` and connection number
+(`FakeDownstream::timed_commands`, `commands_on`); `commands()` is unchanged.
+
+**Tested** (`tests/pool.rs`):
+- `a_drop_after_the_final_dot_on_a_reused_connection_is_not_retried` — 451
+  "delivery unknown", exactly one `DATA` for message 2, one connection.
+- `a_body_write_failure_on_a_reused_connection_is_not_retried` — a 16 MiB body,
+  the downstream reads 16 bytes and closes; exactly one `DATA`, one connection.
+  **Fails** with the `FinalDot` condition removed (checked, then restored).
+- `a_timeout_on_a_reused_connection_is_not_retried` — `RCPT TO` stalls on message
+  2; 451 4.4.2, one `MAIL FROM`, one connection. **Fails** if timeouts are made
+  retryable (checked, then restored).
+
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
