@@ -1679,8 +1679,7 @@ Optional, off unless `telemetry` is configured with a non-empty `endpoint` and n
   §5.8 source, the selected route, domain group, day index and thread pin, with children
   `simmer.route` (the chain walk and every link's skip reason), `simmer.rewrite`,
   `smtp.downstream` (a client span: the downstream's reply code, stage and outcome class, and
-  whether §8.3's one retry happened) `simmer.quota.resolve` (§7.4 phase 3) and, after a commit, `simmer.quota.usage` (the row read
-back for §9.1's gauges). A `4xx` or `5xx`
+  whether §8.3's one retry happened) and `simmer.quota.resolve` (§7.4 phase 3). *(Amended — a `simmer.quota.usage` span over a post-commit read of the row was removed with the read itself; the gauges it fed are refreshed on scrape and on the export interval. See `DECISIONS.md` D-128.)* A `4xx` or `5xx`
   final reply marks the transaction and relay spans as errors. Also: one `simmer.preflight` span
   per §6.7 pass, one `admin.request` per §9.2–§9.4 request except `/health`, `/healthcheck`
   and `/metrics`, and one `link_proxy.request` per §5.7 request.

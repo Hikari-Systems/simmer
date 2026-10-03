@@ -5814,6 +5814,28 @@ depth at all. It now calls `admin::spool::refresh_gauges` too.
 downstream text (only codes), and no webhook URL. `tests/telemetry.rs` checks
 the spool's two traces, their join, and that neither names the recipient.
 
+### D-128 — No read-back of the quota row on the message path
+
+> 2026-10-03, from SOAK.md §20's burst run.
+
+After every commit the relay read the usage row back to set
+`simmer_quota_committed` and `simmer_quota_reserved` — the "gauge only written
+by a relayed message" that D-056 replaced with a refresh on every scrape, and
+that D-126 then gave a span (`simmer.quota.usage`) because §18 caught it taking
+430 ms. Both refreshes exist now — `/metrics` and the OTLP gauge task — so the
+read only ever bought a fresher value between scrapes, and it cost a lock wait
+on the client's time. On SQL Server a read under the default isolation queues
+behind every writer of the row: §20's burst run, with ~70 msg/s steered onto
+one route's row, spent **54 ms p50 and 168 ms p99** of each steered message
+there, against 1 ms for messages on an uncontended row. It is gone, with its
+span; `tests/telemetry.rs` and `tests/telemetry_compose.rs` assert the tree
+without it.
+
+What it does not fix, and §20 records: every reserve and commit of one
+`(ramp, route, domain_group, day)` row still serialises on that row's lock
+(§7.4 — the lock is what makes the count correct). A burst steered onto one
+route queues there, rate limit or not.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

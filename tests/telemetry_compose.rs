@@ -143,7 +143,7 @@ fn attr(obj: &Value, key: &str) -> Option<String> {
 }
 
 /// Every span one relayed message produces.
-const TREE: [&str; 8] = [
+const TREE: [&str; 7] = [
     "smtp.session",
     "smtp.transaction",
     "simmer.relay",
@@ -151,7 +151,6 @@ const TREE: [&str; 8] = [
     "simmer.rewrite",
     "smtp.downstream",
     "simmer.quota.resolve",
-    "simmer.quota.usage",
 ];
 
 #[test]
@@ -219,12 +218,7 @@ fn a_relayed_message_reaches_the_collector_as_traces_metrics_and_logs() {
     let session = by_name("smtp.session");
     let tx = by_name("smtp.transaction");
     let down = by_name("smtp.downstream");
-    for name in [
-        "simmer.route",
-        "simmer.rewrite",
-        "simmer.quota.resolve",
-        "simmer.quota.usage",
-    ] {
+    for name in ["simmer.route", "simmer.rewrite", "simmer.quota.resolve"] {
         assert_eq!(
             by_name(name)["parentSpanId"],
             relay["spanId"],

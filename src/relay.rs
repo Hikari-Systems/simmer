@@ -977,39 +977,12 @@ async fn attempt_inner(
             error = %e,
             "failed to resolve the quota reservation; ramp accounting may be short"
         );
-    } else if outcome.commit {
-        // §9.1 gauges, from the row we just moved.
-        if let Ok(usage) = store
-            .usage(
-                &selected.reservation.ramp,
-                &selected.reservation.route,
-                &selected.reservation.domain_group,
-                selected.reservation.day_index,
-            )
-            // A read of the row other instances are locking, on the client's
-            // time: its own span, so a trace shows it rather than a gap after
-            // `simmer.quota.resolve` (D-126).
-            .instrument(tracing::info_span!(
-                "simmer.quota.usage",
-                otel.name = "simmer.quota.usage",
-                correlation_id,
-            ))
-            .await
-        {
-            metrics::quota_committed(
-                &selected.route.ramp,
-                &selected.route.name,
-                &selected.domain_group,
-                usage.committed as f64,
-            );
-            metrics::quota_reserved(
-                &selected.route.ramp,
-                &selected.route.name,
-                &selected.domain_group,
-                usage.reserved as f64,
-            );
-        }
     }
+    // No read-back of the row for §9.1's committed/reserved gauges here: they
+    // are refreshed from storage on every scrape and every OTLP export
+    // interval (D-056, D-126), and the read cost a lock wait on the client's
+    // time — on SQL Server a read queues behind every writer of that row, which
+    // under a burst steered onto one route was ~54 ms p50 per message (D-128).
 
     metrics::message(
         &selected.route.ramp,

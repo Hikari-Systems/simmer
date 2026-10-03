@@ -177,8 +177,12 @@ async fn a_delivered_message_is_one_trace_from_session_to_quota() {
     let rewrite = named(&trace, "simmer.rewrite");
     let down = named(&trace, "smtp.downstream");
     let resolve = named(&trace, "simmer.quota.resolve");
-    // The post-commit read for the §9.1 gauges (D-126, docs/SOAK.md §18).
-    let usage = named(&trace, "simmer.quota.usage");
+    // D-128: no post-commit read of the row any more; the gauges are
+    // refreshed on scrape and on the export interval.
+    assert!(
+        !trace.iter().any(|s| s.name == "simmer.quota.usage"),
+        "the message path reads no gauge row back"
+    );
 
     assert!(child_of(tx, session), "transaction under the session");
     assert!(child_of(relay, tx), "relay under the transaction");
@@ -187,14 +191,13 @@ async fn a_delivered_message_is_one_trace_from_session_to_quota() {
         ("simmer.rewrite", rewrite),
         ("smtp.downstream", down),
         ("simmer.quota.resolve", resolve),
-        ("simmer.quota.usage", usage),
     ] {
         assert!(child_of(span, relay), "{name} under simmer.relay");
     }
 
     // stdout shows only the innermost span's fields, so every child of the
     // relay carries the id itself — that is what puts it on the outcome lines.
-    for span in [walk, rewrite, down, resolve, usage] {
+    for span in [walk, rewrite, down, resolve] {
         assert_eq!(
             attr_str(span, "correlation_id").as_deref(),
             Some(id.as_str()),

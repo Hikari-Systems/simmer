@@ -650,8 +650,7 @@ telemetry:
     - `simmer.rewrite`;
     - `smtp.downstream`: the downstream's code, stage and outcome, and whether
       the pooled-connection retry happened;
-    - `simmer.quota.resolve`, and after a commit `simmer.quota.usage`, the
-      row read back for the quota gauges.
+    - `simmer.quota.resolve`, the commit or release.
   - Also `simmer.preflight`, `admin.request` and `link_proxy.request` spans.
   - A deferred or rejected message is an error span.
 - **Metrics.** The same §9.1 series as `/metrics`, same names and labels, sent
