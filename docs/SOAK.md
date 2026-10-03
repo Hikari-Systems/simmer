@@ -2241,3 +2241,97 @@ land the claim fix and D-127 first. It gave no verdict and is not counted.
 - **Whether `je_retained`'s path matters.** Two hours with the same ceiling and
   opposite slopes say it does not trend; a longer run would say whether it
   plateaus.
+
+## 20. The rate limit under load — even arrivals, then bursts (SQL Server, export on, 30 minutes each)
+
+### What was run
+
+Two half-hours on `main` at `c7db2d2`, §19's stack and script (the SQL Server
+build against Express, OTLP export on both instances, jemalloc's counters, not a
+published build), with D-111's rate added to `warming-newbrand` by a temporary
+edit to `test/config/simmer.soak.yaml`, reverted after:
+
+```yaml
+rate:
+  schedule: { default: [36000] }   # 10 msg/s, one bucket for both instances
+  burst: 20
+  on_limit: steer
+```
+
+Both instances offer ~20 msg/s together against that 10, so about half is
+steered to `overflow-established` on every message. The second run reshapes the
+same mean load with `SOAK_ARRIVAL=bursts:30s:90s` — loadgen's new `--arrival`:
+Poisson arrivals at four times the mean for 30 s, then 90 s of silence, so a
+combined ~80 msg/s surge against the limit of 10.
+
+During each run `target/soak-tools/poll-warming.sh` read both instances'
+`simmer_messages_total{route="warming-newbrand",result="delivered"}` every 5 s,
+and `check-rate.py` checked GCRA's promise over every window: **at most
+W × rate + burst sent in any window W**, summed across the instances. Artefacts:
+`target/soak-runs/2026-10-03-c7db2d2-mssql-otel-je-rate-30m` and
+`…/2026-10-03-rate-bursts-mssql-otel-je-30m`.
+
+### The limit held, both ways
+
+| worst window | even arrivals | bursts | allowed (W × 10/s + 20) |
+|---|---|---|---|
+| 10 s | 105 in 9.9 s | 64 in 5.1 s (12.4/s) | 119 / 71 |
+| 30 s | 303 in 29.6 s | 270 in 25.7 s | 316 / 277 |
+| 60 s | 615 in 59.8 s | 407 in 57.3 s | 618 / 593 |
+| 300 s | 3,005 in 299.9 s | 1,098 in 299.5 s | 3,019 / 3,015 |
+
+Inside the strict bound every time, without the poll's slack. Under bursts the
+10-second window briefly exceeds 10/s — the burst allowance of 20 spent at the
+start of a surge — and the 30-second window is already back at the limit. The
+warming route averaged 9.67/s with even arrivals and 2.77/s in bursts, where it
+can only send during the surges. Nothing was lost: 18,010 of 18,010 accepted per
+instance in both runs, none deferred, refused or failed; every steered message
+was delivered by overflow (30,867 of them in the burst run). Memory,
+descriptors and threads were back at baseline at rest; the slope gates are
+inconclusive at 30 minutes, as they always are. The export was complete
+(257,156 spans each run, none refused).
+
+### What bursts cost: a hot row, on SQL Server
+
+| | p50 | p99 | max | over 200 ms |
+|---|---|---|---|---|
+| §19, no rate, even | 21.9 / 23.5 ms | 74.4 / 65.0 ms | 448 / 428 ms | 1 / 1 |
+| rate, even | 32.6 / 33.7 ms | 86.5 / 81.1 ms | 242 / 270 ms | 2 / 1 |
+| rate, bursts | 127.5 / 129.6 ms | 2,427 / 2,308 ms | 9,247 / 10,884 ms | 7,332 / — |
+
+With even arrivals the rate costs ~11 ms at p50: one more short transaction per
+message on the bucket's row. The burst numbers are two things, and the traces
+separate them. About half of the slowest message's 9.2 s was spent **inside
+loadgen**, waiting for one of its 16 session slots during the surge — latency is
+measured from the scheduled send, so that queue counts, as it should. The rest
+was the database. Across 31,000 traced messages in the burst run:
+
+| ms, p50 / p99 | `simmer.relay` | `simmer.route` | `quota.resolve` | `quota.usage` | downstream |
+|---|---|---|---|---|---|
+| rate-limited, sent on warming (4,477) | 34 / 251 | 20 | 10 | 1.1 | 1.0 |
+| steered to overflow (25,212) | 198 / 711 | 64 | 69 | 54 | 1.0 |
+
+The limited route is fast. The steered messages are slow, and they are slow on
+`overflow-established`'s one quota row — every reserve and commit of it
+serialises on its lock (§7.4), ~70 a second during a surge — and on SQL
+Server's locking reads: `simmer.quota.usage`, the gauge read after the commit,
+waited 54 ms for writers it had no reason to wait for. So the rate limit does
+not cause the cost; it concentrates a burst onto one route, and that route's row
+is where the cost was always going to be. A burst with no rate would queue on
+`warming-newbrand`'s row instead.
+
+**Fixed after this run:** the gauge read is gone from the message path (D-128);
+the gauges were already refreshed on scrape and on the export interval.
+
+### Not established
+
+- **A burst with no rate**, which would put the hot row on the warming route and
+  show the cost is §7.4's, not D-111's.
+- **Postgres under the same bursts**, where reads do not wait for writers.
+- **`READ_COMMITTED_SNAPSHOT` on SQL Server**, which would stop every read on
+  the message path waiting for writers. A database-level setting; not tried.
+- **Loadgen's share at higher concurrency.** 16 sessions is the soak's
+  standard; a burst run with more would show Simmer's latency with less of the
+  client's queue in it.
+- **`je_allocated`** rose +1.6 MiB/h in the even run and +0.1–0.3 MiB/h under
+  bursts, over half an hour each; too short to say more than §19 did.
