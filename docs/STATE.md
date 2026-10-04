@@ -1,7 +1,7 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-09-25, at release `v0.9.0`.** (The previous snapshots were
-2026-09-24 at `v0.8.0`, 2026-09-23 at `v0.7.2` and `v0.7.1`, 2026-09-22 at `v0.7.0`, 2026-09-21 at `v0.6.0`, 2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
+**Snapshot taken 2026-10-04, at release `v0.10.0`.** (The previous snapshots were
+2026-09-25 at `v0.9.0`, 2026-09-24 at `v0.8.0`, 2026-09-23 at `v0.7.2` and `v0.7.1`, 2026-09-22 at `v0.7.0`, 2026-09-21 at `v0.6.0`, 2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
 numbers are the `v0.6.0` run; what was verified for `v0.4.0` and `v0.5.0` is
 stated there separately. This is a session-handover document, not a
 maintained one: `README.md` describes the service, `DECISIONS.md` records why it is
@@ -28,7 +28,9 @@ put to the spec's author and recorded rather than assumed:
 | **D-096** — the `-mssql` image goes arm64 | tiberius was never the blocker — it is pure Rust and the Dockerfile already carried OpenSSL on both stages. The gate was: Microsoft publishes no arm64 SQL Server (verified against the registry; every 2025 tag is a single-platform amd64 manifest). The arm64 leg runs against Azure SQL Edge — same engine, multi-arch, retired 2025-09-30 — verified at **1054 passed, 0 failed** before adopting. Babelfish rejected: it accepts and ignores table hints, so `UPDLOCK, SERIALIZABLE` would pass while not serialising |
 | **D-097** — `share: auto` | The partial ramp computes its own share, per `(route, domain_group)`, from how full the day's cap is and how far through the ramp day it is: `clamp(floor, ceiling, (cap_left / window_left) ^ gain)`. `fill_by` under 1 aims the fill at a deadline earlier than the day boundary, because simmer cannot delay a message and so cannot rely on later traffic existing; `tail.below` releases the last of the cap, which a floor cannot do. Costs one non-locking `SELECT` per message per auto route. Asked for by the spec's author; `SPEC.md` amended 2026-09-24 (§3.2 step 3c′, §4.1, §4.2, §7.2, §9.2, §9.4) |
 | **D-100** — domain groups by MX (released in `v0.9.0`) | A domain no group lists literally joins the group whose `mx` suffix matches its lowest-preference MX host, so a Workspace company domain counts against `google`. Came from ramp #2, where Google refused Workspace domains too. A failed lookup, or one over 2 s, falls back to the catch-all and never defers mail. **Verified:** unit and validation tests; full suites (Postgres 1254 passed, SQL Server 1095 passed); one live-DNS check by hand; on a local stack, a dry run where holding `google` at 0 also held a Workspace domain, and the acceptance stack's day-0 split (5 warming, 1 overflow) over real SMTP. **Not verified:** `cargo test --test acceptance` itself (it cannot run from the jail), and a deployed dry run. `SPEC.md` amended 2026-09-25 (§3.1, §3.2 step 2, §4.1, §4.2, §9.1, §9.4, §14 item 3) |
-| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp), `v0.7.0` (`/metrics` opt-in; allocator counters; no `unsafe`), `v0.7.1` (the SMTP-smuggling fix), `v0.7.2` (the `-mssql` image on arm64), `v0.8.0` (the computed share), `v0.9.0` (named ramps, D-099; MX domain grouping, D-100 — breaking: config, admin paths, metric labels and schema) |
+| **D-101 – D-110** — hardening and groundwork (released in `v0.10.0`) | Phase 0 of the segment rate-limit/spool plan, landed on `main` without the rate limits or spool themselves (those stay on `feature/segment-rate-limits-and-spool`, which numbers its own decisions from D-111 and will need renumbering). **Fixes:** every reply write is bounded by `timeouts.command`, so a client that never reads cannot hold a session permit forever (D-101); obsolete `From : x` is the From field, so `set_headers` replaces it rather than appending a second and §6.5's strip no longer misses `DKIM-Signature :` or `X-Simmer-Ramp :` (D-102); a `cancel()` with no waiter yet is stored (D-105); §10.4's hard stop no longer drops a relay past the final dot, and shutdown awaits session tasks before `release_outstanding` (D-106); a non-ASCII `MAIL`/`RCPT` keyword is a syntax error rather than a panic. **Truthfulness:** `fail_closed: false`'s log line now says the message is refused, not sent unenforced; what it *should* do is O-19 (D-107). **CI:** GHCR's `latest`/`latest-mssql` move only from `main` (D-104). **Refactors, no behaviour change:** D-068's retry conditions pinned on a reused connection (D-103); the clock read once per message (D-108); one ordered `CHECKS` list behind the walk, dry run and early check (D-109); an owned hand-off at the final dot — **not a spool** (D-110) |
+| **D-111** — optional OTLP export (released in `v0.10.0`) | Traces, metrics and logs over OTLP/gRPC, configured by an optional top-level `telemetry:` block and **off** when absent, `enabled: false`, or `endpoint` empty. Observes only: no trace context enters relayed mail or link-proxy requests (§1.1), and nothing on the message path waits on an export — measured with the collector stopped. Metrics keep §9.1's names; temporality is delta by default after §18's soak found the SDK holding every unmatched-sender series. **Applies with telemetry off too:** JSON log lines carry the innermost span's fields (so `correlation_id` now reaches the downstream-outcome lines), and a downstream's reply text is logged with address local parts redacted. **Verified:** unit, config and in-memory-exporter tests, both builds; the full §12.3 suite with the collector in the stack; the T4 soak on SQL Server with export on (`docs/SOAK.md` §18, leak gates green). **Not verified:** T3 with export on, a TLS endpoint, a real vendor. Asked for by the spec's author; `SPEC.md` amended 2026-10-02 (§4.1, §4.2, §9.1, §9.5, §9.6 new, §12.1, §12.3, §13) |
+| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp), `v0.7.0` (`/metrics` opt-in; allocator counters; no `unsafe`), `v0.7.1` (the SMTP-smuggling fix), `v0.7.2` (the `-mssql` image on arm64), `v0.8.0` (the computed share), `v0.9.0` (named ramps, D-099; MX domain grouping, D-100 — breaking: config, admin paths, metric labels and schema), `v0.10.0` (OTLP export, D-111; the D-101 – D-110 fixes) |
 
 ---
 
@@ -659,7 +661,7 @@ measurement rather than this table.
 
 ## 5. Decisions on record
 
-90 entries, `D-001` to `D-090`. The ones a new reader most needs:
+111 entries, `D-001` to `D-111`. The ones a new reader most needs:
 
 | | |
 |---|---|
@@ -677,6 +679,9 @@ measurement rather than this table.
 | **D-088** | The capture flushes on ten lines or 500 ms of quiet, and each flush reports its bytes to the disk gauge. |
 | **D-089** | `header_rewrites`: a regex over a named header's decoded value. Never on an identity field; stable or fatal. |
 | **D-090** | **Thread affinity.** A reply pins the route whose `Message-ID:` domain it refers to. The pinned route alone skips §7.3's threshold and, once its cap is met, is reserved **past** it — counted, the ceiling unchanged. The only exception to §7.4's "overshoot is not acceptable". |
+| **D-106** | §10.4's hard stop is observed only at waits on the client. A relay in flight finishes and its client gets the real reply, then `421`; shutdown awaits every session before releasing reservations. Can lengthen shutdown by one relay's budget. |
+| **D-110** | The session hands the relay an **owned** message. Nothing stores or reads one back — CLAUDE.md's first and eighth rules hold. |
+| **D-111** | Optional OTLP export. Observe, never alter; off unless configured; `RUST_LOG` cannot reach the export filter. |
 | **D-034** | An unknown template variable is a fatal startup error — a §4.2 rule the spec does not list. |
 | **D-035** | The null sender is never rewritten, so a bounce stays a bounce. |
 | **D-036** | **`SPEC.md` §4.1's example configuration fails `SPEC.md` §4.2.** A finding for the spec's author; `simmer.yaml` was corrected instead. |
@@ -789,9 +794,16 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
 - **`fail_closed`** — the `451 4.3.0` reply is unit-tested, but no test drives it
   with an actually-unreachable database.
 - **§10.4 under a real `SIGTERM`** — `release_by_ids`, the registry and
-  `Pool::drain` are each tested directly; the wiring in `main` that orders them is
-  exercised only by `docker compose kill -s SIGTERM`, which was done for phase 10
-  and is recorded above.
+  `Pool::drain` are each tested directly, and since D-106
+  `support::Simmer::hard_stop` runs `main`'s order (hard stop, await sessions,
+  release) in `tests/smtp_ingress.rs`. A real signal is still exercised only by
+  `docker compose kill -s SIGTERM`, done for phase 10 and recorded above.
+- **D-111's export is unverified against TLS, a real vendor, and T3.** Every run
+  so far exported plaintext gRPC to the contrib collector in the test stack.
+- **The SDK still honours three `OTEL_EXPORTER_OTLP_*` variables** (headers,
+  compression, insecure) despite D-111's "the YAML is the configuration".
+  Closing it means building the tonic channel by hand; the shipped image sets
+  none of them.
 - **The pool's bound under real concurrency.** The saturation test uses one permit
   and two sessions. Nothing drives sixteen sessions at four permits and asserts the
   count never exceeded four — the invariant is enforced by the semaphore and
@@ -874,6 +886,23 @@ Not bugs — scope that has not been reached, or coverage deliberately deferred.
   was written for exactly this and only failed when the full suite ran the server
   hard enough to widen the window.
 
+**Five fixed at `v0.10.0`** — each a D-081-shaped bound or a §1.1/§9.5 leak
+found while laying groundwork, not reported from the field:
+
+- **A client that never reads held its session permit forever** (D-101). Writes
+  had no bound; one such peer per slot denied service.
+- **`From : x` slipped past the rewrite** (D-102): two `From:` fields left, the
+  old identity among them, and a `DKIM-Signature :` or `X-Simmer-Ramp :` could
+  reach a downstream. The §6.6 proptest's minimal case was a single such line.
+- **The hard stop could drop a relay past the final dot** (D-106) — F2 again,
+  which D-081 had fixed only for `timeouts.session` — and shutdown's release
+  raced sessions still committing.
+- **A cancel before any waiter was lost** (D-105), so a SIGTERM during startup
+  might not stop the process.
+- **A downstream's reply text was logged verbatim** (D-111), recipient included,
+  at `INFO`. Now redacted to `<*@domain>` in logs; the client's own reply is
+  unchanged.
+
 **Open, and not defects so much as measured limits:**
 
 - **The one-hour memory gate cannot resolve a small leak.** `docs/SOAK.md` §10's
@@ -908,7 +937,11 @@ login runs. Four tests pin it. See `DECISIONS.md` D-066.
 **Phase 11 closed the one scheduled item below**, and `SPEC.md` is amended to match
 (D-070, D-071). O-16 and O-17 were answered on 2026-09-21 and the spec amended for
 each (D-089, D-090). Still open with the author: O-14 and O-15, both "amend, or
-stay a recorded divergence" questions with a working answer in place.
+stay a recorded divergence" questions with a working answer in place, and **O-19**
+(D-107) — what `database.fail_closed: false` should do. Today it refuses as an
+exhausted chain, which under a ramp's `exhausted_chain_reply: "550"` answers a
+*database outage* with a permanent `550` — §14.1's forbidden case, reachable only
+by two non-default settings together.
 
 A dependency note from the same day: `chacha20 0.10.1`, reached through
 `hickory-resolver`'s `rand`, was yanked upstream after 2026-08-11, so
@@ -979,8 +1012,11 @@ Committed so far:
 
 Since phase 11 the history is one commit per change, each a `Feature:`, `Fix:`,
 `Tests:`, `Docs:` or `Spec:` commit, with `release: X.Y.Z` commits between. The
-most recent: `Feature: header_rewrites …` (D-089), `release: 0.4.0`, `Spec: amend
-for header_rewrites …`, then thread affinity (D-090) and `release: 0.5.0`.
+most recent: `Feature: optional OTLP export …` (D-111, then renumbered twice —
+D-101 → D-126 → D-111 — to make room for and then step back from the
+rate-limit branch's numbers), the D-101 – D-110 groundwork, and
+`release: 0.10.0`. The rate limits and spool are on
+`feature/segment-rate-limits-and-spool`, not `main`.
 Releases are tagged; the tag is pushed only after `build.yml` is green on the
 tagged commit.
 
