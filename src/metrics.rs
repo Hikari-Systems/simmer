@@ -139,7 +139,8 @@ fn describe() {
     );
     describe_counter!(
         "simmer_downstream_errors_total",
-        "Downstream failures by route and error class (§9.1)"
+        "Downstream failures by route, downstream (default, or the group whose \
+         downstream_overrides entry was used — D-112) and error class (§9.1)"
     );
     describe_counter!(
         "simmer_downstream_config_error_total",
@@ -186,7 +187,8 @@ fn describe() {
     describe_histogram!(
         "simmer_downstream_latency_seconds",
         Unit::Seconds,
-        "Time from opening the downstream connection to its reply at the final dot"
+        "Time from opening the downstream connection to its reply at the final dot, \
+         by route and downstream (default, or an override's group — D-112)"
     );
     describe_counter!(
         "simmer_connections_refused_total",
@@ -256,7 +258,8 @@ fn describe() {
     );
     describe_gauge!(
         "simmer_pool_connections",
-        "Downstream connections this process holds for a route (§8.3), by state: \
+        "Downstream connections this process holds for a route's downstream (§8.3; \
+         default, or an override's group — D-112), by state: \
          active is checked out for a message, idle is waiting to be reused. \
          active pinned at max_connections means sessions are queueing for one"
     );
@@ -493,10 +496,16 @@ impl MessageResult {
     }
 }
 
-/// §9.1 `simmer_downstream_errors_total{route,class}`.
-pub fn downstream_error(ramp: &str, route: &str, class: &'static str) {
-    counter!("simmer_downstream_errors_total", "ramp" => ramp.to_string(), "route" => route.to_string(), "class" => class)
-        .increment(1);
+/// §9.1 `simmer_downstream_errors_total{route,downstream,class}`. `downstream` is
+/// `default` or the group whose override was used (D-112): config-defined, so
+/// bounded.
+pub fn downstream_error(ramp: &str, route: &str, downstream: &str, class: &'static str) {
+    counter!(
+        "simmer_downstream_errors_total",
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
+        "downstream" => downstream.to_string(), "class" => class,
+    )
+    .increment(1);
 }
 
 /// D-008 `simmer_downstream_config_error_total{route,stage}`.
@@ -504,11 +513,11 @@ pub fn downstream_error(ramp: &str, route: &str, class: &'static str) {
 /// The signal that catches the §6.5 provisioning risk — a downstream rejecting
 /// our envelope sender because provider domain authentication is unfinished —
 /// which is otherwise completely invisible in the mail flow. **Alert on this.**
-pub fn downstream_config_error(ramp: &str, route: &str, stage: &'static str) {
+pub fn downstream_config_error(ramp: &str, route: &str, downstream: &str, stage: &'static str) {
     counter!(
         "simmer_downstream_config_error_total",
         "ramp" => ramp.to_string(), "route" => route.to_string(),
-        "stage" => stage,
+        "downstream" => downstream.to_string(), "stage" => stage,
     )
     .increment(1);
 }
@@ -612,10 +621,15 @@ pub fn mx_lookup(result: &'static str) {
     counter!("simmer_mx_lookups_total", "result" => result).increment(1);
 }
 
-/// §9.1 `simmer_downstream_latency_seconds{route}` — a histogram in phase 7.
-pub fn downstream_latency(ramp: &str, route: &str, seconds: f64) {
-    metrics::histogram!("simmer_downstream_latency_seconds", "ramp" => ramp.to_string(), "route" => route.to_string())
-        .record(seconds);
+/// §9.1 `simmer_downstream_latency_seconds{route,downstream}` — a histogram in
+/// phase 7; `downstream` as for [`downstream_error`] (D-112).
+pub fn downstream_latency(ramp: &str, route: &str, downstream: &str, seconds: f64) {
+    metrics::histogram!(
+        "simmer_downstream_latency_seconds",
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
+        "downstream" => downstream.to_string(),
+    )
+    .record(seconds);
 }
 
 /// Connections refused before a session began: outside `allowed_cidrs` (§5.1) or
@@ -748,11 +762,17 @@ pub fn tasks_alive(n: usize) {
 /// from one that has not been opened yet, and the difference between "four active"
 /// and "four permits gone" is the difference between a busy downstream and a
 /// stuck one.
-pub fn pool_connections(ramp: &str, route: &str, state: &'static str, count: f64) {
+pub fn pool_connections(
+    ramp: &str,
+    route: &str,
+    downstream: &str,
+    state: &'static str,
+    count: f64,
+) {
     metrics::gauge!(
         "simmer_pool_connections",
         "ramp" => ramp.to_string(), "route" => route.to_string(),
-        "state" => state,
+        "downstream" => downstream.to_string(), "state" => state,
     )
     .set(count);
 }
@@ -764,9 +784,13 @@ pub fn pool_connections(ramp: &str, route: &str, state: &'static str, count: f64
 /// client sees a normal `250` — and a steady rate is the signal that a route's
 /// `idle_ttl` is longer than the downstream's own idle timeout, which costs an
 /// extra connection and an extra round trip on that fraction of all mail.
-pub fn pool_retry(ramp: &str, route: &str) {
-    counter!("simmer_pool_retries_total", "ramp" => ramp.to_string(), "route" => route.to_string())
-        .increment(1);
+pub fn pool_retry(ramp: &str, route: &str, downstream: &str) {
+    counter!(
+        "simmer_pool_retries_total",
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
+        "downstream" => downstream.to_string(),
+    )
+    .increment(1);
 }
 
 // ---------------------------------------------------------------------------

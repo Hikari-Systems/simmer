@@ -450,6 +450,11 @@ async fn reserve_relay_commit_inner(
         );
     }
 
+    // D-112 — which downstream this route uses for the message's group: its own,
+    // or that group's override. Resolved after the walk, so it can choose where
+    // the message goes but never which route or identity it goes under.
+    let target = selected.route.target(&selected.domain_group);
+
     tracing::info!(
         correlation_id,
         // §9.5: the ramp and which §5.8 rule chose it.
@@ -457,6 +462,7 @@ async fn reserve_relay_commit_inner(
         ramp_source = selection.source.as_str(),
         route = %selected.route.name,
         domain_group = %selected.domain_group,
+        downstream = %target.label(),
         day_index = selected.day_index,
         reservation = %selected.reservation.id,
         chain = %chain::render(&evaluation),
@@ -482,8 +488,9 @@ async fn reserve_relay_commit_inner(
         otel.kind = "client",
         otel.status_code = Empty,
         route = %selected.route.name,
-        server.address = %selected.route.downstream.host,
-        server.port = selected.route.downstream.port,
+        downstream = %target.label(),
+        server.address = %target.downstream.host,
+        server.port = target.downstream.port,
         smtp.response.code = Empty,
         smtp.stage = Empty,
         outcome = Empty,
@@ -491,7 +498,7 @@ async fn reserve_relay_commit_inner(
     );
     let started = std::time::Instant::now();
     let result = downstream::relay(
-        selected.route,
+        target,
         &engine.tls,
         &engine.pools,
         &cfg.server.hostname,
@@ -501,7 +508,7 @@ async fn reserve_relay_commit_inner(
             body: &rewritten.raw,
             smtputf8: message.smtputf8,
             body_8bitmime: message.body_8bitmime,
-            assume_8bitmime: selected.route.downstream.assume_8bitmime,
+            assume_8bitmime: target.downstream.assume_8bitmime,
         },
     )
     .instrument(downstream_span.clone())
@@ -510,6 +517,7 @@ async fn reserve_relay_commit_inner(
     metrics::downstream_latency(
         &selected.route.ramp,
         &selected.route.name,
+        target.label(),
         elapsed.as_secs_f64(),
     );
 
@@ -521,6 +529,7 @@ async fn reserve_relay_commit_inner(
             tracing::info!(
                 correlation_id,
                 route = %selected.route.name,
+                downstream = %target.label(),
                 code = d.code,
                 latency_ms = elapsed.as_millis() as u64,
                 "downstream accepted the message"
@@ -537,7 +546,12 @@ async fn reserve_relay_commit_inner(
             if let Some(stage) = e.stage() {
                 span.record("smtp.stage", stage.as_str());
             }
-            downstream::outcome::failed(&selected.route.ramp, &selected.route.name, e)
+            downstream::outcome::failed(
+                &selected.route.ramp,
+                &selected.route.name,
+                target.label(),
+                e,
+            )
         }
     });
     drop(downstream_span);

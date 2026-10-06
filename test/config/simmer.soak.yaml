@@ -25,6 +25,12 @@
 #     steering here is recipient frequency's doing and never quota's. A soak that
 #     silently fell through to overflow after an hour would measure the wrong
 #     route for the other twenty-three.
+#   * A `segment` domain group (literal `segment.soak.test`, so no DNS) whose
+#     mail the warming route sends to the sink's third listener, 2527, through
+#     `downstream_overrides` (D-112). A small stream of its own per instance
+#     sends to that domain, and `soak_analyze` checks that every one of its
+#     messages arrived on 2527, exactly once, and that nothing else did. The
+#     override's pool gets reused, reaped and retried for hours, like the route's own.
 #   * `X-Simmer-Correlation: "{{correlation_id}}"` on every route, which the sink
 #     records: the id Simmer logs a message under, so a slow message can be
 #     followed into the server's log (step 5c). Not in `unstable_headers` —
@@ -88,6 +94,9 @@ default_ramp: main
 ramps:
   main:
     domain_groups:
+      # D-112's segment: the warming route's override sends it to 2527.
+      - name: segment
+        domains: ["segment.soak.test"]
       - name: catchall
         domains: ["*"]
 
@@ -123,6 +132,19 @@ ramps:
             connect: 5s
             command: 10s
             data: 60s
+        # D-112: the `segment` group's mail goes to the sink's third listener.
+        # It is a whole downstream, so it carries its own timeouts (the same as
+        # above, so §7.4's reservation expiry is unchanged) and its own pool.
+        downstream_overrides:
+          segment:
+            host: "sink"
+            port: 2527
+            tls: off
+            pool: { max_connections: 2, idle_ttl: 60s, max_messages_per_connection: 100 }
+            timeouts:
+              connect: 5s
+              command: 10s
+              data: 60s
         identity:
           envelope_from: "bounce@newbrand.com"
           set_headers:

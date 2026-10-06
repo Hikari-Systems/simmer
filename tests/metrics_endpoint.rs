@@ -65,6 +65,12 @@ ramps:
       port: 2525
       tls: off
       pool: { max_connections: 1, idle_ttl: 60s, max_messages_per_connection: 10 }
+    downstream_overrides:                # D-112: its own pool, so its own series
+      google:
+        host: "127.0.0.1"
+        port: 2526
+        tls: off
+        pool: { max_connections: 2, idle_ttl: 60s, max_messages_per_connection: 10 }
     identity: { envelope_from: "bounce@newbrand.com" }
     warmup:
       started: "2020-01-01T00:00:00Z"
@@ -479,12 +485,36 @@ async fn the_pool_gauges_are_exported_for_a_route_that_has_never_sent(pool: PgPo
                 value(
                     &body,
                     "simmer_pool_connections",
-                    &[("ramp", "main"), ("route", route), ("state", state_label)]
+                    &[
+                        ("ramp", "main"),
+                        ("route", route),
+                        ("downstream", "default"),
+                        ("state", state_label),
+                    ]
                 ),
                 "0",
                 "{route}/{state_label} in:\n{body}"
             );
         }
+    }
+
+    // D-112: an override's pool is a series of its own, labelled by its group,
+    // before anything has been sent through it either.
+    for state_label in ["idle", "active"] {
+        assert_eq!(
+            value(
+                &body,
+                "simmer_pool_connections",
+                &[
+                    ("ramp", "main"),
+                    ("route", "warming"),
+                    ("downstream", "google"),
+                    ("state", state_label),
+                ]
+            ),
+            "0",
+            "warming/google/{state_label} in:\n{body}"
+        );
     }
 }
 
@@ -503,7 +533,7 @@ async fn counters_recorded_through_the_named_functions_reach_the_scrape(pool: Pg
         simmer::metrics::MessageResult::Delivered,
     );
     simmer::metrics::route_skipped("main", "warming", "quota");
-    simmer::metrics::downstream_latency("main", "warming", 0.42);
+    simmer::metrics::downstream_latency("main", "warming", "default", 0.42);
     simmer::metrics::body_rewrite_skipped("main", "warming", "signed");
     simmer::metrics::recipient_events_evicted(3);
 

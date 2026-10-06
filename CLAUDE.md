@@ -29,7 +29,9 @@ lists), after O-17 was. And the same day's for the partial ramp (§3.2 step 3c�
 2026-09-23 one for the end-of-data rule (§5.5, §9.1 and §10.3), after O-18 was —
 see D-095. And the 2026-09-24 one for named ramps (§3.4 and §5.8, new, and the
 sections D-099 lists), which the author asked for directly; it re-defers O-14 and
-O-15 explicitly.
+O-15 explicitly. And the 2026-10-06 one for per-group downstreams (§3.1, §3.3,
+§8.3, and the sections D-112 lists), which the author asked for directly; it
+raises O-20.
 
 ## The four things that will bite you
 
@@ -237,7 +239,9 @@ suite measures the wrong day while appearing to pass.
 ## Key files
 
 ```
-src/config/mod.rs        the §4.1 schema; every struct is deny_unknown_fields
+src/config/mod.rs        the §4.1 schema; every struct is deny_unknown_fields.
+                         `Route::target(group)` is the ONE answer to "which MTA" —
+                         an override replaces `downstream` WHOLE, never merged (D-112)
 src/config/validate.rs   §4.2 — accumulates ALL violations, never short-circuits
 src/config/interpolate.rs  ${ENV_VAR}, over the parsed tree not the raw text
 src/routing/sender_match.rs  §5.4 — wildcard precedence, first match wins
@@ -254,7 +258,8 @@ src/smtp/buffer.rs       §8.1 — transient, tmpfs above 1 MiB. Not a spool
 src/downstream/outcome.rs  §10.1 + D-008, as data. The §14.1 test lives in its tests
 src/downstream/client.rs   the outbound conversation; §10.2's ambiguity is in `deliver`.
                          The ONE retry lives here and is bounded by three conditions
-src/downstream/pool.rs   §8.3 — max_connections is a SEMAPHORE, not a cache (D-067)
+src/downstream/pool.rs   §8.3 — max_connections is a SEMAPHORE, not a cache (D-067).
+                         One pool per DOWNSTREAM: (ramp, route, override group) (D-112)
 src/rewrite/mod.rs       §6.1's order of operations. The order is not arbitrary
 src/rewrite/template.rs  §6.3's variables, parsed. An unknown one is fatal (D-034)
 src/rewrite/encode.rs    RFC 2047/5322 conformance. EVERY function is idempotent
@@ -361,6 +366,8 @@ tests/preflight.rs       §6.7 through the walk. A strict failure STEERS; a chai
                          with none left is 451 on the wire, never a 5xx
 tests/pool.rs            §8.3 counted from the DOWNSTREAM's side — accepted
                          connections and command lines, never the pool's own view
+tests/downstream_overrides.rs  D-112 against TWO fake downstreams: the override
+                         picks the MTA, never the identity, and never falls back
 tests/ingress_tls.rs     §5.1/§5.3 end to end. Every handshake VERIFIES against a
                          per-test CA (support::TestPki); an unverified one proves little
 tests/partial_ramp.rs    D-091 through the real walk; dry run agrees per recipient

@@ -12,7 +12,7 @@ pub mod sweeper;
 
 use std::time::Duration;
 
-use crate::config::Route;
+use crate::config::{Downstream, Route};
 use crate::quota::store::RouteState;
 
 #[cfg(feature = "mssql")]
@@ -93,15 +93,16 @@ pub fn allowance_for(
         .unwrap_or(Allowance::Limited(0))
 }
 
-/// §7.4's reservation expiry: the route's whole downstream timeout budget, plus
-/// a margin.
+/// §7.4's reservation expiry: the whole timeout budget of the downstream the
+/// message will meet — the route's own or its group's override (D-112) — plus a
+/// margin.
 ///
 /// Deliberately generous. Expiring early means the sweeper releases headroom for
 /// a send that is still in flight, and the commit then lands against a row that
 /// has already been given back — recoverable (see `PgQuotaStore::commit`) but
 /// noisy. Expiring late only delays the release after a crash.
-pub fn reservation_expiry(route: &Route, recipients: usize) -> Duration {
-    let t = route.downstream.timeouts.as_ref();
+pub fn reservation_expiry(downstream: &Downstream, recipients: usize) -> Duration {
+    let t = downstream.timeouts.as_ref();
     let connect = t.and_then(|t| t.connect).unwrap_or(Duration::from_secs(10));
     let command = t.and_then(|t| t.command).unwrap_or(Duration::from_secs(30));
     let data = t.and_then(|t| t.data).unwrap_or(Duration::from_secs(120));
@@ -301,10 +302,13 @@ ramps:
         let cfg = config();
         let r = cfg.default_ramp().route("warming").unwrap();
         // 10 + 30*8 + 120 + 60 = 430s for one recipient.
-        assert_eq!(reservation_expiry(r, 1), Duration::from_secs(430));
+        assert_eq!(
+            reservation_expiry(&r.downstream, 1),
+            Duration::from_secs(430)
+        );
         // ...and grows with the recipient count, because each RCPT TO is
         // another command round trip.
-        assert!(reservation_expiry(r, 10) > reservation_expiry(r, 1));
+        assert!(reservation_expiry(&r.downstream, 10) > reservation_expiry(&r.downstream, 1));
     }
 
     #[test]
@@ -318,7 +322,7 @@ ramps:
                 + Duration::from_secs(30) * (7 + recipients)
                 + Duration::from_secs(120);
             assert!(
-                reservation_expiry(r, recipients as usize) > budget,
+                reservation_expiry(&r.downstream, recipients as usize) > budget,
                 "{recipients} recipients"
             );
         }

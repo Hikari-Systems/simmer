@@ -176,6 +176,17 @@ pub struct RouteView {
     /// `max_connections`, which is the honest answer and a more useful one than
     /// an absent field.
     pub pool: Option<crate::downstream::PoolStats>,
+    /// D-112 — the route's `downstream_overrides`, each with its own pool, in
+    /// group order. Empty when the route has none: every group uses `downstream`.
+    pub downstream_overrides: Vec<DownstreamOverrideView>,
+}
+
+/// D-112 — one group's override: where that group's mail goes, and its pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DownstreamOverrideView {
+    pub group: String,
+    pub downstream: DownstreamView,
+    pub pool: Option<crate::downstream::PoolStats>,
 }
 
 /// §9.2 `GET /routes`.
@@ -272,14 +283,7 @@ pub fn project_route(
         day_started_at: quota::day::boundary(origin, day_index),
         day_ends_at: quota::day::boundary(origin, day_index + 1),
         warmup_started: route.warmup.as_ref().map(|w| w.started),
-        downstream: DownstreamView {
-            host: route.downstream.host.clone(),
-            port: route.downstream.port,
-            tls: tls_name(route.downstream.tls),
-            smtputf8: route.downstream.smtputf8,
-            assume_8bitmime: route.downstream.assume_8bitmime,
-            authenticated: route.downstream.auth.is_some(),
-        },
+        downstream: downstream_view(&route.downstream),
         recipient_frequency: route.recipient_frequency.as_ref().map(frequency_view),
         partial_ramp: route
             .warmup
@@ -309,6 +313,26 @@ pub fn project_route(
         groups,
         preflight: preflight_view(route, preflight),
         pool: pools.stats(&route.ramp, &route.name),
+        downstream_overrides: route
+            .downstream_overrides
+            .iter()
+            .map(|(group, ds)| DownstreamOverrideView {
+                group: group.clone(),
+                downstream: downstream_view(ds),
+                pool: pools.stats_for(&route.ramp, &route.name, Some(group)),
+            })
+            .collect(),
+    }
+}
+
+fn downstream_view(ds: &crate::config::Downstream) -> DownstreamView {
+    DownstreamView {
+        host: ds.host.clone(),
+        port: ds.port,
+        tls: tls_name(ds.tls),
+        smtputf8: ds.smtputf8,
+        assume_8bitmime: ds.assume_8bitmime,
+        authenticated: ds.auth.is_some(),
     }
 }
 

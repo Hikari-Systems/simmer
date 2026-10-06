@@ -2109,3 +2109,67 @@ async fn a_dry_run_selects_the_ramp_as_the_session_would(pool: PgPool) {
         StatusCode::BAD_REQUEST
     );
 }
+
+// ---------------------------------------------------------------------------
+// D-112 — per-group downstream overrides, as the control plane reports them
+// ---------------------------------------------------------------------------
+
+fn with_google_override() -> Config {
+    let yaml = CFG.replacen(
+        "    identity:\n      envelope_from: \"bounce@newbrand.com\"",
+        "    downstream_overrides:\n      google:\n        host: \"127.0.0.2\"\n        port: 2600\n        tls: off\n        pool: { max_connections: 5, idle_ttl: 60s, max_messages_per_connection: 10 }\n    identity:\n      envelope_from: \"bounce@newbrand.com\"",
+        1,
+    );
+    assert_ne!(yaml, CFG, "the fixture moved");
+    simmer::config::from_str(&yaml, "test").expect("fixture is valid")
+}
+
+#[sqlx::test]
+async fn routes_reports_each_override_with_its_own_pool(pool: PgPool) {
+    let state = state_from(pool, with_google_override());
+    let doc = get(&state, "/ramps/main/routes", Some(TOKEN)).await.json();
+
+    let warming = route_of(&doc, "warming");
+    assert_eq!(
+        warming["downstream"]["port"], 2525,
+        "the route's own is unchanged"
+    );
+    assert_eq!(warming["pool"]["max_connections"], 1);
+
+    let overrides = warming["downstream_overrides"]
+        .as_array()
+        .expect("an array");
+    assert_eq!(overrides.len(), 1);
+    assert_eq!(overrides[0]["group"], "google");
+    assert_eq!(overrides[0]["downstream"]["host"], "127.0.0.2");
+    assert_eq!(overrides[0]["downstream"]["port"], 2600);
+    assert_eq!(overrides[0]["downstream"]["authenticated"], false);
+    assert_eq!(overrides[0]["pool"]["max_connections"], 5);
+
+    assert_eq!(
+        route_of(&doc, "overflow")["downstream_overrides"],
+        serde_json::json!([]),
+        "a route without overrides says so rather than omitting the field"
+    );
+}
+
+#[sqlx::test]
+async fn a_dry_run_names_the_downstream_the_group_would_meet(pool: PgPool) {
+    let state = state_from(pool, with_google_override());
+
+    let doc = post(&state, "/dryrun", Some(TOKEN), DRYRUN).await.json();
+    let outcome = &doc["recipients"][0];
+    assert_eq!(outcome["selected"], "warming");
+    assert_eq!(outcome["domain_group"], "google");
+    assert_eq!(
+        outcome["downstream"],
+        serde_json::json!({"downstream": "google", "host": "127.0.0.2", "port": 2600})
+    );
+
+    let catchall = DRYRUN.replace("someone@gmail.com", "someone@example.org");
+    let doc = post(&state, "/dryrun", Some(TOKEN), &catchall).await.json();
+    assert_eq!(
+        doc["recipients"][0]["downstream"],
+        serde_json::json!({"downstream": "default", "host": "127.0.0.1", "port": 2525})
+    );
+}

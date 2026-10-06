@@ -315,17 +315,24 @@ fn refresh_runtime_gauges(state: &AdminState) {
     }
 }
 
-/// §9.1 `simmer_pool_connections{route,state}`, read off the pools themselves.
+/// §9.1 `simmer_pool_connections{route,downstream,state}`, read off the pools
+/// themselves — one series per downstream, overrides included (D-112).
 ///
 /// Unlike the quota gauges this needs no storage, so it cannot fail and is not
 /// inside the fallible path above.
 fn refresh_pool_gauges(state: &AdminState) {
-    for route in state.config().all_routes() {
-        let Some(stats) = state.engine.pools.stats(&route.ramp, &route.name) else {
+    for target in state.config().all_routes().flat_map(|r| r.targets()) {
+        let route = target.route;
+        let Some(stats) = state
+            .engine
+            .pools
+            .stats_for(&route.ramp, &route.name, target.group)
+        else {
             continue;
         };
-        crate::metrics::pool_connections(&route.ramp, &route.name, "idle", stats.idle as f64);
-        crate::metrics::pool_connections(&route.ramp, &route.name, "active", stats.active as f64);
+        let (ramp, name, ds) = (&route.ramp, &route.name, target.label());
+        crate::metrics::pool_connections(ramp, name, ds, "idle", stats.idle as f64);
+        crate::metrics::pool_connections(ramp, name, ds, "active", stats.active as f64);
     }
 }
 

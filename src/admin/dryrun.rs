@@ -180,6 +180,10 @@ pub struct RecipientOutcome {
     /// have been consulted either.
     pub evaluation: Vec<StepView>,
     pub selected: Option<String>,
+    /// Which of the selected route's downstreams the message would meet (D-112).
+    /// Absent when no route was selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downstream: Option<DownstreamChoice>,
     /// What the client would be answered. `250` when a route was selected — with
     /// the caveat that the downstream still has to accept it — and §10.3's reply
     /// when nothing was.
@@ -199,6 +203,17 @@ pub struct StepView {
     /// for opposite responses and the difference is the whole answer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explanation: Option<&'static str>,
+}
+
+/// D-112 — the downstream a selected route would use for this recipient's group.
+/// Where, never with what credentials.
+#[derive(Debug, Serialize)]
+pub struct DownstreamChoice {
+    /// `default`, or the group whose `downstream_overrides` entry applies — the
+    /// same value as §9.1's `downstream` label.
+    pub downstream: String,
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -415,6 +430,20 @@ async fn evaluate_one(
         .find(|s| s.outcome.is_ok())
         .map(|s| s.route.clone());
 
+    // The relay's own resolver over the walk's own group, so the dry run names
+    // the MTA the message would actually meet.
+    let downstream = selected
+        .as_deref()
+        .and_then(|name| ramp.route(name))
+        .map(|route| {
+            let t = route.target(&domain_group);
+            DownstreamChoice {
+                downstream: t.label().to_string(),
+                host: t.downstream.host.clone(),
+                port: t.downstream.port,
+            }
+        });
+
     let would_reply = match &selected {
         Some(_) => "250 2.0.0 accepted (if the downstream accepts it)".to_string(),
         None => relay::SelectError::ChainExhausted
@@ -436,6 +465,7 @@ async fn evaluate_one(
         domain_group_basis,
         evaluation: evaluation.iter().map(step_view).collect(),
         selected,
+        downstream,
         would_reply,
         outbound,
     })

@@ -177,6 +177,11 @@ key. Never rewritten in place; it selects a chain.
 
 **Route** — a downstream endpoint plus an *outbound identity* to rewrite into, plus (if
 warming) a ramp schedule and optional recipient-frequency constraint. Purely an output.
+Optionally, a different downstream endpoint per domain group (`downstream_overrides`), used
+for a message whose recipient resolved to that group (§3.2 step 2); every other group uses the
+route's own. It chooses only where the message is sent: the identity, the quota row and the
+walk are the route's. *(Amended — a route had exactly one downstream endpoint. See
+`DECISIONS.md` D-112.)*
 
 **Chain** — an ordered list of routes attached to a sender rule. Zero or more warming routes,
 followed by **at most one** overflow route. Evaluated in order; the first eligible route wins.
@@ -242,7 +247,9 @@ for it — every rule, group, chain and route below is that ramp's:
       skip.
    d. Otherwise, attempt reservation (§7.4). If reservation fails due to a concurrent
       claim, re-evaluate this route once, then skip.
-   e. First route to reserve successfully is selected.
+   e. First route to reserve successfully is selected. It is relayed to its
+      `downstream_overrides` entry for this recipient's domain group if it has one, and to
+      its own `downstream` otherwise. *(Added. See `DECISIONS.md` D-112.)*
 4. **If no route is eligible**, reply per `exhausted_chain_reply` (default `451 4.7.1 no
    eligible route, try later`). See §10.3.
 
@@ -253,7 +260,9 @@ Quota is decremented **per message**, by the recipient count, not per recipient.
 A downstream failure is a failure. Simmer does **not** fall through to the next route in the
 chain on a connection error, timeout, or downstream rejection. Doing so would silently emit a
 message under the wrong identity and corrupt both the ramp accounting and the reputation
-being built. The reservation is released and the client is told (§10.1).
+being built. The reservation is released and the client is told (§10.1). Nor does a failure
+at a `downstream_overrides` endpoint fall back to the route's own `downstream`: the override is
+a choice made after selection, not a fallback. *(Added. See `DECISIONS.md` D-112.)*
 
 ### 3.4 Ramps
 
@@ -421,6 +430,15 @@ ramps:                                 # each is a complete, isolated routing pr
             connect: 10s
             command: 30s
             data: 120s
+        downstream_overrides:              # optional (§3.1, D-112); keyed by domain group.
+          google:                          # each value is a WHOLE downstream, nothing is
+            host: "smtp-google.postal.internal"   # inherited; groups not listed use
+            port: 587                      # `downstream` above. Its own pool and timeouts
+            tls: required_verify
+            auth:
+              username: "${POSTAL_G_USER}"
+              password: "${POSTAL_G_PASS}"
+            pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
         identity:
           envelope_from: "bounce@newbrand.com"   # constant. See the note below §4.2
           set_headers:
@@ -522,6 +540,9 @@ not just the first.
   `DECISIONS.md` D-100.)*
 - A `warmup.schedule` array is empty, or contains a negative value.
 - An `overrides` key names a nonexistent domain group.
+- A `downstream_overrides` key names a nonexistent domain group, or names a group called
+  `default` (§9.1's label for the route's own downstream); or an override fails any rule a
+  route's `downstream` would. *(Added. See `DECISIONS.md` D-112.)*
 - `admin.metrics.idle_timeout` is shorter than one minute, whether or not `admin.metrics` is
   enabled. *(Added. See `DECISIONS.md` D-093.)*
 - A `warmup.schedule.share` value is not above 0 and at most 1; or a route with a non-empty
@@ -1293,6 +1314,9 @@ connection is validated with `NOOP` before reuse if idle beyond a short threshol
 discarded on any protocol error rather than returned to the pool. `RSET` between messages on a
 reused connection. The pool bounds concurrency against each downstream.
 
+Each `downstream_overrides` entry has a pool of its own, under its own `max_connections`; a
+group with no override shares the route's. *(Added. See `DECISIONS.md` D-112.)*
+
 ### 8.4 Timeouts
 
 Per-stage: connect, greeting, command, data, final-dot. Each expiry maps to `451` (§10.1) and
@@ -1330,9 +1354,11 @@ See `DECISIONS.md` D-099.)*
 - `simmer_route_skipped_total{route,reason}` — reason: `quota`, `frequency`, `paused`, `preflight`,
   `partial_ramp` *(added, D-091)*
 - `simmer_preflight_ok{route,check}`
-- `simmer_downstream_latency_seconds{route}` — histogram
-- `simmer_downstream_errors_total{route,class}`
-- `simmer_pool_connections{route,state}`
+- `simmer_downstream_latency_seconds{route,downstream}` — histogram
+- `simmer_downstream_errors_total{route,downstream,class}`
+- `simmer_pool_connections{route,downstream,state}` — `downstream` here and in the two above
+  is `default` for the route's own, or the group whose `downstream_overrides` entry was used
+  *(added, D-112)*
 - `simmer_unmatched_sender_total{ramp,domain}`
 - `simmer_ramp_selected_total{ramp,source}` — source: `affinity`, `header`, `default` (§5.8)
 - `simmer_ramp_header_rejected_total{reason}` — §5.8's reasons. Deliberately no value label:
@@ -1381,7 +1407,8 @@ held; gauges are always cumulative. *(Added. See `DECISIONS.md` D-111.)*
   list with today's share *(added, D-091)*. Each domain-group window also carries the share in
   force for it right now, which under `mode: auto` differs between groups and moves as the cap
   fills; the route-level `today` is then `null`, and the `auto` parameters are reported beside
-  the mode *(added, D-097)*.
+  the mode *(added, D-097)*. Each `downstream_overrides` entry is listed by group with its
+  own pool statistics *(added, D-112)*.
 - `GET /ramps/{ramp}/routes/{name}` — as above for one route.
 - `GET /quota?ramp=&route=&group=` — current window detail. `ramp` is required once more than
   one ramp is configured.
@@ -1438,6 +1465,10 @@ Each recipient's domain group is reported with the basis it was chosen on: `lite
 `mx:<host>` (the exchange host that matched), `fallback`, or `fallback:mx-unavailable`. The
 lookup is the real one and fills the same cache the walk reads. *(Added. See `DECISIONS.md`
 D-100.)*
+
+When a route is selected, the downstream it would be relayed to is reported — `default`, or the
+group whose `downstream_overrides` entry applies — with its host and port. *(Added. See
+`DECISIONS.md` D-112.)*
 
 This is the primary tool for validating a configuration before it carries live traffic, and
 should be treated as a first-class feature rather than a debugging afterthought.

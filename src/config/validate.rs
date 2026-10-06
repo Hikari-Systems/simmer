@@ -1559,23 +1559,28 @@ fn check_routes(ramp: &Ramp, v: &mut ViolationList) {
 
         check_identity(&route.identity, &route.name, v);
 
-        if route.downstream.host.trim().is_empty() {
-            v.push(at("downstream.host"), "must not be empty");
-        }
-        if route.downstream.port == 0 {
-            v.push(at("downstream.port"), "must not be zero");
-        }
-        if route.downstream.pool.max_connections == 0 {
-            v.push(
-                at("downstream.pool.max_connections"),
-                "must be at least 1, or the route can never send",
-            );
-        }
-        if route.downstream.pool.max_messages_per_connection == 0 {
-            v.push(
-                at("downstream.pool.max_messages_per_connection"),
-                "must be at least 1",
-            );
+        check_downstream(&route.downstream, &at("downstream"), v);
+
+        // D-112: each override is a whole downstream, checked as one, and keyed
+        // by a group that exists in this ramp.
+        for (group, ds) in &route.downstream_overrides {
+            let path = at(&format!("downstream_overrides.{group}"));
+            if ramp.domain_group(group).is_none() {
+                v.push(
+                    path.clone(),
+                    format!("names domain group '{group}', which is not defined"),
+                );
+            }
+            if group == super::DEFAULT_DOWNSTREAM_LABEL {
+                v.push(
+                    path.clone(),
+                    format!(
+                        "a group named '{group}' cannot carry a downstream override: \
+                         '{group}' is the metric label for the route's own downstream (§9.1)"
+                    ),
+                );
+            }
+            check_downstream(ds, &path, v);
         }
 
         // §6.7: a DKIM preflight check needs a selector to look up.
@@ -1607,6 +1612,28 @@ fn check_routes(ramp: &Ramp, v: &mut ViolationList) {
                 v.push(at("recipient_frequency.window.count"), "must be at least 1");
             }
         }
+    }
+}
+
+/// One downstream block, wherever it sits: a route's own or an override (D-112).
+fn check_downstream(ds: &super::Downstream, at: &str, v: &mut ViolationList) {
+    if ds.host.trim().is_empty() {
+        v.push(format!("{at}.host"), "must not be empty");
+    }
+    if ds.port == 0 {
+        v.push(format!("{at}.port"), "must not be zero");
+    }
+    if ds.pool.max_connections == 0 {
+        v.push(
+            format!("{at}.pool.max_connections"),
+            "must be at least 1, or the route can never send",
+        );
+    }
+    if ds.pool.max_messages_per_connection == 0 {
+        v.push(
+            format!("{at}.pool.max_messages_per_connection"),
+            "must be at least 1",
+        );
     }
 }
 

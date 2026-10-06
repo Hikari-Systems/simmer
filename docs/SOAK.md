@@ -80,6 +80,7 @@ at all, which is why the A/B pair was worth building before any variant.
 | **V2** | `app` scraped, `app2` never — isolates F8 | built, exercised |
 | **V3** | one message in twenty from a fresh `u<n>.soak.test` sender — F7 | built, **drives the defect** |
 | **V4** | the session timeout against relays in flight — F2, and since D-081 its regression check | built (§8) |
+| **segment** | 1 msg/s per instance to the `segment` group, which the warming route's `downstream_overrides` sends to the sink's third listener (2527) — D-112 | built, exercised (§19) |
 | bursts | 60 s at 70 clients every 15 min | outstanding |
 | idle gaps | 3 min past `idle_ttl`, sink closing idle at 45 s — F10/CLOSE_WAIT | outstanding |
 
@@ -2180,3 +2181,41 @@ and it is a condition of this host, not of simmer.
   the collector writing nothing, would separate the disk from the export.
 - **Which fix removed A's early tail.** It was absent here too, but the two
   fixes still went in together.
+
+---
+
+## 19. A per-segment downstream (D-112) — the override, checked by port
+
+**What it adds.** The soak config gains a `segment` domain group (literal
+`segment.soak.test`, so no DNS), and the warming route gains a
+`downstream_overrides` entry sending that group to the sink's third listener,
+`0.0.0.0:2527`. Nothing else points at 2527. A fourth loadgen stream per instance,
+`soak-segment-<instance>`, sends 1 msg/s of 4 KiB messages to that domain from
+the main sender, so its messages walk the same chain as the main stream and
+reach the warming route first. The sink already records the listener each message
+arrived on, so no extra trap is needed. `SOAK_SEGMENT=off` leaves the stream out.
+
+**What is judged** (`soak/segment/routing`):
+
+- every segment message the sink recorded arrived on 2527;
+- nothing from any other stream arrived on 2527;
+- the segment stream reconciles: every `250` stored exactly once, nothing else
+  stored (`compose::reconcile`, the main stream's rules);
+- at least one segment message was accepted, so the check cannot pass on a run
+  that never exercised the override.
+
+`soak_run` copies the segment streams' records to `target/soak/segment-<instance>.jsonl`.
+It copies every sink line that is a segment message *or* arrived on 2527 to
+`segment-sink.jsonl`, so a stray in either direction is in the evidence. The
+rules are unit-tested in `tests/soak.rs` (`segment_verdict`) against synthetic
+records: a misrouted message, an intruder, a lost message and an empty run each fail.
+`the_soak_config_is_valid_and_cannot_run_out_of_allowance` asserts the wiring:
+the group lists the domain, the override points at `sink:2527` with the route's
+own timeouts, and 2527 is reachable from that override alone.
+
+**The first run** (2026-10-06, Postgres, 4 minutes, V4 skipped for length): 2,410
+main-stream and 250 segment messages per instance, every one accepted. 500 segment
+records at the sink, all 500 on 2527, nothing else there. Main-stream p99 was
+55–57 ms. Too short for a leak verdict, and not meant as one. The hour-long run
+with the segment stream on is outstanding.
+

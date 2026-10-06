@@ -728,6 +728,14 @@ pub struct Route {
     #[serde(default)]
     pub overflow: bool,
     pub downstream: Downstream,
+    /// D-112 — an optional downstream per domain group, replacing `downstream`
+    /// whole for a message whose recipient resolved to that group (§3.2 step 2).
+    /// A group with no entry uses `downstream`. Chooses only where the message
+    /// is sent: the identity, the quota row and the walk are the route's, so
+    /// nothing here can reach the rewrite (§1.1). Resolve it through
+    /// [`Route::target`], never by reading either field directly.
+    #[serde(default)]
+    pub downstream_overrides: BTreeMap<String, Downstream>,
     pub identity: Identity,
     /// §6.7. Absent means disabled — see `DECISIONS.md` D-012. When present,
     /// `enabled` defaults to true.
@@ -1866,7 +1874,8 @@ impl Ramp {
         let mut any = false;
         for route in self.reachable_routes() {
             any = true;
-            if !route.downstream.smtputf8 {
+            // D-112: the group is no more knowable at EHLO than the route is.
+            if !route.targets().all(|t| t.downstream.smtputf8) {
                 return false;
             }
         }
@@ -1880,4 +1889,63 @@ impl Route {
     pub fn preflight_enabled(&self) -> bool {
         self.preflight.as_ref().is_some_and(|p| p.enabled)
     }
+
+    /// D-112 — the downstream this route uses for a recipient in `group`: that
+    /// group's `downstream_overrides` entry if it has one, else `downstream`.
+    /// The ONE resolver: the relay, the pool, the reservation expiry and the dry
+    /// run all call it, so they cannot disagree about which MTA a message meets.
+    pub fn target(&self, group: &str) -> Target<'_> {
+        match self.downstream_overrides.get_key_value(group) {
+            Some((g, d)) => Target {
+                route: self,
+                group: Some(g),
+                downstream: d,
+            },
+            None => self.default_target(),
+        }
+    }
+
+    /// The route's own `downstream`, as a [`Target`].
+    pub fn default_target(&self) -> Target<'_> {
+        Target {
+            route: self,
+            group: None,
+            downstream: &self.downstream,
+        }
+    }
+
+    /// Every downstream this route can send to: its own first, then each
+    /// override in group order. What anything sized "per downstream" iterates —
+    /// the pools, `SMTPUTF8` advertising, the §10.4 drain bound.
+    pub fn targets(&self) -> impl Iterator<Item = Target<'_>> {
+        std::iter::once(self.default_target()).chain(self.downstream_overrides.iter().map(
+            move |(g, d)| Target {
+                route: self,
+                group: Some(g),
+                downstream: d,
+            },
+        ))
+    }
 }
+
+/// D-112 — a route and the one downstream it uses for this message.
+#[derive(Debug, Clone, Copy)]
+pub struct Target<'a> {
+    pub route: &'a Route,
+    /// The group whose `downstream_overrides` entry applies; `None` for the
+    /// route's own `downstream`. Not the message's domain group — a message in a
+    /// group with no override is `None` here.
+    pub group: Option<&'a str>,
+    pub downstream: &'a Downstream,
+}
+
+impl<'a> Target<'a> {
+    /// The `downstream` metric label (§9.1): `default`, or the override's group.
+    /// Config-defined, so bounded — unlike F7's client-controlled `domain`.
+    pub fn label(&self) -> &'a str {
+        self.group.unwrap_or(DEFAULT_DOWNSTREAM_LABEL)
+    }
+}
+
+/// See [`Target::label`].
+pub const DEFAULT_DOWNSTREAM_LABEL: &str = "default";

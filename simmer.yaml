@@ -298,6 +298,18 @@ ramps:
           # which modern mailers do) is refused 451 4.3.5 on every retry. A 7-bit
           # body is fine either way. See DECISIONS.md D-074.
           assume_8bitmime: true
+        # Optional: a different downstream for some domain groups (D-112). Each entry
+        # is a WHOLE downstream block, so nothing above is inherited. Groups not listed
+        # use `downstream`. It chooses the MTA only. The identity, quota row and chain
+        # stay the route's, and a failure there is never retried at `downstream`.
+        # downstream_overrides:
+        #   google:
+        #     host: "smtp-google.postal.internal"
+        #     port: 587
+        #     tls: required_verify
+        #     auth: { username: "${POSTAL_G_USER}", password: "${POSTAL_G_PASS}" }
+        #     pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+        #     assume_8bitmime: true
         identity:
           # §1.1 constraint 1: absolute assignment, never a relative transformation.
           #

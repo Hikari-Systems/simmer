@@ -313,12 +313,13 @@ impl Sessions {
 }
 
 /// D-106 — how long §10.4 waits, after the hard stop, for relays still in
-/// flight: the slowest route's downstream budget as D-081 counts it — the pool
+/// flight: the slowest downstream's budget (overrides included, D-112) as D-081 counts it — the pool
 /// wait and the connect (each `connect`), one command and the data stage —
 /// plus a margin for the quota statements either side. Not a tuning knob.
 pub fn relay_drain_bound(cfg: &crate::config::Config) -> Duration {
     cfg.all_routes()
-        .map(crate::downstream::client::conversation_budget)
+        .flat_map(|r| r.targets())
+        .map(|t| crate::downstream::client::conversation_budget(t.downstream))
         .max()
         .unwrap_or_default()
         + RELAY_DRAIN_MARGIN

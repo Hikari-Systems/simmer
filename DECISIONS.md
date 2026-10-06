@@ -5240,6 +5240,114 @@ must never stop Simmer starting.
 - The stress tier (T3) with export on.
 - An export to a TLS endpoint or a real vendor.
 
+## Per-group downstreams (2026-10-06)
+
+### D-112 — A route may send some domain groups to a different downstream
+
+> **Requested 2026-10-06 by the spec's author, and the spec amended in the same
+> change:** §3.1, §3.2 (step 3e), §3.3, §4.1, §4.2, §8.3, §9.1, §9.2 and §9.4.
+> The author's calls: it is **optional**; the route's existing `downstream`
+> **stays** and stays the default; a per-group entry **overrides** it for mail
+> whose recipient was detected as in that group.
+
+**The problem.** A route had exactly one downstream (§3.1). The domain group
+already decided the quota row, the schedule override and the partial-ramp share,
+but never which MTA the message went to. Sending Google-bound and
+Microsoft-bound mail from one warming identity through different MTAs (different
+IPs, different pools) needed two routes and a schedule of zeros to keep each off
+the other's groups. That workaround did not reach overflow routes at all, which
+have no schedule to zero.
+
+**What it does.** `downstream_overrides: { <group>: <downstream> }` on any route,
+overflow included. After the walk selects a route, `Route::target(group)` picks
+that group's entry if there is one and `downstream` otherwise. That one resolver
+is used by the relay, the pool lookup, the reservation expiry (§7.4: an override
+with a longer `data` budget must not expire early) and the dry run, so they
+cannot disagree. A config with no overrides behaves exactly as before.
+
+**Why a whole downstream, not a partial merge.** One block is one MTA. A merge
+would let an override inherit the default's `auth`, sending one provider's
+credentials to another's host. An omitted `auth` means unauthenticated, as it
+does on `downstream`. *Alternative, rejected:* field-by-field inheritance.
+
+**Why after the walk, not inside it.** Choosing the MTA is not an eligibility
+question. Pause, frequency, partial ramp and headroom are the route's, and the
+quota row is already `(route, group)`. Resolving afterwards keeps D-109's one
+`CHECKS` list untouched. It also makes §3.3 hold by construction: the override is
+a choice, not a fallback, and a failure at the override MTA releases and reports
+like any other. Nothing retries it at `downstream`.
+
+**Why the identity stays per route.** §1.1 and §6.6 are about the output
+identity, and nothing here reaches `rewrite::`. A per-group *identity* would be a
+different feature, and it would warm a different domain per group under one
+quota row, which is D-069's objection.
+
+**Pools.** One per downstream, keyed `(ramp, route, override group)`, so each
+override's `max_connections` bounds its own MTA (D-067). A group with no override
+shares the route's pool. Seeded at startup like every other pool, so `/routes`
+and `/metrics` answer for an override nothing has used yet.
+
+**Metrics.** `simmer_downstream_errors_total`, `_config_error_total`,
+`_latency_seconds`, `simmer_pool_connections` and `simmer_pool_retries_total`
+gain a `downstream` label: `default`, or the override's group. It is
+config-defined and so bounded, unlike F7's client-controlled `domain`. A group
+named `default` cannot carry an override (§4.2), so the label is never
+ambiguous. *Alternative, rejected:* labelling by the message's resolved domain
+group. Without an override, that would not say which MTA was involved, and it
+multiplies series for routes that have no overrides. **This changes the label
+set of existing series**: an exact-match selector written against
+`{ramp,route,class}` needs the new label added. Aggregations such as
+`sum by (route)` are unaffected.
+
+**`SMTPUTF8`.** D-018's rule, widened: `EHLO` advertises it only if every
+downstream of every reachable route, overrides included, declares it. The group
+is no more knowable at `EHLO` than the route is.
+
+**Preflight stays per route.** §6.7's `spf_include` asserts one include. With
+overrides, the route's include has to cover every MTA the route can use. A
+per-`(route, group)` preflight verdict would make strict preflight steer per
+group inside the walk, which is a larger change; it is **O-20**.
+
+**§1.1 after cutover.** The output identity is unchanged, so the invariant as
+written holds. But the application, or its MTA, must then make the same
+per-group choice of MTA itself. For literal-domain groups that is an ordinary
+transport map. For groups matched by MX (D-100), it needs an MTA that can route
+on MX records, which most cannot do natively. Recorded so that nobody discovers
+it at cutover; the README says so too.
+
+**Tested:** `tests/config_validation.rs` (no overrides resolves every group to
+`downstream`; an override replaces it for its group only and inherits nothing;
+allowed on overflow; an undefined group, a group named `default`, and every
+per-downstream fault refused and reported together; `deny_unknown_fields`
+reaches an override; `SMTPUTF8` withheld by one override without it);
+`tests/downstream_overrides.rs` (through a real session against two scripted
+downstreams: each group meets its own MTA under one identity; the quota is
+committed against `(route, group)`; a deferral at the override reaches the
+client and the default MTA sees no connection, with the reservation released;
+each downstream has its own seeded pool and bound, and the route's own pool is
+untouched by override traffic); `tests/admin_api.rs` (`/routes` lists each
+override with its pool; dry run names the downstream for an overridden group and
+for a default one); `tests/metrics_endpoint.rs` (an override's pool gauges exist
+before any traffic, under `downstream="google"`). Existing exact-label
+assertions in `tests/e2e_matrix.rs` and `tests/metrics_endpoint.rs` gain
+`downstream="default"`.
+
+**Also run:** the §12.3 acceptance suite, unchanged and passing (5 of 5, including
+the byte-equivalence test) against a stack built from this change, whose config
+carries no overrides. That is the evidence that "no overrides" really is
+the old behaviour. The SQL Server build compiled, passed clippy and ran the two
+new backend-independent test binaries in a `rust:1-bookworm` container.
+
+**Soak** (`docs/SOAK.md` §19): the soak config sends a `segment` group to a
+third sink listener through an override, and a small stream per instance checks
+the override end to end from the sink's side (`soak/segment/routing`). A 4-minute
+run put all 500 segment messages on that port and nothing else there.
+
+**Not run:** the compose tiers (`e2e_matrix`, whose two exact-label assertions
+were edited, and stress), and an hour-long soak with the segment stream; the SQL Server database tests (nothing behind
+`QuotaStore` changed); an override exercised on the acceptance stack against
+real mail servers.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -5266,6 +5374,7 @@ the phase that depends on each.
 | O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment. *Deferred again, explicitly, by the 2026-09-24 amendment — see **D-099**.* |
 | ~~O-18~~ | *Settled 2026-09-23 by the spec's author: `554`, not configurable, and amend the spec. §5.5 (the end-of-data marker is `CRLF . CRLF` and nothing else, and the whole payload is refused), §9.1 (`simmer_ambiguous_terminator_total`) and §10.3 (the one permanent reply that is a statement about the message, and why §14.1's worked example does not reach it) now carry it — see **D-095**.* | | |
 | O-19 | What should `database.fail_closed: false` do? §7.5 defines only `true` (`451 4.3.0`, send nothing). The implementation answers a store failure under `false` as an exhausted chain — the ramp's `exhausted_chain_reply`, so `451 4.7.1` by default and **`550 5.7.1` if the ramp sets `"550"`**, which §14.1 would forbid for a transient failure. The old log line claimed the message was sent unenforced; it never was. Options: (a) true fail-open, relaying without a reservation; (b) keep refusing, but always `451` (4.3.0 or 4.7.1); (c) remove the key. | Behaviour unchanged; log and docs made truthful — see **D-107** | Before any phase that touches §7.5 or the reservation path |
+| O-20 | Should §6.7's preflight be evaluated per `(route, group)` when a route has `downstream_overrides` (**D-112**)? Today it is per route, so one `spf_include` must cover every MTA the route can use, and a strict failure eliminates the route for every group. Per-group verdicts would make strict preflight steer per group inside the walk. | Per route; the operator's `spf_include` covers every override — see **D-112** | Before preflight or the walk next changes |
 
 
 ---

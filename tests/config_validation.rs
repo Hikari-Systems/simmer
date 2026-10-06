@@ -2306,3 +2306,153 @@ fn warns_when_telemetry_headers_would_cross_the_network_in_plaintext() {
     assert!(!warned("http://127.0.0.1:4317"));
     assert!(!warned("http://[::1]:4317"));
 }
+
+// -- D-112: per-group downstream overrides ---------------------------------
+
+/// `BASE` with `overrides` spliced in as the warming route's
+/// `downstream_overrides` block.
+fn with_downstream_overrides(overrides: &str) -> String {
+    let anchor = "      pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }\n    identity:\n      envelope_from: \"bounce@newbrand.com\"";
+    assert!(BASE.contains(anchor), "the fixture moved");
+    BASE.replace(
+        anchor,
+        &anchor.replacen(
+            "\n    identity:",
+            &format!("\n    downstream_overrides:\n{overrides}    identity:"),
+            1,
+        ),
+    )
+}
+
+const GOOGLE_OVERRIDE: &str = "      google:\n        host: \"mta-google.internal\"\n        port: 2525\n        tls: required\n        smtputf8: true\n        pool: { max_connections: 2, idle_ttl: 30s, max_messages_per_connection: 50 }\n";
+
+#[test]
+fn a_route_without_overrides_uses_its_own_downstream_for_every_group() {
+    let cfg = load(BASE).expect("valid");
+    let warming = cfg.default_ramp().route("warming").expect("route");
+    assert!(warming.downstream_overrides.is_empty());
+    for group in ["google", "catchall"] {
+        let t = warming.target(group);
+        assert_eq!(t.group, None);
+        assert_eq!(t.label(), "default");
+        assert_eq!(t.downstream.host, "smtp.postal.internal");
+    }
+    assert_eq!(warming.targets().count(), 1);
+}
+
+#[test]
+fn an_override_replaces_the_downstream_for_its_group_only() {
+    let cfg = load(&with_downstream_overrides(GOOGLE_OVERRIDE)).expect("valid");
+    let warming = cfg.default_ramp().route("warming").expect("route");
+
+    let google = warming.target("google");
+    assert_eq!(google.group, Some("google"));
+    assert_eq!(google.label(), "google");
+    assert_eq!(google.downstream.host, "mta-google.internal");
+    assert_eq!(google.downstream.port, 2525);
+    assert_eq!(google.downstream.tls, config::TlsMode::Required);
+    assert_eq!(google.downstream.pool.max_connections, 2);
+
+    // A whole replacement, not a merge: nothing is inherited from the default.
+    assert!(google.downstream.auth.is_none());
+
+    let catchall = warming.target("catchall");
+    assert_eq!(catchall.group, None);
+    assert_eq!(catchall.downstream.host, "smtp.postal.internal");
+
+    let labels: Vec<&str> = warming.targets().map(|t| t.label()).collect();
+    assert_eq!(labels, ["default", "google"]);
+}
+
+#[test]
+fn overrides_are_allowed_on_an_overflow_route() {
+    let yaml = BASE.replace(
+        "      host: \"smtp.sendgrid.net\"\n      port: 587\n      pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }\n",
+        "      host: \"smtp.sendgrid.net\"\n      port: 587\n      pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }\n    downstream_overrides:\n      google: { host: \"mta-g.internal\", port: 25, pool: { max_connections: 1, idle_ttl: 60s, max_messages_per_connection: 10 } }\n",
+    );
+    let cfg = load(&yaml).expect("valid");
+    let overflow = cfg.default_ramp().route("overflow").expect("route");
+    assert_eq!(overflow.target("google").downstream.host, "mta-g.internal");
+}
+
+#[test]
+fn rejects_an_override_for_an_undefined_group() {
+    rejected_for(
+        &with_downstream_overrides(&GOOGLE_OVERRIDE.replace("      google:", "      yahoo:")),
+        "downstream_overrides.yahoo",
+    );
+}
+
+#[test]
+fn rejects_an_override_for_a_group_named_default() {
+    let yaml = with_downstream_overrides(&GOOGLE_OVERRIDE.replace("      google:", "      default:"))
+        .replace(
+            "  - { name: google, domains: [\"gmail.com\"] }",
+            "  - { name: google, domains: [\"gmail.com\"] }\n  - { name: default, domains: [\"example.org\"] }",
+        );
+    rejected_for(&yaml, "metric label");
+}
+
+#[test]
+fn an_override_is_checked_like_any_downstream_and_every_fault_is_reported() {
+    let yaml = with_downstream_overrides(
+        &GOOGLE_OVERRIDE
+            .replace("\"mta-google.internal\"", "\"  \"")
+            .replace("port: 2525", "port: 0")
+            .replace("max_connections: 2", "max_connections: 0")
+            .replace(
+                "max_messages_per_connection: 50",
+                "max_messages_per_connection: 0",
+            ),
+    );
+    let Err(LoadError::Invalid(v)) = load(&yaml) else {
+        panic!("expected a validation failure");
+    };
+    for needle in [
+        "routes.warming.downstream_overrides.google.host",
+        "routes.warming.downstream_overrides.google.port",
+        "routes.warming.downstream_overrides.google.pool.max_connections",
+        "routes.warming.downstream_overrides.google.pool.max_messages_per_connection",
+    ] {
+        assert!(v.mentions(needle), "no violation for {needle}. Got:\n{v}");
+    }
+}
+
+#[test]
+fn rejects_an_unknown_key_inside_an_override() {
+    match load(&with_downstream_overrides(&GOOGLE_OVERRIDE.replace(
+        "        port: 2525\n",
+        "        port: 2525\n        hots: x\n",
+    ))) {
+        Err(LoadError::Invalid(_)) => panic!("expected a parse failure, not a validation one"),
+        Err(_) => {}
+        Ok(_) => panic!("deny_unknown_fields must reach an override"),
+    }
+}
+
+#[test]
+fn smtputf8_is_advertised_only_if_every_override_carries_it_too() {
+    // Every reachable downstream in the base declares no SMTPUTF8, so turn it
+    // on everywhere but the override and check the override alone withholds it.
+    let all_on = |yaml: &str| {
+        yaml.replace(
+            "      port: 587\n      tls: required_verify\n",
+            "      port: 587\n      tls: required_verify\n      smtputf8: true\n",
+        )
+        .replace(
+            "      host: \"smtp.sendgrid.net\"\n      port: 587\n",
+            "      host: \"smtp.sendgrid.net\"\n      port: 587\n      smtputf8: true\n",
+        )
+    };
+    let with = load(&all_on(&with_downstream_overrides(GOOGLE_OVERRIDE))).expect("valid");
+    assert!(with.advertise_smtputf8(), "every downstream carries it");
+
+    let without = load(&all_on(&with_downstream_overrides(
+        &GOOGLE_OVERRIDE.replace("        smtputf8: true\n", ""),
+    )))
+    .expect("valid");
+    assert!(
+        !without.advertise_smtputf8(),
+        "the group is not knowable at EHLO, so one override without SMTPUTF8 withholds it"
+    );
+}

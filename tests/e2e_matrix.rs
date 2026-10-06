@@ -212,8 +212,7 @@ fn a_strict_server_gets_honest_deferrals_and_never_a_loss() {
     // message may arrive, and a 7-bit message that fits must still go.
     let _logs = MATRIX.logs_on_failure();
     traps::MATRIX.reset();
-    let capability =
-        r#"simmer_downstream_errors_total{ramp="main",route="postfix-strict",class="capability"}"#;
+    let capability = r#"simmer_downstream_errors_total{ramp="main",route="postfix-strict",downstream="default",class="capability"}"#;
     let capability_before = metric(capability);
 
     let eight_bit = send("strict", "strict8bit", 1, &["--charset", "latin1"]);
@@ -289,7 +288,8 @@ fn a_pooled_connection_the_server_reaped_is_replaced_not_deferred() {
     // validation or the one retry must catch it; the client must never see it.
     let _logs = MATRIX.logs_on_failure();
     await_rate_window(); // also leaves a freshly used connection in the pool
-    let retries = r#"simmer_pool_retries_total{ramp="main",route="postfix-ratelimit"}"#;
+    let retries =
+        r#"simmer_pool_retries_total{ramp="main",route="postfix-ratelimit",downstream="default"}"#;
     let before = pool_stats("postfix-ratelimit");
     let retries_before = metric(retries);
 

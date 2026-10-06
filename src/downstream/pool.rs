@@ -36,7 +36,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use super::client::{Budget, Connection};
 use super::outcome::RelayError;
 use super::stream::TlsConfigs;
-use crate::config::{Config, Route};
+use crate::config::{Config, Target};
 
 /// §8.3's "short threshold" for revalidating an idle connection with `NOOP`.
 ///
@@ -48,7 +48,21 @@ use crate::config::{Config, Route};
 /// latency path of a client that is holding a connection open.
 const VALIDATE_AFTER: Duration = Duration::from_secs(5);
 
-/// Every route's pool, built once at startup.
+/// The key of one downstream's pool: `(ramp, route, override group)`. The group
+/// is `None` for the route's own `downstream` and `Some` only for a
+/// `downstream_overrides` entry (D-112), so every group without an override
+/// shares the route's one bound.
+type PoolKey = (String, String, Option<String>);
+
+fn key_of(target: &Target<'_>) -> PoolKey {
+    (
+        target.route.ramp.clone(),
+        target.route.name.clone(),
+        target.group.map(str::to_string),
+    )
+}
+
+/// Every downstream's pool, built once at startup.
 pub struct Pool {
     /// Seeded from the configuration so that `/routes` can report a pool for a
     /// route nothing has yet sent through — an operator asking "how many
@@ -59,35 +73,28 @@ pub struct Pool {
     /// same `Config`, so a miss is unreachable in the service; making it
     /// *impossible* rather than merely unreachable costs one `RwLock` and removes
     /// a branch that could only ever have been handled by lying to a client.
-    /// Keyed `(ramp, route)`: pools are per route *within its ramp* (D-099), so
-    /// two ramps pointing at one downstream each hold their own bound.
-    routes: RwLock<HashMap<(String, String), Arc<RoutePool>>>,
+    /// Keyed `(ramp, route, override group)`: pools are per route *within its
+    /// ramp* (D-099), so two ramps pointing at one downstream each hold their own
+    /// bound — and per downstream within the route (D-112), so each override's
+    /// `max_connections` bounds its own MTA.
+    routes: RwLock<HashMap<PoolKey, Arc<RoutePool>>>,
 }
 
 impl Pool {
     pub fn build(cfg: &Config) -> Pool {
         let routes = cfg
             .all_routes()
-            .map(|r| {
-                (
-                    (r.ramp.clone(), r.name.clone()),
-                    Arc::new(RoutePool::new(r)),
-                )
-            })
+            .flat_map(|r| r.targets())
+            .map(|t| (key_of(&t), Arc::new(RoutePool::new(&t))))
             .collect();
         Pool {
             routes: RwLock::new(routes),
         }
     }
 
-    pub fn for_route(&self, route: &Route) -> Arc<RoutePool> {
-        if let Some(pool) = self
-            .routes
-            .read()
-            .expect("not poisoned")
-            .get(&(route.ramp.clone(), route.name.clone()))
-            .cloned()
-        {
+    pub fn for_target(&self, target: &Target<'_>) -> Arc<RoutePool> {
+        let key = key_of(target);
+        if let Some(pool) = self.routes.read().expect("not poisoned").get(&key).cloned() {
             return pool;
         }
 
@@ -95,17 +102,27 @@ impl Pool {
             self.routes
                 .write()
                 .expect("not poisoned")
-                .entry((route.ramp.clone(), route.name.clone()))
-                .or_insert_with(|| Arc::new(RoutePool::new(route))),
+                .entry(key)
+                .or_insert_with(|| Arc::new(RoutePool::new(target))),
         )
     }
 
-    /// §9.2's "pool statistics", for one route.
+    /// §9.2's "pool statistics", for a route's own downstream.
     pub fn stats(&self, ramp: &str, route: &str) -> Option<PoolStats> {
+        self.stats_for(ramp, route, None)
+    }
+
+    /// §9.2's "pool statistics", for one downstream of a route: its own when
+    /// `group` is `None`, else that group's override (D-112).
+    pub fn stats_for(&self, ramp: &str, route: &str, group: Option<&str>) -> Option<PoolStats> {
         self.routes
             .read()
             .expect("not poisoned")
-            .get(&(ramp.to_string(), route.to_string()))
+            .get(&(
+                ramp.to_string(),
+                route.to_string(),
+                group.map(str::to_string),
+            ))
             .map(|p| p.stats())
     }
 
@@ -133,8 +150,9 @@ impl Pool {
     }
 }
 
-/// One route's pool.
+/// One downstream's pool: a route's own, or one of its overrides (D-112).
 pub struct RoutePool {
+    /// For log lines: `route`, or `route/group` for an override.
     route: String,
     max_connections: usize,
     idle_ttl: Duration,
@@ -164,14 +182,17 @@ struct Idle {
 }
 
 impl RoutePool {
-    fn new(route: &Route) -> RoutePool {
-        let cfg = &route.downstream.pool;
+    fn new(target: &Target<'_>) -> RoutePool {
+        let cfg = &target.downstream.pool;
         RoutePool {
-            route: route.name.clone(),
+            route: match target.group {
+                None => target.route.name.clone(),
+                Some(g) => format!("{}/{g}", target.route.name),
+            },
             max_connections: cfg.max_connections,
             idle_ttl: cfg.idle_ttl,
             max_messages: cfg.max_messages_per_connection,
-            budget: Budget::for_route(route),
+            budget: Budget::for_downstream(target.downstream),
             permits: Arc::new(Semaphore::new(cfg.max_connections)),
             idle: Mutex::new(Vec::new()),
             active: AtomicUsize::new(0),
@@ -189,7 +210,7 @@ impl RoutePool {
     /// Take a connection, reusing an idle one where there is a sound one to reuse.
     pub(super) async fn checkout(
         self: &Arc<Self>,
-        route: &Route,
+        target: &Target<'_>,
         tls: &TlsConfigs,
         hostname: &str,
     ) -> Result<Checkout, RelayError> {
@@ -235,7 +256,7 @@ impl RoutePool {
             return Ok(self.checked_out(permit, conn, idle.messages, true));
         }
 
-        let conn = Connection::open(route, tls, hostname, &self.budget).await?;
+        let conn = Connection::open(target, tls, hostname, &self.budget).await?;
         self.opened.fetch_add(1, Ordering::Relaxed);
         Ok(self.checked_out(permit, conn, 0, false))
     }
@@ -317,7 +338,7 @@ impl Checkout {
     /// so the retry cannot push the route past `max_connections`.
     pub(super) async fn reopen(
         &mut self,
-        route: &Route,
+        target: &Target<'_>,
         tls: &TlsConfigs,
         hostname: &str,
     ) -> Result<(), RelayError> {
@@ -327,7 +348,7 @@ impl Checkout {
         self.conn = None;
         self.pool.discarded.fetch_add(1, Ordering::Relaxed);
 
-        self.conn = Some(Connection::open(route, tls, hostname, &self.pool.budget).await?);
+        self.conn = Some(Connection::open(target, tls, hostname, &self.pool.budget).await?);
         self.pool.opened.fetch_add(1, Ordering::Relaxed);
         self.messages = 0;
         self.reused = false;
@@ -403,6 +424,7 @@ pub struct PoolStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Route;
 
     fn config(pool: &str) -> Config {
         let yaml = format!(
@@ -475,8 +497,8 @@ ramps:
         assert!(pool.stats("main", "only").is_none(), "nothing seeded yet");
 
         let r = cfg.default_ramp().routes.first().expect("one route");
-        let first = pool.for_route(r);
-        let second = pool.for_route(r);
+        let first = pool.for_target(&r.default_target());
+        let second = pool.for_target(&r.default_target());
         assert!(
             Arc::ptr_eq(&first, &second),
             "the second call must reuse the pool the first created, or two \
@@ -495,7 +517,7 @@ ramps:
         // The bound has to hold without a downstream to connect to, so this
         // drives the semaphore directly: two permits, three waiters.
         let r = route("{ max_connections: 2, idle_ttl: 60s, max_messages_per_connection: 10 }");
-        let pool = Arc::new(RoutePool::new(&r));
+        let pool = Arc::new(RoutePool::new(&r.default_target()));
 
         let a = Arc::clone(&pool.permits).acquire_owned().await.expect("a");
         let b = Arc::clone(&pool.permits).acquire_owned().await.expect("b");
@@ -533,7 +555,7 @@ ramps:
             command: None,
             data: None,
         });
-        let pool = Arc::new(RoutePool::new(&r));
+        let pool = Arc::new(RoutePool::new(&r.default_target()));
         let held = Arc::clone(&pool.permits)
             .acquire_owned()
             .await
@@ -541,7 +563,7 @@ ramps:
 
         let (tls, _) = TlsConfigs::load().expect("tls");
         let err = pool
-            .checkout(&r, &tls, "simmer.test")
+            .checkout(&r.default_target(), &tls, "simmer.test")
             .await
             .err()
             .expect("must fail");
@@ -555,13 +577,14 @@ ramps:
     #[tokio::test]
     async fn draining_an_empty_pool_closes_it_to_new_connections() {
         let r = route("{ max_connections: 2, idle_ttl: 60s, max_messages_per_connection: 10 }");
-        let pool = Arc::new(RoutePool::new(&r));
+        let pool = Arc::new(RoutePool::new(&r.default_target()));
         assert_eq!(pool.drain().await, 0);
 
         let (tls, _) = TlsConfigs::load().expect("tls");
         assert!(
             matches!(
-                pool.checkout(&r, &tls, "simmer.test").await,
+                pool.checkout(&r.default_target(), &tls, "simmer.test")
+                    .await,
                 Err(RelayError::PoolExhausted)
             ),
             "a drained pool must not open a new connection during shutdown"

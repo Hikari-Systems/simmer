@@ -172,35 +172,47 @@ pub fn delivered(_route: &str, d: &Delivered) -> Outcome {
 ///
 /// Takes `route` because every counter in §9.1 is labelled by it, and because
 /// D-008's `ERROR` log is the only thing that will ever reveal a §6.5
-/// misconfiguration.
-pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
+/// misconfiguration. `downstream` is [`crate::config::Target::label`]: with
+/// D-112's overrides one route can fail at one MTA and not another.
+pub fn failed(ramp: &str, route: &str, downstream: &str, err: &RelayError) -> Outcome {
     let reply = match err {
         RelayError::Connect(detail) => {
-            tracing::warn!(route, detail, "downstream connect failed");
-            metrics::downstream_error(ramp, route, "connect");
+            tracing::warn!(route, downstream, detail, "downstream connect failed");
+            metrics::downstream_error(ramp, route, downstream, "connect");
             reply::Reply::new(451, "4.4.1 downstream unavailable")
         }
 
         RelayError::Tls(detail) => {
-            tracing::warn!(route, detail, "downstream TLS negotiation failed");
-            metrics::downstream_error(ramp, route, "tls");
+            tracing::warn!(
+                route,
+                downstream,
+                detail,
+                "downstream TLS negotiation failed"
+            );
+            metrics::downstream_error(ramp, route, downstream, "tls");
             reply::Reply::new(451, "4.7.0 downstream TLS failure")
         }
 
         RelayError::Timeout(stage) => {
-            tracing::warn!(route, stage = stage.as_str(), "downstream timeout");
-            metrics::downstream_error(ramp, route, "timeout");
+            tracing::warn!(
+                route,
+                downstream,
+                stage = stage.as_str(),
+                "downstream timeout"
+            );
+            metrics::downstream_error(ramp, route, downstream, "timeout");
             reply::Reply::new(451, "4.4.2 downstream timeout")
         }
 
         RelayError::Protocol(stage, detail) => {
             tracing::warn!(
                 route,
+                downstream,
                 stage = stage.as_str(),
                 detail = %redact_addresses(detail),
                 "downstream protocol violation"
             );
-            metrics::downstream_error(ramp, route, "protocol");
+            metrics::downstream_error(ramp, route, downstream, "protocol");
             reply::Reply::new(451, "4.3.0 downstream protocol error")
         }
 
@@ -209,9 +221,10 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
         RelayError::Ambiguous => {
             tracing::warn!(
                 route,
+                downstream,
                 "connection dropped after the terminating dot; delivery is unknown"
             );
-            metrics::downstream_error(ramp, route, "ambiguous");
+            metrics::downstream_error(ramp, route, downstream, "ambiguous");
             metrics::ambiguous_delivery();
             reply::Reply::new(451, "4.3.0 downstream reply not received, delivery unknown")
         }
@@ -222,12 +235,13 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
             // in the mail flow without this.
             tracing::error!(
                 route,
+                downstream,
                 capability = cap,
                 "downstream does not advertise a capability this route's \
                  configuration claims; messages needing it cannot be relayed"
             );
-            metrics::downstream_config_error(ramp, route, "capability");
-            metrics::downstream_error(ramp, route, "capability");
+            metrics::downstream_config_error(ramp, route, downstream, "capability");
+            metrics::downstream_error(ramp, route, downstream, "capability");
             reply::Reply::new(451, "4.3.5 downstream capability mismatch")
         }
 
@@ -238,10 +252,11 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
         RelayError::PoolExhausted => {
             tracing::warn!(
                 route,
+                downstream,
                 "every pooled connection to this downstream was busy for the whole \
                  connect budget; raise downstream.pool.max_connections if this persists"
             );
-            metrics::downstream_error(ramp, route, "pool_exhausted");
+            metrics::downstream_error(ramp, route, downstream, "pool_exhausted");
             reply::Reply::new(451, "4.4.5 downstream connection pool exhausted")
         }
 
@@ -252,12 +267,13 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
                 // one place §14.1 permits a 550 (D-008).
                 tracing::info!(
                     route,
+                    downstream,
                     stage = stage.as_str(),
                     code,
                     text = %redact_addresses(text),
                     "downstream rejected the recipient"
                 );
-                metrics::downstream_error(ramp, route, "rejected");
+                metrics::downstream_error(ramp, route, downstream, "rejected");
                 reply::with_downstream(550, "5.0.0 rejected by downstream", *code, text)
             } else {
                 if stage.is_config_error_on_5xx() {
@@ -265,6 +281,7 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
                     // ramping flawlessly for weeks while building no reputation.
                     tracing::error!(
                         route,
+                        downstream,
                         stage = stage.as_str(),
                         code,
                         text = %redact_addresses(text),
@@ -272,17 +289,18 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
                          configuration fault, not a recipient fault; returning \
                          451 so the client does not suppress the recipient"
                     );
-                    metrics::downstream_config_error(ramp, route, stage.as_str());
+                    metrics::downstream_config_error(ramp, route, downstream, stage.as_str());
                 } else {
                     tracing::warn!(
                         route,
+                        downstream,
                         stage = stage.as_str(),
                         code,
                         text = %redact_addresses(text),
                         "downstream 5xx"
                     );
                 }
-                metrics::downstream_error(ramp, route, "rejected");
+                metrics::downstream_error(ramp, route, downstream, "rejected");
                 reply::with_downstream(451, "4.0.0 deferred by downstream", *code, text)
             }
         }
@@ -290,12 +308,13 @@ pub fn failed(ramp: &str, route: &str, err: &RelayError) -> Outcome {
         RelayError::Rejected { stage, code, text } => {
             tracing::info!(
                 route,
+                downstream,
                 stage = stage.as_str(),
                 code,
                 text = %redact_addresses(text),
                 "downstream 4xx"
             );
-            metrics::downstream_error(ramp, route, "deferred");
+            metrics::downstream_error(ramp, route, downstream, "deferred");
             reply::with_downstream(451, "4.0.0 deferred by downstream", *code, text)
         }
     };
@@ -408,21 +427,26 @@ mod tests {
 
     #[test]
     fn connect_failure_is_451_4_4_1() {
-        let o = failed("main", "r", &RelayError::Connect("refused".into()));
+        let o = failed(
+            "main",
+            "r",
+            "default",
+            &RelayError::Connect("refused".into()),
+        );
         assert_eq!(o.reply.to_wire(), "451 4.4.1 downstream unavailable\r\n");
         assert!(!o.commit);
     }
 
     #[test]
     fn tls_failure_is_451_4_7_0() {
-        let o = failed("main", "r", &RelayError::Tls("handshake".into()));
+        let o = failed("main", "r", "default", &RelayError::Tls("handshake".into()));
         assert_eq!(o.reply.to_wire(), "451 4.7.0 downstream TLS failure\r\n");
     }
 
     #[test]
     fn a_timeout_at_any_stage_is_451_4_4_2() {
         for stage in ALL_STAGES {
-            let o = failed("main", "r", &RelayError::Timeout(stage));
+            let o = failed("main", "r", "default", &RelayError::Timeout(stage));
             assert_eq!(
                 o.reply.to_wire(),
                 "451 4.4.2 downstream timeout\r\n",
@@ -435,7 +459,12 @@ mod tests {
     #[test]
     fn a_protocol_violation_at_any_stage_is_451_4_3_0() {
         for stage in ALL_STAGES {
-            let o = failed("main", "r", &RelayError::Protocol(stage, "garbage".into()));
+            let o = failed(
+                "main",
+                "r",
+                "default",
+                &RelayError::Protocol(stage, "garbage".into()),
+            );
             assert_eq!(
                 o.reply.to_wire(),
                 "451 4.3.0 downstream protocol error\r\n",
@@ -448,7 +477,7 @@ mod tests {
     fn a_4xx_at_any_stage_is_451_with_the_downstream_text_appended() {
         for stage in ALL_STAGES {
             for code in [421, 450, 451, 452, 454, 471] {
-                let o = failed("main", "r", &rejected(stage, code));
+                let o = failed("main", "r", "default", &rejected(stage, code));
                 assert_eq!(o.reply.code, 451, "{stage:?} {code}");
                 assert!(
                     o.reply
@@ -468,7 +497,7 @@ mod tests {
     #[test]
     fn a_5xx_at_rcpt_to_is_550_because_it_is_genuinely_about_the_recipient() {
         for code in [550, 551, 552, 553, 554] {
-            let o = failed("main", "r", &rejected(Stage::RcptTo, code));
+            let o = failed("main", "r", "default", &rejected(Stage::RcptTo, code));
             assert_eq!(o.reply.code, 550, "{code}");
             assert!(o
                 .reply
@@ -490,7 +519,7 @@ mod tests {
             if stage == Stage::RcptTo {
                 continue;
             }
-            let o = failed("main", "r", &rejected(stage, 550));
+            let o = failed("main", "r", "default", &rejected(stage, 550));
             assert_eq!(o.reply.code, 451, "{stage:?} must not be 550");
             assert!(o.reply.to_wire().contains("550 downstream detail"));
             assert_eq!(o.result, metrics::MessageResult::Deferred);
@@ -502,7 +531,7 @@ mod tests {
         // The exhaustive assertion §12.3 asks for: no combination falls through.
         for stage in ALL_STAGES {
             for code in [211, 250, 354, 421, 450, 500, 550, 554] {
-                let o = failed("main", "r", &rejected(stage, code));
+                let o = failed("main", "r", "default", &rejected(stage, code));
                 assert!(
                     o.reply.code == 451 || o.reply.code == 550,
                     "{stage:?} {code} produced {}",
@@ -517,7 +546,7 @@ mod tests {
 
     #[test]
     fn the_ambiguous_final_dot_is_451_and_releases() {
-        let o = failed("main", "r", &RelayError::Ambiguous);
+        let o = failed("main", "r", "default", &RelayError::Ambiguous);
         assert_eq!(o.reply.code, 451);
         // Never 250: §10.2 is explicit that Simmer must not vouch for a delivery
         // it cannot confirm, even at the cost of a duplicate on retry.
@@ -530,7 +559,7 @@ mod tests {
         // §8.3. Distinct from `connect` on purpose: one says raise
         // `max_connections`, the other says go and look at the provider, and a
         // dashboard that conflates them sends somebody to the wrong place.
-        let o = failed("main", "r", &RelayError::PoolExhausted);
+        let o = failed("main", "r", "default", &RelayError::PoolExhausted);
         assert_eq!(o.reply.code, 451);
         assert!(o.reply.to_wire().contains("4.4.5"));
         assert!(!o.commit);
@@ -539,7 +568,12 @@ mod tests {
 
     #[test]
     fn a_missing_capability_is_451_not_550() {
-        let o = failed("main", "r", &RelayError::MissingCapability("SMTPUTF8"));
+        let o = failed(
+            "main",
+            "r",
+            "default",
+            &RelayError::MissingCapability("SMTPUTF8"),
+        );
         assert_eq!(o.reply.code, 451);
         assert!(!o.commit);
     }
@@ -551,7 +585,7 @@ mod tests {
         let mut permanent = Vec::new();
         for stage in ALL_STAGES {
             for code in [250, 421, 450, 452, 500, 550, 554] {
-                let o = failed("main", "r", &rejected(stage, code));
+                let o = failed("main", "r", "default", &rejected(stage, code));
                 if o.reply.code >= 500 {
                     permanent.push((stage, code));
                 }
@@ -566,7 +600,7 @@ mod tests {
                 RelayError::PoolExhausted,
             ] {
                 assert!(
-                    failed("main", "r", &err).reply.code < 500,
+                    failed("main", "r", "default", &err).reply.code < 500,
                     "{err:?} at {stage:?} must not be permanent"
                 );
             }

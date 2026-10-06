@@ -72,6 +72,18 @@
 //! strands is ever given back. `SOAK_V4=off` leaves it out, for a like-for-like
 //! comparison with a run from before it.
 //!
+//! ## Segment — a per-group downstream override (D-112)
+//!
+//! A small stream per instance ([`SEGMENT_RATE`]) to recipients in
+//! `segment.soak.test`, the soak config's `segment` group. The warming route sends
+//! that group to the sink's third listener, 2527, through `downstream_overrides`.
+//! The sink records the listener every message arrived on, and `soak_analyze`
+//! holds the run to three things (`soak/segment/routing`): every segment message
+//! on 2527, nothing else on 2527, and the segment stream reconciled with no loss and
+//! no duplicate. Over hours, that is the override's pool being reused, reaped and
+//! retried while the route's own pool does the same beside it. `SOAK_SEGMENT=off`
+//! leaves it out.
+//!
 //! ## At rest (step 5c)
 //!
 //! `soak_run` measures each instance before its first message and again once the
@@ -205,6 +217,20 @@ const SLOW_MS: f64 = 200.0;
 /// out, the slowest first: a run gone badly wrong has thousands.
 const SLOW_TRACED: usize = 200;
 
+/// D-112's segment: the recipient domain, the group it is in, and the sink
+/// listener the warming route's override for that group points at. The listener
+/// is the string the sink was started with, which is what it records.
+const SEGMENT_DOMAIN: &str = "segment.soak.test";
+const SEGMENT_GROUP: &str = "segment";
+const SEGMENT_PORT: u16 = 2527;
+const SEGMENT_LISTENER: &str = "0.0.0.0:2527";
+/// The loadgen tag prefix, so the segment's ids are `soak-segment-<instance>-<n>`
+/// and no other stream's id starts with it.
+const SEGMENT_TAG: &str = "soak-segment";
+/// Messages per second per instance: a tenth of the main stream, so the override
+/// pool is busy for the whole run without changing what V2 measures.
+const SEGMENT_RATE: f64 = 1.0;
+
 // ---------------------------------------------------------------------------
 // the one test that needs no Docker
 // ---------------------------------------------------------------------------
@@ -296,7 +322,7 @@ fn assert_soak_config_sound(path: &str) {
         "every V4 session must still be sending when the session timeout fires"
     );
     assert!(
-        simmer::quota::reservation_expiry(cancel, 1) + SWEEP_INTERVAL < session,
+        simmer::quota::reservation_expiry(&cancel.downstream, 1) + SWEEP_INTERVAL < session,
         "a stranded reservation must be swept before the next session's cancellation"
     );
 
@@ -316,6 +342,55 @@ fn assert_soak_config_sound(path: &str) {
             route.name
         );
     }
+    // D-112's segment. Each of these is a way for `soak/segment/routing` to pass
+    // without testing the override: no group for the domain, an override that does
+    // not point at 2527, or 2527 reachable some other way.
+    let ramp = cfg.default_ramp();
+    let group = ramp
+        .domain_group(SEGMENT_GROUP)
+        .expect("a domain group for the segment");
+    assert!(
+        group.domains.iter().any(|d| d == SEGMENT_DOMAIN),
+        "the segment group lists {SEGMENT_DOMAIN} literally, so no DNS decides it"
+    );
+    let segment = warming.target(SEGMENT_GROUP);
+    assert_eq!(
+        segment.group,
+        Some(SEGMENT_GROUP),
+        "the warming route overrides the segment's downstream"
+    );
+    assert_eq!(
+        (segment.downstream.host.as_str(), segment.downstream.port),
+        ("sink", SEGMENT_PORT)
+    );
+    assert_eq!(
+        simmer::quota::reservation_expiry(segment.downstream, 1),
+        simmer::quota::reservation_expiry(&warming.downstream, 1),
+        "the override's timeouts match the route's, so the reservation expiry is unchanged"
+    );
+    let on_segment_port: Vec<String> = ramp
+        .routes
+        .iter()
+        .flat_map(|r| r.targets())
+        .filter(|t| t.downstream.port == SEGMENT_PORT)
+        .map(|t| format!("{}/{}", t.route.name, t.label()))
+        .collect();
+    assert_eq!(
+        on_segment_port,
+        [format!("warming-newbrand/{SEGMENT_GROUP}")],
+        "only the segment override may reach {SEGMENT_PORT}"
+    );
+    let main_rule = ramp
+        .senders
+        .iter()
+        .find(|r| r.pattern == "oldbrand.com")
+        .expect("the main sender rule");
+    assert_eq!(
+        main_rule.chain.first().map(String::as_str),
+        Some("warming-newbrand"),
+        "the segment stream's sender reaches the warming route first"
+    );
+
     let warnings = simmer::config::validate::warnings(&cfg);
     assert!(
         !warnings
@@ -358,7 +433,16 @@ fn soak_run() {
         let _ = fs::remove_file(fds_path(instance, "rest"));
         let _ = fs::remove_file(sample_path(&format!("slow-{instance}.jsonl")));
     }
-    for file in ["metrics.csv", "v4.csv", "v4-sink.jsonl", "slow-sink.jsonl"] {
+    for instance in INSTANCES {
+        let _ = fs::remove_file(sample_path(&format!("segment-{instance}.jsonl")));
+    }
+    for file in [
+        "metrics.csv",
+        "v4.csv",
+        "v4-sink.jsonl",
+        "slow-sink.jsonl",
+        "segment-sink.jsonl",
+    ] {
         let _ = fs::remove_file(sample_path(file));
     }
     recreate_instances();
@@ -466,6 +550,23 @@ fn soak_run() {
         })
         .collect();
 
+    // D-112's segment — a small stream per instance to the `segment` group, which
+    // the warming route sends to the sink's third listener. Identical on both
+    // instances, so V2's pair stays a pair.
+    let segment = segment_enabled();
+    let segment_loads: Vec<_> = if segment {
+        INSTANCES
+            .iter()
+            .map(|instance| {
+                let args = segment_args(instance, &seconds);
+                let name = format!("{instance} segment");
+                thread::spawn(move || run_loadgen(&name, &args))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // V4 (F2) — a third stream per instance, identical on both so that V2's pair
     // stays a pair, with the route's quota row sampled from the database: the one
     // view of it that includes `app2` without scraping it.
@@ -503,6 +604,10 @@ fn soak_run() {
 
     for load in loads {
         let summary = load.join().expect("a load thread");
+        eprintln!("  {summary}");
+    }
+    for load in segment_loads {
+        let summary = load.join().expect("a segment load thread");
         eprintln!("  {summary}");
     }
 
@@ -562,6 +667,9 @@ fn soak_run() {
     }
     if v4 {
         copy_v4_evidence();
+    }
+    if segment {
+        copy_segment_evidence();
     }
     copy_slow_evidence();
     eprintln!(
@@ -829,6 +937,7 @@ fn soak_analyze() {
     analyze_capture(&mut failures);
     analyze_capture_disk_gauge(&mut failures);
     analyze_v4(&mut failures);
+    analyze_segment(&mut failures);
     if baseline_judged {
         verdict(&mut failures, "soak/rest/baseline", joined(baseline));
     }
@@ -1042,6 +1151,247 @@ fn joined(problems: Vec<String>) -> Result<(), String> {
 
 /// V4 (F2): what the session timeout's cancellations cost, judged from what
 /// `soak_run` copied to the host once the load and the drain were over.
+/// D-112's segment (`soak/segment/routing`): did the override send the segment
+/// group's mail, and only that mail, to its own downstream?
+///
+/// Judged from the sink's side, by the listener each message arrived on. A
+/// message on the wrong port would be one the override missed or one it
+/// caught wrongly. The reconcile on top holds the segment stream to the same
+/// rules as the main stream: every message accepted is stored once, and nothing
+/// that was not accepted is stored at all.
+fn analyze_segment(failures: &mut Vec<String>) {
+    let sent: Vec<Sent> = INSTANCES
+        .iter()
+        .filter_map(|i| read_sample_jsonl::<Sent>(&format!("segment-{i}.jsonl")))
+        .flatten()
+        .collect();
+    let Some(text) = fs::read_to_string(sample_path("segment-sink.jsonl")).ok() else {
+        eprintln!(
+            "
+segment: not run (no segment-sink.jsonl; SOAK_SEGMENT=off, or a run from before D-112)"
+        );
+        return;
+    };
+    let on_port: Vec<OnPort> = reconcile::read_jsonl(&text);
+    let received: Vec<Received> = reconcile::read_jsonl(&text);
+    let result = segment_problems(&sent, &on_port, &received);
+    eprintln!(
+        "
+segment: {} sent, {} accepted, {} sink records ({} on {SEGMENT_LISTENER})",
+        sent.len(),
+        sent.iter().filter(|s| s.code == 250).count(),
+        on_port.len(),
+        on_port
+            .iter()
+            .filter(|r| r.listener == SEGMENT_LISTENER)
+            .count()
+    );
+    verdict(failures, "soak/segment/routing", result);
+}
+
+#[cfg(test)]
+mod segment_verdict {
+    //! `soak/segment/routing`'s rules against synthetic records, so a verdict
+    //! that cannot fail is caught here rather than after an hour's run.
+    use super::*;
+    use compose::reconcile::Outcome;
+
+    fn sent(id: &str, code: u16) -> Sent {
+        Sent {
+            id: id.to_string(),
+            code,
+            stage: "dot".to_string(),
+            text: String::new(),
+            latency_ms: 1.0,
+        }
+    }
+
+    fn line(id: &str, listener: &str) -> (OnPort, Received) {
+        (
+            OnPort {
+                id: id.to_string(),
+                listener: listener.to_string(),
+            },
+            Received {
+                id: id.to_string(),
+                outcome: Outcome::Delivered,
+                mismatch: false,
+                correlation: None,
+            },
+        )
+    }
+
+    fn judge(sent: &[Sent], lines: Vec<(OnPort, Received)>) -> Result<(), String> {
+        let (on_port, received): (Vec<_>, Vec<_>) = lines.into_iter().unzip();
+        segment_problems(sent, &on_port, &received)
+    }
+
+    const A: &str = "soak-segment-app-1";
+    const B: &str = "soak-segment-app2-1";
+
+    #[test]
+    fn every_segment_message_on_its_listener_passes() {
+        judge(
+            &[sent(A, 250), sent(B, 250)],
+            vec![line(A, SEGMENT_LISTENER), line(B, SEGMENT_LISTENER)],
+        )
+        .expect("clean");
+    }
+
+    #[test]
+    fn a_segment_message_on_the_routes_own_listener_fails() {
+        let err = judge(
+            &[sent(A, 250), sent(B, 250)],
+            vec![line(A, SEGMENT_LISTENER), line(B, "0.0.0.0:2525")],
+        )
+        .expect_err("misrouted");
+        assert!(err.contains("somewhere other than"), "{err}");
+    }
+
+    #[test]
+    fn another_streams_message_on_the_segment_listener_fails() {
+        let err = judge(
+            &[sent(A, 250)],
+            vec![
+                line(A, SEGMENT_LISTENER),
+                line("soak-app-7", SEGMENT_LISTENER),
+            ],
+        )
+        .expect_err("intruder");
+        assert!(err.contains("outside the segment"), "{err}");
+    }
+
+    #[test]
+    fn an_accepted_segment_message_the_sink_never_saw_fails() {
+        judge(
+            &[sent(A, 250), sent(B, 250)],
+            vec![line(A, SEGMENT_LISTENER)],
+        )
+        .expect_err("lost");
+    }
+
+    #[test]
+    fn a_run_with_nothing_accepted_cannot_pass() {
+        let err = judge(&[sent(A, 451)], Vec::new()).expect_err("vacuous");
+        assert!(err.contains("not exercised"), "{err}");
+        judge(&[], Vec::new()).expect_err("vacuous");
+    }
+}
+
+/// One sink line, for the one field [`Received`] does not carry.
+#[derive(serde::Deserialize)]
+struct OnPort {
+    id: String,
+    listener: String,
+}
+
+fn is_segment_id(id: &str) -> bool {
+    id.starts_with(&format!("{SEGMENT_TAG}-"))
+}
+
+/// The rules [`analyze_segment`] applies. `on_port` and `received` are the same
+/// sink lines, parsed twice: every segment id's line, and every line on the
+/// segment's listener.
+fn segment_problems(
+    sent: &[Sent],
+    on_port: &[OnPort],
+    received: &[Received],
+) -> Result<(), String> {
+    let accepted = sent.iter().filter(|s| s.code == 250).count();
+    if accepted == 0 {
+        // Without this the check passes vacuously: no messages, so none on
+        // the wrong port.
+        return Err(format!(
+            "no segment message was accepted ({} sent): the override was not exercised",
+            sent.len()
+        ));
+    }
+
+    let mut problems = Vec::new();
+    let misrouted: Vec<&OnPort> = on_port
+        .iter()
+        .filter(|r| is_segment_id(&r.id) && r.listener != SEGMENT_LISTENER)
+        .collect();
+    if !misrouted.is_empty() {
+        problems.push(format!(
+            "{} segment messages arrived somewhere other than {SEGMENT_LISTENER}, e.g. {} on {}",
+            misrouted.len(),
+            misrouted[0].id,
+            misrouted[0].listener
+        ));
+    }
+    let intruders: Vec<&OnPort> = on_port
+        .iter()
+        .filter(|r| r.listener == SEGMENT_LISTENER && !is_segment_id(&r.id))
+        .collect();
+    if !intruders.is_empty() {
+        problems.push(format!(
+            "{} messages outside the segment arrived on {SEGMENT_LISTENER}, e.g. {}",
+            intruders.len(),
+            intruders[0].id
+        ));
+    }
+
+    let segment_received: Vec<Received> = received
+        .iter()
+        .filter(|r| is_segment_id(&r.id))
+        .cloned()
+        .collect();
+    let report = reconcile::reconcile(sent, &segment_received, None);
+    problems.extend(report.violations.iter().cloned());
+    joined(problems)
+}
+
+fn segment_enabled() -> bool {
+    std::env::var("SOAK_SEGMENT").map_or(true, |v| v != "off")
+}
+
+fn segment_args(instance: &str, seconds: &str) -> Vec<String> {
+    [
+        "--host",
+        instance,
+        "--port",
+        "25",
+        "--username",
+        "soakapp",
+        "--from",
+        "jane@oldbrand.com",
+        "--recipient-domain",
+        SEGMENT_DOMAIN,
+        "--tag",
+        &format!("{SEGMENT_TAG}-{instance}"),
+        "--rate",
+        &SEGMENT_RATE.to_string(),
+        "--duration",
+        seconds,
+        "--concurrency",
+        "2",
+        "--per-session",
+        "10",
+        "--size",
+        "4k",
+        "--jsonl",
+        &format!("/results/soak-segment-{instance}.jsonl"),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// The segment streams' own records, and every sink line that is either a
+/// segment message or arrived on the segment's listener.
+fn copy_segment_evidence() {
+    for instance in INSTANCES {
+        let text = from_results(&format!("cat /results/soak-segment-{instance}.jsonl"));
+        let _ = fs::write(sample_path(&format!("segment-{instance}.jsonl")), text);
+    }
+    let text = from_results(&format!(
+        "grep -e '\"id\":\"{SEGMENT_TAG}-' -e '\"listener\":\"{SEGMENT_LISTENER}\"' \
+         /results/sink.jsonl || true"
+    ));
+    let _ = fs::write(sample_path("segment-sink.jsonl"), text);
+}
+
 fn analyze_v4(failures: &mut Vec<String>) {
     let sent: Vec<(&str, Vec<Sent>)> = INSTANCES
         .iter()

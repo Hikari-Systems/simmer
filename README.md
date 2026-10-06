@@ -310,6 +310,55 @@ domain_groups:
 - `POST /dryrun` reports each recipient's `domain_group_basis`: `literal`,
   `mx:<host>`, `fallback` or `fallback:mx-unavailable`.
 
+### A downstream per domain group
+
+By default a route sends every message to its one `downstream`. Optionally, a
+route can name a different downstream for some domain groups (D-112). Mail whose
+recipient resolved to that group, by literal domain or by MX, goes there instead.
+Every other group still uses `downstream`.
+
+```yaml
+routes:
+  - name: warming-newbrand
+    downstream: { host: smtp.postal.internal, port: 587, pool: { ... } }   # the default
+    downstream_overrides:
+      google:
+        host: smtp-google.postal.internal
+        port: 587
+        tls: required_verify
+        auth: { username: "${POSTAL_G_USER}", password: "${POSTAL_G_PASS}" }
+        pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+      microsoft:
+        host: smtp-microsoft.postal.internal
+        port: 587
+        pool: { max_connections: 2, idle_ttl: 60s, max_messages_per_connection: 100 }
+```
+
+- **An override is a whole downstream.** Nothing is inherited from `downstream`.
+  Auth, TLS, timeouts, pool, `smtputf8` and `assume_8bitmime` are each the
+  override's own. If you omit `auth`, the override sends unauthenticated.
+- **It chooses the MTA and nothing else.** The route, its identity, its quota row
+  (already per group) and its place in the chain are unchanged. A failure at the
+  override MTA is reported like any other (§3.3). It is never retried at the
+  route's own `downstream`.
+- **Each override has its own pool** and its own `max_connections`. Groups
+  without an override share the route's pool.
+- **Overflow routes can have overrides too.**
+- **Every downstream counts towards `SMTPUTF8`.** `EHLO` advertises it only if
+  every override also says `smtputf8: true`, because the group is not known at
+  `EHLO`.
+- **Preflight is still per route.** If preflight is on, the route's `spf_include`
+  must cover every override MTA as well as its own.
+- **Seeing it:** `simmer_downstream_errors_total`,
+  `simmer_downstream_latency_seconds`, `simmer_pool_connections` and
+  `simmer_pool_retries_total` carry a `downstream` label: `default`, or the
+  override's group. `/ramps/{ramp}/routes` lists each override with its pool.
+  `POST /dryrun` says which downstream a recipient would be relayed to. A group
+  named `default` cannot have an override, because that name is the label.
+- **After cutover**, the application (or its MTA) has to make the same choice.
+  That is easy for literal-domain groups. For groups matched by MX, it needs an
+  MTA that can route on MX records.
+
 ### Partial ramp
 
 Without it, a warming route takes **every** eligible message from the day
@@ -490,8 +539,9 @@ check that relationship still holds.
 
 ### Connection pooling
 
-Each route has its own pool, configured under `downstream.pool`. Two things about
-it are not obvious from the keys:
+Each route has its own pool, configured under `downstream.pool` (and each
+`downstream_overrides` entry has one more, under its own `pool`). Two things
+about it are not obvious from the keys:
 
 **`max_connections` is a bound, not a hint.** It is held for the whole time a
 connection is in use, so a route can never have more connections open than it

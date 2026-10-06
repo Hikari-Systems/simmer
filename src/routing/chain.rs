@@ -524,7 +524,7 @@ impl<'w, 'm> Walker<'w, 'm> {
             correlation_id: correlation_id.to_string(),
             expires_at: self.now
                 + chrono::Duration::from_std(quota::reservation_expiry(
-                    c.route,
+                    c.route.target(&self.group).downstream,
                     self.recipients.len(),
                 ))
                 .unwrap_or_else(|_| chrono::Duration::seconds(600)),

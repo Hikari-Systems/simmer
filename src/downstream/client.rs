@@ -23,7 +23,7 @@ use tokio::net::TcpStream;
 use super::outcome::{Delivered, RelayError, Stage};
 use super::pool::Pool;
 use super::stream::{Stream, TlsConfigs};
-use crate::config::{Route, TlsMode};
+use crate::config::{Downstream, Target, TlsMode};
 use crate::metrics;
 use crate::smtp::buffer::stuff_into;
 
@@ -58,9 +58,9 @@ pub struct Message<'a> {
     pub assume_8bitmime: bool,
 }
 
-/// Timeouts resolved for one route (§8.4).
+/// Timeouts resolved for one downstream (§8.4).
 ///
-/// Resolved once per route when its pool is built, rather than once per message:
+/// Resolved once per downstream when its pool is built, rather than once per message:
 /// the answer is a pure function of configuration, and §8.3's own traffic —
 /// `NOOP`, `RSET`, the `QUIT` that retires a connection — needs the same budget
 /// with no message in hand.
@@ -71,8 +71,8 @@ pub(super) struct Budget {
 }
 
 impl Budget {
-    pub(super) fn for_route(route: &Route) -> Self {
-        let t = route.downstream.timeouts.as_ref();
+    pub(super) fn for_downstream(ds: &Downstream) -> Self {
+        let t = ds.timeouts.as_ref();
         Self {
             connect: t.and_then(|t| t.connect).unwrap_or(DEFAULT_CONNECT),
             command: t.and_then(|t| t.command).unwrap_or(DEFAULT_COMMAND),
@@ -81,11 +81,11 @@ impl Budget {
     }
 }
 
-/// D-106 — a route's downstream conversation as D-081 bounds it: the pool wait
-/// and the connect (each the route's `connect`), a command and the data stage.
+/// D-106 — a downstream conversation as D-081 bounds it: the pool wait and the
+/// connect (each the downstream's `connect`), a command and the data stage.
 /// What §10.4's shutdown allows a relay in flight before it is cut.
-pub fn conversation_budget(route: &Route) -> Duration {
-    let b = Budget::for_route(route);
+pub fn conversation_budget(ds: &Downstream) -> Duration {
+    let b = Budget::for_downstream(ds);
     b.connect * 2 + b.command + b.data
 }
 
@@ -127,17 +127,19 @@ fn has_8bit(body: &[u8]) -> bool {
     body.iter().any(|&b| b > 0x7F)
 }
 
-/// Relay one message to a route's downstream over a pooled connection (§8.3).
+/// Relay one message to the downstream `target` names, over a pooled connection
+/// (§8.3) — the route's own, or its group's override (D-112).
 pub async fn relay(
-    route: &Route,
+    target: Target<'_>,
     tls: &TlsConfigs,
     pools: &Pool,
     hostname: &str,
     message: &Message<'_>,
 ) -> Result<Delivered, RelayError> {
-    let pool = pools.for_route(route);
+    let route = target.route;
+    let pool = pools.for_target(&target);
     let budget = pool.budget();
-    let mut checkout = pool.checkout(route, tls, hostname).await?;
+    let mut checkout = pool.checkout(&target, tls, hostname).await?;
 
     let mut result = checkout.conn().deliver(message, budget).await;
 
@@ -161,13 +163,14 @@ pub async fn relay(
     if checkout.reused() && is_stale_connection(&result) {
         tracing::info!(
             route = %route.name,
+            downstream = %target.label(),
             error = ?result.as_ref().err(),
             "pooled connection was dead on reuse; retrying once on a fresh connection"
         );
-        metrics::pool_retry(&route.ramp, &route.name);
+        metrics::pool_retry(&route.ramp, &route.name, target.label());
         // §9.6 — on the caller's `smtp.downstream` span, when there is one.
         tracing::Span::current().record("retried", true);
-        checkout.reopen(route, tls, hostname).await?;
+        checkout.reopen(&target, tls, hostname).await?;
         result = checkout.conn().deliver(message, budget).await;
     }
 
@@ -208,12 +211,12 @@ impl Connection {
     /// `hostname` is Simmer's own `server.hostname`: the name both `EHLO`s give
     /// (D-077). Never the downstream's.
     pub(super) async fn open(
-        route: &Route,
+        target: &Target<'_>,
         tls: &TlsConfigs,
         hostname: &str,
         budget: &Budget,
     ) -> Result<Connection, RelayError> {
-        let ds = &route.downstream;
+        let ds = target.downstream;
         let addr = format!("{}:{}", ds.host, ds.port);
 
         // §8.2 `opportunistic` says to "continue in plaintext ... if it fails".
@@ -246,7 +249,7 @@ impl Connection {
 
             let wants_tls = allow_starttls && ds.tls != TlsMode::Off;
             if wants_tls {
-                match conn.try_starttls(route, tls, hostname, budget).await {
+                match conn.try_starttls(ds, tls, hostname, budget).await {
                     Ok(true) => {}
                     // Not advertised.
                     Ok(false) => match ds.tls {
@@ -261,7 +264,8 @@ impl Connection {
                     Err(e) => match ds.tls {
                         TlsMode::Opportunistic => {
                             tracing::warn!(
-                                route = %route.name,
+                                route = %target.route.name,
+                                downstream = %target.label(),
                                 error = ?e,
                                 "opportunistic STARTTLS failed; retrying in plaintext"
                             );
@@ -299,7 +303,7 @@ impl Connection {
     /// `STARTTLS` was not advertised.
     async fn try_starttls(
         &mut self,
-        route: &Route,
+        ds: &Downstream,
         tls: &TlsConfigs,
         hostname: &str,
         budget: &Budget,
@@ -338,7 +342,7 @@ impl Connection {
         };
 
         let upgraded = tls
-            .upgrade(route.downstream.tls, &route.downstream.host, tcp)
+            .upgrade(ds.tls, &ds.host, tcp)
             .await
             .map_err(RelayError::Tls)?;
 
