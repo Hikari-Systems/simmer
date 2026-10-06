@@ -5341,10 +5341,13 @@ new backend-independent test binaries in a `rust:1-bookworm` container.
 **Soak** (`docs/SOAK.md` §19): the soak config sends a `segment` group to a
 third sink listener through an override, and a small stream per instance checks
 the override end to end from the sink's side (`soak/segment/routing`). A 4-minute
-run put all 500 segment messages on that port and nothing else there.
+run put all 500 segment messages on that port and nothing else there. The
+hour-long run (after `v0.11.0` was tagged) put all 7,220 there, nothing else, with
+every leak gate green; one shared slow step at ~40 minutes on both instances is
+recorded in §19 and not attributed.
 
 **Not run:** the compose tiers (`e2e_matrix`, whose two exact-label assertions
-were edited, and stress), and an hour-long soak with the segment stream; the SQL Server database tests (nothing behind
+were edited, and stress); the SQL Server database tests (nothing behind
 `QuotaStore` changed); an override exercised on the acceptance stack against
 real mail servers.
 

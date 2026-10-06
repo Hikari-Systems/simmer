@@ -80,7 +80,7 @@ at all, which is why the A/B pair was worth building before any variant.
 | **V2** | `app` scraped, `app2` never — isolates F8 | built, exercised |
 | **V3** | one message in twenty from a fresh `u<n>.soak.test` sender — F7 | built, **drives the defect** |
 | **V4** | the session timeout against relays in flight — F2, and since D-081 its regression check | built (§8) |
-| **segment** | 1 msg/s per instance to the `segment` group, which the warming route's `downstream_overrides` sends to the sink's third listener (2527) — D-112 | built, exercised (§19) |
+| **segment** | 1 msg/s per instance to the `segment` group, which the warming route's `downstream_overrides` sends to the sink's third listener (2527) — D-112 | built, exercised for an hour (§19) |
 | bursts | 60 s at 70 clients every 15 min | outstanding |
 | idle gaps | 3 min past `idle_ttl`, sink closing idle at 45 s — F10/CLOSE_WAIT | outstanding |
 
@@ -2216,6 +2216,38 @@ own timeouts, and 2527 is reachable from that override alone.
 **The first run** (2026-10-06, Postgres, 4 minutes, V4 skipped for length): 2,410
 main-stream and 250 segment messages per instance, every one accepted. 500 segment
 records at the sink, all 500 on 2527, nothing else there. Main-stream p99 was
-55–57 ms. Too short for a leak verdict, and not meant as one. The hour-long run
-with the segment stream on is outstanding.
+55–57 ms. Too short for a leak verdict, and not meant as one.
+
+**The hour** (2026-10-06, Postgres, capture and export off, the `v0.11.0`
+code, V4 on). Every gate green; F7 its usual XFAIL.
+
+| | app | app2 |
+|---|---|---|
+| main stream | 36,010 sent, 36,010 accepted | 36,010 sent, 36,010 accepted |
+| main p50 / p90 / p99 | 10.3 / 41.3 / 74.1 ms | 10.4 / 41.8 / 74.0 ms |
+| segment stream | 3,610 sent, 3,610 accepted | 3,610 sent, 3,610 accepted |
+| anon slope (after 10 min warm-up) | +2.79 MiB/h | −3.07 MiB/h |
+| fds slope | +6.00/h, back at baseline at rest | +4.00/h, back at baseline at rest |
+| threads / tasks at rest | 3 / 11, as before the first message | 3 / 11, as before the first message |
+| peak established / CLOSE_WAIT | 28 / 1 | 27 / 1 |
+| V4 | 11 cut, `reservations_in_flight` 0 after the drain | the same |
+
+`soak/segment/routing`: **7,220 sent, 7,220 accepted, 7,220 sink records, all
+7,220 on `0.0.0.0:2527`**, nothing else there. The override's pool ran an hour of
+reuse, idle reaping and D-068 retries beside the route's own with neither
+showing a trend: the fd ratchet is the same shape §17 recorded, and it
+returned to baseline at rest.
+
+Metric series grew 413 → 1,898 over the run, 1,485 of them F7's unmatched-sender
+`domain` label. D-112's `downstream` label adds two values per series it is on
+(`default`, `segment`), fixed by configuration, so it does not grow.
+
+**One unexplained step.** About 40 minutes in, both instances had the same burst
+of slow messages — `soak-app-24450` to `-24530` and `soak-app2-24454` to
+`-24530`, peaking at 7.8 s and 8.2 s, every one `250` at the dot, recovered within
+a few seconds. That both instances stalled at once points at something they share
+(the database or the host) rather than either process; it is the same shape as
+§17's unexplained step and is not attributed here. The slowest correlation ids
+are `789878a6-ae99-4c05-ac92-d983127e3a5e` (app) and
+`c726e592-690c-432c-bbdc-1a03e0d6dc59` (app2).
 
