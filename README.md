@@ -3,7 +3,7 @@
 An SMTP relay facade that applies a domain reputation warm-up ramp.
 
 <!-- current-version: source of truth for the release number. Keep in sync with the git tag, DOCKERHUB.md, and Cargo.toml; enforced by .githooks/pre-push and the release CI. -->
-**Current version: `v0.11.0`** — [all releases](https://github.com/Hikari-Systems/simmer/releases).
+**Current version: `v0.12.0`** — [all releases](https://github.com/Hikari-Systems/simmer/releases).
 
 Simmer sits between an application and one or more real SMTP providers. It
 accepts a message, selects an outbound route according to quota state, rewrites
@@ -275,6 +275,42 @@ index.
 
 Overflow routes are never capped, but they *are* counted — "how much is spilling
 to overflow" is the number that tells you whether the ramp is set too low.
+
+### A ramp with no overflow route
+
+Every chain normally ends in an overflow route, and startup refuses a
+`default_chain` that does not (§4.2). A ramp that would rather **refuse what it
+cannot warm** than spill it onto an established identity can say so, per ramp
+(D-113):
+
+```yaml
+ramps:
+  transactional:
+    allow_no_overflow_route: true   # default false
+    black_hole_allowed: false       # default false; needs the line above
+```
+
+With `allow_no_overflow_route`, a message that finds no eligible route is
+answered `550 5.7.1` — "no overflow route is configured for this ramp and no
+eligible route was available; the message was not relayed" — instead of
+`exhausted_chain_reply`, and nothing is forwarded. A `default_chain` is still
+required when `strict_senders` is false, but its last route need not be an
+overflow route. Note this is a **permanent** code (§14.1) and also covers a day
+on which every warming route is at its cap.
+
+`black_hole_allowed: true` answers **`250` and discards the message** instead:
+not relayed, not persisted. It is refused at startup without
+`allow_no_overflow_route` and with `strict_senders: true`, so a mistyped sender
+rule cannot be acknowledged and dropped, and it logs a warning on every start.
+Alert on `simmer_no_overflow_total{outcome="discarded_black_hole"}`: that is mail
+the application was told was accepted.
+
+Both outcomes emit two OpenTelemetry events per message, `simmer.no_overflow.reply`
+(the code and enhanced status sent, and whether it was a rejection or the
+black-hole success) and `simmer.no_overflow.action` (`rejected_no_overflow` or
+`discarded_black_hole`), and count `simmer_no_overflow_total{ramp,outcome}`. The
+decision is made at the end of data, so `RCPT TO` is accepted. Thread affinity
+applies as usual.
 
 ### Domain groups by MX
 

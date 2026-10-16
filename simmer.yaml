@@ -259,6 +259,14 @@ ramps:
     default_chain: [overflow-established]
     strict_senders: false
 
+    # D-113 (off by default). Run this ramp with no overflow route: a message that
+    # finds no eligible route is answered 550 5.7.1 and not relayed, instead of
+    # exhausted_chain_reply. black_hole_allowed then answers 250 and DISCARDS it —
+    # needs allow_no_overflow_route and strict_senders: false, and warns on every
+    # start. Alert on simmer_no_overflow_total{outcome="discarded_black_hole"}.
+    # allow_no_overflow_route: false
+    # black_hole_allowed: false
+
     # §3.2 step 2a (D-090): a reply the application sends into a thread Simmer
     # started leaves via the route that started it — past that route's day cap if
     # the cap is already met, and counted. Needs every route's Message-ID to carry a

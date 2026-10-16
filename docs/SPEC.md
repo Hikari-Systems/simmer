@@ -284,8 +284,9 @@ a choice made after selection, not a fallback. *(Added. See `DECISIONS.md` D-112
 
 A ramp is a complete, independent routing profile. Configuration declares one or more under
 `ramps`, keyed by name, and names one of them `default_ramp`. Each carries its own
-`domain_groups`, `senders`, `default_chain`, `strict_senders`, `thread_affinity`,
-`exhausted_chain_reply` and `routes` — everything §3.2 consults — so two ramps can warm two
+`domain_groups`, `senders`, `default_chain`, `strict_senders`, `allow_no_overflow_route`,
+`black_hole_allowed`, `thread_affinity`, `exhausted_chain_reply` and `routes` — everything §3.2
+consults *(the two new keys: D-113)* — so two ramps can warm two
 unrelated identities on unrelated schedules from different start instants.
 
 **Ramps share nothing.** Route and domain-group names are scoped to their ramp, so two ramps may
