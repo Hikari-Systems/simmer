@@ -5351,6 +5351,65 @@ were edited, and stress); the SQL Server database tests (nothing behind
 `QuotaStore` changed); an override exercised on the acceptance stack against
 real mail servers.
 
+### D-113 — A ramp may run with no overflow route: reject, or black-hole
+
+> **Requested 2026-10-16 (HIK-431), and the spec amended in the same change:**
+> §3.1, §3.2 (step 4), §4.1, §4.2 and §9.1. The author's calls, from the ticket:
+> both switches are **per ramp**; the rejection uses **the default 5xx failure
+> code**; **amend the SPEC**; **thread affinity always applies**; and
+> `black_hole_allowed` works **only with `strict_senders: false`**.
+
+**The problem.** §4.2 refused to start a ramp whose `default_chain` did not end in
+an overflow route (with `strict_senders: false`), and every chain was expected to
+end in one. A ramp that should simply refuse what it cannot warm had no way to say
+so: it either carried a pretend overflow route, or answered `451` and let the
+client retry for as long as it liked.
+
+**What it does.** Two per-ramp keys, both off by default.
+
+- `allow_no_overflow_route: true` lifts §4.2's final-route-is-overflow check on
+  `default_chain` (the chain is still required when `strict_senders` is false).
+  A message whose walk finds no eligible route is then answered by the ramp's
+  no-overflow policy, **instead of** `exhausted_chain_reply`: `550 5.7.1` with
+  text saying no overflow route is configured and the message was not relayed.
+- `black_hole_allowed: true`, on top of it, answers `250 2.0.0 ok` and **discards**
+  the message — not relayed, not persisted. Refused at startup without
+  `allow_no_overflow_route`, and with `strict_senders: true`, so a mistyped sender
+  rule can never be answered `250` and dropped. Warned about whenever it is on.
+
+Both outcomes emit two events — `simmer.no_overflow.reply` and
+`simmer.no_overflow.action` — and count `simmer_no_overflow_total{ramp,outcome}`
+(`rejected_no_overflow`, `discarded_black_hole`).
+
+**Where the decision is made.** At the end of data, in `relay`, where the walk
+reports `Exhausted`. The §5.4 early check at `RCPT TO` returns `Ok` for such a ramp:
+refusing there would make the black hole unreachable for any recipient the early
+check could see, and would answer the two modes at different points.
+
+**Why the cutover invariant (§1.1) holds.** A black-holed message is expressed
+application-side as "this class of mail is not sent": the same configuration the
+application would have without Simmer, which is to have no route for it. Nothing
+Simmer does to a *relayed* message changes.
+
+**§14.1 — the one thing to know.** `550` is a permanent code, and §14.1 and the
+second item of CLAUDE.md's list argue against emitting one for a condition that
+is really "this route is full today". In this mode that condition is *not* a
+transient quota state for the client to retry: the operator has said the ramp has
+nowhere else to send it. That is the author's call and it is the default 5xx. Note
+that it also covers a chain that is exhausted because every warming route is
+paused or at its ceiling — in a ramp with the mode on, that is rejected `550`, not
+`451`.
+
+**Not changed.** The §7.5 `fail_closed: false` path still answers as an exhausted
+chain, but the plain one (`exhausted_chain_reply`): it is a store outage, not a
+message that had nowhere to go. `exhausted_chain_reply` is unused by a no-overflow
+ramp.
+
+**Tests.** `config_validation` (the lifted check, the still-required default
+chain, both `black_hole_allowed` refusals, the warning), `relay::tests` (the
+code, enhanced status and action pairing) and `tests/no_overflow.rs` (a real SMTP
+session against a paused route: `550` and `250`, nothing relayed, both events).
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

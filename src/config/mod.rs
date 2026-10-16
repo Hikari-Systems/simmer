@@ -107,6 +107,21 @@ pub struct Ramp {
     #[serde(default)]
     pub strict_senders: bool,
 
+    /// §3.1, §3.2 step 4 (D-113) — let this ramp run with no overflow route.
+    /// Off by default, and then §4.2's "the default chain ends in an overflow
+    /// route" holds unchanged. On, a message that finds no eligible route is
+    /// answered by this ramp's no-overflow policy (a permanent `550`, or the
+    /// black hole if `black_hole_allowed`) instead of `exhausted_chain_reply`.
+    #[serde(default)]
+    pub allow_no_overflow_route: bool,
+
+    /// D-113 — with `allow_no_overflow_route`, answer `250` and discard a message
+    /// that finds no eligible route instead of rejecting it. Off by default;
+    /// refused (§4.2) unless `allow_no_overflow_route` is on and
+    /// `strict_senders` is off.
+    #[serde(default)]
+    pub black_hole_allowed: bool,
+
     /// §3.2 step 2a (D-090) — walk the route that emitted a message ID this
     /// message refers to first. Off by default. When on, §4.2 requires every
     /// route in every chain to set a `Message-ID:` with a literal domain, and

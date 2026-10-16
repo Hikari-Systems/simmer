@@ -560,6 +560,18 @@ fn ramp_warnings(ramp: &Ramp) -> Vec<Warning> {
         });
     }
 
+    // D-113: the one setting under which Simmer answers 250 for mail it did not
+    // send.
+    if ramp.black_hole_allowed && ramp.allow_no_overflow_route && !ramp.strict_senders {
+        out.push(Warning {
+            path: "black_hole_allowed".to_string(),
+            message: "is true: a message that finds no eligible route is answered 250 and \
+                      discarded, never relayed. Alert on simmer_no_overflow_total{outcome=\
+                      \"discarded_black_hole\"} (D-113)"
+                .to_string(),
+        });
+    }
+
     out
 }
 
@@ -1317,6 +1329,7 @@ fn check_ramps(cfg: &Config, v: &mut ViolationList) {
         check_routes(ramp, &mut inner);
         check_chains(ramp, &mut inner);
         check_default_chain(ramp, &mut inner);
+        check_no_overflow(ramp, &mut inner);
         check_thread_affinity(ramp, &mut inner);
         for violation in inner.0 {
             v.push(
@@ -2130,6 +2143,29 @@ fn check_thread_affinity(ramp: &Ramp, v: &mut ViolationList) {
     }
 }
 
+/// §4.2 (D-113): `black_hole_allowed` answers `250` for mail that is thrown
+/// away, so it is only honoured where that is the operator's stated intent.
+fn check_no_overflow(ramp: &Ramp, v: &mut ViolationList) {
+    if !ramp.black_hole_allowed {
+        return;
+    }
+    if !ramp.allow_no_overflow_route {
+        v.push(
+            "black_hole_allowed",
+            "is true but allow_no_overflow_route is false: there is no no-overflow mode for it \
+             to apply to. Set allow_no_overflow_route: true or remove it (D-113)",
+        );
+    }
+    if ramp.strict_senders {
+        v.push(
+            "black_hole_allowed",
+            "is true with strict_senders: true. The black hole is only permitted with \
+             strict_senders: false, so a mistyped sender rule cannot be answered 250 and \
+             discarded (D-113)",
+        );
+    }
+}
+
 fn check_default_chain(ramp: &Ramp, v: &mut ViolationList) {
     // §4.2: "strict_senders: false and default_chain is absent or its final
     // route is not an overflow route."
@@ -2152,6 +2188,12 @@ fn check_default_chain(ramp: &Ramp, v: &mut ViolationList) {
     };
 
     check_chain(ramp, chain, "default_chain", v);
+
+    // D-113: a ramp that has opted into running without an overflow route
+    // answers the exhausted chain itself, so the final link need not be one.
+    if ramp.allow_no_overflow_route {
+        return;
+    }
 
     match chain.last().and_then(|name| ramp.route(name)) {
         Some(route) if route.overflow => {}

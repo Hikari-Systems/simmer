@@ -158,6 +158,12 @@ fn describe() {
          ALERT ON THIS: it is how a typo sends unwarmed traffic at full volume"
     );
     describe_counter!(
+        "simmer_no_overflow_total",
+        "Messages that found no eligible route in a ramp with allow_no_overflow_route (D-113), \
+         by outcome: rejected_no_overflow (550) or discarded_black_hole (250, nothing sent). \
+         ALERT ON discarded_black_hole: that mail was acknowledged and never delivered"
+    );
+    describe_counter!(
         "simmer_ambiguous_terminator_total",
         "Messages whose DATA held an end-of-data marker with a bare CR or LF beside it — \
          the SMTP-smuggling shape (D-095). Every one is refused and relayed nowhere, \
@@ -526,6 +532,18 @@ pub fn downstream_config_error(ramp: &str, route: &str, downstream: &str, stage:
 /// being duplicated by client retries, or lost.
 pub fn ambiguous_delivery() {
     counter!("simmer_ambiguous_delivery_total").increment(1);
+}
+
+/// D-113 `simmer_no_overflow_total{ramp,outcome}` — a message found no eligible
+/// route in a ramp with `allow_no_overflow_route`. `outcome` is
+/// `rejected_no_overflow` or `discarded_black_hole`.
+pub fn no_overflow(ramp: &str, outcome: &str) {
+    counter!(
+        "simmer_no_overflow_total",
+        "ramp" => ramp.to_string(),
+        "outcome" => outcome.to_string(),
+    )
+    .increment(1);
 }
 
 /// §9.1 `simmer_unmatched_sender_total{domain}`.

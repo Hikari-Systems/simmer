@@ -967,6 +967,66 @@ fn accepts_a_missing_default_chain_when_senders_are_strict() {
     load(&yaml).expect("strict_senders makes default_chain unnecessary");
 }
 
+// -- D-113: allow_no_overflow_route and black_hole_allowed ---------------
+
+#[test]
+fn accepts_a_default_chain_with_no_overflow_when_the_ramp_allows_it() {
+    let yaml = BASE
+        .replace("default_chain: [overflow]", "default_chain: [warming]")
+        .replace(
+            "strict_senders: false",
+            "strict_senders: false\n  allow_no_overflow_route: true",
+        );
+    let cfg = load(&yaml).expect("allow_no_overflow_route lifts the final-overflow rule");
+    let ramp = cfg.ramp("main").expect("ramp");
+    assert!(ramp.allow_no_overflow_route && !ramp.black_hole_allowed);
+}
+
+#[test]
+fn still_requires_a_default_chain_in_the_no_overflow_mode() {
+    let yaml = BASE.replace("  default_chain: [overflow]\n", "").replace(
+        "strict_senders: false",
+        "strict_senders: false\n  allow_no_overflow_route: true",
+    );
+    rejected_for(&yaml, "default_chain");
+}
+
+#[test]
+fn rejects_black_hole_allowed_without_the_no_overflow_mode() {
+    let yaml = BASE.replace(
+        "strict_senders: false",
+        "strict_senders: false\n  black_hole_allowed: true",
+    );
+    rejected_for(&yaml, "allow_no_overflow_route is false");
+}
+
+#[test]
+fn rejects_black_hole_allowed_with_strict_senders() {
+    let yaml = BASE.replace(
+        "strict_senders: false",
+        "strict_senders: true\n  allow_no_overflow_route: true\n  black_hole_allowed: true",
+    );
+    rejected_for(&yaml, "only permitted with strict_senders: false");
+}
+
+#[test]
+fn accepts_the_black_hole_and_warns_about_it() {
+    let yaml = BASE
+        .replace("default_chain: [overflow]", "default_chain: [warming]")
+        .replace(
+            "strict_senders: false",
+            "strict_senders: false\n  allow_no_overflow_route: true\n  black_hole_allowed: true",
+        );
+    let cfg = load(&yaml).expect("valid");
+    let warnings = config::validate::warnings(&cfg);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.path == "ramps.main.black_hole_allowed"),
+        "{warnings:?}"
+    );
+}
+
 // -- unknown keys --------------------------------------------------------
 
 #[test]

@@ -191,6 +191,11 @@ pub async fn check_early(
 
     match chain::any_eligible(ramp, &engine.groups, &engine.quota, chain, recipient, now).await {
         Ok(true) => Ok(()),
+        // D-113: a no-overflow ramp answers an exhausted chain once, at the end
+        // of data, where the black hole can discard the message. Refusing here
+        // would make `black_hole_allowed` unreachable for a recipient the
+        // early check can see.
+        Ok(false) if ramp.allow_no_overflow_route => Ok(()),
         Ok(false) => Err(SelectError::ChainExhausted),
         Err(e) => Err(quota_failure(
             &engine.config,
@@ -199,6 +204,50 @@ pub async fn check_early(
             "early eligibility check",
         )),
     }
+}
+
+/// D-113 — what a ramp with `allow_no_overflow_route` does with a message that
+/// found no eligible route: the reply the client gets, and the action actually
+/// taken on the message. Pure, so the pairing is testable without a database.
+pub fn no_overflow_outcome(ramp: &Ramp) -> (Reply, &'static str) {
+    if ramp.black_hole_allowed {
+        (reply::black_holed(), "discarded_black_hole")
+    } else {
+        (reply::no_overflow_route(), "rejected_no_overflow")
+    }
+}
+
+/// D-113 — answer a message that found no eligible route in a no-overflow ramp,
+/// and say so twice: one event for the reply the sender is given, one for what
+/// became of the message. They are separate because the black hole is exactly
+/// the case where the two differ (`250` delivered, discarded in fact).
+fn answer_no_overflow(ramp: &Ramp, correlation_id: &str) -> Reply {
+    let (reply, action) = no_overflow_outcome(ramp);
+    let enhanced = reply
+        .lines
+        .first()
+        .and_then(|l| l.split_whitespace().next())
+        .unwrap_or("");
+    tracing::info!(
+        correlation_id,
+        ramp = %ramp.name,
+        event = "simmer.no_overflow.reply",
+        smtp.reply.code = reply.code,
+        smtp.reply.enhanced_status = enhanced,
+        reply_kind = if reply.code < 300 { "black_hole_success" } else { "rejection" },
+        "response delivered to the sender"
+    );
+    tracing::info!(
+        correlation_id,
+        ramp = %ramp.name,
+        event = "simmer.no_overflow.action",
+        action,
+        forwarded = false,
+        persisted = false,
+        "eventual action taken on the message"
+    );
+    metrics::no_overflow(&ramp.name, action);
+    reply
 }
 
 /// §7.5 — turn a storage failure into the configured posture.
@@ -358,6 +407,15 @@ async fn reserve_relay_commit_inner(
         }
         Ok(Walk::Exhausted) => {
             thread::observe(&ramp.name, &pin, None, false);
+            if ramp.allow_no_overflow_route {
+                tracing::info!(
+                    correlation_id,
+                    chain = %chain::render(&evaluation),
+                    thread_pin = pin.as_log(),
+                    "no eligible route in chain and the ramp has no overflow route"
+                );
+                return answer_no_overflow(ramp, correlation_id);
+            }
             // §10.3, and the whole of §14.1: `451` by default, because a `550`
             // here would permanently suppress a deliverable recipient in systems
             // that outlive Simmer by years.
@@ -917,6 +975,27 @@ ramps:
             domain: "x.com".into(),
         };
         assert_eq!(err.to_reply(cfg.default_ramp()).code, 550);
+    }
+
+    #[test]
+    fn a_no_overflow_ramp_rejects_with_a_descriptive_550_by_default() {
+        let cfg = config(&[("allow_no_overflow_route", "true")]);
+        let (reply, action) = no_overflow_outcome(cfg.ramp("main").expect("ramp"));
+        assert_eq!(reply.code, 550);
+        assert!(reply.lines[0].starts_with("5.7.1 "), "{:?}", reply.lines);
+        assert!(reply.lines[0].contains("no overflow route"));
+        assert_eq!(action, "rejected_no_overflow");
+    }
+
+    #[test]
+    fn black_hole_allowed_answers_250_and_discards() {
+        let cfg = config(&[
+            ("allow_no_overflow_route", "true"),
+            ("black_hole_allowed", "true"),
+        ]);
+        let (reply, action) = no_overflow_outcome(cfg.ramp("main").expect("ramp"));
+        assert_eq!(reply.code, 250);
+        assert_eq!(action, "discarded_black_hole");
     }
 
     #[test]

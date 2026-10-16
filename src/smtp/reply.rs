@@ -433,6 +433,26 @@ pub fn no_eligible_route(permanent: bool) -> Reply {
     }
 }
 
+/// D-113 — a ramp with `allow_no_overflow_route` found no eligible route and has
+/// no overflow route to fall back to. The default `5xx` failure code, `550`, with
+/// text that says what happened.
+///
+/// §14.1 weighs against a permanent code here, and the operator has chosen it:
+/// turning the mode on is the statement that this ramp would rather refuse than
+/// defer. See D-113.
+pub fn no_overflow_route() -> Reply {
+    Reply::new(
+        550,
+        "5.7.1 no overflow route is configured for this ramp and no eligible route was \
+         available; the message was not relayed",
+    )
+}
+
+/// D-113 — `black_hole_allowed`: success is reported and the message is dropped.
+pub fn black_holed() -> Reply {
+    Reply::new(250, "2.0.0 ok")
+}
+
 /// D-085 — the debugging capture could not be written and `capture.on_error` is
 /// `defer`.
 ///

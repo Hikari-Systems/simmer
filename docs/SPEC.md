@@ -188,7 +188,8 @@ followed by **at most one** overflow route. Evaluated in order; the first eligib
 
 **Overflow route** — a route marked `overflow: true`. It carries no warm-up schedule and is
 never quota-limited. It must be last in any chain containing it. A chain may contain at most
-one.
+one. A ramp need not have one if it sets `allow_no_overflow_route: true`; see §3.2 step 4.
+*(Added. See `DECISIONS.md` D-113.)*
 
 **Domain group** — a named list of literal recipient domains, and optionally of MX host
 suffixes, used as the second axis of the quota key. Entirely configuration-defined; no
@@ -252,6 +253,19 @@ for it — every rule, group, chain and route below is that ramp's:
       its own `downstream` otherwise. *(Added. See `DECISIONS.md` D-112.)*
 4. **If no route is eligible**, reply per `exhausted_chain_reply` (default `451 4.7.1 no
    eligible route, try later`). See §10.3.
+
+   In a ramp with `allow_no_overflow_route: true` the message instead has **no overflow route
+   to reach**, and is answered by that ramp's no-overflow policy, whatever
+   `exhausted_chain_reply` says: by default `550 5.7.1`, with text saying that no overflow
+   route is configured and the message was not relayed; with `black_hole_allowed: true`,
+   `250 2.0.0 ok`, and the message is **discarded** — not relayed, not persisted. Either way
+   nothing is forwarded. The decision is made at the end of data (the §5.4 early check at
+   `RCPT TO` lets the message through), because that is where a message can be discarded.
+   Two OpenTelemetry events are emitted for every message that reaches it —
+   `simmer.no_overflow.reply` (the code and enhanced status sent, and whether it was a
+   rejection or the black-hole success) and `simmer.no_overflow.action` (`rejected_no_overflow`
+   or `discarded_black_hole`) — and `simmer_no_overflow_total{ramp,outcome}` is incremented.
+   Thread affinity (step 2a) applies as always. *(Added. See `DECISIONS.md` D-113.)*
 
 Quota is decremented **per message**, by the recipient count, not per recipient.
 
@@ -409,6 +423,11 @@ ramps:                                 # each is a complete, isolated routing pr
 
     default_chain: [overflow-established]  # used for unmatched senders unless strict_senders
     strict_senders: false
+    allow_no_overflow_route: false         # optional (§3.2 step 4, D-113): true lifts §4.2's "default
+                                           # chain ends in an overflow route"; an exhausted chain is
+                                           # then answered 550, or 250 + discard with:
+    black_hole_allowed: false              # optional (D-113): needs allow_no_overflow_route and
+                                           # strict_senders: false
     thread_affinity: false                 # true: replies stay on the route that started the
                                            # thread (§3.2 step 2a); every route then needs a
                                            # Message-ID with its own literal domain (§4.2)
@@ -582,7 +601,10 @@ this inverts: plaintext AUTH is now refused unless allowed. The rest are new. Se
   `unstable_headers`.
 - An identity field is named in `unstable_headers`.
 - `strict_senders: false` and `default_chain` is absent or its final route is not an
-  overflow route.
+  overflow route — unless the ramp sets `allow_no_overflow_route: true`, which lifts only the
+  second half: a `default_chain` is still required. *(Amended. See `DECISIONS.md` D-113.)*
+- `black_hole_allowed: true` without `allow_no_overflow_route: true`, or with
+  `strict_senders: true`. *(Added. See `DECISIONS.md` D-113.)*
 - Any route's `identity.envelope_from` has a **domain that is not a literal** — that is, the
   part after the final `@` contains a template variable. *(Added; see the note below.)*
 - `thread_affinity: true` and any route in any chain (sender rules and `default_chain`) does not
@@ -1360,6 +1382,8 @@ See `DECISIONS.md` D-099.)*
   is `default` for the route's own, or the group whose `downstream_overrides` entry was used
   *(added, D-112)*
 - `simmer_unmatched_sender_total{ramp,domain}`
+- `simmer_no_overflow_total{ramp,outcome}` — outcome: `rejected_no_overflow`,
+  `discarded_black_hole` (§3.2 step 4). Alert on the second *(added, D-113)*
 - `simmer_ramp_selected_total{ramp,source}` — source: `affinity`, `header`, `default` (§5.8)
 - `simmer_ramp_header_rejected_total{reason}` — §5.8's reasons. Deliberately no value label:
   the value is the client's

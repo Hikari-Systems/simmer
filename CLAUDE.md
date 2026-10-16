@@ -31,7 +31,8 @@ see D-095. And the 2026-09-24 one for named ramps (§3.4 and §5.8, new, and the
 sections D-099 lists), which the author asked for directly; it re-defers O-14 and
 O-15 explicitly. And the 2026-10-06 one for per-group downstreams (§3.1, §3.3,
 §8.3, and the sections D-112 lists), which the author asked for directly; it
-raises O-20.
+raises O-20. And the 2026-10-16 one for the no-overflow ramp (§3.1, §3.2 step 4,
+§4.1, §4.2 and §9.1 — D-113), which the author asked for in HIK-431.
 
 ## The four things that will bite you
 
