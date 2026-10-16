@@ -177,6 +177,7 @@ impl Adoption {
 }
 
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait; a lint new in rustc 1.99
 pub trait QuotaStore: Send + Sync + 'static {
     /// §7.4 phase 1 — reserve, in one transaction, under a row lock.
     async fn reserve(&self, req: &ReserveRequest) -> Result<Reserved, QuotaError>;

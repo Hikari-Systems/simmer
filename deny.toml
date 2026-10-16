@@ -47,6 +47,15 @@ multiple-versions = "allow"
 [advisories]
 version = 2
 yanked = "deny"
+# RUSTSEC-2024-0449: `unsafe-libyaml` is unmaintained, and it is how `serde_yaml_ng`
+# parses the config (DECISIONS.md D-004). Not a vulnerability: the config is a
+# trusted, operator-supplied file read once at startup, never message data.
+# Moving to a maintained parser (saphyr / serde-saphyr) is a change to how every
+# config key deserialises, so it is a decision of its own. Revisit then, or on a
+# real advisory against the crate.
+ignore = [
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, not vulnerable; the config parser only reads the operator's own file at startup (D-004)" },
+]
 
 [sources]
 unknown-registry = "deny"

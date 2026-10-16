@@ -31,6 +31,7 @@ impl std::fmt::Display for ResolveError {
 impl std::error::Error for ResolveError {}
 
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait; a lint new in rustc 1.99
 pub trait TxtResolver: Send + Sync {
     /// Every TXT record at `name`, each already concatenated from its
     /// character-strings.
@@ -62,6 +63,7 @@ pub struct MxAnswer {
 /// The MX leg of §3.2 step 2 (D-100), behind a trait for the same reason
 /// `TxtResolver` is.
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait; a lint new in rustc 1.99
 pub trait MxResolver: Send + Sync {
     /// Every MX record at `domain`. An empty answer is "resolved, no MX" (and
     /// NXDOMAIN reads the same way); `Err` is "we could not find out".
