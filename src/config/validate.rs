@@ -551,12 +551,19 @@ fn ramp_warnings(ramp: &Ramp) -> Vec<Warning> {
     // §14.2: an unmatched sender goes to the overflow route at full volume. If
     // that is not what the operator wants, strict_senders exists.
     if !ramp.strict_senders {
+        let message = if ramp.allow_no_overflow_route {
+            // D-113: there is no overflow route to send it to.
+            "is false, so an unmatched sender is routed through the default chain, with no \
+             overflow route behind it. Alert on simmer_unmatched_sender_total or set \
+             strict_senders: true"
+        } else {
+            "is false, so an unmatched sender routes to the default chain's overflow \
+             route at full volume. Alert on simmer_unmatched_sender_total or set \
+             strict_senders: true"
+        };
         out.push(Warning {
             path: "strict_senders".to_string(),
-            message: "is false, so an unmatched sender routes to the default chain's overflow \
-                      route at full volume. Alert on simmer_unmatched_sender_total or set \
-                      strict_senders: true"
-                .to_string(),
+            message: message.to_string(),
         });
     }
 

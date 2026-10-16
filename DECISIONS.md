@@ -5405,6 +5405,19 @@ chain, but the plain one (`exhausted_chain_reply`): it is a store outage, not a
 message that had nowhere to go. `exhausted_chain_reply` is unused by a no-overflow
 ramp.
 
+**Run on the compose stack (2026-10-16).** `test/config/simmer.nooverflow.yaml`:
+two ramps, `reject` and `hole`, each with a 3,000-a-day warming route and no
+overflow route, on listeners 25 and 26, OTLP export to the acceptance collector.
+Two loadgens at 20 msg/s each for 5 minutes (6,001 messages each): `reject`
+answered 2,997 `250` and 3,004 `550 5.7.1 no overflow route…`; `hole` answered
+6,001 `250`, of which 3,003 were `2.0.0 ok`. The sink received exactly 6,000
+messages, 3,000 per ramp, and none of the 3,003 black-holed ones. The collector
+received 6,007 `simmer.no_overflow.reply` and 6,007 `.action` log records, each
+joined to its trace, with the code, enhanced status and action as attributes, and
+`simmer_no_overflow_total` as a metric. 14 MiB resident at the end, and no
+warning or error beyond the three startup warnings. Not run: the soak, a database
+other than Postgres, or two instances.
+
 **Tests.** `config_validation` (the lifted check, the still-required default
 chain, both `black_hole_allowed` refusals, the warning), `relay::tests` (the
 code, enhanced status and action pairing) and `tests/no_overflow.rs` (a real SMTP
