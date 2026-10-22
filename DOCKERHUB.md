@@ -319,6 +319,12 @@ series and the log lines are exported too, correlated with the trace. It never
 adds a header to relayed mail, a dead collector never delays a message, and the
 same privacy rules as the logs apply: no bodies, no recipient addresses.
 
+To trace per recipient, opt in with `recipients:` — `domain`, `hashed` (a keyed
+hash, with `recipient_hash_key`) or `address`. It adds the recipient to the
+message's spans and the downstream's reply text to its downstream span. It
+never reaches the logs or the metrics. `address` sends personal data to your
+collector.
+
 ---
 
 ## Control plane

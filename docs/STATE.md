@@ -1,7 +1,7 @@
 # Simmer — state of the build
 
-**Snapshot taken 2026-10-16, at release `v0.12.0`.** (The previous snapshots were
-2026-10-04 at `v0.10.0`, 2026-10-06 at `v0.11.0`, 2026-10-04 at `v0.10.0`, 2026-09-25 at `v0.9.0`, 2026-09-24 at `v0.8.0`, 2026-09-23 at `v0.7.2` and `v0.7.1`, 2026-09-22 at `v0.7.0`, 2026-09-21 at `v0.6.0`, 2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
+**Snapshot taken 2026-10-22, at release `v0.13.0`.** (The previous snapshots were
+2026-10-16 at `v0.12.0`, 2026-10-04 at `v0.10.0`, 2026-10-06 at `v0.11.0`, 2026-10-04 at `v0.10.0`, 2026-09-25 at `v0.9.0`, 2026-09-24 at `v0.8.0`, 2026-09-23 at `v0.7.2` and `v0.7.1`, 2026-09-22 at `v0.7.0`, 2026-09-21 at `v0.6.0`, 2026-09-20 at `v0.3.1`, and 2026-09-11 at the end of phase 11.) §2's full-suite
 numbers are the `v0.6.0` run; what was verified for `v0.4.0` and `v0.5.0` is
 stated there separately. This is a session-handover document, not a
 maintained one: `README.md` describes the service, `DECISIONS.md` records why it is
@@ -32,7 +32,8 @@ put to the spec's author and recorded rather than assumed:
 | **D-111** — optional OTLP export (released in `v0.10.0`) | Traces, metrics and logs over OTLP/gRPC, configured by an optional top-level `telemetry:` block and **off** when absent, `enabled: false`, or `endpoint` empty. Observes only: no trace context enters relayed mail or link-proxy requests (§1.1), and nothing on the message path waits on an export — measured with the collector stopped. Metrics keep §9.1's names; temporality is delta by default after §18's soak found the SDK holding every unmatched-sender series. **Applies with telemetry off too:** JSON log lines carry the innermost span's fields (so `correlation_id` now reaches the downstream-outcome lines), and a downstream's reply text is logged with address local parts redacted. **Verified:** unit, config and in-memory-exporter tests, both builds; the full §12.3 suite with the collector in the stack; the T4 soak on SQL Server with export on (`docs/SOAK.md` §18, leak gates green). **Not verified:** T3 with export on, a TLS endpoint, a real vendor. Asked for by the spec's author; `SPEC.md` amended 2026-10-02 (§4.1, §4.2, §9.1, §9.5, §9.6 new, §12.1, §12.3, §13) |
 | **D-112** — per-group downstreams (released in `v0.11.0`) | A route may name `downstream_overrides`, keyed by domain group, each a whole `Downstream`: a message whose recipient's group has one goes to that MTA, anything else to the route's own `downstream`, which stays mandatory. Chosen after the walk, never merged, never a fallback (§3.3); identity stays per route; one pool per downstream; metrics gain a `downstream` label. Preflight stays per route (O-20). **Verified:** unit, validation, admin, metrics and two-fake-downstream tests on Postgres; the new tests on the SQL Server build; the §12.3 suite; the T4 soak for an hour with a `segment` group sent to the sink's port 2527 (`docs/SOAK.md` §19 — all 7,220 segment messages there, nothing else; leak gates green; finished after the tag). **Not verified:** T2/T3, the full SQL Server suite. Asked for by the spec's author; `SPEC.md` amended 2026-10-06 (§3.1, §3.2 3e, §3.3, §4.1, §4.2, §8.3, §9.1, §9.2, §9.4) |
 | **D-113** — a ramp may run with no overflow route (released in `v0.12.0`) | `allow_no_overflow_route` lifts §4.2's final-route-is-overflow check; a message that finds no eligible route is answered `550 5.7.1` with a descriptive text, nothing relayed. `black_hole_allowed` (needs the mode and `strict_senders: false`) answers `250` and discards it. Both emit `simmer.no_overflow.reply` / `.action` events and `simmer_no_overflow_total{ramp,outcome}`. Spec §3.1, §3.2, §4.1, §4.2, §9.1 amended. Run for 5 minutes on the compose stack with the OTLP collector (D-113). HIK-431. |
-| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp), `v0.7.0` (`/metrics` opt-in; allocator counters; no `unsafe`), `v0.7.1` (the SMTP-smuggling fix), `v0.7.2` (the `-mssql` image on arm64), `v0.8.0` (the computed share), `v0.9.0` (named ramps, D-099; MX domain grouping, D-100 — breaking: config, admin paths, metric labels and schema), `v0.10.0` (OTLP export, D-111; the D-101 – D-110 fixes), `v0.11.0` (per-group downstreams, D-112), `v0.12.0` (no-overflow ramps; D-113) |
+| **D-114** — recipients in the trace export (released in `v0.13.0`) | `telemetry.recipients`: `none` (default), `domain`, `hashed` (HMAC under its own `recipient_hash_key`, never §7.3's salt) or `address`, on `smtp.transaction` and `simmer.relay`; a refused `RCPT TO` is an `smtp.rcpt.refused` event; `smtp.response.text` on `smtp.downstream`, masked except under `address`. Set on the OTel span, never as a `tracing` field, so stdout is unchanged — a test captures stdout and was mutation-checked. **Verified:** Postgres suite, clippy, fmt, the compose build. **Not verified:** the SQL Server build (local OpenSSL toolchain), `cargo deny`, `telemetry_compose` against the dummy collector. Spec §4.1, §4.2, §9.6 amended. |
+| Releases | `v0.2.0`, `v0.3.0` (capture + replay), `v0.3.1` (the fixes below), `v0.4.0` (`header_rewrites`), `v0.5.0` (thread affinity), `v0.6.0` (the partial ramp), `v0.7.0` (`/metrics` opt-in; allocator counters; no `unsafe`), `v0.7.1` (the SMTP-smuggling fix), `v0.7.2` (the `-mssql` image on arm64), `v0.8.0` (the computed share), `v0.9.0` (named ramps, D-099; MX domain grouping, D-100 — breaking: config, admin paths, metric labels and schema), `v0.10.0` (OTLP export, D-111; the D-101 – D-110 fixes), `v0.11.0` (per-group downstreams, D-112), `v0.12.0` (no-overflow ramps; D-113), `v0.13.0` (recipients in the trace export; D-114) |
 
 ---
 
@@ -663,7 +664,7 @@ measurement rather than this table.
 
 ## 5. Decisions on record
 
-113 entries, `D-001` to `D-113`. The ones a new reader most needs:
+114 entries, `D-001` to `D-114`. The ones a new reader most needs:
 
 | | |
 |---|---|
@@ -685,6 +686,7 @@ measurement rather than this table.
 | **D-110** | The session hands the relay an **owned** message. Nothing stores or reads one back — CLAUDE.md's first and eighth rules hold. |
 | **D-111** | Optional OTLP export. Observe, never alter; off unless configured; `RUST_LOG` cannot reach the export filter. |
 | **D-113** | A ramp may run with no overflow route: `550` by default, `250` + discard with `black_hole_allowed`. Decided at the end of data. |
+| **D-114** | Recipients in the trace export, opt-in by mode and on spans only — never stdout, log records or metric labels. |
 | **D-112** | Per-group downstreams. `Route::target(group)` is the one answer to "which MTA"; an override replaces the downstream whole and is never a fallback. |
 | **D-034** | An unknown template variable is a fatal startup error — a §4.2 rule the spec does not list. |
 | **D-035** | The null sender is never rewritten, so a bounce stays a bounce. |

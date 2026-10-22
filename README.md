@@ -690,6 +690,27 @@ What is exported is filtered by `telemetry.level`, not `logging.level`, and
 `RUST_LOG` does not reach it. The privacy rules that apply to stdout apply to
 the export: no bodies, no recipient addresses, no link-proxy query strings.
 
+**Recipients, by opt-in (D-114).** `telemetry.recipients` relaxes the second
+rule for **spans only**:
+
+| `recipients` | `smtp.transaction`, `simmer.relay` | `smtp.downstream` |
+|---|---|---|
+| `none` (default) | nothing | nothing more |
+| `domain` | `simmer.recipient.domain` | `smtp.response.text`, local parts masked |
+| `hashed` | and `simmer.recipient.hash` | the same |
+| `address` | and `simmer.recipient.address` | `smtp.response.text` unmasked |
+
+`hashed` needs `recipient_hash_key` (16 bytes or more, shared by every
+instance): the hash is HMAC-SHA256 of the normalised address, so
+`Bob.Smith+x@gmail.com` and `bobsmith@gmail.com` agree, and anyone holding the
+key can hash an address to search for it. A refused `RCPT TO` is an
+`smtp.rcpt.refused` event on the transaction, carrying the same attributes and
+the reply code. The reply text is where a provider's queue id appears, which is
+what joins a trace to their logs. In no mode does the recipient reach stdout,
+exported log records or a metric label. `address` exports personal data to
+whoever runs the collector; a plain `http://` endpoint off-host is warned
+about.
+
 **It observes only.** No trace header is added to relayed mail, so the cutover
 invariant holds. A collector that is down or slow costs dropped telemetry, never
 mail: the exporter connects lazily, exports run off the message path, and

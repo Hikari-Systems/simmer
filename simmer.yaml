@@ -138,7 +138,9 @@ logging:
 # collector that is down costs dropped telemetry, never a delayed message.
 #
 # What is exported follows `level`, not `logging.level`, and RUST_LOG does not
-# reach it. §9.5's rules hold: no bodies, no recipient addresses. The OTEL_*
+# reach it. §9.5's rules hold: no bodies, and no recipient addresses unless
+# `recipients` says otherwise — and even then only on spans, never stdout,
+# log records or metric labels (D-114). The OTEL_*
 # environment variables are not read for the endpoint, timeout or resource —
 # this block is the configuration.
 #
@@ -155,6 +157,8 @@ logging:
 #   metrics_interval: 60s
 #   metrics_temporality: delta       # or cumulative, for a backend that rejects delta sums
 #   timeout: 10s
+#   recipients: none                 # default; domain | hashed | address (D-114)
+#   recipient_hash_key: "${SIMMER_TELEMETRY_RECIPIENT_KEY}"   # hashed only; >= 16 bytes
 
 # D-085 — an optional debugging capture of every accepted message. Absent means
 # nothing is written and no task is started, which is how it should normally be.
