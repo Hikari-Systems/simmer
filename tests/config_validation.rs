@@ -2367,6 +2367,97 @@ fn warns_when_telemetry_headers_would_cross_the_network_in_plaintext() {
     assert!(!warned("http://[::1]:4317"));
 }
 
+// -- D-114: recipients in the trace export ---------------------------------
+
+#[test]
+fn telemetry_exports_no_recipient_by_default() {
+    let cfg = load(&with_telemetry("  endpoint: \"http://collector:4317\"\n")).unwrap();
+    let t = cfg.telemetry().expect("on");
+    assert_eq!(t.recipients, config::RecipientExposure::None);
+    assert!(t.recipient_hash_key.is_none());
+}
+
+#[test]
+fn telemetry_recipients_accepts_each_mode() {
+    for (yaml, mode) in [
+        ("none", config::RecipientExposure::None),
+        ("domain", config::RecipientExposure::Domain),
+        ("address", config::RecipientExposure::Address),
+    ] {
+        let cfg = load(&with_telemetry(&format!(
+            "  endpoint: \"https://collector:4317\"\n  recipients: {yaml}\n"
+        )))
+        .unwrap_or_else(|e| panic!("{yaml}: {e}"));
+        assert_eq!(cfg.telemetry().expect("on").recipients, mode);
+    }
+    let hashed = load(&with_telemetry(
+        "  endpoint: \"https://collector:4317\"\n  recipients: hashed\n  recipient_hash_key: \"0123456789abcdef\"\n",
+    ))
+    .unwrap();
+    assert_eq!(
+        hashed.telemetry().expect("on").recipients,
+        config::RecipientExposure::Hashed
+    );
+    assert!(load(&with_telemetry(
+        "  endpoint: \"https://collector:4317\"\n  recipients: everything\n"
+    ))
+    .is_err());
+}
+
+#[test]
+fn rejects_a_recipient_hash_key_that_is_missing_short_or_unused() {
+    let ep = "  endpoint: \"https://collector:4317\"\n";
+    for (extra, needle) in [
+        ("  recipients: hashed\n", "is required when"),
+        (
+            "  recipients: hashed\n  recipient_hash_key: \"short\"\n",
+            "it must be at least 16",
+        ),
+        (
+            "  recipients: domain\n  recipient_hash_key: \"0123456789abcdef\"\n",
+            "only telemetry.recipients: hashed uses it",
+        ),
+        (
+            "  recipient_hash_key: \"0123456789abcdef\"\n",
+            "only telemetry.recipients: hashed uses it",
+        ),
+        (
+            "  recipients: domain\n  traces: false\n",
+            "only spans carry it",
+        ),
+    ] {
+        rejected_for(&with_telemetry(&format!("{ep}{extra}")), needle);
+    }
+}
+
+#[test]
+fn the_recipient_hash_key_is_redacted_in_debug() {
+    let cfg = load(&with_telemetry(
+        "  endpoint: \"https://collector:4317\"\n  recipients: hashed\n  recipient_hash_key: \"k3y-that-is-a-secret\"\n",
+    ))
+    .unwrap();
+    let shown = format!("{cfg:?}");
+    assert!(shown.contains("recipient_hash_key"));
+    assert!(!shown.contains("k3y-that-is-a-secret"), "{shown}");
+}
+
+#[test]
+fn warns_when_recipient_addresses_would_cross_the_network_in_plaintext() {
+    let warned = |endpoint: &str, mode: &str| {
+        let cfg = load(&with_telemetry(&format!(
+            "  endpoint: \"{endpoint}\"\n  recipients: {mode}\n"
+        )))
+        .unwrap();
+        config::validate::warnings(&cfg)
+            .iter()
+            .any(|w| w.path == "telemetry.endpoint" && w.message.contains("recipient"))
+    };
+    assert!(warned("http://collector.example.net:4317", "address"));
+    assert!(!warned("http://collector.example.net:4317", "domain"));
+    assert!(!warned("https://collector.example.net:4317", "address"));
+    assert!(!warned("http://127.0.0.1:4317", "address"));
+}
+
 // -- D-112: per-group downstream overrides ---------------------------------
 
 /// `BASE` with `overrides` spliced in as the warming route's

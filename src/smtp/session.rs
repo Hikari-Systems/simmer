@@ -52,6 +52,7 @@ use crate::metrics;
 use crate::relay::{self, Engine};
 use crate::routing::ramp_select;
 use crate::routing::sender_match::Senders;
+use crate::telemetry::recipient::Exposure;
 
 /// RFC 5321 §4.5.3.1: 512 octets for a command line including CRLF.
 ///
@@ -686,14 +687,43 @@ impl Session {
     }
 
     async fn rcpt_to(&mut self, to: String) -> Result<Option<SessionEnd>, ()> {
-        let Some(tx) = self.transaction.as_ref() else {
+        if self.transaction.is_none() {
             return self.reply(reply::bad_sequence()).await;
-        };
+        }
+        let r = self.rcpt_verdict(&to).await;
+        // D-114 — the recipient on the transaction's span when it is accepted,
+        // and as an event carrying the reply when it is not: the refusals here
+        // (§5.4's early check above all) are the per-recipient answers an
+        // operator most needs to find. Exported only; see `telemetry::recipient`.
+        if let Some(exposure) = Exposure::from_config(&self.engine.config) {
+            if let Some(tx) = &self.transaction {
+                if r.code < 400 {
+                    exposure.annotate(&tx.span, &to);
+                } else {
+                    exposure.refused(&tx.span, &to, r.code);
+                }
+            }
+        }
+        if r.code < 400 {
+            self.transaction
+                .as_mut()
+                .expect("checked above")
+                .recipients
+                .push(to);
+        }
+        self.reply(r).await
+    }
+
+    /// `RCPT TO`'s reply, for a session with a transaction open. Accepting the
+    /// recipient — pushing it onto the transaction — is the caller's, on a
+    /// reply below `400`.
+    async fn rcpt_verdict(&self, to: &str) -> Reply {
+        let tx = self.transaction.as_ref().expect("the caller checked");
 
         // D-018 again: a UTF-8 recipient is as much an RFC 6531 address as a
         // UTF-8 sender.
-        if command::needs_smtputf8(&to) && !self.config().advertise_smtputf8() {
-            return self.reply(reply::smtputf8_unsupported()).await;
+        if command::needs_smtputf8(to) && !self.config().advertise_smtputf8() {
+            return reply::smtputf8_unsupported();
         }
 
         let cfg = &self.engine.config;
@@ -711,7 +741,7 @@ impl Session {
                 correlation_id = %self.correlation_id,
                 "second RCPT TO in one transaction; refused 452 (D-047)"
             );
-            return self.reply(reply::multiple_recipients_not_permitted()).await;
+            return reply::multiple_recipients_not_permitted();
         }
 
         // §5.4: "When all rules use `envelope`, Simmer should decide early and
@@ -744,23 +774,18 @@ impl Session {
                 .expect("fixed_at_rcpt returns a configured ramp");
             // D-108 — the one clock read for this check.
             let now = chrono::Utc::now();
-            if let Err(e) = relay::check_early(&engine, ramp, &senders, &to, now).await {
+            if let Err(e) = relay::check_early(&engine, ramp, &senders, to, now).await {
                 let r = e.to_reply(ramp);
                 tracing::info!(
                     correlation_id = %self.correlation_id,
                     reason = ?e,
                     "rejected at RCPT TO"
                 );
-                return self.reply(r).await;
+                return r;
             }
         }
 
-        self.transaction
-            .as_mut()
-            .expect("checked above")
-            .recipients
-            .push(to);
-        self.reply(reply::ok()).await
+        reply::ok()
     }
 
     async fn data(&mut self) -> Result<Option<SessionEnd>, ()> {

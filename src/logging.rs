@@ -18,6 +18,7 @@
 //! included (`with_span_list(false)`): the chain of parents repeats fields the
 //! transaction span already has, on every line.
 
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
@@ -43,6 +44,21 @@ pub fn init(level: &str, format: LogFormat, telemetry: Option<&Pipeline>) {
 /// The layers [`init`] installs, unassembled — so a test can build the same
 /// stack against its own exporters with `tracing::subscriber::set_default`.
 pub fn layers(level: &str, format: LogFormat, telemetry: Option<&Pipeline>) -> Vec<BoxedLayer> {
+    layers_to(level, format, telemetry, std::io::stdout)
+}
+
+/// [`layers`], with "stdout" written to `writer` — so a test can read what
+/// stdout would have printed (D-114's guard that no recipient reaches it).
+#[doc(hidden)]
+pub fn layers_to<W>(
+    level: &str,
+    format: LogFormat,
+    telemetry: Option<&Pipeline>,
+    writer: W,
+) -> Vec<BoxedLayer>
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
     // As in the house pattern, the level string is a full EnvFilter directive, so
     // `"info,sqlx=warn"` works. RUST_LOG still wins when set, for debugging a
     // container without editing its config.
@@ -52,6 +68,7 @@ pub fn layers(level: &str, format: LogFormat, telemetry: Option<&Pipeline>) -> V
 
     let stdout: BoxedLayer = match format {
         LogFormat::Json => tracing_subscriber::fmt::layer()
+            .with_writer(writer)
             .json()
             .with_current_span(true)
             .with_span_list(false)
@@ -60,6 +77,7 @@ pub fn layers(level: &str, format: LogFormat, telemetry: Option<&Pipeline>) -> V
         // ANSI off to match the house convention: these logs are shipped to
         // CloudWatch, where escape codes are noise.
         LogFormat::Text => tracing_subscriber::fmt::layer()
+            .with_writer(writer)
             .with_ansi(false)
             .with_target(false)
             .with_filter(filter)

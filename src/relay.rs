@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::{Config, Ramp};
 use crate::downstream::{self, TlsConfigs};
@@ -40,6 +41,7 @@ use crate::routing::ramp_select;
 use crate::routing::sender_match::{self, Senders};
 use crate::routing::thread;
 use crate::smtp::reply::{self, Reply};
+use crate::telemetry::recipient::Exposure;
 
 /// Everything a session needs to relay, assembled once at startup.
 #[derive(Clone)]
@@ -311,6 +313,12 @@ pub async fn reserve_relay_commit(
         result = Empty,
         smtp.reply.code = Empty,
     );
+    // D-114 — exported only, so set on the OTel span rather than as a field.
+    // D-047: there is exactly one recipient.
+    let exposure = Exposure::from_config(&engine.config);
+    if let (Some(e), Some(rcpt)) = (&exposure, message.recipients.first()) {
+        e.annotate(&span, rcpt);
+    }
     let reply =
         reserve_relay_commit_inner(engine, selection, senders, message, correlation_id, now)
             .instrument(span.clone())
@@ -579,6 +587,17 @@ async fn reserve_relay_commit_inner(
         elapsed.as_secs_f64(),
     );
 
+    // D-114 — the reply text, which carries the provider's queue id on a `2xx`
+    // and its reason on a refusal. Masked unless `recipients: address`.
+    if let Some(e) = Exposure::from_config(cfg) {
+        let text = match &result {
+            Ok(d) => Some(d.text.as_str()),
+            Err(err) => err.text(),
+        };
+        if let Some(t) = text {
+            downstream_span.set_attribute("smtp.response.text", e.reply_text(t));
+        }
+    }
     let outcome = downstream_span.in_scope(|| match &result {
         Ok(d) => {
             let span = Span::current();

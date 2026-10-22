@@ -390,6 +390,8 @@ telemetry:                             # optional; absent => nothing exported (�
   metrics_interval: 60s
   metrics_temporality: delta           # default; or cumulative
   timeout: 10s                         # per export
+  recipients: none                     # default; or domain | hashed | address — what SPANS carry (§9.6)
+  recipient_hash_key: "${SIMMER_TELEMETRY_RECIPIENT_KEY}"   # required with, and only with, hashed
 
 default_ramp: main                     # required; the ramp for a session with no affinity
                                        # and no usable header (§5.8)
@@ -639,6 +641,9 @@ this inverts: plaintext AUTH is now refused unless allowed. The rest are new. Se
   - `sample_ratio` is outside [0, 1]; `metrics_interval` is under 1s; `timeout` is zero;
     `level` is not a valid filter directive; `service_name` is empty.
   - `traces`, `metrics` and `logs` are all `false`.
+  - `recipients` is `hashed` and `recipient_hash_key` is absent or shorter than 16 bytes; or
+    `recipient_hash_key` is set and `recipients` is not `hashed`; or `recipients` is not `none`
+    and `traces` is `false`. *(Added. See `DECISIONS.md` D-114.)*
 
 **Note on `envelope_from`, added after implementation.** The example in §4.1 originally read
 `bounce+{{original.envelope_from.local}}@newbrand.com`. That is a *relative transformation* —
@@ -1537,7 +1542,22 @@ back for §9.1's gauges). A `4xx` or `5xx`
 What is exported is filtered by `telemetry.level`, which `RUST_LOG` does not reach, so turning a
 container's own logging up to `debug` does not ship debug lines to a telemetry backend. Every
 rule of §9.5 holds for the export as it does for stdout: no body, no recipient address, no link
-proxy query string. The exporter's own diagnostics — a failed export above all — are logged to
+proxy query string — **except** that `telemetry.recipients` may put the recipient on **spans**:
+
+| `recipients` | `smtp.transaction` and `simmer.relay` carry | `smtp.downstream` carries |
+|---|---|---|
+| `none` (default) | nothing | nothing more |
+| `domain` | `simmer.recipient.domain` | `smtp.response.text`, local parts masked as §9.5 logs it |
+| `hashed` | and `simmer.recipient.hash` | the same |
+| `address` | and `simmer.recipient.address` | `smtp.response.text` unmasked |
+
+The hash is HMAC-SHA256 under `recipient_hash_key` of §7.3's `to_address` normalisation,
+truncated to 16 bytes and hex-encoded; it is never keyed by §7.3's salt. A `RCPT TO` that is
+refused adds an `smtp.rcpt.refused` event to `smtp.transaction`, with the same attributes and the
+reply code. In every mode the recipient is set on the exported span only: stdout, exported log
+records and §9.1's labels never carry it. *(Amended 2026-10-22. It used to say, without
+exception, "no body, no recipient address, no link proxy query string". See `DECISIONS.md`
+D-114.)* The exporter's own diagnostics — a failed export above all — are logged to
 stdout and never exported.
 
 **Telemetry observes and never alters.** No trace context is propagated into relayed mail or

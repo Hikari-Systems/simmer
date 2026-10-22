@@ -5423,6 +5423,57 @@ chain, both `black_hole_allowed` refusals, the warning), `relay::tests` (the
 code, enhanced status and action pairing) and `tests/no_overflow.rs` (a real SMTP
 session against a paused route: `550` and `250`, nothing relayed, both events).
 
+### D-114 — Recipients in the trace export, opt-in and span-only (§9.6)
+
+> **Requested 2026-10-22 by the spec's author, who asked directly that the
+> export be able to carry recipient data; the spec is amended in the same change
+> (§4.1, §4.2, §9.6).** §9.5 is unchanged: stdout keeps every rule it had.
+
+**The problem.** D-111 exported nothing about the recipient, so a trace could
+not answer the question an operator asks first — "what happened to mail for
+this address", or "which recipients on this route are deferring". The
+downstream's reply text, which carries the provider's queue id on a `2xx` and its
+reason on a refusal, was not exported at all, even masked.
+
+**What it does.** `telemetry.recipients`, default `none`, with three graded
+modes, each a superset of the one before: `domain`, `hashed` (a keyed hash of
+the normalised address under `recipient_hash_key`), and `address`. The
+attributes go on `smtp.transaction` and `simmer.relay`. A refused `RCPT TO`, the
+§5.4 early check above all, is an `smtp.rcpt.refused` event on the transaction,
+because the transaction outlives it and the client may try another recipient.
+`smtp.downstream` gains `smtp.response.text`, masked as §9.5 logs it in every
+mode but `address`. `telemetry::recipient::Exposure` is the one place any of
+this is decided.
+
+**Why span-only, set through `OpenTelemetrySpanExt`.** The stdout JSON layer
+prints the current span's fields on every line inside it
+(`with_current_span(true)`). A recipient recorded as a `tracing` field would
+therefore be on every INFO line of the relay, which §9.5 forbids. Setting the
+attribute on the OTel span's own data reaches only the trace exporter.
+`tests/telemetry_recipients.rs` reads what stdout printed under `address`, and
+fails if the address is there. Recording it as a field on `simmer.relay` was
+tried as a mutation and does fail it. The recipient goes in no metric label in
+any mode, for cardinality as much as privacy.
+
+**Why a separate key, not §7.3's salt.** Under the salt and the same
+normalisation, the exported hash would *be* the `recipient_events` key, and the
+export would become an index into that table for anyone holding both. The key is
+configuration rather than generated, so that every instance's hashes agree and an
+operator can hash a known address to search for it. §4.2 requires at least 16
+bytes. It also refuses a key under any other mode, so that a deployment switched
+away from `hashed` does not leave a secret in the file that looks as though it
+does something.
+
+**What `address` costs.** It exports personal data to whoever runs the collector,
+under that vendor's retention, and those obligations are the operator's. §4.2
+does not refuse it. It warns when the endpoint is plain `http://` off-host, as
+D-111 does for `headers`: an in-cluster collector over plain gRPC is normal
+enough that a refusal would be wrong.
+
+**Not changed.** The admin endpoints (no read emits an `@`), stdout, exported log
+records, `telemetry.level`'s independence from `RUST_LOG`, and §1.1: still no
+trace context in relayed mail.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before

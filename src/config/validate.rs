@@ -300,6 +300,18 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
                     .to_string(),
             });
         }
+        // D-114 — the same, for recipient addresses.
+        if t.recipients == crate::config::RecipientExposure::Address
+            && plaintext_off_host(&t.endpoint)
+        {
+            out.push(Warning {
+                path: "telemetry.endpoint".to_string(),
+                message: "is http:// to a host other than loopback, so the recipient \
+                          addresses telemetry.recipients: address exports cross the network \
+                          unencrypted"
+                    .to_string(),
+            });
+        }
     }
     if let Some(t) = &cfg.telemetry {
         if cfg.telemetry().is_none() {
@@ -1041,6 +1053,36 @@ fn check_telemetry(cfg: &Config, v: &mut ViolationList) {
     if t.timeout.is_zero() {
         v.push("telemetry.timeout", "must be greater than zero".to_string());
     }
+    // D-114. A key no mode reads is refused rather than ignored, so a hashed
+    // deployment switched to `domain` does not leave a secret lying in the
+    // file looking as though it does something.
+    use crate::config::RecipientExposure;
+    match (&t.recipient_hash_key, t.recipients) {
+        (None, RecipientExposure::Hashed) => v.push(
+            "telemetry.recipient_hash_key",
+            "is required when telemetry.recipients is hashed".to_string(),
+        ),
+        (Some(k), RecipientExposure::Hashed) if k.len() < 16 => v.push(
+            "telemetry.recipient_hash_key",
+            format!(
+                "is {} bytes; it must be at least 16, or the hashes can be reversed by \
+                 trying every key",
+                k.len()
+            ),
+        ),
+        (Some(_), mode) if mode != RecipientExposure::Hashed => v.push(
+            "telemetry.recipient_hash_key",
+            "is set, but only telemetry.recipients: hashed uses it".to_string(),
+        ),
+        _ => {}
+    }
+    if t.recipients != RecipientExposure::None && !t.traces {
+        v.push(
+            "telemetry.recipients",
+            "is set, but telemetry.traces is false and only spans carry it".to_string(),
+        );
+    }
+
     if !(t.traces || t.metrics || t.logs) {
         v.push(
             "telemetry",

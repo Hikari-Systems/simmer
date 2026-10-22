@@ -32,7 +32,9 @@ sections D-099 lists), which the author asked for directly; it re-defers O-14 an
 O-15 explicitly. And the 2026-10-06 one for per-group downstreams (§3.1, §3.3,
 §8.3, and the sections D-112 lists), which the author asked for directly; it
 raises O-20. And the 2026-10-16 one for the no-overflow ramp (§3.1, §3.2 step 4,
-§4.1, §4.2 and §9.1 — D-113), which the author asked for in HIK-431.
+§4.1, §4.2 and §9.1 — D-113), which the author asked for in HIK-431. And the
+2026-10-22 one for recipients in the trace export (§4.1, §4.2, §9.6 — D-114),
+which the author asked for directly; §9.5 and stdout are unchanged.
 
 ## The four things that will bite you
 
@@ -314,6 +316,9 @@ src/telemetry/mod.rs     §9.6 (D-111) — the optional OTLP/gRPC export. Off un
                          `Config::telemetry()` says so. OBSERVES ONLY: never add trace
                          context to relayed mail or link-proxy requests (§1.1), and
                          nothing on the message path may wait on an export
+src/telemetry/recipient.rs  D-114 — `telemetry.recipients`, decided in ONE place. Set on
+                         the OTel span via OpenTelemetrySpanExt, NEVER as a `tracing`
+                         field: stdout prints the current span's fields on every line
 src/telemetry/metrics.rs the §9.1 facade bridged to OTel, fanned out beside Prometheus
                          by `metrics::install_with`. Gauges keep a cell per series
                          because the facade's increments are relative (F17)
@@ -378,6 +383,8 @@ tests/metrics_idle.rs    D-093's counter expiry. Its own binary, for the same re
 tests/link_proxy.rs      D-083 on the wire: raw client, recording upstream
 tests/telemetry.rs       D-111 over in-memory exporters: the span tree, and that NO
                          recipient address is exported. Its own binary (global subscriber)
+tests/telemetry_recipients.rs  D-114 per mode, AND that stdout never sees the address.
+                         Its own binary: its spans carry recipients on purpose
 tests/telemetry_compose.rs  D-111 against the acceptance stack's dummy collector
 tests/acceptance.rs      §12.3 against real mail servers; behind --ignored
 simmer.acceptance.yaml   the acceptance stack's config (D-042)

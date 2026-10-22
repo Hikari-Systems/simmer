@@ -129,11 +129,21 @@ impl RelayError {
         }
     }
 
-    /// The downstream's reply code, when it gave one. Never its text, which can
-    /// quote the recipient back (§9.5).
+    /// The downstream's reply code, when it gave one.
     pub fn code(&self) -> Option<u16> {
         match self {
             Self::Rejected { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// The downstream's reply text, when it gave one. Raw: it can quote the
+    /// recipient back, so anything exported goes through
+    /// `telemetry::recipient::Exposure::reply_text` (D-114) and anything logged
+    /// through [`redact_addresses`].
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Rejected { text, .. } => Some(text),
             _ => None,
         }
     }

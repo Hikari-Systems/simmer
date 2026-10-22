@@ -1146,6 +1146,38 @@ pub struct Telemetry {
         deserialize_with = "duration::deserialize"
     )]
     pub timeout: Duration,
+
+    /// What of a message's recipient the exported **spans** carry (D-114).
+    /// Default `none`, which is §9.6's original rule. Never reaches stdout, log
+    /// records or metric labels, in any mode. See [`RecipientExposure`].
+    #[serde(default)]
+    pub recipients: RecipientExposure,
+
+    /// The HMAC key for `recipients: hashed`, and only for it. Shared by every
+    /// instance so their hashes agree; deliberately not §7.3's salt (D-114).
+    /// Redacted in `Debug`.
+    #[serde(default)]
+    pub recipient_hash_key: Option<String>,
+}
+
+/// `telemetry.recipients` (D-114) — each mode exports what the one before it
+/// does, and more.
+///
+/// - **`none`** — nothing. §9.6 as D-111 wrote it.
+/// - **`domain`** — `simmer.recipient.domain`, and the downstream's reply text
+///   with every address's local part masked, as §9.5 logs it.
+/// - **`hashed`** — also `simmer.recipient.hash`, a keyed hash of the §7.3-
+///   normalised address under `recipient_hash_key`.
+/// - **`address`** — also `simmer.recipient.address`, and the reply text
+///   unmasked. Personal data, exported to whoever runs the collector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RecipientExposure {
+    #[default]
+    None,
+    Domain,
+    Hashed,
+    Address,
 }
 
 impl fmt::Debug for Telemetry {
@@ -1166,6 +1198,11 @@ impl fmt::Debug for Telemetry {
             .field("metrics_temporality", &self.metrics_temporality)
             .field("logs", &self.logs)
             .field("timeout", &self.timeout)
+            .field("recipients", &self.recipients)
+            .field(
+                "recipient_hash_key",
+                &self.recipient_hash_key.as_ref().map(|_| "(redacted)"),
+            )
             .finish()
     }
 }

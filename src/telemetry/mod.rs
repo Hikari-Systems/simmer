@@ -28,6 +28,7 @@
 //!    set; D-111 records that.)
 
 pub mod metrics;
+pub mod recipient;
 
 use std::time::Duration;
 
