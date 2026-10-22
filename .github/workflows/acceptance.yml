@@ -14,14 +14,25 @@ name: Acceptance (manual)
 on:
   workflow_dispatch:
 
+# On the self-hosted host the stack publishes docker-compose.yml's fixed host
+# ports under one compose project name, so two dispatches at once would fight
+# over both. One at a time; a second dispatch waits.
+concurrency:
+  group: simmer-acceptance
+  cancel-in-progress: false
+
 jobs:
   acceptance:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
+
+      # The self-hosted image has no Rust; Blacksmith's came with it.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       # The host side is `cargo test --test acceptance`, which needs the test
       # binary compiled; the same cache build.yml's check job writes serves it.

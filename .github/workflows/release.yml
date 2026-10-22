@@ -34,7 +34,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     # Most of this is the wait for build.yml below, when the tag was pushed
     # together with the commit it names.
     timeout-minutes: 75
@@ -83,13 +83,21 @@ jobs:
             exit 1
           fi
 
+      # Already on the self-hosted host, whose runner user has no sudo.
       - name: Install skopeo
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y skopeo
+          if ! command -v skopeo >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y skopeo
+          fi
 
+      # Into $RUNNER_TEMP, which the runner deletes after the job: skopeo's
+      # default auth file is in the runner user's home, and on the persistent
+      # self-hosted host that would hand these logins to every later job.
       - name: Log in to GHCR and Docker Hub via skopeo
         run: |
+          echo "REGISTRY_AUTH_FILE=$RUNNER_TEMP/containers-auth.json" >> "$GITHUB_ENV"
+          export REGISTRY_AUTH_FILE="$RUNNER_TEMP/containers-auth.json"
           skopeo login ghcr.io \
             --username ${{ github.actor }} \
             --password ${{ secrets.GH_TOKEN }}

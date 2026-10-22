@@ -26,8 +26,16 @@ jobs:
   # D-060 removed it and there are no git dependencies at all now, but the
   # reason holds for crates.io too — `cargo deny check` is only a gate on the
   # graph that actually resolves.
+  #
+  # amd64 jobs run on the org's self-hosted public runners: two runners on one
+  # persistent host. Two things follow from that, throughout this file. No job
+  # binds a fixed host port — two jobs on that host at once would collide — so
+  # each service publishes to a random port and the job reads it back from
+  # `job.services`. And nothing a job creates outlives it: containers are
+  # named per run and removed, and registry logins go to an auth file under
+  # $RUNNER_TEMP, which the runner deletes, not to the runner user's home.
   check:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 25
 
     services:
@@ -47,24 +55,28 @@ jobs:
           POSTGRES_USER: simmer
           POSTGRES_PASSWORD: simmer
         ports:
-          # 5433 on the host to match the local development URL exactly, so
-          # DATABASE_URL is one string everywhere — README, CLAUDE.md and here.
-          # (Locally 5433 avoids clashing with a developer's own Postgres; on a
-          # runner there is nothing to clash with, but a second spelling of the
-          # same URL is a thing to get wrong.)
-          - 5433:5432
+          # A random host port, not the local development URL's 5433: the
+          # self-hosted runners share a host, so a fixed port is one that two
+          # jobs fight over. DATABASE_URL is set from the port below.
+          - 5432
         options: >-
           --health-cmd "pg_isready -U simmer -d simmer"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
 
-    env:
-      DATABASE_URL: postgres://simmer:simmer@127.0.0.1:5433/simmer
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
+
+      - name: Point DATABASE_URL at the service
+        run: echo "DATABASE_URL=postgres://simmer:simmer@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/simmer" >> "$GITHUB_ENV"
+
+      # The self-hosted image has no Rust; Blacksmith's came with it.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       # The check job compiles because `cargo test` cannot run without building
       # the test binaries. It cannot share that work with the `build` job below —
@@ -131,9 +143,9 @@ jobs:
         platform: [amd64, arm64]
         include:
           - platform: amd64
-            runner: blacksmith-2vcpu-ubuntu-2404
+            runner: self-hosted-public-amd64
           - platform: arm64
-            runner: blacksmith-2vcpu-ubuntu-2404-arm
+            runner: self-hosted-public-arm64
     services:
       registry:
         image: registry:3.0
@@ -145,8 +157,6 @@ jobs:
           REGISTRY_STORAGE_S3_BUCKET: hikari-docker-registry
           REGISTRY_HTTP_ADDR: :5000
           REGISTRY_HTTP_SECRET: ${{ secrets.DOCKER_REGISTRY_SECRET }}
-        ports:
-          - 5000:5000
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
@@ -161,42 +171,41 @@ jobs:
       # server. CLAUDE.md and docker-compose.yml both say so; this is the
       # deployment pipeline they were warning. See DECISIONS.md D-073.
       #
-      # Built on Blacksmith's builder, whose BuildKit state lives on a sticky
-      # disk that persists between runs under `cache-key`. A fresh runner has no
-      # Docker layers, so without a cache every build compiled all ~240
-      # dependencies from scratch, even when only src/ had changed — the
-      # Dockerfile's dependency-stub layer only pays off when that layer is
-      # found. One key per image and platform, since each one's layers differ.
+      # Built the way the woodhouse repos build, since both arches now run on
+      # self-hosted runners and the arm64 one is a container under Docker
+      # Desktop on the Mac: a buildx builder on the job's Docker network, so it
+      # reaches the plain-HTTP registry service by name and needs no host port —
+      # under Docker Desktop a Docker-assigned host port is not reachable from
+      # there. That also keeps two jobs on the amd64 host from colliding over a
+      # fixed one.
       #
-      # It replaced `type=gha,mode=max`, which uploaded the builder stage's
-      # compiled-dependency layer (~350 MB) to the Actions cache at about
-      # 1 MB/s from these runners: six of the build's twelve minutes, on every
-      # main build, for a cache that by the next build had usually been evicted
-      # (0 layers reused on 2026-10-06 and 2026-10-16). The sticky disk uploads
-      # nothing. Branch builds now share main's disk rather than only reading
-      # it; there is no longer a cache quota for them to evict each other under.
-      # `load: true` puts the image in the runner's Docker, so the push below
-      # is unchanged.
-      - name: Set up Docker builder
-        uses: useblacksmith/setup-docker-builder@v2.2.0
+      # It replaced Blacksmith's sticky-disk builder, which only exists on
+      # Blacksmith. The layer cache now lives in the same S3-backed registry,
+      # one cache tag per image and platform since each one's layers differ, so
+      # the Dockerfile's dependency-stub layer is still found on the next build.
+      # (`type=gha` was tried first and lost: see git history, 2a92690.) No
+      # provenance or SBOM: they would turn the per-platform tag into an index,
+      # which `docker manifest create` refuses.
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v4
         with:
-          cache-key: simmer/${{ matrix.platform }}
-          platforms: linux/${{ matrix.platform }}
+          driver-opts: network=${{ job.container.network }}
+          buildkitd-config-inline: |
+            [registry."registry:5000"]
+              http = true
+              insecure = true
 
-      - name: Build
-        uses: useblacksmith/build-push-action@v2.3.0
-        with:
-          context: .
-          target: runtime
-          platforms: linux/${{ matrix.platform }}
-          tags: localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }}
-          load: true
-
-      - name: Push to S3 registry
-        run: docker push localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }}
+      - name: Build and push to S3 registry
+        run: |
+          CACHE=registry:5000/${{ env.REPO_NAME }}:buildcache-${{ matrix.platform }}
+          docker buildx build --target runtime --platform linux/${{ matrix.platform }} \
+            --cache-from type=registry,ref=$CACHE \
+            --cache-to type=registry,ref=$CACHE,mode=max,image-manifest=true,oci-mediatypes=true \
+            --provenance=false --sbom=false --push \
+            -t registry:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }} .
 
   merge-manifest:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 10
     needs: build
     services:
@@ -212,10 +221,13 @@ jobs:
           REGISTRY_HTTP_SECRET: ${{ secrets.DOCKER_REGISTRY_SECRET }}
           REGISTRY_STORAGE_DELETE_ENABLED: "true"
         ports:
-          - 5000:5000
+          - 5000
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
+
+      - name: Point REGISTRY at the service
+        run: echo "REGISTRY=localhost:${{ job.services.registry.ports['5000'] }}" >> "$GITHUB_ENV"
 
       # A branch name is not always a valid image tag. Since the trigger widened
       # to `**` a `feat/…` branch does reach here, and anything outside the tag
@@ -223,23 +235,28 @@ jobs:
       - name: Make branch name
         run: echo "BRANCH_NAME=$(echo ${{ github.ref }} | sed -e 's/^refs\/heads\///' -e 's/[^A-Za-z0-9_.-]/-/g')" >> $GITHUB_ENV
 
+      # Already on the self-hosted host, whose runner user has no sudo.
       - name: Install skopeo
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y skopeo
+          if ! command -v skopeo >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y skopeo
+          fi
 
       - name: Log in to GHCR via skopeo
         run: |
+          echo "REGISTRY_AUTH_FILE=$RUNNER_TEMP/containers-auth.json" >> "$GITHUB_ENV"
+          export REGISTRY_AUTH_FILE="$RUNNER_TEMP/containers-auth.json"
           skopeo login ghcr.io \
             --username ${{ github.actor }} \
             --password ${{ secrets.GH_TOKEN }}
 
       - name: Create multi-arch manifest in S3 registry
         run: |
-          docker manifest create --insecure localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }} \
-            localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-amd64 \
-            localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-arm64
-          docker manifest push --insecure localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}
+          docker manifest create --insecure ${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${{ github.sha }} \
+            ${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${{ github.sha }}-amd64 \
+            ${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${{ github.sha }}-arm64
+          docker manifest push --purge --insecure ${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${{ github.sha }}
 
       - name: Copy multi-arch manifest from S3 registry to GHCR
         run: |
@@ -253,7 +270,7 @@ jobs:
             skopeo copy \
               --all \
               --src-tls-verify=false \
-              docker://localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }} \
+              docker://${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${{ github.sha }} \
               docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${TAG}
           done
 
@@ -282,20 +299,26 @@ jobs:
         platform: [amd64, arm64]
         include:
           - platform: amd64
-            runner: blacksmith-2vcpu-ubuntu-2404
+            runner: self-hosted-public-amd64
             db_image: mcr.microsoft.com/mssql/server:2022-latest
           - platform: arm64
-            runner: blacksmith-2vcpu-ubuntu-2404-arm
+            runner: self-hosted-public-arm64
             db_image: mcr.microsoft.com/azure-sql-edge:latest
 
     env:
-      # The login the harness creates one database per test with. Port 1434 on
-      # the host, as in docker-compose.yml's `mssql` profile.
-      MSSQL_URL: server=tcp:127.0.0.1,1434;user id=sa;password=Simmer-ci-1!;TrustServerCertificate=true
+      # Named per run and leg: on the shared self-hosted host a fixed name
+      # collides with a concurrent run, or with one that was cancelled before
+      # its teardown.
+      DB_CONTAINER: simmer-ci-db-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.platform }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       # Started here rather than as a `services:` container. The health check
       # this job used to carry ran `sqlcmd` inside the container, and Azure SQL
@@ -305,31 +328,36 @@ jobs:
       # accepted by both (Edge's own docs say `1`).
       - name: Start SQL Server
         run: |
-          docker run -d --name simmer-ci-db -p 1434:1433 \
+          docker run -d --name "$DB_CONTAINER" -p 127.0.0.1::1433 \
             -e ACCEPT_EULA=Y \
             -e MSSQL_SA_PASSWORD='Simmer-ci-1!' \
             -e MSSQL_PID=Developer \
             ${{ matrix.db_image }}
+          # The login the harness creates one database per test with, on
+          # whichever host port Docker picked (1434 locally, per
+          # docker-compose.yml's `mssql` profile).
+          port="$(docker port "$DB_CONTAINER" 1433/tcp | head -n1 | sed 's/.*://')"
+          echo "MSSQL_URL=server=tcp:127.0.0.1,$port;user id=sa;password=Simmer-ci-1!;TrustServerCertificate=true" >> "$GITHUB_ENV"
 
       # Polls the log rather than the port: the listener binds before recovery
       # finishes, so a TCP check reports ready while a login would still fail.
       - name: Wait for SQL Server
         run: |
           for _ in $(seq 1 60); do
-            if docker logs simmer-ci-db 2>&1 \
+            if docker logs "$DB_CONTAINER" 2>&1 \
                  | grep -q 'SQL Server is now ready for client connections'; then
               echo "ready"
               exit 0
             fi
-            if ! docker ps --format '{{.Names}}' | grep -qx simmer-ci-db; then
+            if ! docker ps --format '{{.Names}}' | grep -qx "$DB_CONTAINER"; then
               echo "::error::${{ matrix.db_image }} exited before becoming ready"
-              docker logs --tail 50 simmer-ci-db
+              docker logs --tail 50 "$DB_CONTAINER"
               exit 1
             fi
             sleep 5
           done
           echo "::error::${{ matrix.db_image }} was not ready within 5 minutes"
-          docker logs --tail 50 simmer-ci-db
+          docker logs --tail 50 "$DB_CONTAINER"
           exit 1
 
       - name: Cache Rust dependencies
@@ -361,6 +389,10 @@ jobs:
         if: matrix.platform == 'amd64'
         run: cargo deny --no-default-features --features mssql check
 
+      - name: Remove SQL Server
+        if: always()
+        run: docker rm -f "$DB_CONTAINER" || true
+
   # Multi-arch since D-096, and so built the way `build` is: each platform on a
   # runner of its own, staged in the S3 registry, merged by the job below. Not
   # one job with `platforms: linux/amd64,linux/arm64` — that builds the foreign
@@ -375,9 +407,9 @@ jobs:
         platform: [amd64, arm64]
         include:
           - platform: amd64
-            runner: blacksmith-2vcpu-ubuntu-2404
+            runner: self-hosted-public-amd64
           - platform: arm64
-            runner: blacksmith-2vcpu-ubuntu-2404-arm
+            runner: self-hosted-public-arm64
     services:
       registry:
         image: registry:3.0
@@ -389,8 +421,6 @@ jobs:
           REGISTRY_STORAGE_S3_BUCKET: hikari-docker-registry
           REGISTRY_HTTP_ADDR: :5000
           REGISTRY_HTTP_SECRET: ${{ secrets.DOCKER_REGISTRY_SECRET }}
-        ports:
-          - 5000:5000
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
@@ -398,35 +428,33 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
 
-      # `target: runtime` for the same reason as `build` (D-073), and
-      # Blacksmith's builder for the same reason too, under a cache key of its
-      # own per arch: the feature set compiles a different dependency graph, and
-      # each platform's layers differ.
-      - name: Set up Docker builder
-        uses: useblacksmith/setup-docker-builder@v2.2.0
+      # `target: runtime` for the same reason as `build` (D-073), and built the
+      # same way too, under a cache tag of its own per arch: the feature set
+      # compiles a different dependency graph, and each platform's layers differ.
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v4
         with:
-          cache-key: simmer-mssql/${{ matrix.platform }}
-          platforms: linux/${{ matrix.platform }}
+          driver-opts: network=${{ job.container.network }}
+          buildkitd-config-inline: |
+            [registry."registry:5000"]
+              http = true
+              insecure = true
 
-      - name: Build
-        uses: useblacksmith/build-push-action@v2.3.0
-        with:
-          context: .
-          target: runtime
-          platforms: linux/${{ matrix.platform }}
-          build-args: |
-            CARGO_FEATURES=--no-default-features --features mssql
-          tags: localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-${{ matrix.platform }}
-          load: true
-
-      - name: Push to S3 registry
-        run: docker push localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-${{ matrix.platform }}
+      - name: Build and push to S3 registry
+        run: |
+          CACHE=registry:5000/${{ env.REPO_NAME }}:buildcache-mssql-${{ matrix.platform }}
+          docker buildx build --target runtime --platform linux/${{ matrix.platform }} \
+            --build-arg 'CARGO_FEATURES=--no-default-features --features mssql' \
+            --cache-from type=registry,ref=$CACHE \
+            --cache-to type=registry,ref=$CACHE,mode=max,image-manifest=true,oci-mediatypes=true \
+            --provenance=false --sbom=false --push \
+            -t registry:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-${{ matrix.platform }} .
 
   # The `-mssql` half of `merge-manifest`, kept separate so the two images can
   # fail independently: a broken SQL Server build must not stop the Postgres
   # image publishing, which is what almost every deployment runs.
   merge-manifest-mssql:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted-public-amd64
     timeout-minutes: 10
     needs: build-mssql
     services:
@@ -442,31 +470,39 @@ jobs:
           REGISTRY_HTTP_SECRET: ${{ secrets.DOCKER_REGISTRY_SECRET }}
           REGISTRY_STORAGE_DELETE_ENABLED: "true"
         ports:
-          - 5000:5000
+          - 5000
     steps:
       - name: Make repo name
         run: echo "REPO_NAME=$(echo ${{ github.repository }} | sed -e 's/^Hikari-Systems\///')" >> $GITHUB_ENV
 
+      - name: Point REGISTRY at the service
+        run: echo "REGISTRY=localhost:${{ job.services.registry.ports['5000'] }}" >> "$GITHUB_ENV"
+
       - name: Make branch name
         run: echo "BRANCH_NAME=$(echo ${{ github.ref }} | sed -e 's/^refs\/heads\///' -e 's/[^A-Za-z0-9_.-]/-/g')" >> $GITHUB_ENV
 
+      # Already on the self-hosted host, whose runner user has no sudo.
       - name: Install skopeo
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y skopeo
+          if ! command -v skopeo >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y skopeo
+          fi
 
       - name: Log in to GHCR via skopeo
         run: |
+          echo "REGISTRY_AUTH_FILE=$RUNNER_TEMP/containers-auth.json" >> "$GITHUB_ENV"
+          export REGISTRY_AUTH_FILE="$RUNNER_TEMP/containers-auth.json"
           skopeo login ghcr.io \
             --username ${{ github.actor }} \
             --password ${{ secrets.GH_TOKEN }}
 
       - name: Create multi-arch manifest in S3 registry
         run: |
-          docker manifest create --insecure localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql \
-            localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-amd64 \
-            localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-arm64
-          docker manifest push --insecure localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql
+          docker manifest create --insecure ${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${{ github.sha }}-mssql \
+            ${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-amd64 \
+            ${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-arm64
+          docker manifest push --purge --insecure ${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${{ github.sha }}-mssql
 
       - name: Copy multi-arch manifest from S3 registry to GHCR
         run: |
@@ -480,6 +516,6 @@ jobs:
             skopeo copy \
               --all \
               --src-tls-verify=false \
-              docker://localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql \
+              docker://${{ env.REGISTRY }}/${{ env.REPO_NAME }}:${{ github.sha }}-mssql \
               docker://ghcr.io/hikari-systems/${{ env.REPO_NAME }}:${TAG}
           done
