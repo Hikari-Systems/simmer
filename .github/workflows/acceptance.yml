@@ -30,6 +30,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
 
+      # One Rust home per runner; see build.yml's `check` for why.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
+
       # The self-hosted image has no Rust; Blacksmith's came with it.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

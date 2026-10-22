@@ -72,6 +72,17 @@ jobs:
       - name: Point DATABASE_URL at the service
         run: echo "DATABASE_URL=postgres://simmer:simmer@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/simmer" >> "$GITHUB_ENV"
 
+      # One Rust home per runner, not the runner user's shared ~/.rustup: the
+      # self-hosted runners on a host run as one user, and two jobs installing
+      # into one toolchain directory at once break each other ("could not
+      # rename component file ... Directory not empty"). A runner runs one job
+      # at a time, so its own home is never written concurrently, and it keeps
+      # its toolchain between jobs.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
+
       # The self-hosted image has no Rust; Blacksmith's came with it.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -314,6 +325,12 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
+
+      # One Rust home per runner; see `check` above for why.
+      - name: Per-runner Rust home
+        run: |
+          echo "RUSTUP_HOME=$HOME/.rustup-$RUNNER_NAME" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo-$RUNNER_NAME" >> "$GITHUB_ENV"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
