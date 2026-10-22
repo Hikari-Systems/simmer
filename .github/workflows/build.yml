@@ -161,30 +161,36 @@ jobs:
       # server. CLAUDE.md and docker-compose.yml both say so; this is the
       # deployment pipeline they were warning. See DECISIONS.md D-073.
       #
-      # Built with buildx so the layers can live in the GitHub Actions cache.
-      # A fresh runner has no Docker layers, so without it every build compiled
-      # all ~240 dependencies from scratch, even when only src/ had changed —
-      # the Dockerfile's dependency-stub layer only pays off when that layer is
-      # found. `mode=max` caches the builder stage too, which is the one worth
-      # having. One scope per image, since each platform's layers differ.
-      # Written only from main, as the cargo caches are (`save-if` above):
-      # branches read main's layers without each writing a copy that would
-      # evict the others under the repository's 10 GB cache quota.
+      # Built on Blacksmith's builder, whose BuildKit state lives on a sticky
+      # disk that persists between runs under `cache-key`. A fresh runner has no
+      # Docker layers, so without a cache every build compiled all ~240
+      # dependencies from scratch, even when only src/ had changed — the
+      # Dockerfile's dependency-stub layer only pays off when that layer is
+      # found. One key per image and platform, since each one's layers differ.
+      #
+      # It replaced `type=gha,mode=max`, which uploaded the builder stage's
+      # compiled-dependency layer (~350 MB) to the Actions cache at about
+      # 1 MB/s from these runners: six of the build's twelve minutes, on every
+      # main build, for a cache that by the next build had usually been evicted
+      # (0 layers reused on 2026-10-06 and 2026-10-16). The sticky disk uploads
+      # nothing. Branch builds now share main's disk rather than only reading
+      # it; there is no longer a cache quota for them to evict each other under.
       # `load: true` puts the image in the runner's Docker, so the push below
       # is unchanged.
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      - name: Set up Docker builder
+        uses: useblacksmith/setup-docker-builder@v2.2.0
+        with:
+          cache-key: simmer/${{ matrix.platform }}
+          platforms: linux/${{ matrix.platform }}
 
       - name: Build
-        uses: docker/build-push-action@v7
+        uses: useblacksmith/build-push-action@v2.3.0
         with:
           context: .
           target: runtime
           platforms: linux/${{ matrix.platform }}
           tags: localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }}
           load: true
-          cache-from: type=gha,scope=simmer-${{ matrix.platform }}
-          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope=simmer-{0}', matrix.platform) || '' }}
 
       - name: Push to S3 registry
         run: docker push localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }}
@@ -392,15 +398,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
 
-      # `target: runtime` for the same reason as `build` (D-073), and the
-      # Actions cache for the same reason too, in a scope of its own per arch:
-      # the feature set compiles a different dependency graph, and each
-      # platform's layers differ.
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      # `target: runtime` for the same reason as `build` (D-073), and
+      # Blacksmith's builder for the same reason too, under a cache key of its
+      # own per arch: the feature set compiles a different dependency graph, and
+      # each platform's layers differ.
+      - name: Set up Docker builder
+        uses: useblacksmith/setup-docker-builder@v2.2.0
+        with:
+          cache-key: simmer-mssql/${{ matrix.platform }}
+          platforms: linux/${{ matrix.platform }}
 
       - name: Build
-        uses: docker/build-push-action@v7
+        uses: useblacksmith/build-push-action@v2.3.0
         with:
           context: .
           target: runtime
@@ -409,8 +418,6 @@ jobs:
             CARGO_FEATURES=--no-default-features --features mssql
           tags: localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-${{ matrix.platform }}
           load: true
-          cache-from: type=gha,scope=simmer-mssql-${{ matrix.platform }}
-          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,mode=max,scope=simmer-mssql-{0}', matrix.platform) || '' }}
 
       - name: Push to S3 registry
         run: docker push localhost:5000/${{ env.REPO_NAME }}:${{ github.sha }}-mssql-${{ matrix.platform }}
