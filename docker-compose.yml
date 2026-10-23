@@ -117,7 +117,7 @@ services:
       POSTGRES_PASSWORD: simmer
     ports:
       # Fixed rather than ephemeral: the phase 3 tests reach this database
-      # directly (see README "Development"). 5433 to avoid clashing with a
+      # directly (see docs/DEVELOPMENT.md). 5433 to avoid clashing with a
       # Postgres already running on the developer's machine.
       - "127.0.0.1:5433:5432"
     healthcheck:

@@ -842,7 +842,7 @@ pub struct PoolConfig {
 }
 
 /// §8.4. Per-stage; the sum should sit comfortably below the client's own
-/// timeout (documented in the README).
+/// timeout (docs/manual/07-routes.md, "Timeouts").
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DownstreamTimeouts {

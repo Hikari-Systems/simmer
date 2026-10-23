@@ -1,7 +1,7 @@
 //! §7 against real Postgres.
 //!
 //! These use `#[sqlx::test]`, which creates a fresh database per test and applies
-//! `migrations/` to it. They need `DATABASE_URL` — see the README. Faking the
+//! `migrations/` to it. They need `DATABASE_URL` — see docs/DEVELOPMENT.md. Faking the
 //! database here would prove nothing: the whole argument for §7.4's three-phase
 //! protocol is about what two transactions do to one row at the same time, and
 //! that is a property of Postgres, not of Rust.

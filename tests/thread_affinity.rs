@@ -94,7 +94,7 @@ fn first(n: u32) -> String {
 }
 
 /// The application's reply to the recipient's reply to `emitted` — the
-/// headers the README's table lists, built from the recipient's message.
+/// headers docs/manual/09-thread-affinity.md's table lists, built from the recipient's message.
 fn reply_to(emitted: &str) -> String {
     format!(
         "From: jane@oldbrand.com\r\nTo: bob@example.com\r\nSubject: Re: Your quote\r\n\

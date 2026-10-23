@@ -1,0 +1,108 @@
+# simmer: a minimal starter configuration.
+#
+# One warming route that builds reputation for a NEW domain through one SMTP
+# provider, and one overflow route that sends everything the ramp cannot take
+# under your CURRENT, established domain through another. Every site-specific
+# value comes from an environment variable, so this file can be used unchanged
+# with `docker run -e …`. Every variable must be set: an unset one stops startup
+# and is reported, along with any others.
+#
+# Walkthrough: docs/manual/01-getting-started.md
+# Every key:   docs/manual/reference.md
+
+server:
+  listeners:
+    # 2525 so the process needs no privilege to bind it. Plaintext with AUTH
+    # required, which is acceptable only on a trusted internal network; see
+    # docs/manual/04-server.md to add TLS and ports 587/465.
+    - address: "0.0.0.0:2525"
+      auth: required
+  hostname: "${SIMMER_HOSTNAME}"
+  max_message_bytes: 26214400          # 25 MiB
+  max_recipients: 1                    # one recipient per transaction, always
+  max_concurrent_sessions: 64
+  allowed_cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"]
+  timeouts:
+    command: 30s
+    data: 300s
+    session: 600s
+  auth:
+    allow_insecure_auth: true          # AUTH over plaintext; see the listener note
+    users:
+      - username: "${SIMMER_SMTP_USER}"
+        password_hash: "${SIMMER_SMTP_PASSWORD_HASH}"   # from `server hash-password`
+        grants:
+          send_as: ["${SIMMER_CURRENT_DOMAIN}", "${SIMMER_NEW_DOMAIN}"]
+
+database:
+  url: "${DATABASE_URL}"
+  connect_timeout: 5s
+
+admin:
+  listen: "0.0.0.0:8080"
+  auth_token: "${SIMMER_ADMIN_TOKEN}"
+  metrics: true
+
+default_ramp: main
+ramps:
+  main:
+    domain_groups:
+      - name: google
+        domains: ["gmail.com", "googlemail.com"]
+        mx: ["google.com", "googlemail.com"]
+      - name: microsoft
+        domains: ["outlook.com", "hotmail.com", "live.com", "msn.com"]
+        mx: ["mail.protection.outlook.com", "olc.protection.outlook.com"]
+      - name: yahoo
+        domains: ["yahoo.com", "aol.com"]
+        mx: ["yahoodns.net"]
+      - name: other
+        domains: ["*"]
+
+    # Mail from either domain takes the warming route while it has allowance,
+    # and the overflow route after that.
+    senders:
+      - match: "${SIMMER_CURRENT_DOMAIN}"
+        match_on: from_header
+        chain: [warming, overflow]
+      - match: "${SIMMER_NEW_DOMAIN}"
+        match_on: from_header
+        chain: [warming, overflow]
+    default_chain: [overflow]
+
+    routes:
+      - name: warming
+        downstream:
+          host: "${SIMMER_WARM_SMTP_HOST}"
+          port: 587
+          tls: required_verify
+          auth:
+            username: "${SIMMER_WARM_SMTP_USER}"
+            password: "${SIMMER_WARM_SMTP_PASSWORD}"
+          pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@${SIMMER_NEW_DOMAIN}"
+          set_headers:
+            From: "{{original.from.display_name}} <{{original.from.local}}@${SIMMER_NEW_DOMAIN}>"
+            Message-ID: "<{{uuid}}@${SIMMER_NEW_DOMAIN}>"
+        warmup:
+          started: "${SIMMER_WARMUP_STARTED}"   # RFC 3339, e.g. 2026-11-02T09:00:00Z
+          schedule:
+            # Messages per day per domain group, from day 0. The last value repeats.
+            default: [50, 100, 200, 400, 800, 1500, 3000, 5000, 8000, 12000]
+
+      - name: overflow
+        overflow: true
+        downstream:
+          host: "${SIMMER_OVERFLOW_SMTP_HOST}"
+          port: 587
+          tls: required_verify
+          auth:
+            username: "${SIMMER_OVERFLOW_SMTP_USER}"
+            password: "${SIMMER_OVERFLOW_SMTP_PASSWORD}"
+          pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@${SIMMER_CURRENT_DOMAIN}"
+          set_headers:
+            From: "{{original.from.display_name}} <{{original.from.local}}@${SIMMER_CURRENT_DOMAIN}>"
+            Message-ID: "<{{uuid}}@${SIMMER_CURRENT_DOMAIN}>"

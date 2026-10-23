@@ -137,7 +137,7 @@ jobs:
       # which compiles it from source on every run — several minutes of work to
       # produce a tool that is byte-identical each time. Deliberately not
       # EmbarkStudios/cargo-deny-action: keeping the bare `cargo deny check`
-      # means CI runs exactly the command the README tells a developer to run.
+      # means CI runs exactly the command docs/DEVELOPMENT.md tells a developer to run.
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:

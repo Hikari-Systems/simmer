@@ -388,6 +388,11 @@ tests/telemetry_recipients.rs  D-114 per mode, AND that stdout never sees the ad
 tests/telemetry_compose.rs  D-111 against the acceptance stack's dummy collector
 tests/acceptance.rs      §12.3 against real mail servers; behind --ignored
 simmer.acceptance.yaml   the acceptance stack's config (D-042)
+docs/manual/             the user manual. README.md and DOCKERHUB.md are short and link
+                         here, so a behaviour change belongs in the manual chapter too
+tests/manual_examples.rs every docs/manual/examples/*.yaml must load, and the recipient
+                         hash vectors must match what D-114 exports
+docs/DEVELOPMENT.md      building, testing, CI and releasing (moved out of the README)
 ```
 
 ## House pattern
