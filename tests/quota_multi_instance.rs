@@ -109,6 +109,7 @@ fn request(route: &str, allowance: Option<i64>, count: i64) -> ReserveRequest {
         correlation_id: Uuid::new_v4().to_string(),
         expires_at: Utc::now() + Duration::minutes(10),
         over_cap: false,
+        ..Default::default()
     }
 }
 
@@ -144,6 +145,7 @@ async fn n_reservations_split_across_two_pools_never_overshoot(
                     true
                 }
                 Ok(Reserved::NoHeadroom { .. }) => false,
+                Ok(other) => panic!("ungrouped: {other:?}"),
                 Err(e) => panic!("reserve failed: {e}"),
             }
         }));
@@ -210,16 +212,23 @@ async fn one_instances_open_reservation_blocks_the_others(
         .expect("reserve");
     let warm = match warm {
         Reserved::Taken(r) => r,
-        Reserved::NoHeadroom { .. } => panic!("the row starts empty"),
+        other => panic!("the row starts empty: {other:?}"),
     };
     a.store.commit(&warm, &[]).await.expect("commit");
     // Allowance 2, one committed. One slot left, and two instances about to want it.
 
     let mut tx = a.pool.begin().await.expect("begin");
-    let usage =
-        simmer::models::quota::lock_usage(&mut tx, "main", "warming", "catchall", 0, Some(2))
-            .await
-            .expect("lock the existing row");
+    let (usage, _created) = simmer::models::quota::lock_usage(
+        &mut tx,
+        "main",
+        "warming",
+        "catchall",
+        0,
+        Some(2),
+        Some(0),
+    )
+    .await
+    .expect("lock the existing row");
     assert!(usage.has_headroom_for(1), "one slot left");
     simmer::models::quota::insert_reservation(
         &mut tx,

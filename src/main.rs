@@ -432,6 +432,15 @@ async fn run() -> anyhow::Result<()> {
         ))
     });
 
+    // D-118 — drop an auto partial ramp's members once its route has been idle
+    // for `member_retention_days`. Always started: a route that is no longer
+    // auto still has rows to bound.
+    let member_sweeper = tokio::spawn(simmer::routing::partial_members::run(
+        Arc::clone(&quota),
+        Arc::clone(&config),
+        stop_accepting.clone(),
+    ));
+
     // D-085's retention. Not started when capture is off: nothing writes bucket
     // files then, so there is nothing to evict — the frequency sweeper's
     // precedent, for the same reason.
@@ -598,6 +607,7 @@ async fn run() -> anyhow::Result<()> {
     if let Some(task) = frequency_sweeper {
         let _ = task.await;
     }
+    let _ = member_sweeper.await;
     if let Some(task) = preflight_task {
         let _ = task.await;
     }

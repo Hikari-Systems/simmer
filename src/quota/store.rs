@@ -26,6 +26,47 @@ pub struct Reservation {
     pub domain_group: String,
     pub day_index: i64,
     pub count: i64,
+    /// D-115 — did this reservation **create** the day's row? Exactly one
+    /// reservation per row says so, under the row lock, which is what lets
+    /// `simmer_warmup_advance_total` count each element's daily decision once
+    /// across every instance. Not consulted by commit or release.
+    pub created_row: bool,
+    /// D-116 — the ramp group row this reservation also holds headroom on.
+    /// `None` outside any group, and on every overflow route. Commit and
+    /// release resolve it with the route row, group row first.
+    pub ramp_group: Option<GroupHold>,
+    /// D-116 — did this reservation create the group's day row? D-115's
+    /// `created_row`, for the group's own advance decision.
+    pub created_group_row: bool,
+}
+
+/// D-116 — the group row a [`Reservation`] holds headroom on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupHold {
+    pub name: String,
+    /// The group's own day, from its `started` — not the route's.
+    pub day_index: i64,
+}
+
+/// D-116 — the group half of a [`ReserveRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupReserve {
+    pub name: String,
+    pub day_index: i64,
+    /// The ceiling to write if the group's row does not yet exist; ignored once
+    /// it does (D-026), exactly as the route's `allowance`.
+    pub allowance: i64,
+    /// D-115's step, written beside it on the same terms.
+    pub step: i64,
+}
+
+/// D-118 — one route's membership, as the sweeper sees it. Carries no key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberRoute {
+    pub ramp: String,
+    pub route: String,
+    pub members: i64,
+    pub last_committed_at: DateTime<Utc>,
 }
 
 /// What one `(ramp, route, domain_group, day_index)` row says.
@@ -85,6 +126,32 @@ pub struct Reset {
     pub reserved_after: i64,
 }
 
+/// D-115 — the rows [`super::advance::decide`] reads for one element: its row
+/// for the day asked about, if any, and the latest one before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AdvanceRows {
+    pub today: Option<super::advance::Row>,
+    pub previous: Option<super::advance::Row>,
+}
+
+impl AdvanceRows {
+    /// Split the newest-first rows at or before `day_index` (at most two) into
+    /// today's and the one before.
+    pub fn from_newest_first(day_index: i64, rows: &[super::advance::Row]) -> Self {
+        let mut it = rows.iter().copied().filter(|r| r.day_index <= day_index);
+        match it.next() {
+            Some(r) if r.day_index == day_index => Self {
+                today: Some(r),
+                previous: it.next(),
+            },
+            first => Self {
+                today: None,
+                previous: first,
+            },
+        }
+    }
+}
+
 /// §9.3 route-scoped admin state. Absent rows read as the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RouteState {
@@ -93,7 +160,10 @@ pub struct RouteState {
 }
 
 /// Everything a reservation attempt needs to know.
-#[derive(Debug, Clone)]
+///
+/// `Default` exists for tests and literals that set only what they care about;
+/// the walk sets every field.
+#[derive(Debug, Clone, Default)]
 pub struct ReserveRequest {
     /// D-099 — the ramp the message is being routed in.
     pub ramp: String,
@@ -103,6 +173,10 @@ pub struct ReserveRequest {
     /// The ceiling to write **if the row does not yet exist**. Ignored when it
     /// does, because §7.4's row is authoritative once created (D-026).
     pub allowance: Option<i64>,
+    /// D-115 — the schedule step to write **if the row does not yet exist**,
+    /// beside `allowance`, and authoritative thereafter for the same reason.
+    /// `None` for an overflow route.
+    pub step: Option<i64>,
     /// §3.2: "decremented per message, by the recipient count, not per
     /// recipient" — one reservation of this magnitude (O-7).
     pub count: i64,
@@ -114,7 +188,12 @@ pub struct ReserveRequest {
     /// counted and contenders are still serialised; `committed` may simply end
     /// above `allowance`. Set only for a thread-affinity reply on its pinned
     /// route, and only once an ordinary reservation has been refused.
+    /// D-116: it skips the group's check as well, and still counts there.
     pub over_cap: bool,
+    /// D-116 — the ramp group this route's warming traffic also counts
+    /// against. The group row is locked **before** the route row, and both
+    /// must have headroom. `None` for an ungrouped ramp or an overflow route.
+    pub group: Option<GroupReserve>,
 }
 
 /// The outcome of §7.4 phase 1.
@@ -123,6 +202,13 @@ pub enum Reserved {
     Taken(Reservation),
     /// No headroom. The chain walk moves to the next route (§3.2 step 3c).
     NoHeadroom {
+        usage: Usage,
+    },
+    /// D-116 — the route has headroom, or was not asked, but its ramp group
+    /// has none today. Checked **before** the route row, so a day both are
+    /// full is reported as the group's: the wider ceiling is the one binding.
+    /// `usage` is the group row's.
+    NoGroupHeadroom {
         usage: Usage,
     },
 }
@@ -199,6 +285,22 @@ pub trait QuotaStore: Send + Sync + 'static {
         &self,
         reservation: &Reservation,
         recipient_keys: &[crate::frequency::Key],
+    ) -> Result<(), QuotaError> {
+        self.commit_recording(reservation, recipient_keys, None)
+            .await
+    }
+
+    /// [`commit`](Self::commit), also recording D-118's membership: `member`
+    /// is the recipient's member key on a route whose share is `mode: auto`,
+    /// and `None` everywhere else. Same transaction, for the same reason as the
+    /// events: a delivered message must never be missing its row, and an
+    /// undelivered one must never have one. Insert-if-absent, then the row's
+    /// `last_committed_at` moves forward.
+    async fn commit_recording(
+        &self,
+        reservation: &Reservation,
+        recipient_keys: &[crate::frequency::Key],
+        member: Option<&crate::frequency::Key>,
     ) -> Result<(), QuotaError>;
 
     /// §7.4 phase 3 — anything else: give the headroom back.
@@ -238,7 +340,9 @@ pub trait QuotaStore: Send + Sync + 'static {
     /// §9.3 `POST /routes/{name}/allowance`. `allowance: None` clears the
     /// override; `scheduled` is what to write into `allowance` if the row does
     /// not exist yet, so that clearing an override on a fresh row leaves the
-    /// schedule's own number behind rather than a null (D-025).
+    /// schedule's own number behind rather than a null (D-025). `scheduled_step`
+    /// is D-115's step, written beside it for the same reason.
+    #[allow(clippy::too_many_arguments)] // D-115 added the step beside the allowance
     async fn set_allowance_override(
         &self,
         ramp: &str,
@@ -247,7 +351,18 @@ pub trait QuotaStore: Send + Sync + 'static {
         day_index: i64,
         allowance: Option<i64>,
         scheduled: Option<i64>,
+        scheduled_step: Option<i64>,
     ) -> Result<(), QuotaError>;
+
+    /// D-115 — the element's row for `day_index` and the latest row before it,
+    /// unlocked. What [`super::position`] decides a threshold step from.
+    async fn advance_rows(
+        &self,
+        ramp: &str,
+        route: &str,
+        domain_group: &str,
+        day_index: i64,
+    ) -> Result<AdvanceRows, QuotaError>;
 
     /// §9.3 `POST /quota/reset`. `None` means there was no row to reset.
     async fn reset_counters(
@@ -292,12 +407,51 @@ pub trait QuotaStore: Send + Sync + 'static {
     /// §7.3's sweeper — evict events older than `cutoff`. Returns how many.
     async fn sweep_recipient_events(&self, cutoff: DateTime<Utc>) -> Result<u64, QuotaError>;
 
+    /// D-118 — has a message to this member key been committed on this
+    /// route? Unlocked: a pair racing to be the recipient's first commit both
+    /// read "no", and each is judged on the share instead, which is what would
+    /// have happened without the table.
+    async fn is_partial_member(
+        &self,
+        ramp: &str,
+        route: &str,
+        member: &crate::frequency::Key,
+    ) -> Result<bool, QuotaError>;
+
+    /// D-118's sweeper read — every route that has members, with the newest
+    /// commit among them (which is the route's last commit, since every commit
+    /// on an auto route touches a row).
+    async fn partial_member_routes(&self) -> Result<Vec<MemberRoute>, QuotaError>;
+
+    /// D-118's eviction — drop every member row of `(ramp, route)`, but only if
+    /// none of them was committed at or after `idle_since`. The guard is in the
+    /// statement, so a commit landing between the read and this cannot be
+    /// swept with its route. Returns how many went.
+    async fn drop_partial_members(
+        &self,
+        ramp: &str,
+        route: &str,
+        idle_since: DateTime<Utc>,
+    ) -> Result<u64, QuotaError>;
+
     /// D-099 — move every pre-ramps row (`ramp = ''`, which the migration
     /// wrote) into `ramp`, in one transaction under a lock that serialises
     /// replicas starting together. Idempotent: a second call finds nothing.
     /// Refuses with [`QuotaError::LegacyConflict`] if a legacy
     /// `quota_usage` or `route_state` key already exists under `ramp`.
     async fn adopt_legacy_rows(&self, ramp: &str) -> Result<Adoption, QuotaError>;
+
+    /// D-116 — a ramp group's row for `day_index`, unlocked. Absent reads as
+    /// all-zero with no allowance, which the caller fills from the schedule.
+    async fn group_usage(&self, ramp_group: &str, day_index: i64) -> Result<Usage, QuotaError>;
+
+    /// D-116 — the group's row for `day_index` and the latest before it, for
+    /// D-115's [`super::advance::decide`] applied to the group.
+    async fn group_advance_rows(
+        &self,
+        ramp_group: &str,
+        day_index: i64,
+    ) -> Result<AdvanceRows, QuotaError>;
 
     /// Is the backing store reachable? §7.5.
     async fn is_available(&self) -> bool;

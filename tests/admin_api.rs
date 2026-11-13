@@ -253,6 +253,8 @@ const PROTECTED: &[(&str, &str, &str)] = &[
         "/dryrun",
         r#"{"envelope_from":"a@oldbrand.com","recipients":["b@gmail.com"]}"#,
     ),
+    ("GET", "/ramp-groups", ""),
+    ("GET", "/ramp-groups/brands", ""),
 ];
 
 #[sqlx::test]
@@ -441,6 +443,7 @@ async fn a_reservation_shows_up_as_reserved_and_reduces_headroom(pool: PgPool) {
             correlation_id: "test".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
             over_cap: false,
+            ..Default::default()
         })
         .await
         .expect("reserved");
@@ -477,6 +480,7 @@ async fn the_read_api_reports_the_row_when_the_schedule_has_moved_under_it(pool:
             correlation_id: "test".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
             over_cap: false,
+            ..Default::default()
         })
         .await
         .expect("reserved");
@@ -780,6 +784,7 @@ async fn an_override_takes_effect_on_the_next_reservation(pool: PgPool) {
                 correlation_id: format!("test-{i}"),
                 expires_at: Utc::now() + chrono::Duration::minutes(10),
                 over_cap: false,
+                ..Default::default()
             })
             .await
             .expect("store");
@@ -941,6 +946,7 @@ async fn a_reset_zeroes_committed_and_keeps_live_reservations(pool: PgPool) {
             correlation_id: "committed".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
             over_cap: false,
+            ..Default::default()
         })
         .await
         .expect("reserve");
@@ -961,6 +967,7 @@ async fn a_reset_zeroes_committed_and_keeps_live_reservations(pool: PgPool) {
             correlation_id: "in-flight".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
             over_cap: false,
+            ..Default::default()
         })
         .await
         .expect("reserve");
@@ -1351,6 +1358,7 @@ async fn dry_run_agrees_with_the_real_walk_on_an_exhausted_quota(pool: PgPool) {
             correlation_id: "filler".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
             over_cap: false,
+            ..Default::default()
         })
         .await
         .expect("reserve");
@@ -1422,6 +1430,7 @@ async fn dry_run_agrees_with_the_real_walk_on_a_frequency_skip(pool: PgPool) {
             correlation_id: "filler".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
             over_cap: false,
+            ..Default::default()
         })
         .await
         .expect("reserve");
@@ -1449,8 +1458,9 @@ async fn dry_run_agrees_with_the_real_walk_on_a_frequency_skip(pool: PgPool) {
 async fn no_endpoint_exposes_a_recipient(pool: PgPool) {
     // §7.3 hashes so the container does not accumulate a record of who was
     // mailed. Every read endpoint is checked, not just the ones that touch the
-    // frequency tables, so a future addition has to think about it.
-    let state = state(pool.clone());
+    // frequency tables, so a future addition has to think about it. With a
+    // ramp group (D-116), so its endpoints are among them.
+    let state = state_from(pool.clone(), config(GROUPS));
     let day = today(&state.engine.config, "warming");
 
     // Put a real recipient through the system first, so there is something to
@@ -1477,6 +1487,8 @@ async fn no_endpoint_exposes_a_recipient(pool: PgPool) {
             correlation_id: "real".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
             over_cap: false,
+            group: Some(brands_today()),
+            ..Default::default()
         })
         .await
         .expect("reserve");
@@ -1493,6 +1505,10 @@ async fn no_endpoint_exposes_a_recipient(pool: PgPool) {
         "/ramps/main/routes/warming",
         "/quota",
         "/health",
+        "/ramps",
+        "/ramps/main",
+        "/ramp-groups",
+        "/ramp-groups/brands",
     ] {
         let body = get(&state, uri, Some(TOKEN)).await.body;
         assert!(!body.contains("victim"), "{uri} leaked a recipient: {body}");
@@ -1536,6 +1552,7 @@ async fn a_dry_run_echoes_only_what_the_caller_supplied(pool: PgPool) {
             correlation_id: "other".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
             over_cap: false,
+            ..Default::default()
         })
         .await
         .expect("reserve");
@@ -1644,6 +1661,7 @@ async fn spend_google(state: &AdminState) {
             correlation_id: "filler".into(),
             expires_at: Utc::now() + chrono::Duration::minutes(10),
             over_cap: false,
+            ..Default::default()
         })
         .await
         .expect("reserve")
@@ -2172,4 +2190,143 @@ async fn a_dry_run_names_the_downstream_the_group_would_meet(pool: PgPool) {
         doc["recipients"][0]["downstream"],
         serde_json::json!({"downstream": "default", "host": "127.0.0.1", "port": 2525})
     );
+}
+
+// ---------------------------------------------------------------------------
+// D-116 — ramp groups on the read API
+// ---------------------------------------------------------------------------
+
+/// `main` in a group of its own, threshold-advanced from a start long ago.
+const GROUPS: &str = r#"
+ramp_groups:
+  brands:
+    ramps: [main]
+    started: "2020-01-01T00:00:00Z"
+    schedule: [5, 10]
+"#;
+
+fn brands_day() -> i64 {
+    quota::day::index("2020-01-01T00:00:00Z".parse().unwrap(), Utc::now())
+}
+
+/// What the walk would pass for `brands` today: no earlier row, so step 0.
+fn brands_today() -> simmer::quota::GroupReserve {
+    simmer::quota::GroupReserve {
+        name: "brands".into(),
+        day_index: brands_day(),
+        allowance: 5,
+        step: 0,
+    }
+}
+
+#[sqlx::test]
+async fn ramp_groups_reports_each_group_before_and_after_a_send(pool: PgPool) {
+    let state = state_from(pool, config(GROUPS));
+    let doc = get(&state, "/ramp-groups/brands", Some(TOKEN)).await.json();
+    assert_eq!(doc["name"], "brands");
+    assert_eq!(doc["ramps"], serde_json::json!(["main"]));
+    assert_eq!(doc["schedule"], serde_json::json!([5, 10]));
+    assert_eq!(doc["advance"]["mode"], "threshold");
+    assert_eq!(doc["advance"]["threshold"], 0.9);
+    assert_eq!(doc["in_force"], true);
+    assert_eq!(doc["day_index"], brands_day());
+    // No earlier row: D-115's first day, step 0, however long ago it started.
+    assert_eq!(doc["step"], 0);
+    assert_eq!(doc["held_days"], brands_day());
+    assert_eq!(doc["allowance"], 5);
+    assert_eq!(doc["headroom"], 5);
+    assert_eq!(doc["row_exists"], false);
+    assert_eq!(doc["next_allowance_if_met"], 10);
+    assert!(doc["previous"].is_null());
+
+    // A message through the real dry-run's sibling, the real walk.
+    let cfg = Arc::clone(&state.engine.config);
+    let mut evaluation = Vec::new();
+    let walked = simmer::routing::chain::walk_and_reserve(
+        cfg.default_ramp(),
+        &state.engine.groups,
+        &cfg.dot_insensitive_domains,
+        &state.engine.quota,
+        &state.engine.frequency,
+        &state.engine.preflight,
+        &["warming".to_string(), "overflow".to_string()],
+        None,
+        &["reader@example.com".to_string()],
+        "groups",
+        &mut evaluation,
+        Utc::now(),
+    )
+    .await
+    .expect("walk");
+    let simmer::routing::chain::Walk::Selected(s) = walked else {
+        panic!("selected");
+    };
+    assert_eq!(s.route.name, "warming");
+    store(&state).commit(&s.reservation, &[]).await.unwrap();
+
+    let doc = get(&state, "/ramp-groups/brands", Some(TOKEN)).await.json();
+    assert_eq!(doc["row_exists"], true);
+    assert_eq!(doc["committed"], 1);
+    assert_eq!(doc["reserved"], 0);
+    assert_eq!(doc["headroom"], 4);
+
+    let list = get(&state, "/ramp-groups", Some(TOKEN)).await.json();
+    assert_eq!(list["ramp_groups"].as_array().unwrap().len(), 1);
+    assert_eq!(list["ramp_groups"][0], doc);
+}
+
+#[sqlx::test]
+async fn an_unknown_ramp_group_is_a_404_and_no_groups_is_an_empty_list(pool: PgPool) {
+    let state = state(pool);
+    let r = get(&state, "/ramp-groups/brands", Some(TOKEN)).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let list = get(&state, "/ramp-groups", Some(TOKEN)).await.json();
+    assert_eq!(list["ramp_groups"], serde_json::json!([]));
+    assert!(get(&state, "/ramps/main", Some(TOKEN)).await.json()["ramp_group"].is_null());
+}
+
+#[sqlx::test]
+async fn a_ramp_names_its_group(pool: PgPool) {
+    let state = state_from(pool, config(GROUPS));
+    let doc = get(&state, "/ramps/main", Some(TOKEN)).await.json();
+    assert_eq!(doc["ramp_group"], "brands");
+}
+
+#[sqlx::test]
+async fn a_dry_run_reports_the_group_a_warming_route_counts_against(pool: PgPool) {
+    let state = state_from(pool, config(GROUPS));
+    let doc = post(&state, "/dryrun", Some(TOKEN), DRYRUN).await.json();
+    let evaluation = &doc["recipients"][0]["evaluation"];
+    assert_eq!(evaluation[0]["route"], "warming");
+    let g = &evaluation[0]["ramp_group"];
+    assert_eq!(g["name"], "brands");
+    assert_eq!(g["allowance"], 5);
+    assert_eq!(g["headroom"], 5);
+    assert_eq!(g["step"], 0);
+}
+
+#[sqlx::test]
+async fn dry_run_agrees_with_the_real_walk_on_a_full_ramp_group(pool: PgPool) {
+    // A group whose ceiling is 0: full before anything is sent, while the
+    // route itself still has its 1 for Google.
+    let cfg = config(&GROUPS.replace("[5, 10]", "[0]"));
+    let state = state_from(pool, cfg);
+    let doc = post(&state, "/dryrun", Some(TOKEN), DRYRUN).await.json();
+    let evaluation = &doc["recipients"][0]["evaluation"];
+    assert_eq!(evaluation[0]["reason"], "group_quota");
+    assert_eq!(evaluation[0]["ramp_group"]["headroom"], 0);
+    assert!(evaluation[0]["explanation"]
+        .as_str()
+        .unwrap()
+        .contains("ramp group"));
+    assert_eq!(doc["recipients"][0]["selected"], "overflow");
+
+    let (dry, real) = compare_walks(&state, "b@gmail.com").await;
+    assert_eq!(dry, real);
+    assert_eq!(real, "warming=group_quota,overflow=selected");
+
+    // A pinned reply passes the full group, in both walks alike (D-090).
+    let (dry, real) = compare_pinned_walks(&state, "b@gmail.com", Some("warming")).await;
+    assert_eq!(dry, real);
+    assert_eq!(real, "warming=selected_over_cap");
 }

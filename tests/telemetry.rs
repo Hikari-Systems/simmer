@@ -334,3 +334,253 @@ async fn no_recipient_address_is_exported() {
     assert_eq!(attr_str(down, "smtp.response.code").as_deref(), Some("550"));
     assert_eq!(attr_str(down, "smtp.stage").as_deref(), Some("rcpt_to"));
 }
+
+// -- D-115: the schedule step, as a trace sees it ---------------------------
+
+/// `config_for`'s one route made a warming route, alone in a ramp that may
+/// have no overflow (D-113), so the walk selects it and the relay span says
+/// where it stood on its schedule.
+fn warming_config(addr: std::net::SocketAddr) -> String {
+    config_for(
+        addr,
+        "    warmup:\n      started: \"2020-01-01T00:00:00Z\"\n      schedule: { default: [50, 100] }\n",
+    )
+    .replace("    overflow: true\n", "")
+    .replace(
+        "  default_chain: [only]\n",
+        "  default_chain: [only]\n  allow_no_overflow_route: true\n",
+    )
+}
+
+#[tokio::test]
+async fn the_relay_span_says_where_the_route_stood_on_its_schedule() {
+    exported();
+    let downstream = FakeDownstream::start(Script::default()).await;
+    let simmer = Simmer::start(&warming_config(downstream.addr)).await;
+    let mut client = simmer.connect().await;
+    client.hello().await;
+    let reply = client
+        .deliver(
+            "jane@oldbrand.com",
+            RECIPIENT,
+            "From: jane@oldbrand.com\r\nSubject: hi\r\n\r\nhello\r\n",
+        )
+        .await;
+    assert_eq!(reply.code, 250);
+    client.command("QUIT").await;
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let relay = exported()
+        .spans
+        .get_finished_spans()
+        .expect("spans")
+        .into_iter()
+        .filter(|s| s.name == "simmer.relay")
+        .find(|r| attr_str(r, "warmup.advance_mode").is_some())
+        .expect("a relay span for the warming route");
+    // The test store grants everything and keeps no history, so a threshold
+    // route is on its first step — 2000-odd days behind its calendar.
+    assert_eq!(
+        attr_str(&relay, "warmup.advance_mode").as_deref(),
+        Some("threshold")
+    );
+    assert_eq!(attr_str(&relay, "warmup.step").as_deref(), Some("0"));
+    let held: i64 = attr_str(&relay, "warmup.held_days")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let day: i64 = attr_str(&relay, "day_index").unwrap().parse().unwrap();
+    assert_eq!(held, day);
+}
+
+#[tokio::test]
+async fn the_daily_decision_is_an_exported_span_event_and_a_counter() {
+    use simmer::quota::advance::Row;
+    use simmer::quota::store::RouteState;
+    exported();
+    let cfg = simmer::config::from_str(&warming_config("127.0.0.1:1".parse().unwrap()), "test")
+        .expect("valid");
+    let route = cfg.default_ramp().route("only").expect("route");
+    // Yesterday sent 40 of 50 at step 0: held, with a bar of 45.
+    let position = simmer::quota::position_from(
+        route,
+        "catchall",
+        1,
+        RouteState::default(),
+        simmer::quota::AdvanceRows {
+            today: None,
+            previous: Some(Row {
+                day_index: 0,
+                step: Some(0),
+                allowance: Some(50),
+                committed: 40,
+            }),
+        },
+    );
+
+    let span = tracing::info_span!("test.d115", otel.name = "test.d115");
+    span.in_scope(|| simmer::quota::report_row_created(route, "catchall", &position));
+    drop(span);
+
+    let span = exported()
+        .spans
+        .get_finished_spans()
+        .expect("spans")
+        .into_iter()
+        .find(|s| s.name == "test.d115")
+        .expect("the span");
+    let event = span
+        .events
+        .iter()
+        .find(|e| {
+            e.attributes.iter().any(|kv| {
+                kv.key.as_str() == "event" && kv.value.as_str() == "simmer.warmup.advance"
+            })
+        })
+        .expect("a simmer.warmup.advance event");
+    let get = |k: &str| {
+        event
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == k)
+            .map(|kv| kv.value.as_str().into_owned())
+    };
+    assert_eq!(get("outcome").as_deref(), Some("held"));
+    assert_eq!(get("step").as_deref(), Some("0"));
+    assert_eq!(get("required").as_deref(), Some("45"));
+    assert_eq!(get("previous_committed").as_deref(), Some("40"));
+    assert_eq!(get("previous_allowance").as_deref(), Some("50"));
+    assert_eq!(get("advance_mode").as_deref(), Some("threshold"));
+    let text = format!("{:?}", event.attributes);
+    assert!(
+        !text.contains('@'),
+        "no recipient in a schedule event: {text}"
+    );
+
+    // ...and the counter reaches OTLP through the same facade as /metrics.
+    exported().meter.force_flush().expect("flush metrics");
+    let counted = exported()
+        .metrics
+        .get_finished_metrics()
+        .expect("metrics")
+        .iter()
+        .flat_map(|rm| rm.scope_metrics())
+        .flat_map(|sm| sm.metrics())
+        .filter(|m| m.name() == "simmer_warmup_advance_total")
+        .any(|m| match m.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => sum.data_points().any(|p| {
+                p.attributes()
+                    .any(|kv| kv.key.as_str() == "outcome" && kv.value.as_str() == "held")
+            }),
+            _ => false,
+        });
+    assert!(
+        counted,
+        "simmer_warmup_advance_total{{outcome=\"held\"}} was exported"
+    );
+}
+
+/// [`warming_config`] with its ramp in a ramp group (D-116).
+fn grouped_config(addr: std::net::SocketAddr) -> String {
+    format!(
+        "{}\nramp_groups:\n  telemetry-group:\n    ramps: [main]\n    started: \"2020-01-01T00:00:00Z\"\n    schedule: [1000]\n",
+        warming_config(addr)
+    )
+}
+
+#[tokio::test]
+async fn the_relay_span_names_the_ramp_group_it_counted_against() {
+    exported();
+    let downstream = FakeDownstream::start(Script::default()).await;
+    let simmer = Simmer::start(&grouped_config(downstream.addr)).await;
+    let mut client = simmer.connect().await;
+    client.hello().await;
+    let reply = client
+        .deliver(
+            "jane@oldbrand.com",
+            RECIPIENT,
+            "From: jane@oldbrand.com\r\nSubject: hi\r\n\r\nhello\r\n",
+        )
+        .await;
+    assert_eq!(reply.code, 250);
+    client.command("QUIT").await;
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let spans = exported().spans.get_finished_spans().expect("spans");
+    let relay = spans
+        .iter()
+        .filter(|s| s.name == "simmer.relay")
+        .find(|r| attr_str(r, "ramp_group").is_some())
+        .expect("a relay span naming the group");
+    assert_eq!(
+        attr_str(relay, "ramp_group").as_deref(),
+        Some("telemetry-group")
+    );
+    assert_eq!(attr_str(relay, "ramp_group.step").as_deref(), Some("0"));
+    let walk = spans
+        .iter()
+        .filter(|s| s.name == "simmer.route")
+        .find(|r| attr_str(r, "ramp_group").is_some())
+        .expect("the walk span too");
+    assert_eq!(
+        attr_str(walk, "ramp_group").as_deref(),
+        Some("telemetry-group")
+    );
+}
+
+#[tokio::test]
+async fn the_group_daily_decision_is_an_exported_span_event() {
+    use simmer::quota::advance::Row;
+    exported();
+    let cfg = simmer::config::from_str(&grouped_config("127.0.0.1:1".parse().unwrap()), "test")
+        .expect("valid");
+    let group = cfg.ramp_groups.get("telemetry-group").expect("group");
+    // Yesterday committed 950 of 1000: met at 0.9, so advanced.
+    let position = simmer::quota::group_position_from(
+        group,
+        1,
+        simmer::quota::AdvanceRows {
+            today: None,
+            previous: Some(Row {
+                day_index: 0,
+                step: Some(0),
+                allowance: Some(1000),
+                committed: 950,
+            }),
+        },
+    );
+    let span = tracing::info_span!("test.d116", otel.name = "test.d116");
+    span.in_scope(|| simmer::quota::report_group_row_created(group, &position));
+    drop(span);
+
+    let span = exported()
+        .spans
+        .get_finished_spans()
+        .expect("spans")
+        .into_iter()
+        .find(|s| s.name == "test.d116")
+        .expect("the span");
+    let event = span
+        .events
+        .iter()
+        .find(|e| {
+            e.attributes.iter().any(|kv| {
+                kv.key.as_str() == "event" && kv.value.as_str() == "simmer.ramp_group.advance"
+            })
+        })
+        .expect("a simmer.ramp_group.advance event");
+    let get = |k: &str| {
+        event
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == k)
+            .map(|kv| kv.value.as_str().into_owned())
+    };
+    assert_eq!(get("ramp_group").as_deref(), Some("telemetry-group"));
+    assert_eq!(get("outcome").as_deref(), Some("advanced"));
+    assert_eq!(get("step").as_deref(), Some("1"));
+    assert_eq!(get("required").as_deref(), Some("900"));
+    assert_eq!(get("previous_committed").as_deref(), Some("950"));
+}

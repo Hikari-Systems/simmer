@@ -101,6 +101,8 @@ pub fn router(state: AdminState) -> Router {
         .route("/ramps/{ramp}/routes", get(routes))
         .route("/ramps/{ramp}/routes/{name}", get(route_by_name))
         .route("/quota", get(quota_detail))
+        .route("/ramp-groups", get(ramp_groups))
+        .route("/ramp-groups/{name}", get(ramp_group_by_name))
         // -- §9.3 write ------------------------------------------------
         .route("/ramps/{ramp}/routes/{name}/pause", post(mutate::pause))
         .route("/ramps/{ramp}/routes/{name}/resume", post(mutate::resume))
@@ -340,7 +342,65 @@ async fn refresh_quota_gauges(state: &AdminState) -> Result<(), quota::QuotaErro
     for ramp in state.config().ramps.iter() {
         refresh_ramp_quota_gauges(state, ramp).await?;
     }
+    // D-116: every group's gauges, from the same reads `/ramp-groups` makes.
+    let now = Utc::now();
+    for group in state.config().ramp_groups.iter() {
+        let (position, usage) = ramp_group_state(state, group, now).await?;
+        crate::metrics::ramp_group(&group.name, &position, &usage.unwrap_or_default());
+    }
     Ok(())
+}
+
+/// D-116 — a group's position and its row today (`None` when no row exists).
+async fn ramp_group_state(
+    state: &AdminState,
+    group: &crate::config::RampGroup,
+    now: chrono::DateTime<Utc>,
+) -> Result<(quota::GroupPosition, Option<quota::Usage>), quota::QuotaError> {
+    let store = state.store();
+    // `quota::group_position`, split so its row read also says whether today's
+    // row exists: an absent row is reported as absent, not as zeros.
+    let day_index = quota::day::index(group.started, now);
+    let rows = if day_index >= 0 {
+        store.group_advance_rows(&group.name, day_index).await?
+    } else {
+        quota::AdvanceRows::default()
+    };
+    let position = quota::group_position_from(group, day_index, rows);
+    let usage = match rows.today {
+        Some(_) => Some(store.group_usage(&group.name, day_index).await?),
+        None => None,
+    };
+    Ok((position, usage))
+}
+
+/// §9.2 (D-116) `GET /ramp-groups` — every ramp group, in document order.
+async fn ramp_groups(
+    State(state): State<AdminState>,
+    _actor: Actor,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let now = Utc::now();
+    let mut out = Vec::new();
+    for group in state.config().ramp_groups.iter() {
+        let (position, usage) = ramp_group_state(&state, group, now).await?;
+        out.push(view::project_ramp_group(group, &position, usage));
+    }
+    Ok(Json(json!({ "ramp_groups": out })))
+}
+
+/// §9.2 (D-116) `GET /ramp-groups/{name}`.
+async fn ramp_group_by_name(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    _actor: Actor,
+) -> Result<Json<view::RampGroupView>, ApiError> {
+    let group = state
+        .config()
+        .ramp_groups
+        .get(&name)
+        .ok_or_else(|| ApiError::not_found("ramp group", &name))?;
+    let (position, usage) = ramp_group_state(&state, group, Utc::now()).await?;
+    Ok(Json(view::project_ramp_group(group, &position, usage)))
 }
 
 async fn refresh_ramp_quota_gauges(
@@ -353,6 +413,7 @@ async fn refresh_ramp_quota_gauges(
         .store()
         .usage_many(&ramp.name, &keys_for(ramp, now))
         .await?;
+    let advance = advance_rows_for(state.store().as_ref(), ramp, None, now).await?;
 
     for route in &ramp.routes {
         let projected = view::project_route(
@@ -360,11 +421,22 @@ async fn refresh_ramp_quota_gauges(
             route,
             states.get(&route.name).copied().unwrap_or_default(),
             &usage,
+            &advance,
             &state.engine.preflight,
             &state.engine.pools,
             now,
         );
         crate::metrics::warmup_day(&route.ramp, &route.name, projected.day_index);
+        if let Some(threshold) = route.warmup.as_ref().and_then(|w| w.advance().threshold()) {
+            crate::metrics::warmup_advance_threshold(&route.ramp, &route.name, threshold);
+        }
+        if route.warmup.is_some() {
+            let state_of = states.get(&route.name).copied().unwrap_or_default();
+            for group in &ramp.domain_groups {
+                let position = view::position_for(route, &group.name, state_of, &advance, now);
+                crate::metrics::warmup_step(&route.ramp, &route.name, &group.name, &position);
+            }
+        }
         // §9.3's pause has no other trace on a dashboard. `route_skipped_total`
         // only moves when a message is steered, so a route paused three weeks ago
         // on a chain nothing reaches is invisible — which is exactly the state
@@ -445,6 +517,38 @@ fn keys_for(ramp: &crate::config::Ramp, now: chrono::DateTime<Utc>) -> Vec<Usage
     keys
 }
 
+/// D-115 — the rows each threshold-mode warming `(route, domain_group)` decides
+/// its step from. Under `auto`, and for an overflow route, nothing is read: the
+/// step is the day index.
+///
+/// One unlocked read per such window. At warm-up scale — a handful of routes
+/// times a handful of groups — that is cheaper than the statement it would take
+/// to batch it on two backends.
+pub(crate) async fn advance_rows_for(
+    store: &dyn quota::QuotaStore,
+    ramp: &crate::config::Ramp,
+    only_route: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> Result<view::AdvanceByRoute, quota::QuotaError> {
+    let mut out = view::AdvanceByRoute::new();
+    for route in &ramp.routes {
+        if only_route.is_some_and(|r| r != route.name) {
+            continue;
+        }
+        let day_index = quota::day::for_route(route, now);
+        if !quota::position_reads_rows(route, day_index) {
+            continue;
+        }
+        for group in &ramp.domain_groups {
+            let rows = store
+                .advance_rows(&ramp.name, &route.name, &group.name, day_index)
+                .await?;
+            out.insert((route.name.clone(), group.name.clone()), rows);
+        }
+    }
+    Ok(out)
+}
+
 /// §9.2 `GET /ramps` — each ramp's name, whether it is `default_ramp`, the
 /// listeners with affinity to it, and its routes' names (D-099).
 async fn ramps(State(state): State<AdminState>, _actor: Actor) -> Json<serde_json::Value> {
@@ -477,6 +581,9 @@ fn ramp_summary(cfg: &crate::config::Config, ramp: &crate::config::Ramp) -> serd
             .map(|l| l.address.clone())
             .collect::<Vec<_>>(),
         "routes": ramp.routes.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+        // D-116: the group whose shared ceiling this ramp's warming routes
+        // count against, or null.
+        "ramp_group": ramp.ramp_group.as_ref().map(|g| g.name.clone()),
     })
 }
 
@@ -528,11 +635,13 @@ async fn routes(
         .store()
         .usage_many(&ramp.name, &keys_for(ramp, now))
         .await?;
+    let advance = advance_rows_for(state.store().as_ref(), ramp, None, now).await?;
 
     Ok(Json(view::project_routes(
         ramp,
         &states,
         &usage,
+        &advance,
         &state.engine.preflight,
         &state.engine.pools,
         now,
@@ -564,12 +673,14 @@ async fn route_by_name(
         })
         .collect();
     let usage = state.store().usage_many(&ramp.name, &keys).await?;
+    let advance = advance_rows_for(state.store().as_ref(), ramp, Some(&name), now).await?;
 
     Ok(Json(view::project_route(
         ramp,
         route,
         states.get(&name).copied().unwrap_or_default(),
         &usage,
+        &advance,
         &state.engine.preflight,
         &state.engine.pools,
         now,
@@ -623,10 +734,12 @@ async fn quota_detail(
         .store()
         .usage_many(&ramp.name, &keys_for(ramp, now))
         .await?;
+    let advance = advance_rows_for(state.store().as_ref(), ramp, None, now).await?;
     let projected = view::project_routes(
         ramp,
         &states,
         &usage,
+        &advance,
         &state.engine.preflight,
         &state.engine.pools,
         now,

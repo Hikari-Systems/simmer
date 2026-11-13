@@ -111,7 +111,13 @@ fn handle() -> metrics_exporter_prometheus::PrometheusHandle {
 }
 
 fn state(pool: PgPool) -> AdminState {
-    let cfg: Arc<Config> = Arc::new(simmer::config::from_str(CFG, "test").expect("valid"));
+    state_with(pool, "")
+}
+
+/// [`state`], with `extra` appended to the configuration.
+fn state_with(pool: PgPool, extra: &str) -> AdminState {
+    let cfg: Arc<Config> =
+        Arc::new(simmer::config::from_str(&format!("{CFG}{extra}"), "test").expect("valid"));
     let (tls, _) = simmer::downstream::TlsConfigs::load().expect("tls");
     let rewriters = simmer::rewrite::Rewriters::compile(&cfg).expect("templates compile");
 
@@ -263,6 +269,7 @@ async fn a_reservation_moves_the_gauges_without_a_relay(pool: PgPool) {
             correlation_id: "metrics".into(),
             expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
             over_cap: false,
+            ..Default::default()
         })
         .await
         .expect("reserve");
@@ -671,6 +678,9 @@ async fn the_runtime_gauges_are_exported_on_every_scrape(pool: PgPool) {
             domain_group: "catchall".into(),
             day_index: 0,
             count: 1,
+            created_row: false,
+            ramp_group: None,
+            created_group_row: false,
         });
 
     let (_, body) = scrape(&state).await;
@@ -778,4 +788,320 @@ async fn ramp_selection_is_counted_and_a_rejected_value_never_becomes_a_label(po
         body.contains("# HELP simmer_ramp_header_rejected_total"),
         "{body}"
     );
+}
+
+// -- D-115: the schedule step, as a dashboard sees it -------------------------
+
+/// Write a committed row for `day` at `step`, planned at `allowance`.
+async fn sent_on(state: &AdminState, group: &str, day: i64, step: i64, allowance: i64, n: i64) {
+    let taken = state
+        .engine
+        .quota
+        .reserve(&ReserveRequest {
+            ramp: "main".into(),
+            route: "warming".into(),
+            domain_group: group.into(),
+            day_index: day,
+            allowance: Some(allowance),
+            step: Some(step),
+            count: n,
+            correlation_id: "metrics".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            ..Default::default()
+        })
+        .await
+        .expect("reserve");
+    let simmer::quota::Reserved::Taken(taken) = taken else {
+        panic!("expected a reservation");
+    };
+    state
+        .engine
+        .quota
+        .commit(&taken, &[])
+        .await
+        .expect("commit");
+}
+
+/// One real walk for a recipient in `group`, committed.
+async fn walk_once(state: &AdminState, recipient: &str) {
+    let cfg = Arc::clone(&state.engine.config);
+    let mut evaluation = Vec::new();
+    let walked = simmer::routing::chain::walk_and_reserve(
+        cfg.default_ramp(),
+        &state.engine.groups,
+        &cfg.dot_insensitive_domains,
+        &state.engine.quota,
+        &state.engine.frequency,
+        &state.engine.preflight,
+        &["warming".to_string(), "overflow".to_string()],
+        None,
+        &[recipient.to_string()],
+        "metrics-walk",
+        &mut evaluation,
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("walk");
+    if let simmer::routing::chain::Walk::Selected(s) = walked {
+        state
+            .engine
+            .quota
+            .commit(&s.reservation, &[])
+            .await
+            .expect("commit");
+    }
+}
+
+fn warming_day(state: &AdminState) -> i64 {
+    quota::day::for_route(
+        state.engine.config.default_ramp().route("warming").unwrap(),
+        chrono::Utc::now(),
+    )
+}
+
+#[sqlx::test]
+async fn a_held_window_reports_its_step_held_days_and_attainment(pool: PgPool) {
+    let _serialised = exclusive().await;
+    let state = state(pool);
+    let day = warming_day(&state);
+
+    // Yesterday, catchall committed 1 of a planned 3 at step 0: held.
+    sent_on(&state, "catchall", day - 1, 0, 3, 1).await;
+    // google committed 7 of 7 yesterday at step 4: advanced to 5.
+    sent_on(&state, "google", day - 1, 4, 7, 7).await;
+
+    let (_, body) = scrape(&state).await;
+    let labels = |g| [("domain_group", g), ("ramp", "main"), ("route", "warming")];
+
+    assert_eq!(value(&body, "simmer_warmup_step", &labels("catchall")), "0");
+    assert_eq!(
+        value(&body, "simmer_warmup_held_days", &labels("catchall")),
+        day.to_string()
+    );
+    let attainment: f64 = value(
+        &body,
+        "simmer_warmup_previous_attainment",
+        &labels("catchall"),
+    )
+    .parse()
+    .unwrap();
+    assert!((attainment - 1.0 / 3.0).abs() < 1e-9, "{attainment}");
+
+    assert_eq!(value(&body, "simmer_warmup_step", &labels("google")), "5");
+    assert_eq!(
+        value(
+            &body,
+            "simmer_warmup_previous_attainment",
+            &labels("google")
+        ),
+        "1"
+    );
+
+    // The threshold is the route's, and the default is 0.9.
+    assert_eq!(
+        value(
+            &body,
+            "simmer_warmup_advance_threshold",
+            &[("ramp", "main"), ("route", "warming")]
+        ),
+        "0.9"
+    );
+    // The calendar day is unchanged beside it, so the two can be compared.
+    assert_eq!(
+        value(
+            &body,
+            "simmer_warmup_day",
+            &[("ramp", "main"), ("route", "warming")]
+        ),
+        day.to_string()
+    );
+}
+
+#[sqlx::test]
+async fn each_days_decision_is_counted_once_by_outcome(pool: PgPool) {
+    let _serialised = exclusive().await;
+    let state = state(pool);
+    let day = warming_day(&state);
+    let count = |body: &str, group: &str, outcome: &str| -> f64 {
+        samples(body, "simmer_warmup_advance_total")
+            .into_iter()
+            .find(|(l, _)| {
+                l.get("domain_group").map(String::as_str) == Some(group)
+                    && l.get("outcome").map(String::as_str) == Some(outcome)
+                    && l.get("route").map(String::as_str) == Some("warming")
+            })
+            .map_or(0.0, |(_, v)| v.parse().unwrap())
+    };
+    let (_, before) = scrape(&state).await;
+    let held_before = count(&before, "catchall", "held");
+    let advanced_before = count(&before, "google", "advanced");
+
+    // catchall fell short yesterday, google met.
+    sent_on(&state, "catchall", day - 1, 0, 3, 1).await;
+    sent_on(&state, "google", day - 1, 0, 7, 7).await;
+
+    // Three messages each today: only the first creates the row and is counted.
+    for i in 0..3 {
+        walk_once(&state, &format!("r{i}@example.com")).await;
+        walk_once(&state, &format!("r{i}@gmail.com")).await;
+    }
+
+    let (_, body) = scrape(&state).await;
+    assert_eq!(count(&body, "catchall", "held") - held_before, 1.0);
+    assert_eq!(count(&body, "google", "advanced") - advanced_before, 1.0);
+}
+
+#[sqlx::test]
+async fn the_new_series_carry_help_text_and_no_recipient(pool: PgPool) {
+    let _serialised = exclusive().await;
+    let state = state(pool);
+    walk_once(&state, "someone@example.com").await;
+    let (_, body) = scrape(&state).await;
+    for name in [
+        "simmer_warmup_step",
+        "simmer_warmup_held_days",
+        "simmer_warmup_advance_threshold",
+    ] {
+        assert!(body.contains(&format!("# HELP {name} ")), "{name}: {body}");
+    }
+    assert!(!body.contains('@'), "{body}");
+}
+
+#[sqlx::test]
+async fn the_partial_ramp_member_series_reach_the_scrape_with_help_and_no_key(pool: PgPool) {
+    let _serialised = exclusive().await;
+    // D-118: three series, labelled ramp and route only. A count of members is
+    // what an operator needs; a key would be a record of who was mailed.
+    let state = state(pool);
+    simmer::metrics::partial_ramp_member_offered("main", "warming");
+    simmer::metrics::partial_ramp_member_offered("main", "warming");
+    simmer::metrics::partial_ramp_members("main", "warming", 42);
+    simmer::metrics::partial_ramp_members_evicted("main", "warming", 7);
+
+    let (_, body) = scrape(&state).await;
+    let labels = [("ramp", "main"), ("route", "warming")];
+    assert_eq!(
+        value(&body, "simmer_partial_ramp_member_offered_total", &labels),
+        "2"
+    );
+    assert_eq!(value(&body, "simmer_partial_ramp_members", &labels), "42");
+    assert_eq!(
+        value(&body, "simmer_partial_ramp_members_evicted_total", &labels),
+        "7"
+    );
+    for name in [
+        "simmer_partial_ramp_member_offered_total",
+        "simmer_partial_ramp_members",
+        "simmer_partial_ramp_members_evicted_total",
+    ] {
+        assert!(body.contains(&format!("# HELP {name}")), "{name}: {body}");
+    }
+    assert!(!body.contains('@'), "{body}");
+}
+
+#[sqlx::test]
+async fn the_ramp_group_series_reach_the_scrape_with_help_and_no_recipient(pool: PgPool) {
+    let _serialised = exclusive().await;
+    // D-116: a group of one ramp with a ceiling of 1, so one message fills it,
+    // the next is steered for `group_quota`, and a pinned reply passes it.
+    let state = state_with(
+        pool,
+        r#"
+ramp_groups:
+  metrics-brands:
+    ramps: [main]
+    started: "2020-01-01T00:00:00Z"
+    schedule: [1, 2]
+"#,
+    );
+    let group_day = quota::day::index("2020-01-01T00:00:00Z".parse().unwrap(), chrono::Utc::now());
+
+    // Before anything is sent: the gauges exist from the scrape alone (D-056).
+    let (_, body) = scrape(&state).await;
+    let labels = [("ramp_group", "metrics-brands")];
+    assert_eq!(value(&body, "simmer_ramp_group_allowance", &labels), "1");
+    assert_eq!(value(&body, "simmer_ramp_group_committed", &labels), "0");
+    assert_eq!(value(&body, "simmer_ramp_group_step", &labels), "0");
+    assert_eq!(
+        value(&body, "simmer_ramp_group_day", &labels),
+        group_day.to_string()
+    );
+    assert_eq!(
+        value(&body, "simmer_ramp_group_held_days", &labels),
+        group_day.to_string()
+    );
+
+    walk_once(&state, "a@example.com").await; // fills the group
+    walk_once(&state, "b@example.com").await; // steered: group_quota
+
+    // A pinned reply past the full group.
+    let cfg = Arc::clone(&state.engine.config);
+    let mut evaluation = Vec::new();
+    let walked = simmer::routing::chain::walk_and_reserve(
+        cfg.default_ramp(),
+        &state.engine.groups,
+        &cfg.dot_insensitive_domains,
+        &state.engine.quota,
+        &state.engine.frequency,
+        &state.engine.preflight,
+        &["warming".to_string(), "overflow".to_string()],
+        Some("warming"),
+        &["c@example.com".to_string()],
+        "metrics-walk",
+        &mut evaluation,
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("walk");
+    let simmer::routing::chain::Walk::Selected(s) = walked else {
+        panic!("selected");
+    };
+    assert!(s.over_cap);
+    state
+        .engine
+        .quota
+        .commit(&s.reservation, &[])
+        .await
+        .unwrap();
+
+    let (_, body) = scrape(&state).await;
+    assert_eq!(value(&body, "simmer_ramp_group_committed", &labels), "2");
+    assert_eq!(value(&body, "simmer_ramp_group_reserved", &labels), "0");
+    assert_eq!(
+        value(&body, "simmer_ramp_group_over_cap_total", &labels),
+        "1"
+    );
+    assert_eq!(
+        value(
+            &body,
+            "simmer_ramp_group_advance_total",
+            &[("ramp_group", "metrics-brands"), ("outcome", "first")]
+        ),
+        "1"
+    );
+    assert_eq!(
+        value(
+            &body,
+            "simmer_route_skipped_total",
+            &[
+                ("ramp", "main"),
+                ("route", "warming"),
+                ("reason", "group_quota")
+            ]
+        ),
+        "1"
+    );
+    for name in [
+        "simmer_ramp_group_allowance",
+        "simmer_ramp_group_committed",
+        "simmer_ramp_group_reserved",
+        "simmer_ramp_group_day",
+        "simmer_ramp_group_step",
+        "simmer_ramp_group_held_days",
+        "simmer_ramp_group_advance_total",
+        "simmer_ramp_group_over_cap_total",
+    ] {
+        assert!(body.contains(&format!("# HELP {name}")), "{name}");
+    }
+    assert!(!body.contains('@'), "{body}");
 }

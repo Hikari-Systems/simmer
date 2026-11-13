@@ -62,6 +62,10 @@ pub enum SkipReason {
     /// message is not in it. Not `quota`: the route has headroom, and
     /// is being given less traffic on purpose.
     PartialRamp,
+    /// D-116 — the route's ramp group has no headroom left today. Not `quota`:
+    /// the route itself may well have room, and what binds is a ceiling it
+    /// shares with other ramps. Only a warming route can be skipped for it.
+    GroupQuota,
     /// The chain names a route that does not exist. §4.2 rejects this at
     /// startup, so it is unreachable; skipping rather than panicking keeps a
     /// configuration mistake from taking the process down.
@@ -77,6 +81,7 @@ impl SkipReason {
             SkipReason::Frequency => "frequency",
             SkipReason::Preflight => "preflight",
             SkipReason::PartialRamp => "partial_ramp",
+            SkipReason::GroupQuota => "group_quota",
             SkipReason::Unknown => "unknown_route",
         }
     }
@@ -91,6 +96,25 @@ pub struct Step {
     /// with no headroom left, so the reservation was taken past the cap. Only
     /// ever true on an `Ok` step.
     pub over_cap: bool,
+    /// D-115 — the schedule step the route was evaluated at, for a route that
+    /// reached the headroom check. `None` when an earlier check skipped it.
+    pub warmup_step: Option<i64>,
+    /// D-116 — the ramp group this route's traffic counted against, for a
+    /// warming route in a grouped ramp that reached the headroom check.
+    pub ramp_group: Option<GroupStep>,
+}
+
+/// D-116 — a ramp group as one walk saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupStep {
+    pub name: String,
+    pub day_index: i64,
+    pub step: i64,
+    pub allowance: i64,
+    /// What the group had left, where the walk read it without the lock: the
+    /// dry run and the early check. `None` for a real walk, whose check is
+    /// inside the reservation.
+    pub headroom: Option<i64>,
 }
 
 /// A route selected and its quota reserved.
@@ -101,6 +125,8 @@ pub struct Selected<'a> {
     pub route: &'a Route,
     pub domain_group: String,
     pub day_index: i64,
+    /// D-115 — where this `(route, domain_group)` stood on its schedule.
+    pub position: quota::Position,
     pub reservation: Reservation,
     /// §7.3 — the recipient keys this route's constraint was evaluated against,
     /// carried forward so §7.4 phase 3 can record them on a downstream `2xx`.
@@ -112,6 +138,14 @@ pub struct Selected<'a> {
     /// §3.2 step 2a (D-090): the reservation was taken past the day's cap,
     /// because this is a thread-affinity reply on its pinned route.
     pub over_cap: bool,
+    /// D-118 — the recipient's member key, on a route whose share is `mode:
+    /// auto`. §7.4 phase 3 records it with the commit; `None` elsewhere.
+    pub member_key: Option<frequency::Key>,
+    /// D-118 — offered only because an earlier commit made them a member: the
+    /// share alone would have sent them past this route.
+    pub partial_member: bool,
+    /// D-116 — the ramp group the reservation also counts against.
+    pub ramp_group: Option<GroupStep>,
 }
 
 /// The result of walking a chain.
@@ -234,6 +268,9 @@ struct Walker<'w, 'm> {
     recipients: &'m [String],
     states: std::collections::HashMap<String, quota::store::RouteState>,
     group: String,
+    /// D-116 — the ramp's group and where it is today, read once per walk.
+    /// `None` for an ungrouped ramp and for a group not yet in force.
+    ramp_group: Option<(&'w crate::config::RampGroup, quota::GroupPosition)>,
     now: DateTime<Utc>,
 }
 
@@ -258,6 +295,15 @@ impl<'w, 'm> Walker<'w, 'm> {
                 .map(|g| g.name.clone())
                 .unwrap_or_else(|| "catchall".to_string()),
         };
+        // D-116: once per message, not per route — every warming route in the
+        // chain counts against the same group row.
+        let ramp_group = match ramp.ramp_group.as_ref() {
+            Some(g) => {
+                let p = quota::group_position(store.as_ref(), g, now).await?;
+                p.allowance.is_some().then_some((g, p))
+            }
+            None => None,
+        };
         Ok(Walker {
             mode,
             ramp,
@@ -265,6 +311,7 @@ impl<'w, 'm> Walker<'w, 'm> {
             recipients,
             states,
             group,
+            ramp_group,
             now,
         })
     }
@@ -280,12 +327,18 @@ struct Candidate<'r> {
     /// that it has sent enough.
     pinned: bool,
     day_index: i64,
+    /// D-115 — the schedule step and what it was decided from.
+    position: quota::Position,
     allowance: Allowance,
     /// The day's row, when a check has read it.
     usage: Option<Usage>,
     /// §7.3's keys, kept by `Reserve` for commit. Empty for a route with no
     /// `recipient_frequency`: keys are mode-specific to the route.
     recipient_keys: Vec<frequency::Key>,
+    /// D-118 — kept by `Reserve` for commit, on an auto-share route only.
+    member_key: Option<frequency::Key>,
+    /// D-118 — the share refused and membership let them through.
+    partial_member: bool,
 }
 
 /// How a walk ended.
@@ -312,14 +365,21 @@ impl<'w, 'm> Walker<'w, 'm> {
             // Both pure: computing them before the checks that use them changes
             // nothing a caller can observe.
             let day_index = quota::day::for_route(route, self.now);
+            // D-115: one unlocked read for a threshold-mode warming route, none
+            // otherwise. Advisory until a reservation writes it (D-026).
+            let position =
+                quota::position(self.store.as_ref(), route, &self.group, day_index, state).await?;
             let mut candidate = Candidate {
                 route,
                 state,
                 pinned: pinned == Some(name.as_str()),
                 day_index,
-                allowance: quota::allowance_for(route, &self.group, day_index, state),
+                position,
+                allowance: position.allowance,
                 usage: None,
                 recipient_keys: Vec::new(),
+                member_key: None,
+                partial_member: false,
             };
 
             for check in CHECKS {
@@ -429,6 +489,26 @@ impl<'w, 'm> Walker<'w, 'm> {
                             .await?,
                     );
                 }
+                let recipient = self
+                    .recipients
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                // D-118: an auto route records who it mailed, pinned replies
+                // included — they were mailed on it too.
+                let member_key = if partial::keeps_members(route, c.state) {
+                    let keyer = deps.frequency.keyer(self.store.as_ref()).await?;
+                    Some(partial::member_key(
+                        keyer,
+                        recipient,
+                        deps.dot_insensitive_domains,
+                    ))
+                } else {
+                    None
+                };
+                if matches!(self.mode, Mode::Reserve { .. }) {
+                    c.member_key = member_key.clone();
+                }
                 // A pinned reply is exempt: a reply that changed identity on the
                 // hash's say-so is what D-090 exists to prevent.
                 if c.pinned {
@@ -437,6 +517,7 @@ impl<'w, 'm> Walker<'w, 'm> {
                 let Some(share) = partial::share_for_group(
                     route,
                     c.day_index,
+                    c.position.step,
                     c.state,
                     self.now,
                     c.allowance,
@@ -445,32 +526,88 @@ impl<'w, 'm> Walker<'w, 'm> {
                     return Ok(None);
                 };
                 let keyer = deps.frequency.keyer(self.store.as_ref()).await?;
-                let recipient = self
-                    .recipients
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or_default();
-                Ok((!partial::offered(
+                if partial::offered(
                     keyer,
                     &self.ramp.name,
                     name,
                     recipient,
-                    c.day_index,
                     share,
                     deps.dot_insensitive_domains,
-                ))
-                .then_some(SkipReason::PartialRamp))
+                ) {
+                    return Ok(None);
+                }
+                // D-118 (O-21): the share refused, but an auto share moves down
+                // as well as up, so a recipient this route has already mailed
+                // stays on it. Read only here — anyone the share offers costs
+                // no lookup.
+                if let Some(key) = member_key.as_ref() {
+                    if self
+                        .store
+                        .is_partial_member(&self.ramp.name, name, key)
+                        .await?
+                    {
+                        c.partial_member = true;
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(SkipReason::PartialRamp))
             }
         }
     }
 
     /// (c) and (d): headroom, and for `Reserve` the reservation, as one step.
+    ///
+    /// Whatever it decides, the step it pushes carries the schedule step the
+    /// route was measured at (D-115), so §9.4's dry run can show it.
     async fn headroom(
         &self,
         c: Candidate<'w>,
         evaluation: &mut Vec<Step>,
     ) -> Result<Ended<'w>, QuotaError> {
+        let warmup_step = c.route.warmup.is_some().then_some(c.position.step);
+        let name = c.route.name.clone();
+        let before = evaluation.len();
+        let ended = self.headroom_inner(c, evaluation).await?;
+        if evaluation.len() > before {
+            if let Some(last) = evaluation.last_mut().filter(|s| s.route == name) {
+                last.warmup_step = warmup_step;
+            }
+        }
+        Ok(ended)
+    }
+
+    /// D-116 — the group this route counts against: only a **warming** route,
+    /// only in a grouped ramp, only once the group is in force. Overflow never
+    /// touches the group row.
+    fn group_for(&self, route: &Route) -> Option<GroupStep> {
+        let (g, p) = self.ramp_group.as_ref()?;
+        route.warmup.as_ref()?;
+        Some(GroupStep {
+            name: g.name.clone(),
+            day_index: p.day_index,
+            step: p.step,
+            allowance: p.allowance?,
+            headroom: None,
+        })
+    }
+
+    /// The unlocked group check, for `DryRun` and `Early`. `Some(headroom)`.
+    async fn group_headroom(&self, g: &GroupStep) -> Result<i64, QuotaError> {
+        let usage = self.store.group_usage(&g.name, g.day_index).await?;
+        let effective = Usage {
+            allowance: usage.allowance.or(Some(g.allowance)),
+            ..usage
+        };
+        Ok(effective.headroom().unwrap_or(i64::MAX))
+    }
+
+    async fn headroom_inner(
+        &self,
+        c: Candidate<'w>,
+        evaluation: &mut Vec<Step>,
+    ) -> Result<Ended<'w>, QuotaError> {
         let name = &c.route.name;
+        let ramp_group = self.group_for(c.route);
         let correlation_id = match self.mode {
             Mode::Reserve { correlation_id, .. } => correlation_id,
             Mode::DryRun { .. } | Mode::Early => {
@@ -478,6 +615,32 @@ impl<'w, 'm> Walker<'w, 'm> {
                 if matches!(self.mode, Mode::Early) && c.allowance == Allowance::Unlimited {
                     evaluation.push(step(name, Ok(())));
                     return Ok(Ended::Eligible);
+                }
+                // D-116: the group before the route, as the reservation checks.
+                let ramp_group = match ramp_group {
+                    Some(g) => Some(GroupStep {
+                        headroom: Some(self.group_headroom(&g).await?),
+                        ..g
+                    }),
+                    None => None,
+                };
+                let group_full = ramp_group
+                    .as_ref()
+                    .is_some_and(|g| g.headroom.is_some_and(|h| h < 1));
+                if group_full {
+                    if c.pinned {
+                        evaluation.push(Step {
+                            over_cap: true,
+                            ramp_group,
+                            ..step(name, Ok(()))
+                        });
+                        return Ok(Ended::Eligible);
+                    }
+                    self.skip(evaluation, name, SkipReason::GroupQuota);
+                    if let Some(last) = evaluation.last_mut() {
+                        last.ramp_group = ramp_group;
+                    }
+                    return Ok(Ended::Exhausted);
                 }
                 let usage = match c.usage {
                     Some(u) => u,
@@ -494,17 +657,24 @@ impl<'w, 'm> Walker<'w, 'm> {
                     ..usage
                 };
                 if effective.has_headroom_for(1) {
-                    evaluation.push(step(name, Ok(())));
+                    evaluation.push(Step {
+                        ramp_group,
+                        ..step(name, Ok(()))
+                    });
                     return Ok(Ended::Eligible);
                 }
                 if c.pinned {
                     evaluation.push(Step {
                         over_cap: true,
+                        ramp_group,
                         ..step(name, Ok(()))
                     });
                     return Ok(Ended::Eligible);
                 }
                 self.skip(evaluation, name, SkipReason::Quota);
+                if let Some(last) = evaluation.last_mut() {
+                    last.ramp_group = ramp_group;
+                }
                 return Ok(Ended::Exhausted);
             }
         };
@@ -520,6 +690,7 @@ impl<'w, 'm> Walker<'w, 'm> {
             domain_group: self.group.clone(),
             day_index: c.day_index,
             allowance: c.allowance.as_column(),
+            step: c.position.step_column(),
             count,
             correlation_id: correlation_id.to_string(),
             expires_at: self.now
@@ -529,6 +700,11 @@ impl<'w, 'm> Walker<'w, 'm> {
                 ))
                 .unwrap_or_else(|_| chrono::Duration::seconds(600)),
             over_cap: false,
+            group: self
+                .ramp_group
+                .as_ref()
+                .filter(|_| ramp_group.is_some())
+                .and_then(|(g, p)| p.reserve(g)),
         };
 
         // D-090: the ordinary reservation first, even for a pinned route, so
@@ -536,9 +712,17 @@ impl<'w, 'm> Walker<'w, 'm> {
         // `simmer_thread_affinity_total{outcome="over_cap"}` counts. Only a
         // refusal is retried, and the retry cannot be refused.
         let mut over_cap = false;
+        let mut group_over_cap = false;
         let mut reserved = self.store.reserve(&request).await?;
-        if c.pinned && matches!(reserved, Reserved::NoHeadroom { .. }) {
+        if c.pinned
+            && matches!(
+                reserved,
+                Reserved::NoHeadroom { .. } | Reserved::NoGroupHeadroom { .. }
+            )
+        {
             over_cap = true;
+            // The group is checked first, so this is exact: the group was full.
+            group_over_cap = matches!(reserved, Reserved::NoGroupHeadroom { .. });
             reserved = self
                 .store
                 .reserve(&ReserveRequest {
@@ -560,11 +744,37 @@ impl<'w, 'm> Walker<'w, 'm> {
                     );
                 }
                 evaluation.push(Step {
-                    route: name.to_string(),
-                    outcome: Ok(()),
                     over_cap,
+                    ramp_group: ramp_group.clone(),
+                    ..step(name, Ok(()))
                 });
+                if let Some((g, p)) = self.ramp_group.as_ref().filter(|_| ramp_group.is_some()) {
+                    if reservation.created_group_row {
+                        // D-116: this reservation fixed the group's step today.
+                        crate::quota::report_group_row_created(g, p);
+                    }
+                    if group_over_cap {
+                        tracing::info!(
+                            route = %name,
+                            ramp_group = %g.name,
+                            day_index = p.day_index,
+                            correlation_id,
+                            "thread-affinity reply reserved past the ramp group's cap (D-090, \
+                             D-116)"
+                        );
+                        metrics::ramp_group_over_cap(&g.name);
+                    }
+                }
+                if reservation.created_row {
+                    // D-115: this reservation created the day's row, so it is
+                    // the one that fixed the element's step for today.
+                    crate::quota::report_row_created(c.route, &self.group, &c.position);
+                }
                 metrics::warmup_day(&self.ramp.name, name, c.day_index);
+                metrics::warmup_step(&self.ramp.name, name, &self.group, &c.position);
+                if c.partial_member {
+                    metrics::partial_ramp_member_offered(&self.ramp.name, name);
+                }
                 if let Allowance::Limited(a) = c.allowance {
                     metrics::quota_allowance(&self.ramp.name, name, &self.group, a as f64);
                 } else {
@@ -574,9 +784,13 @@ impl<'w, 'm> Walker<'w, 'm> {
                     route: c.route,
                     domain_group: self.group.clone(),
                     day_index: c.day_index,
+                    position: c.position,
                     reservation,
                     recipient_keys: c.recipient_keys,
                     over_cap,
+                    member_key: c.member_key,
+                    partial_member: c.partial_member,
+                    ramp_group,
                 })))
             }
             Reserved::NoHeadroom { usage } => {
@@ -590,6 +804,21 @@ impl<'w, 'm> Walker<'w, 'm> {
                     "route has no headroom today"
                 );
                 self.skip(evaluation, name, SkipReason::Quota);
+                Ok(Ended::Exhausted)
+            }
+            Reserved::NoGroupHeadroom { usage } => {
+                tracing::debug!(
+                    route = %name,
+                    ramp_group = ?ramp_group.as_ref().map(|g| &g.name),
+                    allowance = ?usage.allowance,
+                    committed = usage.committed,
+                    reserved = usage.reserved,
+                    "route's ramp group has no headroom today (D-116)"
+                );
+                self.skip(evaluation, name, SkipReason::GroupQuota);
+                if let Some(last) = evaluation.last_mut() {
+                    last.ramp_group = ramp_group;
+                }
                 Ok(Ended::Exhausted)
             }
         }
@@ -716,6 +945,8 @@ fn step(route: &str, outcome: Result<(), SkipReason>) -> Step {
         route: route.to_string(),
         outcome,
         over_cap: false,
+        warmup_step: None,
+        ramp_group: None,
     }
 }
 
@@ -775,6 +1006,7 @@ mod tests {
         assert_eq!(SkipReason::Preflight.as_str(), "preflight");
         assert_eq!(SkipReason::NotStarted.as_str(), "not_started");
         assert_eq!(SkipReason::PartialRamp.as_str(), "partial_ramp");
+        assert_eq!(SkipReason::GroupQuota.as_str(), "group_quota");
     }
 
     #[test]
@@ -807,11 +1039,15 @@ mod tests {
                 route: "warming".into(),
                 outcome: Err(SkipReason::Quota),
                 over_cap: false,
+                warmup_step: None,
+                ramp_group: None,
             },
             Step {
                 route: "overflow".into(),
                 outcome: Ok(()),
                 over_cap: false,
+                warmup_step: None,
+                ramp_group: None,
             },
         ];
         assert_eq!(render(&steps), "warming=quota,overflow=selected");
@@ -824,11 +1060,15 @@ mod tests {
                 route: "a".into(),
                 outcome: Err(SkipReason::Paused),
                 over_cap: false,
+                warmup_step: None,
+                ramp_group: None,
             },
             Step {
                 route: "b".into(),
                 outcome: Err(SkipReason::NotStarted),
                 over_cap: false,
+                warmup_step: None,
+                ramp_group: None,
             },
         ];
         assert_eq!(render(&steps), "a=paused,b=not_started");

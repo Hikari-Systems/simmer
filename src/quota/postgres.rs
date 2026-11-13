@@ -21,8 +21,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::store::{
-    Adoption, Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset,
-    RouteState, Usage, UsageKey,
+    Adoption, Expired, MemberRoute, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved,
+    Reset, RouteState, Usage, UsageKey,
 };
 use crate::models;
 
@@ -45,17 +45,37 @@ impl QuotaStore for PgQuotaStore {
     async fn reserve(&self, req: &ReserveRequest) -> Result<Reserved, QuotaError> {
         let mut tx = self.pool.begin().await?;
 
+        // D-116: the group row first, always — the order every transaction
+        // touching both rows keeps, so none can deadlock against another.
+        let group = match req.group.as_ref() {
+            Some(g) => Some(
+                models::ramp_group_usage::lock(&mut tx, &g.name, g.day_index, g.allowance, g.step)
+                    .await?,
+            ),
+            None => None,
+        };
+
         // Takes the row lock. Everything below runs with contenders queued
         // behind it, which is what makes the read-then-write safe.
-        let usage = models::quota::lock_usage(
+        let (usage, created_row) = models::quota::lock_usage(
             &mut tx,
             &req.ramp,
             &req.route,
             &req.domain_group,
             req.day_index,
             req.allowance,
+            req.step,
         )
         .await?;
+
+        // D-116: the group is checked first, so a day on which both are full
+        // is reported as the group's — the wider ceiling is the one binding.
+        if let Some((group_usage, _)) = group {
+            if !req.over_cap && !group_usage.has_headroom_for(req.count) {
+                tx.rollback().await?;
+                return Ok(Reserved::NoGroupHeadroom { usage: group_usage });
+            }
+        }
 
         if !req.over_cap && !usage.has_headroom_for(req.count) {
             // Roll back rather than commit: the only thing the transaction did
@@ -67,6 +87,9 @@ impl QuotaStore for PgQuotaStore {
 
         let id = Uuid::new_v4();
         models::quota::insert_reservation(&mut tx, id, req).await?;
+        if let Some(g) = req.group.as_ref() {
+            models::ramp_group_usage::reserve(&mut tx, &g.name, g.day_index, req.count).await?;
+        }
 
         tx.commit().await?;
 
@@ -77,13 +100,20 @@ impl QuotaStore for PgQuotaStore {
             domain_group: req.domain_group.clone(),
             day_index: req.day_index,
             count: req.count,
+            created_row,
+            ramp_group: req.group.as_ref().map(|g| super::GroupHold {
+                name: g.name.clone(),
+                day_index: g.day_index,
+            }),
+            created_group_row: group.is_some_and(|(_, created)| created),
         }))
     }
 
-    async fn commit(
+    async fn commit_recording(
         &self,
         reservation: &Reservation,
         recipient_keys: &[crate::frequency::Key],
+        member: Option<&crate::frequency::Key>,
     ) -> Result<(), QuotaError> {
         let mut tx = self.pool.begin().await?;
 
@@ -99,6 +129,18 @@ impl QuotaStore for PgQuotaStore {
                  A nonzero rate here means the reservation expiry is tuned shorter than \
                  real downstream latency (§7.4)"
             );
+        }
+
+        // D-116: the group row before the route row, as everywhere.
+        if let Some(g) = reservation.ramp_group.as_ref() {
+            models::ramp_group_usage::commit(
+                &mut tx,
+                &g.name,
+                g.day_index,
+                reservation.count,
+                still_reserved,
+            )
+            .await?;
         }
 
         models::quota::commit_usage(
@@ -126,6 +168,19 @@ impl QuotaStore for PgQuotaStore {
             .await?;
         }
 
+        // D-118, in the same transaction: a delivered message on an auto route
+        // makes its recipient a member.
+        if let Some(member) = member {
+            models::partial_ramp_member::record(
+                &mut tx,
+                &reservation.ramp,
+                &reservation.route,
+                member,
+                chrono::Utc::now(),
+            )
+            .await?;
+        }
+
         tx.commit().await?;
         Ok(())
     }
@@ -134,6 +189,10 @@ impl QuotaStore for PgQuotaStore {
         let mut tx = self.pool.begin().await?;
 
         if models::quota::take_reservation(&mut tx, reservation.id).await? {
+            if let Some(g) = reservation.ramp_group.as_ref() {
+                models::ramp_group_usage::release(&mut tx, &g.name, g.day_index, reservation.count)
+                    .await?;
+            }
             models::quota::release_usage(
                 &mut tx,
                 &reservation.ramp,
@@ -186,6 +245,7 @@ impl QuotaStore for PgQuotaStore {
         models::route_state::set_graduated(&self.pool, ramp, route, graduated).await
     }
 
+    #[allow(clippy::too_many_arguments)] // D-115 added the step beside the allowance
     async fn set_allowance_override(
         &self,
         ramp: &str,
@@ -194,6 +254,7 @@ impl QuotaStore for PgQuotaStore {
         day_index: i64,
         allowance: Option<i64>,
         scheduled: Option<i64>,
+        scheduled_step: Option<i64>,
     ) -> Result<(), QuotaError> {
         models::route_state::set_allowance_override(
             &self.pool,
@@ -203,8 +264,19 @@ impl QuotaStore for PgQuotaStore {
             day_index,
             allowance,
             scheduled,
+            scheduled_step,
         )
         .await
+    }
+
+    async fn advance_rows(
+        &self,
+        ramp: &str,
+        route: &str,
+        domain_group: &str,
+        day_index: i64,
+    ) -> Result<super::AdvanceRows, QuotaError> {
+        models::quota::read_advance_rows(&self.pool, ramp, route, domain_group, day_index).await
     }
 
     async fn reset_counters(
@@ -270,8 +342,46 @@ impl QuotaStore for PgQuotaStore {
         models::recipient_event::evict_before(&self.pool, cutoff).await
     }
 
+    async fn is_partial_member(
+        &self,
+        ramp: &str,
+        route: &str,
+        member: &crate::frequency::Key,
+    ) -> Result<bool, QuotaError> {
+        models::partial_ramp_member::is_member(&self.pool, ramp, route, member).await
+    }
+
+    async fn partial_member_routes(&self) -> Result<Vec<MemberRoute>, QuotaError> {
+        models::partial_ramp_member::routes(&self.pool).await
+    }
+
+    async fn drop_partial_members(
+        &self,
+        ramp: &str,
+        route: &str,
+        idle_since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, QuotaError> {
+        models::partial_ramp_member::drop_idle(&self.pool, ramp, route, idle_since).await
+    }
+
     async fn adopt_legacy_rows(&self, ramp: &str) -> Result<Adoption, QuotaError> {
         models::legacy::adopt(&self.pool, ramp).await
+    }
+
+    async fn group_usage(&self, ramp_group: &str, day_index: i64) -> Result<Usage, QuotaError> {
+        Ok(
+            models::ramp_group_usage::read(&self.pool, ramp_group, day_index)
+                .await?
+                .unwrap_or_default(),
+        )
+    }
+
+    async fn group_advance_rows(
+        &self,
+        ramp_group: &str,
+        day_index: i64,
+    ) -> Result<super::AdvanceRows, QuotaError> {
+        models::ramp_group_usage::advance_rows(&self.pool, ramp_group, day_index).await
     }
 
     async fn is_available(&self) -> bool {

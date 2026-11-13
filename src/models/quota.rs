@@ -34,14 +34,19 @@ pub async fn lock_usage(
     domain_group: &str,
     day_index: i64,
     allowance: Option<i64>,
-) -> Result<Usage, QuotaError> {
+    step: Option<i64>,
+) -> Result<(Usage, bool), QuotaError> {
+    // `xmax = 0` is true exactly for a row this statement inserted: the
+    // conflict arm updates it, which sets `xmax`. Contenders on a fresh key
+    // queue on the unique index, so one of them inserts and the rest update —
+    // D-115's "decided once" rests on that.
     let row = sqlx::query(
         r#"
-        INSERT INTO quota_usage (ramp, route, domain_group, day_index, allowance)
-        VALUES ($5, $1, $2, $3, $4)
+        INSERT INTO quota_usage (ramp, route, domain_group, day_index, allowance, step)
+        VALUES ($5, $1, $2, $3, $4, $6)
         ON CONFLICT (ramp, route, domain_group, day_index)
         DO UPDATE SET updated_at = now()
-        RETURNING allowance, allowance_override, committed, reserved
+        RETURNING allowance, allowance_override, committed, reserved, (xmax = 0) AS created
         "#,
     )
     .bind(route)
@@ -49,15 +54,60 @@ pub async fn lock_usage(
     .bind(day_index)
     .bind(allowance)
     .bind(ramp)
+    .bind(step)
     .fetch_one(&mut **tx)
     .await?;
 
-    Ok(Usage {
-        allowance: row.try_get("allowance")?,
-        allowance_override: row.try_get("allowance_override")?,
-        committed: row.try_get("committed")?,
-        reserved: row.try_get("reserved")?,
-    })
+    Ok((
+        Usage {
+            allowance: row.try_get("allowance")?,
+            allowance_override: row.try_get("allowance_override")?,
+            committed: row.try_get("committed")?,
+            reserved: row.try_get("reserved")?,
+        },
+        row.try_get("created")?,
+    ))
+}
+
+/// D-115 — the element's row for `day_index` and the one before it, newest
+/// first. The primary key's order serves the `ORDER BY … LIMIT` directly.
+pub async fn read_advance_rows(
+    pool: &PgPool,
+    ramp: &str,
+    route: &str,
+    domain_group: &str,
+    day_index: i64,
+) -> Result<crate::quota::AdvanceRows, QuotaError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT day_index, step, allowance, committed
+        FROM quota_usage
+        WHERE ramp = $1 AND route = $2 AND domain_group = $3 AND day_index <= $4
+        ORDER BY day_index DESC
+        LIMIT 2
+        "#,
+    )
+    .bind(ramp)
+    .bind(route)
+    .bind(domain_group)
+    .bind(day_index)
+    .fetch_all(pool)
+    .await?;
+
+    let rows = rows
+        .into_iter()
+        .map(|r| {
+            Ok(crate::quota::advance::Row {
+                day_index: r.try_get("day_index")?,
+                step: r.try_get("step")?,
+                allowance: r.try_get("allowance")?,
+                committed: r.try_get("committed")?,
+            })
+        })
+        .collect::<Result<Vec<_>, QuotaError>>()?;
+    Ok(crate::quota::AdvanceRows::from_newest_first(
+        day_index, &rows,
+    ))
 }
 
 /// Read a row without locking it. Absent means untouched today.
@@ -243,8 +293,9 @@ pub async fn insert_reservation(
     sqlx::query(
         r#"
         INSERT INTO quota_reservation
-            (id, route, domain_group, day_index, count, correlation_id, expires_at, ramp)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            (id, route, domain_group, day_index, count, correlation_id, expires_at, ramp,
+             ramp_group, group_day_index)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
     )
     .bind(id)
@@ -255,6 +306,8 @@ pub async fn insert_reservation(
     .bind(&req.correlation_id)
     .bind(req.expires_at)
     .bind(&req.ramp)
+    .bind(req.group.as_ref().map(|g| g.name.as_str()))
+    .bind(req.group.as_ref().map(|g| g.day_index))
     .execute(&mut **tx)
     .await?;
 
@@ -349,49 +402,92 @@ pub async fn release_usage(
     Ok(())
 }
 
-/// §7.4's sweeper: delete every expired reservation and give back what it held,
-/// in **one statement**.
+/// §7.4's sweeper: delete every expired reservation and give back what it held.
 ///
-/// Written as a CTE rather than a select-then-update loop so it is safe under
-/// concurrency — §11 asks that the storage layer not preclude horizontal scaling
-/// later, and D-007 keeps the shapes that cost nothing now. Two sweepers running
-/// this simultaneously cannot double-release: only one `DELETE` can win a row,
-/// and the decrement is derived from the rows that `DELETE` actually removed.
+/// Safe under concurrency — §11 asks that the storage layer not preclude
+/// horizontal scaling later, and D-007 keeps the shapes that cost nothing now.
+/// Two sweepers running at once cannot double-release: only one `DELETE` can win
+/// a row, and every decrement is derived from the rows that `DELETE` actually
+/// removed.
+///
+/// D-116 made it a transaction of several statements rather than one CTE: a
+/// reservation may also hold a ramp group's row, and every transaction touching
+/// both locks the **group row first**. One statement updating both would take
+/// them in whatever order the plan chose, which is how two transactions end up
+/// each holding the lock the other wants.
 pub async fn sweep_expired(pool: &PgPool) -> Result<Vec<Expired>, QuotaError> {
-    let rows = sqlx::query(
+    let mut tx = pool.begin().await?;
+    let taken = sqlx::query(
         r#"
-        WITH expired AS (
-            DELETE FROM quota_reservation
-            WHERE expires_at < now()
-            RETURNING ramp, route, domain_group, day_index, count
-        ),
-        totals AS (
-            SELECT ramp, route, domain_group, day_index, SUM(count)::BIGINT AS n
-            FROM expired
-            GROUP BY ramp, route, domain_group, day_index
-        )
-        UPDATE quota_usage q
-        SET reserved = GREATEST(q.reserved - t.n, 0), updated_at = now()
-        FROM totals t
-        WHERE q.ramp = t.ramp
-          AND q.route = t.route
-          AND q.domain_group = t.domain_group
-          AND q.day_index = t.day_index
-        RETURNING q.ramp, q.route, t.n
+        DELETE FROM quota_reservation
+        WHERE expires_at < now()
+        RETURNING ramp, route, domain_group, day_index, count, ramp_group, group_day_index
         "#,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    let out = give_back(&mut tx, &taken).await?;
+    tx.commit().await?;
+    Ok(out)
+}
 
-    rows.into_iter()
-        .map(|r| {
-            Ok(Expired {
-                ramp: r.try_get("ramp")?,
-                route: r.try_get("route")?,
-                count: r.try_get::<i64, _>("n")?,
-            })
-        })
-        .collect()
+/// Decrement `reserved` for reservation rows already deleted: the group rows,
+/// in key order, then the route rows, in key order. Returns one entry per route
+/// row that was there to decrement.
+async fn give_back(
+    tx: &mut Transaction<'_, Postgres>,
+    taken: &[sqlx::postgres::PgRow],
+) -> Result<Vec<Expired>, QuotaError> {
+    use std::collections::BTreeMap;
+
+    let mut groups: BTreeMap<(String, i64), i64> = BTreeMap::new();
+    let mut routes: BTreeMap<(String, String, String, i64), i64> = BTreeMap::new();
+    for r in taken {
+        let count: i64 = r.try_get("count")?;
+        let group: Option<String> = r.try_get("ramp_group")?;
+        let group_day: Option<i64> = r.try_get("group_day_index")?;
+        if let (Some(g), Some(d)) = (group, group_day) {
+            *groups.entry((g, d)).or_default() += count;
+        }
+        *routes
+            .entry((
+                r.try_get("ramp")?,
+                r.try_get("route")?,
+                r.try_get("domain_group")?,
+                r.try_get("day_index")?,
+            ))
+            .or_default() += count;
+    }
+
+    for ((group, day), n) in &groups {
+        crate::models::ramp_group_usage::release(tx, group, *day, *n).await?;
+    }
+
+    let mut out = Vec::new();
+    for ((ramp, route, domain_group, day), n) in routes {
+        let updated = sqlx::query(
+            r#"
+            UPDATE quota_usage
+            SET reserved = GREATEST(reserved - $5, 0), updated_at = now()
+            WHERE ramp = $1 AND route = $2 AND domain_group = $3 AND day_index = $4
+            "#,
+        )
+        .bind(&ramp)
+        .bind(&route)
+        .bind(&domain_group)
+        .bind(day)
+        .bind(n)
+        .execute(&mut **tx)
+        .await?;
+        if updated.rows_affected() > 0 {
+            out.push(Expired {
+                ramp,
+                route,
+                count: n,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// §10.4 — release the reservations this process still holds, at shutdown.
@@ -404,31 +500,20 @@ pub async fn release_by_ids(pool: &PgPool, ids: &[Uuid]) -> Result<u64, QuotaErr
         return Ok(0);
     }
 
-    let rows = sqlx::query(
+    // As the sweeper, and for its reason: group rows before route rows (D-116).
+    let mut tx = pool.begin().await?;
+    let taken = sqlx::query(
         r#"
-        WITH taken AS (
-            DELETE FROM quota_reservation
-            WHERE id = ANY($1)
-            RETURNING ramp, route, domain_group, day_index, count
-        ),
-        totals AS (
-            SELECT ramp, route, domain_group, day_index, SUM(count)::BIGINT AS n
-            FROM taken
-            GROUP BY ramp, route, domain_group, day_index
-        )
-        UPDATE quota_usage q
-        SET reserved = GREATEST(q.reserved - t.n, 0), updated_at = now()
-        FROM totals t
-        WHERE q.ramp = t.ramp
-          AND q.route = t.route
-          AND q.domain_group = t.domain_group
-          AND q.day_index = t.day_index
-        RETURNING q.route
+        DELETE FROM quota_reservation
+        WHERE id = ANY($1)
+        RETURNING ramp, route, domain_group, day_index, count, ramp_group, group_day_index
         "#,
     )
     .bind(ids)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    let released = give_back(&mut tx, &taken).await?;
+    tx.commit().await?;
 
-    Ok(rows.len() as u64)
+    Ok(released.len() as u64)
 }

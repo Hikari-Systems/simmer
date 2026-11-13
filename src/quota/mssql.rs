@@ -43,8 +43,8 @@ use tiberius::Row;
 use uuid::Uuid;
 
 use super::store::{
-    Adoption, Expired, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset,
-    RouteState, Usage, UsageKey,
+    Adoption, Expired, MemberRoute, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved,
+    Reset, RouteState, Usage, UsageKey,
 };
 use crate::db::mssql::{self, Pool};
 
@@ -99,16 +99,48 @@ fn missing(what: &str) -> QuotaError {
 }
 
 /// The upsert-and-lock of the module docs, then the row it locked.
+///
+/// `created` is D-115's "this reservation created the day's row": the insert arm
+/// runs for exactly one contender, because the key-range lock serialises them.
 const LOCK_USAGE: &str = "\
+    DECLARE @created BIT = 0; \
     UPDATE dbo.quota_usage WITH (UPDLOCK, SERIALIZABLE) \
        SET updated_at = SYSUTCDATETIME() \
      WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3; \
     IF @@ROWCOUNT = 0 \
-        INSERT INTO dbo.quota_usage (ramp, route, domain_group, day_index, allowance) \
-        VALUES (@P5, @P1, @P2, @P3, @P4); \
-    SELECT allowance, allowance_override, committed, reserved \
+    BEGIN \
+        INSERT INTO dbo.quota_usage (ramp, route, domain_group, day_index, allowance, step) \
+        VALUES (@P5, @P1, @P2, @P3, @P4, @P6); \
+        SET @created = 1; \
+    END; \
+    SELECT allowance, allowance_override, committed, reserved, @created AS created \
       FROM dbo.quota_usage \
      WHERE ramp = @P5 AND route = @P1 AND domain_group = @P2 AND day_index = @P3;";
+
+/// D-116 — the group row's upsert-and-lock, as [`LOCK_USAGE`]. Always run
+/// before it in the same transaction: group row first, everywhere.
+const LOCK_GROUP: &str = "\
+    DECLARE @created BIT = 0; \
+    UPDATE dbo.ramp_group_usage WITH (UPDLOCK, SERIALIZABLE) \
+       SET updated_at = SYSUTCDATETIME() \
+     WHERE ramp_group = @P1 AND day_index = @P2; \
+    IF @@ROWCOUNT = 0 \
+    BEGIN \
+        INSERT INTO dbo.ramp_group_usage (ramp_group, day_index, allowance, step) \
+        VALUES (@P1, @P2, @P3, @P4); \
+        SET @created = 1; \
+    END; \
+    SELECT allowance, CAST(NULL AS BIGINT) AS allowance_override, committed, reserved, \
+           @created AS created \
+      FROM dbo.ramp_group_usage \
+     WHERE ramp_group = @P1 AND day_index = @P2;";
+
+/// D-116 — give a group row's headroom back.
+const RELEASE_GROUP: &str = "\
+    UPDATE dbo.ramp_group_usage \
+       SET reserved = CASE WHEN reserved - @P3 < 0 THEN 0 ELSE reserved - @P3 END, \
+           updated_at = SYSUTCDATETIME() \
+     WHERE ramp_group = @P1 AND day_index = @P2;";
 
 /// `GREATEST(reserved - n, 0)`, for SQL Server before 2022.
 const RELEASE_USAGE: &str = "\
@@ -138,6 +170,23 @@ impl QuotaStore for MssqlQuotaStore {
             .into_results()
             .await?;
 
+        // D-116: the group row first, always.
+        let group = match req.group.as_ref() {
+            Some(g) => {
+                let row = client
+                    .query(LOCK_GROUP, &[&g.name, &g.day_index, &g.allowance, &g.step])
+                    .await?
+                    .into_row()
+                    .await?
+                    .ok_or_else(|| missing("locking the ramp group row"))?;
+                Some((
+                    usage(&row)?,
+                    row.try_get::<bool, _>("created")?.unwrap_or(false),
+                ))
+            }
+            None => None,
+        };
+
         let row = client
             .query(
                 LOCK_USAGE,
@@ -147,6 +196,7 @@ impl QuotaStore for MssqlQuotaStore {
                     &req.day_index,
                     &req.allowance,
                     &req.ramp,
+                    &req.step,
                 ],
             )
             .await?
@@ -154,6 +204,20 @@ impl QuotaStore for MssqlQuotaStore {
             .await?
             .ok_or_else(|| missing("locking the quota row"))?;
         let current = usage(&row)?;
+        let created_row = row.try_get::<bool, _>("created")?.unwrap_or(false);
+
+        // D-116: the group first, so a day both are full reports the group.
+        if let Some((group_usage, _)) = group {
+            if !req.over_cap && !group_usage.has_headroom_for(req.count) {
+                client
+                    .simple_query("ROLLBACK TRANSACTION")
+                    .await?
+                    .into_results()
+                    .await?;
+                conn.broken = false;
+                return Ok(Reserved::NoGroupHeadroom { usage: group_usage });
+            }
+        }
 
         if !req.over_cap && !current.has_headroom_for(req.count) {
             client
@@ -173,8 +237,12 @@ impl QuotaStore for MssqlQuotaStore {
                   WHERE ramp = @P8 AND route = @P1 AND domain_group = @P2 AND day_index = @P3; \
                  INSERT INTO dbo.quota_reservation \
                      (id, ramp, route, domain_group, day_index, [count], correlation_id, \
-                      expires_at) \
-                 VALUES (@P5, @P8, @P1, @P2, @P3, @P4, @P6, @P7);",
+                      expires_at, ramp_group, group_day_index) \
+                 VALUES (@P5, @P8, @P1, @P2, @P3, @P4, @P6, @P7, @P9, @P10); \
+                 IF @P9 IS NOT NULL \
+                     UPDATE dbo.ramp_group_usage \
+                        SET reserved = reserved + @P4, updated_at = SYSUTCDATETIME() \
+                      WHERE ramp_group = @P9 AND day_index = @P10;",
                 &[
                     &req.route,
                     &req.domain_group,
@@ -184,6 +252,8 @@ impl QuotaStore for MssqlQuotaStore {
                     &req.correlation_id,
                     &req.expires_at.naive_utc(),
                     &req.ramp,
+                    &req.group.as_ref().map(|g| g.name.as_str()),
+                    &req.group.as_ref().map(|g| g.day_index),
                 ],
             )
             .await?;
@@ -201,13 +271,20 @@ impl QuotaStore for MssqlQuotaStore {
             domain_group: req.domain_group.clone(),
             day_index: req.day_index,
             count: req.count,
+            created_row,
+            ramp_group: req.group.as_ref().map(|g| super::store::GroupHold {
+                name: g.name.clone(),
+                day_index: g.day_index,
+            }),
+            created_group_row: group.is_some_and(|(_, created)| created),
         }))
     }
 
-    async fn commit(
+    async fn commit_recording(
         &self,
         reservation: &Reservation,
         recipient_keys: &[crate::frequency::Key],
+        member: Option<&crate::frequency::Key>,
     ) -> Result<(), QuotaError> {
         let mut conn = mssql::get(&self.pool).await?;
         conn.broken = true;
@@ -236,6 +313,24 @@ impl QuotaStore for MssqlQuotaStore {
                  A nonzero rate here means the reservation expiry is tuned shorter than \
                  real downstream latency (§7.4)"
             );
+        }
+
+        // D-116: the group row before the route row, as everywhere.
+        if let Some(g) = reservation.ramp_group.as_ref() {
+            let sql = if still_reserved {
+                "UPDATE dbo.ramp_group_usage \
+                    SET reserved = CASE WHEN reserved - @P3 < 0 THEN 0 ELSE reserved - @P3 END, \
+                        committed = committed + @P3, \
+                        updated_at = SYSUTCDATETIME() \
+                  WHERE ramp_group = @P1 AND day_index = @P2;"
+            } else {
+                "UPDATE dbo.ramp_group_usage \
+                    SET committed = committed + @P3, updated_at = SYSUTCDATETIME() \
+                  WHERE ramp_group = @P1 AND day_index = @P2;"
+            };
+            client
+                .execute(sql, &[&g.name, &g.day_index, &reservation.count])
+                .await?;
         }
 
         let sql = if still_reserved {
@@ -279,6 +374,30 @@ impl QuotaStore for MssqlQuotaStore {
                 .await?;
         }
 
+        // D-118, in the same transaction. The UPDLOCK + SERIALIZABLE update,
+        // then insert-if-nothing-updated, is `LOCK_USAGE`'s safe upsert: two
+        // first commits for one recipient cannot both insert.
+        if let Some(member) = member {
+            client
+                .execute(
+                    "UPDATE dbo.partial_ramp_member WITH (UPDLOCK, SERIALIZABLE) \
+                        SET last_committed_at = CASE WHEN last_committed_at < @P4 \
+                                                     THEN @P4 ELSE last_committed_at END \
+                      WHERE ramp = @P1 AND route = @P2 AND recipient_hash = @P3; \
+                     IF @@ROWCOUNT = 0 \
+                         INSERT INTO dbo.partial_ramp_member \
+                             (ramp, route, recipient_hash, first_committed_at, last_committed_at) \
+                         VALUES (@P1, @P2, @P3, @P4, @P4);",
+                    &[
+                        &reservation.ramp,
+                        &reservation.route,
+                        &member.as_bytes(),
+                        &sent_at,
+                    ],
+                )
+                .await?;
+        }
+
         client
             .simple_query("COMMIT TRANSACTION")
             .await?
@@ -308,6 +427,11 @@ impl QuotaStore for MssqlQuotaStore {
         // Already swept means the headroom is already back; see
         // `PgQuotaStore::release`.
         if int(&taken, "n")? > 0 {
+            if let Some(g) = reservation.ramp_group.as_ref() {
+                client
+                    .execute(RELEASE_GROUP, &[&g.name, &g.day_index, &reservation.count])
+                    .await?;
+            }
             client
                 .execute(
                     RELEASE_USAGE,
@@ -418,6 +542,7 @@ impl QuotaStore for MssqlQuotaStore {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)] // D-115 added the step beside the allowance
     async fn set_allowance_override(
         &self,
         ramp: &str,
@@ -426,6 +551,7 @@ impl QuotaStore for MssqlQuotaStore {
         day_index: i64,
         allowance: Option<i64>,
         scheduled: Option<i64>,
+        scheduled_step: Option<i64>,
     ) -> Result<(), QuotaError> {
         let mut conn = mssql::get(&self.pool).await?;
         conn.broken = true;
@@ -440,8 +566,9 @@ impl QuotaStore for MssqlQuotaStore {
                     AND day_index = @P3; \
                  IF @@ROWCOUNT = 0 \
                      INSERT INTO dbo.quota_usage \
-                         (ramp, route, domain_group, day_index, allowance, allowance_override) \
-                     VALUES (@P6, @P1, @P2, @P3, @P5, @P4); \
+                         (ramp, route, domain_group, day_index, allowance, allowance_override, \
+                          step) \
+                     VALUES (@P6, @P1, @P2, @P3, @P5, @P4, @P7); \
                  COMMIT TRANSACTION;",
                 &[
                     &route,
@@ -450,11 +577,49 @@ impl QuotaStore for MssqlQuotaStore {
                     &allowance,
                     &scheduled,
                     &ramp,
+                    &scheduled_step,
                 ],
             )
             .await?;
         conn.broken = false;
         Ok(())
+    }
+
+    async fn advance_rows(
+        &self,
+        ramp: &str,
+        route: &str,
+        domain_group: &str,
+        day_index: i64,
+    ) -> Result<super::AdvanceRows, QuotaError> {
+        let mut conn = mssql::get(&self.pool).await?;
+        conn.broken = true;
+        let rows = conn
+            .client
+            .query(
+                "SELECT TOP 2 day_index, step, allowance, committed \
+                   FROM dbo.quota_usage \
+                  WHERE ramp = @P1 AND route = @P2 AND domain_group = @P3 \
+                    AND day_index <= @P4 \
+                  ORDER BY day_index DESC;",
+                &[&ramp, &route, &domain_group, &day_index],
+            )
+            .await?
+            .into_first_result()
+            .await?;
+        let rows = rows
+            .iter()
+            .map(|r| {
+                Ok(super::advance::Row {
+                    day_index: int(r, "day_index")?,
+                    step: opt_int(r, "step")?,
+                    allowance: opt_int(r, "allowance")?,
+                    committed: int(r, "committed")?,
+                })
+            })
+            .collect::<Result<Vec<_>, QuotaError>>()?;
+        conn.broken = false;
+        Ok(super::AdvanceRows::from_newest_first(day_index, &rows))
     }
 
     async fn reset_counters(
@@ -563,16 +728,26 @@ impl QuotaStore for MssqlQuotaStore {
                      route        NVARCHAR(128) COLLATE Latin1_General_100_BIN2, \
                      domain_group NVARCHAR(128) COLLATE Latin1_General_100_BIN2, \
                      day_index    BIGINT, \
-                     n            BIGINT); \
+                     n            BIGINT, \
+                     ramp_group   NVARCHAR(128) COLLATE Latin1_General_100_BIN2, \
+                     group_day    BIGINT); \
                  DECLARE @done TABLE ( \
                      ramp  NVARCHAR(128) COLLATE Latin1_General_100_BIN2, \
                      route NVARCHAR(128) COLLATE Latin1_General_100_BIN2, \
                      n     BIGINT); \
                  DELETE FROM dbo.quota_reservation \
                  OUTPUT deleted.ramp, deleted.route, deleted.domain_group, deleted.day_index, \
-                        deleted.[count] \
+                        deleted.[count], deleted.ramp_group, deleted.group_day_index \
                    INTO @expired \
                   WHERE expires_at < SYSUTCDATETIME(); \
+                 UPDATE g \
+                    SET reserved = CASE WHEN g.reserved - t.n < 0 THEN 0 ELSE g.reserved - t.n END, \
+                        updated_at = SYSUTCDATETIME() \
+                   FROM dbo.ramp_group_usage g \
+                   JOIN (SELECT ramp_group, group_day, SUM(n) AS n \
+                           FROM @expired WHERE ramp_group IS NOT NULL \
+                          GROUP BY ramp_group, group_day) t \
+                     ON g.ramp_group = t.ramp_group AND g.day_index = t.group_day; \
                  UPDATE q \
                     SET reserved = CASE WHEN q.reserved - t.n < 0 THEN 0 ELSE q.reserved - t.n END, \
                         updated_at = SYSUTCDATETIME() \
@@ -688,6 +863,97 @@ impl QuotaStore for MssqlQuotaStore {
         Ok(n.max(0) as u64)
     }
 
+    async fn is_partial_member(
+        &self,
+        ramp: &str,
+        route: &str,
+        member: &crate::frequency::Key,
+    ) -> Result<bool, QuotaError> {
+        let mut conn = mssql::get(&self.pool).await?;
+        conn.broken = true;
+        let row = conn
+            .client
+            .query(
+                "SELECT CAST(CASE WHEN EXISTS ( \
+                     SELECT 1 FROM dbo.partial_ramp_member \
+                      WHERE ramp = @P1 AND route = @P2 AND recipient_hash = @P3) \
+                 THEN 1 ELSE 0 END AS BIGINT) AS member;",
+                &[&ramp, &route, &member.as_bytes()],
+            )
+            .await?
+            .into_row()
+            .await?
+            .ok_or_else(|| missing("reading a partial-ramp member"))?;
+        let member = int(&row, "member")? == 1;
+        conn.broken = false;
+        Ok(member)
+    }
+
+    async fn partial_member_routes(&self) -> Result<Vec<MemberRoute>, QuotaError> {
+        let mut conn = mssql::get(&self.pool).await?;
+        conn.broken = true;
+        let rows = conn
+            .client
+            .query(
+                "SELECT ramp, route, COUNT_BIG(*) AS members, \
+                        MAX(last_committed_at) AS last \
+                   FROM dbo.partial_ramp_member \
+                  GROUP BY ramp, route \
+                  ORDER BY ramp, route;",
+                &[],
+            )
+            .await?
+            .into_first_result()
+            .await?;
+        let out = rows
+            .iter()
+            .map(|r| {
+                let last = r
+                    .try_get::<chrono::NaiveDateTime, _>("last")?
+                    .ok_or_else(|| missing("a member route's last commit"))?;
+                Ok(MemberRoute {
+                    ramp: text(r, "ramp")?,
+                    route: text(r, "route")?,
+                    members: int(r, "members")?,
+                    last_committed_at: last.and_utc(),
+                })
+            })
+            .collect::<Result<_, QuotaError>>()?;
+        conn.broken = false;
+        Ok(out)
+    }
+
+    async fn drop_partial_members(
+        &self,
+        ramp: &str,
+        route: &str,
+        idle_since: DateTime<Utc>,
+    ) -> Result<u64, QuotaError> {
+        let mut conn = mssql::get(&self.pool).await?;
+        conn.broken = true;
+        // The guard is in the statement, as on Postgres; SERIALIZABLE on the
+        // probe is what stops a commit inserting between it and the delete.
+        let row = conn
+            .client
+            .query(
+                "DELETE FROM dbo.partial_ramp_member \
+                  WHERE ramp = @P1 AND route = @P2 \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM dbo.partial_ramp_member recent WITH (SERIALIZABLE) \
+                         WHERE recent.ramp = @P1 AND recent.route = @P2 \
+                           AND recent.last_committed_at >= @P3); \
+                 SELECT CAST(@@ROWCOUNT AS BIGINT) AS n;",
+                &[&ramp, &route, &idle_since.naive_utc()],
+            )
+            .await?
+            .into_row()
+            .await?
+            .ok_or_else(|| missing("dropping partial-ramp members"))?;
+        let n = int(&row, "n")?;
+        conn.broken = false;
+        Ok(n.max(0) as u64)
+    }
+
     async fn adopt_legacy_rows(&self, ramp: &str) -> Result<Adoption, QuotaError> {
         let mut conn = mssql::get(&self.pool).await?;
         conn.broken = true;
@@ -776,6 +1042,60 @@ impl QuotaStore for MssqlQuotaStore {
         };
         conn.broken = false;
         Ok(out)
+    }
+
+    async fn group_usage(&self, ramp_group: &str, day_index: i64) -> Result<Usage, QuotaError> {
+        let mut conn = mssql::get(&self.pool).await?;
+        conn.broken = true;
+        let row = conn
+            .client
+            .query(
+                "SELECT allowance, CAST(NULL AS BIGINT) AS allowance_override, committed, \
+                        reserved \
+                   FROM dbo.ramp_group_usage \
+                  WHERE ramp_group = @P1 AND day_index = @P2;",
+                &[&ramp_group, &day_index],
+            )
+            .await?
+            .into_row()
+            .await?;
+        let out = row.as_ref().map(usage).transpose()?.unwrap_or_default();
+        conn.broken = false;
+        Ok(out)
+    }
+
+    async fn group_advance_rows(
+        &self,
+        ramp_group: &str,
+        day_index: i64,
+    ) -> Result<super::AdvanceRows, QuotaError> {
+        let mut conn = mssql::get(&self.pool).await?;
+        conn.broken = true;
+        let rows = conn
+            .client
+            .query(
+                "SELECT TOP 2 day_index, step, allowance, committed \
+                   FROM dbo.ramp_group_usage \
+                  WHERE ramp_group = @P1 AND day_index <= @P2 \
+                  ORDER BY day_index DESC;",
+                &[&ramp_group, &day_index],
+            )
+            .await?
+            .into_first_result()
+            .await?;
+        let rows = rows
+            .iter()
+            .map(|r| {
+                Ok(crate::quota::advance::Row {
+                    day_index: int(r, "day_index")?,
+                    step: opt_int(r, "step")?,
+                    allowance: opt_int(r, "allowance")?,
+                    committed: int(r, "committed")?,
+                })
+            })
+            .collect::<Result<Vec<_>, QuotaError>>()?;
+        conn.broken = false;
+        Ok(super::AdvanceRows::from_newest_first(day_index, &rows))
     }
 
     async fn is_available(&self) -> bool {

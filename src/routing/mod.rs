@@ -6,6 +6,7 @@
 pub mod chain;
 pub mod domain_group;
 pub mod partial;
+pub mod partial_members;
 pub mod ramp_select;
 pub mod sender_match;
 pub mod thread;

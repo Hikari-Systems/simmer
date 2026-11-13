@@ -263,6 +263,14 @@ ramps:
     default_chain: [overflow-established]
     strict_senders: false
 
+    # D-115. How this ramp's warming routes move along their schedules. The
+    # default: a route/domain-group moves to its next schedule entry only after a
+    # day on which it committed at least `threshold` of that day's planned
+    # allowance; otherwise it repeats the same entry. `auto` advances one entry
+    # per elapsed day whatever was sent (the behaviour before D-115). A route's
+    # own `warmup.advance` overrides this. Watch simmer_warmup_held_days.
+    warmup_advance: { mode: threshold, threshold: 0.9 }
+
     # D-113 (off by default). Run this ramp with no overflow route: a message that
     # finds no eligible route is answered 550 5.7.1 and not relayed, instead of
     # exhausted_chain_reply. black_hole_allowed then answers 250 and DISCARDS it —

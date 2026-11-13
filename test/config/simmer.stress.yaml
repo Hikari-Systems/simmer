@@ -74,6 +74,9 @@ ramps:
         chain: [warming-newbrand, overflow-established]
 
     default_chain: [overflow-established]
+    # D-115: this tier measures days on the calendar (D-042), so the schedule
+    # advances on elapsed days rather than on volume.
+    warmup_advance: auto
     strict_senders: false
 
     routes:

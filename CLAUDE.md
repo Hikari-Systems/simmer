@@ -34,7 +34,14 @@ O-15 explicitly. And the 2026-10-06 one for per-group downstreams (§3.1, §3.3,
 raises O-20. And the 2026-10-16 one for the no-overflow ramp (§3.1, §3.2 step 4,
 §4.1, §4.2 and §9.1 — D-113), which the author asked for in HIK-431. And the
 2026-10-22 one for recipients in the trace export (§4.1, §4.2, §9.6 — D-114),
-which the author asked for directly; §9.5 and stdout are unchanged.
+which the author asked for directly; §9.5 and stdout are unchanged. And the
+2026-11-13 one for volume-gated advancement (§7.2's **step**, separate from the
+day index — D-115) and for sticky partial ramps (the day index left the hash —
+D-117), both asked for directly; and O-21, settled the same day as D-118 — an `auto`
+share keeps a stored, hashed **membership** of who it mailed, a deliberate exception to
+§7.3's "no record of every address mailed" that the author accepted knowingly. And
+the same day's for **ramp groups** (§3.4's one exception to "ramps share nothing", and
+the sections D-116 lists), asked for directly.
 
 ## The four things that will bite you
 
@@ -190,7 +197,11 @@ cargo deny --no-default-features --features mssql check
 ```
 
 A change behind `QuotaStore` goes into **both** stores, and into
-`tests/store_conformance/` first. A race test there must warm its pools and
+`tests/store_conformance/` first. **Lock order** (D-116): any transaction that
+touches a `ramp_group_usage` row and a `quota_usage` row takes the **group row
+first** — reserve, commit, release, the sweeper. Invert it anywhere and the
+conformance interleaving test reports `deadlock detected`; that is also why the
+Postgres sweeper is several ordered statements and not one CTE. A race test there must warm its pools and
 start behind a barrier: contenders that each open a fresh connection never
 overlap, and the test then passes with the lock removed. That happened once
 already (D-084).
@@ -287,6 +298,13 @@ src/frequency/sweeper.rs §7.3's eviction. Hourly; not started if nothing needs 
 src/quota/postgres.rs    the §7.4 protocol. The row lock is what makes it correct
                          `commit` also records §7.3's events, in ONE transaction
 src/quota/day.rs         §7.2 elapsed-duration day index; NEVER calendar arithmetic
+src/quota/advance.rs     D-115 — the STEP, which indexes the schedule. NOT the day index:
+                         the day keys the row, the step picks the allowance. PURE;
+                         `quota::position` is the ONE entry point everything calls. The
+                         basis is the PLANNED allowance, never §9.3's override.
+                         D-116's ramp group reuses `decide` unchanged:
+                         `quota::group_position` is ITS one entry point, called
+                         once per walk. Before `started` a group caps nothing
 src/routing/domain_group.rs  §3.2 step 2 — literal, then MX suffix (D-100). DNS NEVER
                          defers: a failed or slow lookup is the catch-all. One shared
                          `Grouper` (Engine::groups) so walk, early check and dry run agree
@@ -296,12 +314,23 @@ src/routing/ramp_select.rs  §5.8 (D-099) — which ramp. PURE: the session, the
                          is stripped (§6.5) whatever became of it
 src/routing/chain.rs     §3.2 step 3 — the walk. Headroom check and reserve are ONE op.
                          ONE ordered `CHECKS` list; the real walk, dry run and early
-                         check are `Mode`s of it (D-109). `now` comes from the caller
+                         check are `Mode`s of it (D-109). `now` comes from the caller.
+                         A grouped WARMING route reserves on its ramp group too
+                         (D-116): group checked first, `group_quota` steers.
+                         Overflow never touches the group
 src/routing/thread.rs    §3.2 step 2a (D-090) — thread affinity. A REORDERING plus two
                          exemptions for the pinned route only: no §7.3 threshold, and
                          an ordinary reservation first, then `over_cap` past the cap
 src/routing/partial.rs   §3.2 step 3c′ (D-091, D-097) — `schedule.share`. A KEYED
                          HASH, not a dice roll, so dry run and every instance agree.
+                         NO DAY in the hash (D-117): a recipient's draw is fixed for the
+                         ramp, so a non-decreasing list never drops anyone it ramped.
+                         A list is indexed by the D-115 STEP. Under `auto` the
+                         share falls as well as rises, so D-118 keeps MEMBERS:
+                         a recipient committed on the route is offered it whatever
+                         the share. Membership answers the share ONLY — never the
+                         cap, §7.3 or pause. Written in commit's transaction
+                         (`commit_recording`), read only when the share refuses
                          Past a list's end the share is 1, NOT a cap's repeated last
                          value. `mode: auto` computes the share from the day's row
                          and the clock instead: `auto_share` is the arithmetic and
@@ -309,6 +338,13 @@ src/routing/partial.rs   §3.2 step 3c′ (D-091, D-097) — `schedule.share`. A
                          the ONE entry point the walk, the dry run and /routes all
                          call. `fill_by` is under 1 on purpose and `tail` is what
                          makes a ramp finish — a floor cannot
+src/models/ramp_group_usage.rs  D-116's group row: `quota_usage` with the route and
+                         domain group taken out. Locked BEFORE the route row, always
+src/routing/partial_members.rs  D-118's sweeper. A route's members go TOGETHER,
+                         `member_retention_days` after its LAST commit — never per
+                         row, which would drop the recipients mailed least often
+src/models/partial_ramp_member.rs  D-118's rows: a 16-byte keyed hash over a
+                         DOMAIN-SEPARATED input, so it never joins `recipient_event`
 src/metrics.rs           §9.1 counters, the recorder, and every `# HELP` line. The
                          recorder exists only with `admin.metrics` (D-093): off, every
                          `metrics::` call is a no-op and /metrics is a 404
@@ -377,6 +413,8 @@ tests/downstream_overrides.rs  D-112 against TWO fake downstreams: the override
 tests/ingress_tls.rs     §5.1/§5.3 end to end. Every handshake VERIFIES against a
                          per-test CA (support::TestPki); an unverified one proves little
 tests/partial_ramp.rs    D-091 through the real walk; dry run agrees per recipient
+tests/ramp_groups.rs     D-116 through the real walk: the shared cap steers, the route
+                         cap is still `quota`, a pinned reply passes both, two pools race
 tests/admin_api.rs       §9. Pins dry run against the REAL walk, step for step
 tests/metrics_endpoint.rs  §9.1. Its own binary — one global recorder per process
 tests/metrics_idle.rs    D-093's counter expiry. Its own binary, for the same reason

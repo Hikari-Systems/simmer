@@ -238,14 +238,27 @@ for it — every rule, group, chain and route below is that ramp's:
    b. If the route has a `recipient_frequency` constraint and this recipient is at or over
       threshold within the window, skip. Evaluated **first** — it can eliminate routes outright.
    c′. If the route's `warmup.schedule.share` is below 1 right now (§7.2) and this message
-      is not in it, skip. Membership is a keyed hash of the normalised recipient, the ramp,
-      the route and the day index under the §7.3 salt — deterministic, so every instance and §9.4's dry
-      run give the same answer. *(Added. See `DECISIONS.md` D-091.)* Under `mode: auto` the
+      is not in it, skip. Membership is a keyed hash of the normalised recipient, the ramp
+      and the route under the §7.3 salt — deterministic, so every instance and §9.4's dry
+      run give the same answer. *(Added. See `DECISIONS.md` D-091.)* The day index is **not**
+      in the hash, so a recipient's place is fixed for the whole ramp and a recipient offered
+      the route on one day is offered it on every later day whose share is no lower.
+      *(Amended 2026-11-13 — the day index was in the hash, which re-drew the offered set
+      daily. See `DECISIONS.md` D-117.)* Under `mode: auto` the
       share itself is computed from the day's usage row and the clock, so the row is read
       — without a lock, and before the reservation — to decide it. *(Added. See
-      `DECISIONS.md` D-097.)*
+      `DECISIONS.md` D-097.)* Under `mode: auto` a recipient a message has been
+      **committed** to on this route is a **member** of it, and a member is not skipped
+      here whatever the share — the same day or any later one. Membership is stored as a
+      keyed hash under the §7.3 salt (§11) and answers this step only: steps 3a, 3b and 3c
+      still apply to a member. *(Added 2026-11-13. See `DECISIONS.md` D-118.)*
    c. If the route is warming and has no remaining headroom for this domain group today,
-      skip.
+      skip. If the route is warming, its ramp is in a **ramp group** (§3.4) and the group has
+      no remaining headroom today, skip — the same steer, reported as `group_quota`, and
+      checked before the route's own headroom, so a day on which both are exhausted reports
+      the group. An overflow route is never checked against a group. A thread-affinity
+      reply on its pinned route (step 2a) may pass a full group exactly as it may pass a full
+      route, and is counted on both. *(Added 2026-11-13. See `DECISIONS.md` D-116.)*
    d. Otherwise, attempt reservation (§7.4). If reservation fails due to a concurrent
       claim, re-evaluate this route once, then skip.
    e. First route to reserve successfully is selected. It is relayed to its
@@ -296,6 +309,19 @@ recipient-frequency history (§7.3) and the partial-ramp hash (§7.2). A thread-
 (§3.2 step 2a) can only name a route in the selected ramp's chain. Each route has its own
 connection pool (§8.3), so two ramps pointing at one downstream present it with the sum of
 their `max_connections`.
+
+**One exception: ramp groups.** *(Added 2026-11-13. See `DECISIONS.md` D-116.)* Top-level
+`ramp_groups` may name several ramps that share **one daily ceiling** across the warming routes
+of all of them — for two brands warming separately on infrastructure that should not, between
+them, carry more than a set volume a day. A ramp is in at most one group. The ceiling is a
+schedule of its own, walked as a route's is (§7.2): its own `started`, elapsed 24-hour days, a
+step decided by its own `advance` rule against the group's own committed total, and the final
+value repeating. Before `started` the group is not in force and caps nothing. Only **warming**
+routes count against it; overflow routes are untouched, so a full group steers each further
+warming message to its chain's next link (§3.2 step 3c) rather than refusing it, and a ramp
+without an overflow route answers with its usual no-overflow policy (§3.2 step 4). The group's
+row is the only state member ramps share; everything else above still holds for them, and a
+ramp in no group behaves exactly as before.
 
 **What is global:** listeners, TLS and authentication (§5), which is what selects a ramp;
 `dot_insensitive_domains` (§7.3), a fact about mailbox providers rather than a routing policy;
@@ -431,6 +457,10 @@ ramps:                                 # each is a complete, isolated routing pr
                                            # then answered 550, or 250 + discard with:
     black_hole_allowed: false              # optional (D-113): needs allow_no_overflow_route and
                                            # strict_senders: false
+    warmup_advance: { mode: threshold, threshold: 0.9 }   # the default (§7.2, D-115): a
+                                           # route/group moves to its next schedule entry only
+                                           # after a day that committed 90% of its plan;
+                                           # `auto` moves one entry per elapsed day
     thread_affinity: false                 # true: replies stay on the route that started the
                                            # thread (§3.2 step 2a); every route then needs a
                                            # Message-ID with its own literal domain (§4.2)
@@ -487,6 +517,7 @@ ramps:                                 # each is a complete, isolated routing pr
           require_dmarc: true
         warmup:
           started: "2026-08-01T09:00:00Z"   # RFC 3339 instant, must be explicit
+          advance: auto                    # optional (D-115): overrides the ramp's warmup_advance
           schedule:
             default: [50, 100, 200, 400, 800, 1500, 3000, 5000]
             share:   [0.1, 0.25, 0.5]      # optional (§7.2, D-091); every message from day 3
@@ -498,6 +529,8 @@ ramps:                                 # each is a complete, isolated routing pr
             #   gain:    4.0                 # how sharply it reacts to running ahead of pace
             #   fill_by: 0.6                 # meet the cap this far through the ramp day
             #   tail: { below: 0.1, ceiling: 1.0 }   # release the last tenth of the cap
+            #   member_retention_days: 30    # drop the route's members this long after
+            #                                # its last commit (D-118)
             overrides:
               google:    [20, 50, 100, 250, 500, 1000, 2000, 4000]
               microsoft: [20, 50, 100, 250, 500, 1000, 2000, 4000]
@@ -539,7 +572,18 @@ ramps:                                 # each is a complete, isolated routing pr
       - name: overflow
         overflow: true
         # ... downstream, identity
+
+# Optional (§3.4, D-116): one shared daily ceiling over the WARMING routes of several ramps.
+# Absent, every ramp shares nothing. A ramp is in at most one group.
+ramp_groups:
+  brands:
+    ramps: [main, partner]
+    started: "2026-08-12T09:00:00Z"   # the group's own day 0; before it, the group caps nothing
+    schedule: [500, 1000, 2000, 4000] # one ceiling per step; the final value repeats (§7.2)
+    advance: { mode: threshold, threshold: 0.9 }  # optional; the default, as a route's (D-115)
 ```
+
+*(Added 2026-11-13 — `ramp_groups`. See `DECISIONS.md` D-116.)*
 
 *(Amended — `domain_groups`, `senders`, `default_chain`, `strict_senders`, `thread_affinity`,
 `exhausted_chain_reply` and `routes` were top-level keys; they now sit, unchanged, inside each
@@ -575,7 +619,18 @@ not just the first.
   and at most 1; `tail.below` is below 0 or at least 1 (0 disables the release); `gain` is not
   above 0 and finite; or `floor` is above `ceiling`. The chain-position rule above applies to
   an `auto` route too, and more so: there is no day on which the gate lifts.
-  *(Added. See `DECISIONS.md` D-097.)*
+  *(Added. See `DECISIONS.md` D-097.)* `member_retention_days` is below 1. *(Added. See
+  `DECISIONS.md` D-118.)*
+- A `warmup.schedule.share` list decreases from one entry to the next: a recipient already
+  offered the route would be dropped from it (§3.2 step 3c′). *(Added. See `DECISIONS.md`
+  D-117.)*
+- A ramp's `warmup_advance` or a route's `warmup.advance` names a threshold that is not above 0
+  and at most 1, gives `threshold` with `mode: auto`, or names a mode other than `auto` and
+  `threshold`. *(Added. See `DECISIONS.md` D-115.)*
+- A `ramp_groups` entry lists no ramps, names a ramp that is not declared, or lists a ramp that
+  another group (or the same one) already lists; its name breaks the ramp-name rule; its
+  `schedule` is empty or contains a negative value; or its `advance` breaks the rule above.
+  *(Added 2026-11-13. See `DECISIONS.md` D-116.)*
 - `${ENV_VAR}` interpolation cannot be resolved.
 - `server.listeners` is empty, or two listeners share an address.
 - A listener's `tls` is not `off` and `server.tls` is absent.
@@ -1179,6 +1234,16 @@ two ramps may each have a route of the same name (§3.4). *(Amended — was `(ro
 domain_group)`. See `DECISIONS.md` D-099.)* The domain group is the second axis because mailbox
 providers throttle independently of one another.
 
+A ramp group (§3.4) adds one more key, shared by its member ramps:
+
+```
+(ramp_group) → daily ceiling over every member ramp's warming routes
+```
+
+bucketed by the group's own day index, from the group's `started` by §7.2's arithmetic. A
+warming route's message is counted under both keys; an overflow route's under its own only.
+*(Added 2026-11-13. See `DECISIONS.md` D-116.)*
+
 ### 7.2 Warm-up day index
 
 ```
@@ -1190,11 +1255,29 @@ is deliberate: a route started at 14:00 has its boundary at 14:00 every day, is 
 transitions, and cannot produce a 23- or 25-hour window. The process timezone governs only how
 dates are rendered in logs and the admin API.
 
-`day_index` is used to index the schedule array. When it exceeds the array bounds, the
-**final value repeats indefinitely**. Routes do not auto-graduate to uncapped; a warm route is
+`day_index` keys the day's quota row and sets its boundary. The schedule array is indexed by
+the element's **step** — for each `(ramp, route, domain_group)` separately — and when the step
+exceeds the array bounds, the **final value repeats indefinitely**.
+
+**How the step moves** is the route's `warmup.advance`, else its ramp's `warmup_advance`:
+
+- `threshold` (the default, at `0.9`): the step moves to the next entry only after a day on
+  which the element **committed** at least `ceil(threshold × planned allowance)`, where the
+  planned allowance is the schedule's value the day's row was created with — never §9.3's
+  override. Otherwise the next day repeats the same entry. With `P` the element's latest row
+  before day `d`: `step(d) = min(d, P.step + (P met ? 1 : 0))`, and `0` when there is no `P`.
+  A day with no traffic has no row, so it advances nothing; at most one entry per day.
+- `auto`: `step = day_index` — one entry per elapsed day, whatever was sent.
+
+The step is written into the day's row when the row is created, beside `allowance`, and is
+authoritative thereafter for the reason `allowance` is: every instance computes the same step
+from the same earlier row, and the first to create the row fixes it. A message committed against
+day `d-1` after day `d`'s row exists does not re-decide day `d`. *(Amended 2026-11-13 — the
+schedule was indexed by `day_index` itself, so every route advanced one entry per day
+whatever it sent. See `DECISIONS.md` D-115.)* Routes do not auto-graduate to uncapped; a warm route is
 made uncapped by editing the configuration and restarting, or by removing Simmer entirely.
 
-**Partial ramp.** A schedule may carry `share`, a list indexed by `day_index` like the caps
+**Partial ramp.** A schedule may carry `share`, a list indexed by the step like the caps
 and applying to every domain group. On day `i`, only `share[i]` of the messages that reach
 the route in the walk are offered to it (§3.2 step 3c′); the rest go to the next link. The
 cap is then reached later in the day, and the route's volume is spread across it rather than
@@ -1235,8 +1318,19 @@ Everything else is unchanged — *which* messages are offered is still the keyed
 allowance is still untouched, and §3.2 step 2a's pinned reply is still exempt.
 *(Added. See `DECISIONS.md` D-097.)*
 
+Because the controller's share falls as well as rises, the hash alone would steer a recipient
+mailed in the morning back to the old identity in the afternoon. So an `auto` route keeps its
+**members** — every recipient a message was committed to on it, pinned replies included — and
+offers them the route whatever the share (§3.2 step 3c′). A member still uses the cap like
+anyone else, so a day heavy with members lowers the share for everybody new rather than
+overrunning. A route's members are dropped together once it has committed nothing for
+`member_retention_days` (default 30). A listed share keeps no members: being non-decreasing,
+it never drops anyone it offered. *(Added 2026-11-13. See `DECISIONS.md` D-118.)*
+
 An unused allowance does not carry over. A route that sent nothing yesterday still advances
-its `day_index`, because the index is a function of elapsed time only.
+its `day_index`, because the index is a function of elapsed time only — but under the
+`threshold` rule its **step** does not, and the day repeats yesterday's entry. *(Amended
+2026-11-13. See `DECISIONS.md` D-115.)*
 
 `warmup.started` in the future makes the route ineligible until it arrives; log at startup.
 
@@ -1302,6 +1396,16 @@ lock, incrementing `reserved`, and committed or released exactly as any other. S
 raised, and every message that is not a pinned reply is still refused at it. A reservation past
 the cap that creates the day's row writes the schedule's allowance, as any first reservation
 does. *(Added. See `DECISIONS.md` D-090.)*
+
+**A grouped warming route** (§3.4) reserves on two rows in the one transaction: the ramp
+group's row for its day, then the route's row. Both are locked — the **group row first**, in
+that order in every transaction that touches both (reserve, commit, release and the sweeper),
+so no two can each hold the lock the other wants. Both must have headroom for
+`recipient_count`; the group is checked first. The reservation row records the group row it
+holds, so commit, release and the sweeper resolve both from it. A pinned reply past the cap
+skips both checks and is counted on both; the group's ceiling is never raised either. The
+group row's `allowance` and `step` are written when it is created and are authoritative
+thereafter, as a route row's are. *(Added 2026-11-13. See `DECISIONS.md` D-116.)*
 
 ### 7.5 Database unavailability
 
@@ -1379,8 +1483,30 @@ See `DECISIONS.md` D-099.)*
 - `simmer_quota_committed{route,domain_group}` — used today
 - `simmer_quota_reserved{route,domain_group}`
 - `simmer_warmup_day{route}`
+- `simmer_warmup_step{route,domain_group}` — the schedule entry in force (§7.2) *(added, D-115)*
+- `simmer_warmup_held_days{route,domain_group}` — `day_index - step` *(added, D-115)*
+- `simmer_warmup_advance_threshold{route}` — absent under `auto` *(added, D-115)*
+- `simmer_warmup_previous_attainment{route,domain_group}` — committed over planned allowance on
+  the day today's step was decided from *(added, D-115)*
+- `simmer_warmup_advance_total{route,domain_group,outcome}` — outcome: `advanced`, `held`,
+  `first`, `auto`; counted once, by the reservation that creates the day's row *(added, D-115)*
+- `simmer_partial_ramp_member_offered_total{route}` — the share refused and membership kept
+  the recipient on the route *(added, D-118)*
+- `simmer_partial_ramp_members{route}` — how many members an `auto` route has; set hourly by
+  the member sweeper *(added, D-118)*
+- `simmer_partial_ramp_members_evicted_total{route}` — member rows dropped after
+  `member_retention_days` idle *(added, D-118)*
 - `simmer_route_skipped_total{route,reason}` — reason: `quota`, `frequency`, `paused`, `preflight`,
-  `partial_ramp` *(added, D-091)*
+  `partial_ramp` *(added, D-091)*, `group_quota` *(added, D-116)*
+- `simmer_ramp_group_allowance{ramp_group}`, `simmer_ramp_group_committed{ramp_group}`,
+  `simmer_ramp_group_reserved{ramp_group}`, `simmer_ramp_group_day{ramp_group}`,
+  `simmer_ramp_group_step{ramp_group}`, `simmer_ramp_group_held_days{ramp_group}` — a ramp
+  group's day, recomputed at scrape time; the allowance, step and held days are absent before
+  the group's `started` *(added, D-116)*
+- `simmer_ramp_group_advance_total{ramp_group,outcome}` — as `simmer_warmup_advance_total`, for
+  the group's row *(added, D-116)*
+- `simmer_ramp_group_over_cap_total{ramp_group}` — thread-affinity replies reserved past a full
+  group *(added, D-116)*
 - `simmer_preflight_ok{route,check}`
 - `simmer_downstream_latency_seconds{route,downstream}` — histogram
 - `simmer_downstream_errors_total{route,downstream,class}`
@@ -1438,8 +1564,17 @@ held; gauges are always cumulative. *(Added. See `DECISIONS.md` D-111.)*
   force for it right now, which under `mode: auto` differs between groups and moves as the cap
   fills; the route-level `today` is then `null`, and the `auto` parameters are reported beside
   the mode *(added, D-097)*. Each `downstream_overrides` entry is listed by group with its
-  own pool statistics *(added, D-112)*.
+  own pool statistics *(added, D-112)*. Each route reports its `advance` rule and where it was
+configured; each domain-group window its `step`, `held_days`, `next_allowance_if_met`, and the
+`previous` day it was decided from — committed, planned allowance, the bar, attainment and
+whether it was met *(added, D-115)*.
 - `GET /ramps/{ramp}/routes/{name}` — as above for one route.
+- `GET /ramp-groups` — every ramp group: its member ramps, schedule, `started` and `advance`
+  rule; today's `day_index`, whether it is `in_force`, `step`, `held_days`, allowance,
+  committed, reserved, headroom, `next_allowance_if_met`, and the `previous` day the step was
+  decided from. `GET /ramp-groups/{name}` — one of them. `GET /ramps/{ramp}` names the ramp's
+  group, or `null`. There are no group mutations. *(Added 2026-11-13. See `DECISIONS.md`
+  D-116.)*
 - `GET /quota?ramp=&route=&group=` — current window detail. `ramp` is required once more than
   one ramp is configured.
 - `GET /metrics` — Prometheus, when `admin.metrics` is enabled (§9.1).
@@ -1496,6 +1631,13 @@ Each recipient's domain group is reported with the basis it was chosen on: `lite
 lookup is the real one and fills the same cache the walk reads. *(Added. See `DECISIONS.md`
 D-100.)*
 
+Each route that reaches the headroom check reports the schedule step it was measured at
+(`warmup_step`). *(Added. See `DECISIONS.md` D-115.)*
+
+A warming route in a grouped ramp also reports the group it counts against — name, day, step,
+allowance and headroom — and a route passed over because the group is full is reported with
+reason `group_quota`. *(Added 2026-11-13. See `DECISIONS.md` D-116.)*
+
 When a route is selected, the downstream it would be relayed to is reported — `default`, or the
 group whose `downstream_overrides` entry applies — with its host and port. *(Added. See
 `DECISIONS.md` D-112.)*
@@ -1528,7 +1670,8 @@ Optional, off unless `telemetry` is configured with a non-empty `endpoint` and n
 - **Traces.** One `smtp.session` span per inbound connection (refused ones included); under it
   one `smtp.transaction` per message, from the accepted `MAIL FROM` to its final reply, carrying
   `correlation_id` and the final reply code; under that `simmer.relay`, carrying the ramp, its
-  §5.8 source, the selected route, domain group, day index and thread pin, with children
+  §5.8 source, the selected route, domain group, day index, schedule step, held days and advance
+mode *(D-115)*, whether partial-ramp membership decided *(D-118)*, and thread pin, with children
   `simmer.route` (the chain walk and every link's skip reason), `simmer.rewrite`,
   `smtp.downstream` (a client span: the downstream's reply code, stage and outcome class, and
   whether §8.3's one retry happened) `simmer.quota.resolve` (§7.4 phase 3) and, after a commit, `simmer.quota.usage` (the row read
@@ -1537,6 +1680,10 @@ back for §9.1's gauges). A `4xx` or `5xx`
   per §6.7 pass, one `admin.request` per §9.2–§9.4 request except `/health`, `/healthcheck`
   and `/metrics`, and one `link_proxy.request` per §5.7 request.
 - **Metrics.** §9.1's, as described there.
+- **Events.** `simmer.warmup.advance`, once per element per active day, when the reservation
+  that creates the day's row fixes its step: the step, the outcome, the threshold, and the
+  previous day's committed, planned allowance and bar. No recipient. *(Added. See
+  `DECISIONS.md` D-115.)*
 - **Logs.** Every §9.5 log event, correlated with the span it was emitted in.
 
 What is exported is filtered by `telemetry.level`, which `RUST_LOG` does not reach, so turning a
@@ -1675,6 +1822,16 @@ Indicative tables:
 - `route_state(ramp, route, paused, graduated, allowance_override, override_expires_at,
   updated_at)` — admin mutations, so they survive restart.
 - `instance_config(key, value)` — the recipient hash salt and similar singletons.
+- `partial_ramp_member(ramp, route, recipient_hash, first_committed_at, last_committed_at)` —
+  primary key on the first three; written in §7.4 phase 3's transaction for an `auto` partial
+  ramp only, and a route's rows dropped together `member_retention_days` after its last commit.
+  Unlike `recipient_event`, it does not age out per row, so it holds a keyed hash of every
+  address mailed on such a route for the life of its ramp. *(Added 2026-11-13. See
+  `DECISIONS.md` D-118.)*
+- `ramp_group_usage(ramp_group, day_index, allowance, step, committed, reserved, updated_at)` —
+  primary key on the first two; a ramp group's daily row (§3.4, §7.4). `quota_reservation`
+  gains `ramp_group` and `group_day_index`, null for a reservation that holds no group row.
+  *(Added 2026-11-13. See `DECISIONS.md` D-116.)*
 
 *(Amended — `ramp` is new in every table but `instance_config`. The migration that adds it
 fills existing rows with a sentinel that cannot be a ramp name and then drops the column

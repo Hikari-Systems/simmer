@@ -7,6 +7,8 @@
 
 pub mod instance_config;
 pub mod legacy;
+pub mod partial_ramp_member;
 pub mod quota;
+pub mod ramp_group_usage;
 pub mod recipient_event;
 pub mod route_state;

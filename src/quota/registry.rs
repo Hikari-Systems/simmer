@@ -78,6 +78,9 @@ mod tests {
             domain_group: "catchall".into(),
             day_index: 0,
             count: n,
+            ramp_group: None,
+            created_group_row: false,
+            created_row: false,
         }
     }
 

@@ -21,6 +21,8 @@ const VARS: &[(&str, &str)] = &[
     ),
     ("SIMMER_CURRENT_DOMAIN", "oldbrand.example"),
     ("SIMMER_NEW_DOMAIN", "newbrand.example"),
+    ("SIMMER_PARTNER_CURRENT_DOMAIN", "oldpartner.example"),
+    ("SIMMER_PARTNER_NEW_DOMAIN", "newpartner.example"),
     ("SIMMER_WARM_SMTP_HOST", "smtp.warm.example"),
     ("SIMMER_WARM_SMTP_USER", "warm"),
     ("SIMMER_WARM_SMTP_PASSWORD", "warm-secret"),

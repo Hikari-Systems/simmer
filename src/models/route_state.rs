@@ -80,6 +80,7 @@ pub async fn set_graduated(
 /// §9.3 `POST /routes/{name}/allowance` — override today's ceiling for one
 /// domain group. Expires at the next day boundary by construction: it is a
 /// column on the row for one `day_index`, and tomorrow is a different row.
+#[allow(clippy::too_many_arguments)] // D-115 added the step beside the allowance
 pub async fn set_allowance_override(
     pool: &PgPool,
     ramp: &str,
@@ -88,12 +89,13 @@ pub async fn set_allowance_override(
     day_index: i64,
     allowance: Option<i64>,
     scheduled: Option<i64>,
+    scheduled_step: Option<i64>,
 ) -> Result<(), QuotaError> {
     sqlx::query(
         r#"
         INSERT INTO quota_usage
-            (ramp, route, domain_group, day_index, allowance, allowance_override)
-        VALUES ($6, $1, $2, $3, $5, $4)
+            (ramp, route, domain_group, day_index, allowance, allowance_override, step)
+        VALUES ($6, $1, $2, $3, $5, $4, $7)
         ON CONFLICT (ramp, route, domain_group, day_index)
         DO UPDATE SET allowance_override = $4, updated_at = now()
         "#,
@@ -104,6 +106,7 @@ pub async fn set_allowance_override(
     .bind(allowance)
     .bind(scheduled)
     .bind(ramp)
+    .bind(scheduled_step)
     .execute(pool)
     .await?;
     Ok(())

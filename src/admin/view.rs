@@ -66,6 +66,123 @@ pub struct GroupWindow {
     /// numbers above are what the first message will create rather than what is
     /// stored.
     pub row_exists: bool,
+    /// D-115 — the schedule entry `scheduled` comes from. Equal to the day index
+    /// under `advance: auto`; `null` for an overflow route or before the start.
+    pub step: Option<i64>,
+    /// D-115 — `day_index - step`: how far this window is held behind its
+    /// calendar by low volume.
+    pub held_days: Option<i64>,
+    /// D-115 — what tomorrow's allowance will be if today meets the threshold.
+    /// Under `auto`, what it will be regardless.
+    pub next_allowance_if_met: Option<i64>,
+    /// D-115 — the day today's step was decided from, under the threshold rule.
+    /// `null` under `auto` and on a window's first day.
+    pub previous: Option<PreviousDayView>,
+}
+
+/// D-115 — the last day a window sent on, and whether it met its bar.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct PreviousDayView {
+    pub day_index: i64,
+    pub step: i64,
+    /// The planned allowance — never §9.3's override (D-115).
+    pub allowance: Option<i64>,
+    pub committed: i64,
+    /// `ceil(threshold × allowance)`.
+    pub required: i64,
+    /// `committed / allowance`; `null` for a zero or unlimited allowance.
+    pub attainment: Option<f64>,
+    pub met: bool,
+}
+
+/// D-115 — how a route moves along its schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct AdvanceView {
+    /// `auto` or `threshold`.
+    pub mode: &'static str,
+    /// `null` under `auto`.
+    pub threshold: Option<f64>,
+    /// `route`, `ramp` or `default`: which configuration level said so.
+    pub source: &'static str,
+}
+
+/// D-116 — §9.2's view of one ramp group: its shared ceiling today and what
+/// its member ramps' warming routes have spent of it. Names and counts only.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RampGroupView {
+    pub name: String,
+    pub ramps: Vec<String>,
+    pub started: DateTime<Utc>,
+    pub schedule: Vec<i64>,
+    pub advance: GroupAdvanceView,
+    /// Elapsed days since `started`; negative before it.
+    pub day_index: i64,
+    /// False before `started`: the group caps nothing yet and has no row.
+    pub in_force: bool,
+    /// `null` before `started`.
+    pub step: Option<i64>,
+    pub held_days: Option<i64>,
+    /// What the row says once it exists, else what the schedule plans.
+    pub allowance: Option<i64>,
+    pub committed: i64,
+    pub reserved: i64,
+    pub headroom: Option<i64>,
+    pub row_exists: bool,
+    pub next_allowance_if_met: Option<i64>,
+    pub previous: Option<PreviousDayView>,
+    pub day_ends_at: DateTime<Utc>,
+}
+
+/// D-116 — how a ramp group moves along its schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct GroupAdvanceView {
+    pub mode: &'static str,
+    pub threshold: Option<f64>,
+}
+
+/// D-116 — project a group from [`quota::group_position`] and its row.
+pub fn project_ramp_group(
+    group: &crate::config::RampGroup,
+    position: &quota::GroupPosition,
+    usage: Option<Usage>,
+) -> RampGroupView {
+    let in_force = position.allowance.is_some();
+    let row = usage.unwrap_or_default();
+    let allowance = row.allowance.or(position.allowance);
+    RampGroupView {
+        name: group.name.clone(),
+        ramps: group.ramps.clone(),
+        started: group.started,
+        schedule: group.schedule.clone(),
+        advance: GroupAdvanceView {
+            mode: position.rule.mode(),
+            threshold: position.rule.threshold(),
+        },
+        day_index: position.day_index,
+        in_force,
+        step: in_force.then_some(position.step),
+        held_days: in_force.then_some(position.held_days()),
+        allowance,
+        committed: row.committed,
+        reserved: row.reserved,
+        headroom: allowance.map(|a| (a - row.committed - row.reserved).max(0)),
+        row_exists: usage.is_some(),
+        next_allowance_if_met: if in_force {
+            group.allowance_at(position.step + 1)
+        } else {
+            group.allowance_at(0)
+        },
+        previous: position.decision.basis.map(|b| PreviousDayView {
+            day_index: b.previous.day_index,
+            step: b.previous.step_or_day(),
+            allowance: b.previous.allowance,
+            committed: b.previous.committed,
+            required: b.required,
+            attainment: b.attainment(),
+            met: b.met,
+        }),
+        day_ends_at: quota::day::boundary(group.started, position.day_index + 1),
+    }
 }
 
 /// Whether a route can be selected at all, which is a separate question from
@@ -158,6 +275,8 @@ pub struct RouteView {
     pub downstream: DownstreamView,
     pub recipient_frequency: Option<FrequencyView>,
     pub partial_ramp: Option<PartialRampView>,
+    /// D-115 — `null` for an overflow route, which has no schedule.
+    pub advance: Option<AdvanceView>,
     pub groups: Vec<GroupWindow>,
     /// §9.2's preflight results (§6.7).
     ///
@@ -238,13 +357,38 @@ fn preflight_view(route: &Route, registry: &crate::preflight::Registry) -> Optio
 /// Everything the projection needs from storage, keyed the way it is read.
 pub type UsageByRoute = HashMap<(String, String), Usage>;
 
+/// D-115 — the rows each `(route, domain_group)`'s step is decided from, keyed
+/// like [`UsageByRoute`]. Absent is "no rows read", which is the right answer
+/// for a route under `advance: auto` and for one that has never sent.
+pub type AdvanceByRoute = HashMap<(String, String), quota::AdvanceRows>;
+
+/// D-115 — every `(route, domain_group)`'s position, from rows already read.
+/// The same pure function `quota::position` calls, so `/routes` and the gauges
+/// cannot describe a step the walk is not using.
+pub fn position_for(
+    route: &Route,
+    group: &str,
+    state: RouteState,
+    advance: &AdvanceByRoute,
+    now: DateTime<Utc>,
+) -> quota::Position {
+    let day_index = quota::day::for_route(route, now);
+    let rows = advance
+        .get(&(route.name.clone(), group.to_string()))
+        .copied()
+        .unwrap_or_default();
+    quota::position_from(route, group, day_index, state, rows)
+}
+
 /// Project one route. `usage` is keyed `(route, domain_group)` so one query can
 /// feed every route.
+#[allow(clippy::too_many_arguments)]
 pub fn project_route(
     ramp: &Ramp,
     route: &Route,
     state: RouteState,
     usage: &UsageByRoute,
+    advance: &AdvanceByRoute,
     preflight: &crate::preflight::Registry,
     pools: &crate::downstream::Pool,
     now: DateTime<Utc>,
@@ -264,12 +408,41 @@ pub fn project_route(
         .domain_groups
         .iter()
         .map(|group| {
-            let scheduled = quota::allowance_for(route, &group.name, day_index, state);
+            let position = position_for(route, &group.name, state, advance, now);
+            let scheduled = position.allowance;
             let usage = usage.get(&(route.name.clone(), group.name.clone()));
             let share = crate::routing::partial::share_for_group(
-                route, day_index, state, now, scheduled, usage,
+                route,
+                day_index,
+                position.step,
+                state,
+                now,
+                scheduled,
+                usage,
             );
-            project_group(group, scheduled, usage, share)
+            let mut window = project_group(group, scheduled, usage, share);
+            if route.warmup.is_some() && day_index >= 0 {
+                window.step = Some(position.step);
+                window.held_days = Some(position.held_days());
+                window.next_allowance_if_met = quota::allowance_for(
+                    route,
+                    &group.name,
+                    day_index + 1,
+                    position.step + 1,
+                    state,
+                )
+                .as_column();
+                window.previous = position.decision.basis.map(|b| PreviousDayView {
+                    day_index: b.previous.day_index,
+                    step: b.previous.step_or_day(),
+                    allowance: b.previous.allowance,
+                    committed: b.previous.committed,
+                    required: b.required,
+                    attainment: b.attainment(),
+                    met: b.met,
+                });
+            }
+            window
         })
         .collect();
 
@@ -293,7 +466,16 @@ pub fn project_route(
                 ShareSchedule::Days(days) => PartialRampView {
                     mode: "days",
                     share: days.clone(),
-                    today: crate::routing::partial::share_today(route, day_index, state),
+                    // A list is indexed by step (D-115), which may differ per
+                    // group; the route-level summary is the first group's.
+                    today: crate::routing::partial::share_today(
+                        route,
+                        day_index,
+                        ramp.domain_groups.first().map_or(day_index, |g| {
+                            position_for(route, &g.name, state, advance, now).step
+                        }),
+                        state,
+                    ),
                     auto: None,
                 },
                 ShareSchedule::Auto(a) => PartialRampView {
@@ -310,6 +492,15 @@ pub fn project_route(
                     }),
                 },
             }),
+        advance: route.warmup.as_ref().map(|w| AdvanceView {
+            mode: w.advance().mode(),
+            threshold: w.advance().threshold(),
+            source: match w.advance_source {
+                crate::config::AdvanceSource::Route => "route",
+                crate::config::AdvanceSource::Ramp => "ramp",
+                crate::config::AdvanceSource::Default => "default",
+            },
+        }),
         groups,
         preflight: preflight_view(route, preflight),
         pool: pools.stats(&route.ramp, &route.name),
@@ -360,6 +551,10 @@ pub fn project_group(
             drift: false,
             partial_ramp_share,
             row_exists: false,
+            step: None,
+            held_days: None,
+            next_allowance_if_met: None,
+            previous: None,
         },
         Some(u) => GroupWindow {
             domain_group: group.name.clone(),
@@ -375,6 +570,10 @@ pub fn project_group(
             drift: u.allowance != scheduled_column,
             partial_ramp_share,
             row_exists: true,
+            step: None,
+            held_days: None,
+            next_allowance_if_met: None,
+            previous: None,
         },
     }
 }
@@ -384,6 +583,7 @@ pub fn project_routes(
     ramp: &Ramp,
     states: &HashMap<String, RouteState>,
     usage: &UsageByRoute,
+    advance: &AdvanceByRoute,
     preflight: &crate::preflight::Registry,
     pools: &crate::downstream::Pool,
     now: DateTime<Utc>,
@@ -395,7 +595,7 @@ pub fn project_routes(
             .iter()
             .map(|route| {
                 let state = states.get(&route.name).copied().unwrap_or_default();
-                project_route(ramp, route, state, usage, preflight, pools, now)
+                project_route(ramp, route, state, usage, advance, preflight, pools, now)
             })
             .collect(),
     }
@@ -457,6 +657,9 @@ ramps:
   senders:
   - { match: "oldbrand.com", match_on: envelope, chain: [warming, overflow] }
   default_chain: [overflow]
+  # These tests are about D-026's drift and the calendar's day index; D-115's
+  # threshold rule has its own below, from `threshold_config`.
+  warmup_advance: auto
   routes:
   - name: warming
     downstream:
@@ -504,6 +707,7 @@ ramps:
             cfg.default_ramp().route(route).unwrap(),
             state,
             usage,
+            &AdvanceByRoute::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(cfg),
             now(),
@@ -673,6 +877,7 @@ ramps:
             cfg.default_ramp().route("warming").unwrap(),
             RouteState::default(),
             &UsageByRoute::new(),
+            &AdvanceByRoute::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             earlier,
@@ -695,6 +900,7 @@ ramps:
                 graduated: false,
             },
             &UsageByRoute::new(),
+            &AdvanceByRoute::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             earlier,
@@ -717,6 +923,7 @@ ramps:
             cfg.default_ramp().route("warming").unwrap(),
             state,
             &UsageByRoute::new(),
+            &AdvanceByRoute::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             earlier,
@@ -830,6 +1037,7 @@ ramps:
             cfg.default_ramp(),
             &states,
             &usage,
+            &AdvanceByRoute::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             now(),
@@ -904,6 +1112,7 @@ ramps:
             cfg.default_ramp(),
             &HashMap::new(),
             &UsageByRoute::new(),
+            &AdvanceByRoute::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             now(),
@@ -919,6 +1128,7 @@ ramps:
             cfg.default_ramp(),
             &HashMap::new(),
             &UsageByRoute::new(),
+            &AdvanceByRoute::new(),
             &crate::preflight::Registry::new(),
             &crate::downstream::Pool::build(&cfg),
             now(),
@@ -1043,5 +1253,155 @@ ramps:
             w.scheduled, None,
             "a route that has not started has no ceiling to report; RouteStatus says why"
         );
+    }
+
+    // -- D-115: the threshold rule, as /routes reports it ----------------------
+
+    fn threshold_config() -> Config {
+        crate::config::from_str(
+            &CFG.replace(
+                "warmup_advance: auto",
+                "warmup_advance: { mode: threshold, threshold: 0.9 }",
+            ),
+            "test",
+        )
+        .expect("fixture is valid")
+    }
+
+    fn advance_rows(entries: &[(&str, crate::quota::AdvanceRows)]) -> AdvanceByRoute {
+        entries
+            .iter()
+            .map(|(g, rows)| (("warming".to_string(), g.to_string()), *rows))
+            .collect()
+    }
+
+    fn prior(
+        day_index: i64,
+        step: i64,
+        allowance: i64,
+        committed: i64,
+    ) -> crate::quota::AdvanceRows {
+        crate::quota::AdvanceRows {
+            today: None,
+            previous: Some(crate::quota::advance::Row {
+                day_index,
+                step: Some(step),
+                allowance: Some(allowance),
+                committed,
+            }),
+        }
+    }
+
+    fn threshold_view(advance: &AdvanceByRoute) -> RouteView {
+        let cfg = threshold_config();
+        project_route(
+            cfg.default_ramp(),
+            cfg.default_ramp().route("warming").unwrap(),
+            RouteState::default(),
+            &UsageByRoute::new(),
+            advance,
+            &crate::preflight::Registry::new(),
+            &crate::downstream::Pool::build(&cfg),
+            now(),
+        )
+    }
+
+    #[test]
+    fn a_held_window_reports_its_step_and_how_far_behind_it_is() {
+        // Day 2. catchall sent 40 of 100 on day 1 at step 1: held at step 1, so
+        // 100 again, one day behind. google met 36 of 40 at step 1: step 2,
+        // which past the end of [20, 40] repeats 40.
+        let v = threshold_view(&advance_rows(&[
+            ("catchall", prior(1, 1, 100, 40)),
+            ("google", prior(1, 1, 40, 36)),
+        ]));
+        let catchall = window(&v, "catchall");
+        assert_eq!(catchall.step, Some(1));
+        assert_eq!(catchall.held_days, Some(1));
+        assert_eq!(catchall.scheduled, Some(100));
+        assert_eq!(catchall.next_allowance_if_met, Some(200));
+        let p = catchall.previous.expect("the day it was decided from");
+        assert_eq!(
+            (p.day_index, p.committed, p.required, p.met),
+            (1, 40, 90, false)
+        );
+        assert_eq!(p.attainment, Some(0.4));
+
+        let google = window(&v, "google");
+        assert_eq!(
+            (google.step, google.held_days, google.scheduled),
+            (Some(2), Some(0), Some(40))
+        );
+        assert!(google.previous.unwrap().met);
+    }
+
+    #[test]
+    fn a_window_that_never_sent_is_on_its_first_step() {
+        let v = threshold_view(&AdvanceByRoute::new());
+        let w = window(&v, "catchall");
+        assert_eq!(
+            (w.step, w.held_days, w.scheduled),
+            (Some(0), Some(2), Some(50))
+        );
+        assert_eq!(w.previous, None);
+        assert_eq!(w.next_allowance_if_met, Some(100));
+    }
+
+    #[test]
+    fn the_route_says_how_it_advances_and_where_that_came_from() {
+        let v = threshold_view(&AdvanceByRoute::new());
+        let a = v.advance.expect("a warming route");
+        assert_eq!(
+            (a.mode, a.threshold, a.source),
+            ("threshold", Some(0.9), "ramp")
+        );
+
+        let auto = view(
+            &config(),
+            "warming",
+            RouteState::default(),
+            &UsageByRoute::new(),
+        );
+        let a = auto.advance.expect("a warming route");
+        assert_eq!((a.mode, a.threshold), ("auto", None));
+        assert_eq!(
+            view(
+                &config(),
+                "overflow",
+                RouteState::default(),
+                &UsageByRoute::new()
+            )
+            .advance,
+            None
+        );
+    }
+
+    #[test]
+    fn under_auto_the_step_is_the_day_and_nothing_is_held() {
+        let v = view(
+            &config(),
+            "warming",
+            RouteState::default(),
+            &UsageByRoute::new(),
+        );
+        let w = window(&v, "catchall");
+        assert_eq!(
+            (w.step, w.held_days, w.scheduled),
+            (Some(2), Some(0), Some(200))
+        );
+        assert_eq!(w.previous, None);
+    }
+
+    #[test]
+    fn an_overflow_route_reports_no_step() {
+        let v = view(
+            &config(),
+            "overflow",
+            RouteState::default(),
+            &UsageByRoute::new(),
+        );
+        for w in &v.groups {
+            assert_eq!((w.step, w.held_days, w.previous), (None, None, None));
+        }
     }
 }

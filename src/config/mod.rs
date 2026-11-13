@@ -73,6 +73,13 @@ pub struct Config {
 
     /// §3.4 (D-099) — every routing profile, in document order.
     pub ramps: Ramps,
+
+    /// §3.4 (D-116) — shared daily ceilings across ramps, in document order.
+    /// Absent is none: every ramp then shares nothing, as before D-116. Each
+    /// member ramp also carries its group as [`Ramp::ramp_group`], filled in by
+    /// [`from_str`], so the walk never looks it up.
+    #[serde(default)]
+    pub ramp_groups: RampGroups,
 }
 
 fn default_dot_insensitive_domains() -> Vec<String> {
@@ -134,7 +141,19 @@ pub struct Ramp {
     #[serde(default)]
     pub exhausted_chain_reply: ExhaustedChainReply,
 
+    /// §7.2 (D-115) — how this ramp's warming routes move along their
+    /// schedules, unless a route's own `warmup.advance` says otherwise. Absent
+    /// is [`Advance::default`]: volume-gated at 0.9.
+    #[serde(default)]
+    pub warmup_advance: Option<Advance>,
+
     pub routes: Vec<Route>,
+
+    /// D-116 — the ramp group this ramp belongs to, if any: a copy of the
+    /// `ramp_groups` entry that lists it, filled in by [`from_str`] and never
+    /// read from the document. §4.2 refuses a ramp listed by two groups.
+    #[serde(skip)]
+    pub ramp_group: Option<RampGroup>,
 }
 
 /// `ramps:` — a YAML mapping from name to [`Ramp`], kept in document order so
@@ -183,6 +202,18 @@ impl<'de> Deserialize<'de> for Ramps {
                 while let Some((name, mut ramp)) = map.next_entry::<String, Ramp>()? {
                     for route in &mut ramp.routes {
                         route.ramp = name.clone();
+                        // D-115: resolve the advance rule once, here, so nothing
+                        // downstream has to know there were three places to look.
+                        if let Some(w) = route.warmup.as_mut() {
+                            w.advance_source = match (w.advance, ramp.warmup_advance) {
+                                (Some(_), _) => AdvanceSource::Route,
+                                (None, Some(a)) => {
+                                    w.advance = Some(a);
+                                    AdvanceSource::Ramp
+                                }
+                                (None, None) => AdvanceSource::Default,
+                            };
+                        }
                     }
                     ramp.name = name;
                     out.push(ramp);
@@ -192,6 +223,115 @@ impl<'de> Deserialize<'de> for Ramps {
         }
 
         deserializer.deserialize_map(Visitor)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ramp_groups (§3.4, D-116)
+// ---------------------------------------------------------------------------
+
+/// D-116 — one shared daily ceiling over the **warming** routes of several
+/// ramps. The one piece of state member ramps share: §3.4's "ramps share
+/// nothing" holds for everything else.
+///
+/// The ceiling is a schedule of its own, walked exactly as a route's is: day
+/// index from `started` by §7.2's elapsed-duration arithmetic, a step decided
+/// by [`Advance`] (D-115), and the final value repeating.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RampGroup {
+    /// The key it was declared under. Filled in by [`RampGroups`]' deserialiser.
+    #[serde(skip)]
+    pub name: String,
+    /// Member ramps. A ramp is in at most one group (§4.2).
+    pub ramps: Vec<String>,
+    /// RFC 3339; day 0 of the group's schedule. Before it the group is not in
+    /// force and caps nothing (D-116).
+    pub started: chrono::DateTime<chrono::Utc>,
+    /// Daily ceilings, one per step; the final value repeats. Signed so that a
+    /// negative value is §4.2's to refuse, with a path, rather than serde's.
+    pub schedule: Vec<i64>,
+    /// D-115's rule, applied to the group's own row. Absent is the default:
+    /// volume-gated at 0.9.
+    #[serde(default)]
+    pub advance: Option<Advance>,
+}
+
+impl RampGroup {
+    /// The ONE answer to "how does this group advance".
+    pub fn advance(&self) -> Advance {
+        self.advance.unwrap_or_default()
+    }
+
+    /// The ceiling at `step`, the final value repeating past the end. `None`
+    /// only for an empty schedule, which §4.2 refuses.
+    pub fn allowance_at(&self, step: i64) -> Option<i64> {
+        let last = self.schedule.len().checked_sub(1)?;
+        let i = usize::try_from(step.max(0)).unwrap_or(usize::MAX).min(last);
+        Some(self.schedule[i].max(0))
+    }
+
+    pub fn has_ramp(&self, ramp: &str) -> bool {
+        self.ramps.iter().any(|r| r == ramp)
+    }
+}
+
+/// `ramp_groups:` — a mapping from name to [`RampGroup`], in document order.
+#[derive(Debug, Clone, Default)]
+pub struct RampGroups(pub Vec<RampGroup>);
+
+impl RampGroups {
+    pub fn iter(&self) -> std::slice::Iter<'_, RampGroup> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&RampGroup> {
+        self.0.iter().find(|g| g.name == name)
+    }
+
+    /// The first group listing `ramp`. §4.2 refuses a second.
+    pub fn of_ramp(&self, ramp: &str) -> Option<&RampGroup> {
+        self.0.iter().find(|g| g.has_ramp(ramp))
+    }
+}
+
+impl<'de> Deserialize<'de> for RampGroups {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = RampGroups;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a mapping from ramp group name to its shared ceiling")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<RampGroups, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut out = Vec::new();
+                while let Some((name, mut group)) = map.next_entry::<String, RampGroup>()? {
+                    group.name = name;
+                    out.push(group);
+                }
+                Ok(RampGroups(out))
+            }
+
+            // `ramp_groups:` with nothing under it is YAML null: no groups.
+            fn visit_unit<E: serde::de::Error>(self) -> Result<RampGroups, E> {
+                Ok(RampGroups::default())
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -1391,6 +1531,124 @@ pub struct Warmup {
     /// window.
     pub started: chrono::DateTime<chrono::Utc>,
     pub schedule: Schedule,
+    /// §7.2 (D-115) — what moves the route from one schedule entry to the
+    /// next. After loading this holds the *resolved* rule — the route's own,
+    /// else its ramp's `warmup_advance` — and `None` only when neither said;
+    /// read it through [`Warmup::advance`].
+    #[serde(default)]
+    pub advance: Option<Advance>,
+    /// Where [`Warmup::advance`]'s answer came from, for the startup log.
+    #[serde(skip)]
+    pub advance_source: AdvanceSource,
+}
+
+impl Warmup {
+    /// The ONE answer to "how does this route advance" (D-115).
+    pub fn advance(&self) -> Advance {
+        self.advance.unwrap_or_default()
+    }
+}
+
+/// D-115 — how a warming element (a `(ramp, route, domain_group)` quota row,
+/// or a ramp group's row) moves from one schedule entry to the next.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Advance {
+    /// One entry per elapsed 24h, whatever was sent: §7.2 as it was before
+    /// D-115. The schedule position is the day index.
+    Auto,
+    /// Move on only after a day whose committed volume reached `threshold` of
+    /// its planned allowance. §4.2 holds it to `(0, 1]`.
+    Threshold { threshold: f64 },
+}
+
+/// D-115's default threshold when none is configured.
+pub const DEFAULT_ADVANCE_THRESHOLD: f64 = 0.9;
+
+impl Default for Advance {
+    fn default() -> Self {
+        Advance::Threshold {
+            threshold: DEFAULT_ADVANCE_THRESHOLD,
+        }
+    }
+}
+
+impl Advance {
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Advance::Auto => "auto",
+            Advance::Threshold { .. } => "threshold",
+        }
+    }
+
+    pub fn threshold(&self) -> Option<f64> {
+        match self {
+            Advance::Auto => None,
+            Advance::Threshold { threshold } => Some(*threshold),
+        }
+    }
+}
+
+/// Which configuration level supplied a route's [`Advance`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AdvanceSource {
+    Route,
+    Ramp,
+    /// Neither: the built-in default. Logged at startup, because a
+    /// configuration written before D-115 loads cleanly and has changed meaning.
+    #[default]
+    Default,
+}
+
+impl<'de> Deserialize<'de> for Advance {
+    /// `auto`, `threshold`, or `{ mode: auto | threshold, threshold: 0.8 }`.
+    /// By hand so that a wrong key says which, as `ShareSchedule` does.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum Mode {
+            Auto,
+            Threshold,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Map {
+            mode: Mode,
+            #[serde(default)]
+            threshold: Option<f64>,
+        }
+
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = Advance;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(
+                    "`auto`, `threshold`, or a map `{ mode: auto | threshold, threshold: <0..1] }`",
+                )
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Advance, E> {
+                match v {
+                    "auto" => Ok(Advance::Auto),
+                    "threshold" => Ok(Advance::default()),
+                    other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+                }
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Advance, A::Error> {
+                let m = Map::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                match (m.mode, m.threshold) {
+                    (Mode::Auto, None) => Ok(Advance::Auto),
+                    (Mode::Auto, Some(_)) => Err(serde::de::Error::custom(
+                        "`threshold` has no meaning with `mode: auto`",
+                    )),
+                    (Mode::Threshold, t) => Ok(Advance::Threshold {
+                        threshold: t.unwrap_or(DEFAULT_ADVANCE_THRESHOLD),
+                    }),
+                }
+            }
+        }
+
+        d.deserialize_any(V)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1555,6 +1813,12 @@ pub struct AutoShare {
     /// `ceiling`.
     pub fill_by: f64,
     pub tail: Tail,
+    /// D-118 — how long a route's recipient membership outlives the route's
+    /// last commit. Every recipient a message was committed to on an auto
+    /// route stays offered it, whatever the share (O-21); the rows that record
+    /// that are dropped, all of a route's at once, once the route has
+    /// committed nothing for this many days.
+    pub member_retention_days: u32,
 }
 
 /// D-097's tail release: what happens when the cap is nearly met.
@@ -1598,6 +1862,7 @@ impl AutoShare {
     pub const DEFAULT_CEILING: f64 = 1.0;
     pub const DEFAULT_GAIN: f64 = 4.0;
     pub const DEFAULT_FILL_BY: f64 = 0.6;
+    pub const DEFAULT_MEMBER_RETENTION_DAYS: u32 = 30;
 }
 
 impl Default for AutoShare {
@@ -1608,6 +1873,7 @@ impl Default for AutoShare {
             gain: Self::DEFAULT_GAIN,
             fill_by: Self::DEFAULT_FILL_BY,
             tail: Tail::default(),
+            member_retention_days: Self::DEFAULT_MEMBER_RETENTION_DAYS,
         }
     }
 }
@@ -1632,6 +1898,7 @@ impl<'de> Deserialize<'de> for AutoShare {
             gain: Option<f64>,
             fill_by: Option<f64>,
             tail: Option<Tail>,
+            member_retention_days: Option<u32>,
         }
 
         let t = Table::deserialize(d)?;
@@ -1642,6 +1909,7 @@ impl<'de> Deserialize<'de> for AutoShare {
             gain: t.gain.unwrap_or(d.gain),
             fill_by: t.fill_by.unwrap_or(d.fill_by),
             tail: t.tail.unwrap_or(d.tail),
+            member_retention_days: t.member_retention_days.unwrap_or(d.member_retention_days),
         })
     }
 }
@@ -1782,6 +2050,9 @@ pub fn from_str(text: &str, origin: &str) -> Result<Config, LoadError> {
         source,
     })?;
 
+    let mut config = config;
+    config.link_ramp_groups();
+
     let violations = validate::validate(&config);
     if !violations.is_empty() {
         return Err(LoadError::Invalid(violations));
@@ -1798,6 +2069,15 @@ pub struct NamedChain<'a> {
 }
 
 impl Config {
+    /// D-116 — copy each ramp's group onto it, so the walk reads
+    /// [`Ramp::ramp_group`] and never searches. Called by [`from_str`]; a test
+    /// that edits `ramp_groups` in place calls it again.
+    pub fn link_ramp_groups(&mut self) {
+        for ramp in &mut self.ramps.0 {
+            ramp.ramp_group = self.ramp_groups.of_ramp(&ramp.name).cloned();
+        }
+    }
+
     /// The ramp named `name`, if there is one.
     pub fn ramp(&self, name: &str) -> Option<&Ramp> {
         self.ramps.get(name)

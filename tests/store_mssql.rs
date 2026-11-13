@@ -133,7 +133,7 @@ async fn migrations_are_idempotent_and_recorded() {
             .unwrap()
             .get::<i64, _>("n")
             .unwrap();
-        assert_eq!(n, 4, "one row per file in migrations-mssql/");
+        assert_eq!(n, 7, "one row per file in migrations-mssql/");
     })
     .await;
 }

@@ -174,6 +174,7 @@ pub fn validate(cfg: &Config) -> ViolationList {
     check_admin_tokens(cfg, &mut v);
     check_admin_metrics(cfg, &mut v);
     check_ramps(cfg, &mut v);
+    check_ramp_groups(cfg, &mut v);
     check_link_proxy(cfg, &mut v);
     check_capture(cfg, &mut v);
     check_telemetry(cfg, &mut v);
@@ -198,6 +199,55 @@ pub fn warnings(cfg: &Config) -> Vec<Warning> {
                       silence this warning"
                 .to_string(),
         });
+    }
+
+    // D-116: a group whose ramps have no warming route counts nothing, so its
+    // ceiling can never bind. Not a violation — a ramp may gain one later —
+    // but almost certainly not what was meant.
+    for group in cfg.ramp_groups.iter() {
+        let warms = group
+            .ramps
+            .iter()
+            .filter_map(|r| cfg.ramp(r))
+            .any(|r| r.routes.iter().any(|route| route.warmup.is_some()));
+        if !warms {
+            out.push(Warning {
+                path: format!("ramp_groups.{}", group.name),
+                message: "none of this group's ramps has a warming route, and only warming \
+                          routes count against a ramp group (D-116), so its ceiling never \
+                          binds"
+                    .to_string(),
+            });
+        }
+    }
+
+    // D-115: a warming route that names no advance rule — nor does its ramp —
+    // is volume-gated at the default threshold. A configuration from before
+    // D-115 loads cleanly and has changed meaning, so say so once per ramp.
+    for ramp in cfg.ramps.iter() {
+        let defaulted: Vec<&str> = ramp
+            .routes
+            .iter()
+            .filter(|r| {
+                r.warmup
+                    .as_ref()
+                    .is_some_and(|w| w.advance_source == super::AdvanceSource::Default)
+            })
+            .map(|r| r.name.as_str())
+            .collect();
+        if !defaulted.is_empty() {
+            out.push(Warning {
+                path: format!("ramps.{}.warmup_advance", ramp.name),
+                message: format!(
+                    "is not set, so route(s) {} advance along their schedules only after a \
+                     day that committed at least {} of its planned allowance (D-115). Set \
+                     `warmup_advance: auto` to advance on elapsed days as before, or set it \
+                     explicitly to silence this warning",
+                    defaulted.join(", "),
+                    super::DEFAULT_ADVANCE_THRESHOLD
+                ),
+            });
+        }
     }
 
     // §5.5's ceiling can no longer be reached: D-047 refuses the second RCPT TO
@@ -1373,6 +1423,9 @@ fn check_ramps(cfg: &Config, v: &mut ViolationList) {
         }
 
         let mut inner = ViolationList::default();
+        if let Some(advance) = ramp.warmup_advance {
+            check_advance(advance, "warmup_advance", &mut inner);
+        }
         check_domain_groups(ramp, &mut inner);
         check_route_uniqueness(ramp, &mut inner);
         check_routes(ramp, &mut inner);
@@ -1385,6 +1438,53 @@ fn check_ramps(cfg: &Config, v: &mut ViolationList) {
                 format!("ramps.{}.{}", ramp.name, violation.path),
                 violation.message,
             );
+        }
+    }
+}
+
+/// §4.2 for D-116's `ramp_groups`. Every violation is reported, as everywhere.
+fn check_ramp_groups(cfg: &Config, v: &mut ViolationList) {
+    // ramp -> the first group that listed it, to refuse a second.
+    let mut claimed: BTreeMap<&str, &str> = BTreeMap::new();
+    for group in cfg.ramp_groups.iter() {
+        let at = |field: &str| format!("ramp_groups.{}.{field}", group.name);
+        if let Some(problem) = ramp_name_problem(&group.name) {
+            v.push(
+                format!("ramp_groups.{}", group.name),
+                problem.replace("a ramp name", "a ramp group name"),
+            );
+        }
+        if group.ramps.is_empty() {
+            v.push(at("ramps"), "must list at least one ramp");
+        }
+        for (i, name) in group.ramps.iter().enumerate() {
+            if cfg.ramp(name).is_none() {
+                v.push(
+                    format!("{}[{i}]", at("ramps")),
+                    format!("names ramp '{name}', which is not declared in ramps"),
+                );
+                continue;
+            }
+            match claimed.get(name.as_str()) {
+                Some(first) if *first == group.name => v.push(
+                    format!("{}[{i}]", at("ramps")),
+                    format!("lists ramp '{name}' twice"),
+                ),
+                Some(first) => v.push(
+                    format!("{}[{i}]", at("ramps")),
+                    format!(
+                        "lists ramp '{name}', which ramp group '{first}' already lists; a \
+                         ramp is in at most one group (D-116)"
+                    ),
+                ),
+                None => {
+                    claimed.insert(name, &group.name);
+                }
+            }
+        }
+        check_series(&group.schedule, &at("schedule"), v);
+        if let Some(advance) = group.advance {
+            check_advance(advance, &at("advance"), v);
         }
     }
 }
@@ -1577,6 +1677,8 @@ fn check_storage(cfg: &Config, v: &mut ViolationList) {
     // for both builds. Postgres has no such limit, so the rule is this build's
     // alone.
     const MAX: usize = crate::db::mssql::MAX_NAME_CHARS;
+    // D-116: a group name is capped at 64 for both builds already, well inside
+    // MAX; nothing further to check for it here.
     for ramp in cfg.ramps.iter() {
         for (i, r) in ramp.routes.iter().enumerate() {
             if r.name.chars().count() > MAX {
@@ -1717,6 +1819,31 @@ fn check_schedule(ramp: &Ramp, route: &Route, warmup: &super::Warmup, v: &mut Vi
     }
 
     check_share(&warmup.schedule.share, &at("share"), v);
+
+    // D-115. An inherited rule is reported once, at the ramp's own key, by
+    // `check_ramps`; here only the route's own.
+    if warmup.advance_source == super::AdvanceSource::Route {
+        if let Some(advance) = warmup.advance {
+            check_advance(advance, &format!("routes.{}.warmup.advance", route.name), v);
+        }
+    }
+}
+
+/// §4.2 for D-115's `advance`: a threshold above 0 and at most 1. Written so
+/// that NaN fails too.
+pub(crate) fn check_advance(advance: super::Advance, path: &str, v: &mut ViolationList) {
+    if let super::Advance::Threshold { threshold } = advance {
+        if !(threshold > 0.0 && threshold <= 1.0) {
+            v.push(
+                format!("{path}.threshold"),
+                format!(
+                    "is {threshold}; an advance threshold must be above 0 and at most 1. \
+                     To advance on elapsed days whatever is sent, use `advance: auto` \
+                     (§4.2, D-115)"
+                ),
+            );
+        }
+    }
 }
 
 /// §4.2 for D-091's `schedule.share` and D-097's `auto`. Where a route carrying
@@ -1726,6 +1853,22 @@ fn check_share(share: &ShareSchedule, path: &str, v: &mut ViolationList) {
         ShareSchedule::Days(days) => {
             for (i, value) in days.iter().enumerate() {
                 check_fraction(*value, &format!("{path}[{i}]"), v);
+            }
+            // D-117: a recipient ramped onto the route stays ramped for the rest
+            // of the ramp only while the share never falls — the offered sets
+            // are nested, so a lower share drops whoever drew between the two.
+            for (i, pair) in days.windows(2).enumerate() {
+                if pair[1] < pair[0] {
+                    v.push(
+                        format!("{path}[{}]", i + 1),
+                        format!(
+                            "is {}, below the previous day's {}; a share list must never \
+                             decrease, or recipients already ramped onto this route would \
+                             fall back to the next link (§4.2, D-117)",
+                            pair[1], pair[0]
+                        ),
+                    );
+                }
             }
         }
         ShareSchedule::Auto(auto) => check_auto_share(auto, path, v),
@@ -1763,6 +1906,15 @@ fn check_auto_share(auto: &AutoShare, path: &str, v: &mut ViolationList) {
                  throttles harder when the route runs ahead of pace (§4.2, D-097)",
                 auto.gain
             ),
+        );
+    }
+
+    if auto.member_retention_days == 0 {
+        v.push(
+            at("member_retention_days"),
+            "must be at least 1; a route's members are dropped this many days after its \
+             last commit, and 0 would drop them while it is still sending (§4.2, D-118)"
+                .to_string(),
         );
     }
 

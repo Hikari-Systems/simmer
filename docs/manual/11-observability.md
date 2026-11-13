@@ -81,9 +81,22 @@ only unique within its ramp. Include `ramp` in `sum by (...)` clauses.
 | `simmer_quota_committed` | `ramp`, `route`, `domain_group` | Messages delivered today |
 | `simmer_quota_reserved` | `ramp`, `route`, `domain_group` | Messages being sent right now |
 | `simmer_warmup_day` | `ramp`, `route` | The route's day index. Negative before `started` |
+| `simmer_warmup_step` | `ramp`, `route`, `domain_group` | The schedule entry in use today. The same as the day under `advance: auto` |
+| `simmer_warmup_held_days` | `ramp`, `route`, `domain_group` | Days behind the calendar because a day fell short. Worth a dashboard |
+| `simmer_warmup_advance_threshold` | `ramp`, `route` | The fraction of its plan a day must deliver. Absent under `auto` |
+| `simmer_warmup_previous_attainment` | `ramp`, `route`, `domain_group` | Delivered divided by planned, on the day today's step was decided from |
+| `simmer_warmup_advance_total` | `ramp`, `route`, `domain_group`, `outcome` | Each day's decision: `advanced`, `held`, `first` or `auto`. Counted once across instances |
 | `simmer_route_paused` | `ramp`, `route` | 1 while paused |
-| `simmer_route_skipped_total` | `ramp`, `route`, `reason` | Routes passed over in a chain, by reason |
+| `simmer_route_skipped_total` | `ramp`, `route`, `reason` | Routes passed over in a chain, by reason. `group_quota` means the route's ramp group was full |
 | `simmer_partial_ramp_share` | `ramp`, `route`, `domain_group` | The share currently offered, when a partial ramp is holding some back |
+| `simmer_partial_ramp_member_offered_total` | `ramp`, `route` | Messages the automatic share would have turned away, kept on the route because the recipient is a member |
+| `simmer_partial_ramp_members` | `ramp`, `route` | Members of an automatic-share route. Updated hourly by the member sweeper |
+| `simmer_partial_ramp_members_evicted_total` | `ramp`, `route` | Member rows dropped after `member_retention_days` with no delivery on the route |
+| `simmer_ramp_group_allowance` | `ramp_group` | Today's shared ceiling. Absent before the group's `started` |
+| `simmer_ramp_group_committed`, `simmer_ramp_group_reserved` | `ramp_group` | Delivered today, and being sent now, across every member ramp's warming routes |
+| `simmer_ramp_group_day`, `simmer_ramp_group_step`, `simmer_ramp_group_held_days` | `ramp_group` | The group's day, the schedule entry in use, and how many days it is behind |
+| `simmer_ramp_group_advance_total` | `ramp_group`, `outcome` | Each day's decision for the group, as `simmer_warmup_advance_total` |
+| `simmer_ramp_group_over_cap_total` | `ramp_group` | Thread-affinity replies sent past a full group |
 | `simmer_ramp_selected_total` | `ramp`, `source` | Which rule picked each message's ramp |
 | `simmer_ramp_header_rejected_total` | `reason` | `X-Simmer-Ramp` headers ignored |
 | `simmer_mx_lookups_total` | `result` | MX lookups for domain grouping |

@@ -70,6 +70,36 @@ macro_rules! conformance_suite {
         $harness!(adoption_is_idempotent);
         $harness!(adoption_refuses_a_quota_key_that_exists_under_the_ramp);
         $harness!(adoption_refuses_a_route_state_that_exists_under_the_ramp);
+        $harness!(a_new_row_records_its_step_and_keeps_it);
+        $harness!(an_override_that_creates_the_row_records_its_step);
+        $harness!(advance_rows_split_today_from_the_latest_earlier_row);
+        $harness!(advance_rows_skip_days_with_no_row);
+        $harness!(advance_rows_are_per_ramp_route_and_group);
+        $harness!(only_the_reservation_that_creates_a_row_says_so);
+        $harness!(exactly_one_racing_reservation_reports_creating_the_row);
+        $harness!(a_commit_with_a_member_key_makes_a_member);
+        $harness!(a_commit_without_a_member_key_makes_none);
+        $harness!(an_undelivered_message_makes_no_member);
+        $harness!(membership_is_per_ramp_and_route);
+        $harness!(a_repeat_commit_keeps_one_member_row);
+        $harness!(members_are_dropped_only_once_the_route_is_idle);
+        $harness!(dropping_one_route_keeps_the_others);
+        $harness!(racing_first_commits_for_one_recipient_make_one_member);
+        $harness!(a_grouped_reservation_counts_on_both_rows);
+        $harness!(a_grouped_release_gives_both_rows_back);
+        $harness!(the_group_cap_binds_across_ramps);
+        $harness!(the_route_cap_binds_when_the_group_has_room);
+        $harness!(a_day_both_are_full_is_reported_as_the_groups);
+        $harness!(a_refused_group_reservation_changes_nothing);
+        $harness!(an_over_cap_grouped_reservation_counts_on_both_rows);
+        $harness!(the_first_group_allowance_written_is_authoritative);
+        $harness!(the_sweeper_releases_group_rows_too);
+        $harness!(committing_a_swept_grouped_reservation_still_counts_on_both);
+        $harness!(group_advance_rows_split_today_from_the_latest_earlier_row);
+        $harness!(an_ungrouped_reservation_never_touches_a_group_row);
+        $harness!(racing_ramps_never_overshoot_their_group);
+        $harness!(exactly_one_racing_reservation_creates_the_group_row);
+        $harness!(grouped_reserves_commits_and_releases_interleave_without_deadlock);
     };
 }
 
@@ -92,6 +122,7 @@ fn at(route: &str, group: &str, day: i64, allowance: Option<i64>, count: i64) ->
         correlation_id: Uuid::new_v4().to_string(),
         expires_at: Utc::now() + Duration::minutes(10),
         over_cap: false,
+        ..Default::default()
     }
 }
 
@@ -125,13 +156,16 @@ async fn taken(store: &Arc<dyn QuotaStore>, req: &ReserveRequest) -> Reservation
     match store.reserve(req).await.expect("reserve") {
         Reserved::Taken(r) => r,
         Reserved::NoHeadroom { usage } => panic!("expected headroom, got {usage:?}"),
+        Reserved::NoGroupHeadroom { usage } => {
+            panic!("expected group headroom, got {usage:?}")
+        }
     }
 }
 
 async fn refused(store: &Arc<dyn QuotaStore>, req: &ReserveRequest) {
     match store.reserve(req).await.expect("reserve") {
         Reserved::NoHeadroom { .. } => {}
-        Reserved::Taken(r) => panic!("expected no headroom, got {r:?}"),
+        other => panic!("expected no headroom on the route, got {other:?}"),
     }
 }
 
@@ -317,7 +351,7 @@ pub async fn an_override_raises_the_ceiling_and_can_be_cleared(stores: Stores<'_
     s.commit(&r, &[]).await.unwrap();
     refused(&s, &request("warming", Some(1), 1)).await;
 
-    s.set_allowance_override("main", "warming", "catchall", 0, Some(3), Some(1))
+    s.set_allowance_override("main", "warming", "catchall", 0, Some(3), Some(1), None)
         .await
         .unwrap();
     let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
@@ -326,7 +360,7 @@ pub async fn an_override_raises_the_ceiling_and_can_be_cleared(stores: Stores<'_
     taken(&s, &request("warming", Some(1), 1)).await;
     refused(&s, &request("warming", Some(1), 1)).await;
 
-    s.set_allowance_override("main", "warming", "catchall", 0, None, Some(1))
+    s.set_allowance_override("main", "warming", "catchall", 0, None, Some(1), None)
         .await
         .unwrap();
     let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
@@ -337,11 +371,11 @@ pub async fn an_override_on_a_fresh_row_keeps_the_schedule_behind_it(stores: Sto
     // D-025: clearing an override on a row the override created leaves the
     // schedule's number, not a null (which would read as unlimited).
     let s = stores();
-    s.set_allowance_override("main", "warming", "google", 4, Some(0), Some(20))
+    s.set_allowance_override("main", "warming", "google", 4, Some(0), Some(20), None)
         .await
         .unwrap();
     refused(&s, &at("warming", "google", 4, Some(20), 1)).await;
-    s.set_allowance_override("main", "warming", "google", 4, None, Some(20))
+    s.set_allowance_override("main", "warming", "google", 4, None, Some(20), None)
         .await
         .unwrap();
     let u = s.usage("main", "warming", "google", 4).await.unwrap();
@@ -495,6 +529,7 @@ async fn race(stores: &[Arc<dyn QuotaStore>], n: usize, slots: i64) -> i64 {
                     1
                 }
                 Ok(Reserved::NoHeadroom { .. }) => 0,
+                Ok(other) => panic!("ungrouped: {other:?}"),
                 Err(e) => panic!("reserve failed: {e}"),
             }
         }));
@@ -672,8 +707,16 @@ pub async fn concurrent_admin_upserts_on_fresh_keys_do_not_collide(stores: Store
                 gate.wait().await;
                 let route = format!("r{round}");
                 if i % 3 == 0 {
-                    s.set_allowance_override("main", &route, "google", round, Some(5), Some(1))
-                        .await
+                    s.set_allowance_override(
+                        "main",
+                        &route,
+                        "google",
+                        round,
+                        Some(5),
+                        Some(1),
+                        None,
+                    )
+                    .await
                 } else if i % 3 == 1 {
                     s.set_paused("main", &route, true).await
                 } else {
@@ -991,4 +1034,772 @@ pub async fn adoption_refuses_a_route_state_that_exists_under_the_ramp(stores: S
         "{err}"
     );
     assert!(s.route_states("").await.unwrap()["warming"].paused);
+}
+
+// ---------------------------------------------------------------------------
+// D-115 — the step a row is created at
+// ---------------------------------------------------------------------------
+
+fn stepped(route: &str, day: i64, allowance: i64, step: i64, count: i64) -> ReserveRequest {
+    ReserveRequest {
+        step: Some(step),
+        ..at(route, "catchall", day, Some(allowance), count)
+    }
+}
+
+pub async fn a_new_row_records_its_step_and_keeps_it(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(&s, &stepped("warming", 3, 50, 1, 1)).await;
+    s.commit(&r, &[]).await.unwrap();
+    // A later reservation offering a different step changes nothing: the row is
+    // authoritative once written, like its allowance (D-026).
+    let r = taken(&s, &stepped("warming", 3, 999, 2, 1)).await;
+    s.commit(&r, &[]).await.unwrap();
+
+    let rows = s
+        .advance_rows("main", "warming", "catchall", 3)
+        .await
+        .unwrap();
+    let today = rows.today.expect("today's row");
+    assert_eq!(
+        (
+            today.day_index,
+            today.step,
+            today.allowance,
+            today.committed
+        ),
+        (3, Some(1), Some(50), 2)
+    );
+}
+
+pub async fn an_override_that_creates_the_row_records_its_step(stores: Stores<'_>) {
+    let s = stores();
+    s.set_allowance_override(
+        "main",
+        "warming",
+        "catchall",
+        4,
+        Some(10),
+        Some(50),
+        Some(2),
+    )
+    .await
+    .unwrap();
+    let today = s
+        .advance_rows("main", "warming", "catchall", 4)
+        .await
+        .unwrap()
+        .today
+        .expect("the override created it");
+    // The planned allowance, not the override: D-115 measures against the plan.
+    assert_eq!((today.step, today.allowance), (Some(2), Some(50)));
+}
+
+pub async fn advance_rows_split_today_from_the_latest_earlier_row(stores: Stores<'_>) {
+    let s = stores();
+    for (day, step) in [(0, 0), (1, 1), (2, 1)] {
+        let r = taken(&s, &stepped("warming", day, 100, step, 1)).await;
+        s.commit(&r, &[]).await.unwrap();
+    }
+    // Asking about day 2: today is day 2, previous is day 1.
+    let rows = s
+        .advance_rows("main", "warming", "catchall", 2)
+        .await
+        .unwrap();
+    assert_eq!(rows.today.map(|r| r.day_index), Some(2));
+    assert_eq!(
+        rows.previous.map(|r| (r.day_index, r.step)),
+        Some((1, Some(1)))
+    );
+    // Asking about day 3, which has no row: no today, previous is day 2.
+    let rows = s
+        .advance_rows("main", "warming", "catchall", 3)
+        .await
+        .unwrap();
+    assert_eq!(rows.today, None);
+    assert_eq!(rows.previous.map(|r| r.day_index), Some(2));
+    // Asking about day 1 never sees day 2: nothing from the future.
+    let rows = s
+        .advance_rows("main", "warming", "catchall", 1)
+        .await
+        .unwrap();
+    assert_eq!(rows.today.map(|r| r.day_index), Some(1));
+    assert_eq!(rows.previous.map(|r| r.day_index), Some(0));
+}
+
+pub async fn advance_rows_skip_days_with_no_row(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(&s, &stepped("warming", 1, 100, 1, 1)).await;
+    s.commit(&r, &[]).await.unwrap();
+    // Days 2–9 sent nothing; day 10's previous is still day 1.
+    let rows = s
+        .advance_rows("main", "warming", "catchall", 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.today, None);
+    let p = rows.previous.expect("day 1");
+    assert_eq!((p.day_index, p.committed, p.allowance), (1, 1, Some(100)));
+    // And an element that has never sent has neither.
+    let none = s
+        .advance_rows("main", "never", "catchall", 10)
+        .await
+        .unwrap();
+    assert_eq!((none.today, none.previous), (None, None));
+}
+
+pub async fn advance_rows_are_per_ramp_route_and_group(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(&s, &stepped("warming", 0, 100, 0, 1)).await;
+    s.commit(&r, &[]).await.unwrap();
+    for (ramp, route, group) in [
+        ("other", "warming", "catchall"),
+        ("main", "warming-b", "catchall"),
+        ("main", "warming", "google"),
+    ] {
+        let rows = s.advance_rows(ramp, route, group, 1).await.unwrap();
+        assert_eq!(rows.previous, None, "{ramp}/{route}/{group}");
+    }
+}
+
+pub async fn only_the_reservation_that_creates_a_row_says_so(stores: Stores<'_>) {
+    let s = stores();
+    let first = taken(&s, &stepped("warming", 0, 10, 0, 1)).await;
+    let second = taken(&s, &stepped("warming", 0, 10, 0, 1)).await;
+    assert!(first.created_row);
+    assert!(!second.created_row);
+    // A refused reservation on a fresh zero-allowance row creates nothing that
+    // lasts, and the next attempt still finds no row to have been created.
+    refused(&s, &stepped("empty", 0, 0, 0, 1)).await;
+    assert_eq!(
+        s.advance_rows("main", "empty", "catchall", 0)
+            .await
+            .unwrap()
+            .today,
+        None
+    );
+}
+
+pub async fn exactly_one_racing_reservation_reports_creating_the_row(stores: Stores<'_>) {
+    // D-115's counter counts each element's daily decision once across every
+    // instance. Two pools, warmed, released together on fresh keys.
+    const N: usize = 16;
+    const ROUNDS: i64 = 10;
+    let (a, b) = (stores(), stores());
+    warm(&[Arc::clone(&a), Arc::clone(&b)], N).await;
+    for day in 0..ROUNDS {
+        let gate = Arc::new(tokio::sync::Barrier::new(N));
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let st = if i % 2 == 0 {
+                Arc::clone(&a)
+            } else {
+                Arc::clone(&b)
+            };
+            let gate = Arc::clone(&gate);
+            handles.push(tokio::spawn(async move {
+                gate.wait().await;
+                match st.reserve(&stepped("race", day, N as i64, 0, 1)).await {
+                    Ok(Reserved::Taken(r)) => r.created_row,
+                    other => panic!("every contender reserves: {other:?}"),
+                }
+            }));
+        }
+        let mut created = 0;
+        for h in handles {
+            if h.await.expect("task") {
+                created += 1;
+            }
+        }
+        assert_eq!(created, 1, "round {day}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D-118 — sticky membership of an auto partial ramp
+// ---------------------------------------------------------------------------
+
+async fn member(store: &Arc<dyn QuotaStore>, recipient: &str) -> simmer::frequency::Key {
+    keyer(store).await.key(&format!("{recipient}\0member"))
+}
+
+async fn is_member(
+    store: &Arc<dyn QuotaStore>,
+    ramp: &str,
+    route: &str,
+    key: &simmer::frequency::Key,
+) -> bool {
+    store
+        .is_partial_member(ramp, route, key)
+        .await
+        .expect("is_partial_member")
+}
+
+pub async fn a_commit_with_a_member_key_makes_a_member(stores: Stores<'_>) {
+    let s = stores();
+    let k = member(&s, "a@example.com").await;
+    assert!(!is_member(&s, "main", "warming", &k).await);
+    let r = taken(&s, &request("warming", Some(10), 1)).await;
+    s.commit_recording(&r, &[], Some(&k)).await.unwrap();
+    assert!(is_member(&s, "main", "warming", &k).await);
+    // Someone else is not.
+    let other = member(&s, "b@example.com").await;
+    assert!(!is_member(&s, "main", "warming", &other).await);
+    // And the count moved exactly as a plain commit's does.
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
+    assert_eq!((u.reserved, u.committed), (0, 1));
+}
+
+pub async fn a_commit_without_a_member_key_makes_none(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(&s, &request("warming", Some(10), 1)).await;
+    s.commit(&r, &[]).await.unwrap();
+    assert!(s.partial_member_routes().await.unwrap().is_empty());
+}
+
+pub async fn an_undelivered_message_makes_no_member(stores: Stores<'_>) {
+    // Membership is "a message was COMMITTED to them on this route": a release
+    // is not that, so it must leave no row behind.
+    let s = stores();
+    let k = member(&s, "a@example.com").await;
+    let r = taken(&s, &request("warming", Some(10), 1)).await;
+    s.release(&r).await.unwrap();
+    assert!(!is_member(&s, "main", "warming", &k).await);
+    assert!(s.partial_member_routes().await.unwrap().is_empty());
+}
+
+pub async fn membership_is_per_ramp_and_route(stores: Stores<'_>) {
+    let s = stores();
+    let k = member(&s, "a@example.com").await;
+    let r = taken(&s, &request("warming", Some(10), 1)).await;
+    s.commit_recording(&r, &[], Some(&k)).await.unwrap();
+    assert!(is_member(&s, "main", "warming", &k).await);
+    assert!(!is_member(&s, "main", "other", &k).await, "another route");
+    assert!(
+        !is_member(&s, "partner", "warming", &k).await,
+        "another ramp"
+    );
+    assert!(
+        !is_member(&s, "main", "Warming", &k).await,
+        "case-sensitive"
+    );
+}
+
+pub async fn a_repeat_commit_keeps_one_member_row(stores: Stores<'_>) {
+    let s = stores();
+    let k = member(&s, "a@example.com").await;
+    for day in 0..3 {
+        let r = taken(&s, &at("warming", "catchall", day, Some(10), 1)).await;
+        s.commit_recording(&r, &[], Some(&k)).await.unwrap();
+    }
+    let routes = s.partial_member_routes().await.unwrap();
+    assert_eq!(routes.len(), 1);
+    assert_eq!(
+        (
+            routes[0].ramp.as_str(),
+            routes[0].route.as_str(),
+            routes[0].members
+        ),
+        ("main", "warming", 1)
+    );
+}
+
+pub async fn members_are_dropped_only_once_the_route_is_idle(stores: Stores<'_>) {
+    let s = stores();
+    let (a, b) = (
+        member(&s, "a@example.com").await,
+        member(&s, "b@example.com").await,
+    );
+    for k in [&a, &b] {
+        let r = taken(&s, &request("warming", Some(10), 1)).await;
+        s.commit_recording(&r, &[], Some(k)).await.unwrap();
+    }
+    let before = Utc::now();
+    let last = s.partial_member_routes().await.unwrap()[0].last_committed_at;
+    assert!(last <= before + Duration::seconds(5), "{last} vs {before}");
+
+    // Idle since an hour ago: the route committed after that, so nothing goes.
+    let kept = s
+        .drop_partial_members("main", "warming", Utc::now() - Duration::hours(1))
+        .await
+        .unwrap();
+    assert_eq!(kept, 0);
+    assert!(is_member(&s, "main", "warming", &a).await);
+
+    // Idle since a minute from now: every commit was before it, so the route's
+    // rows go together.
+    let dropped = s
+        .drop_partial_members("main", "warming", Utc::now() + Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(dropped, 2);
+    assert!(!is_member(&s, "main", "warming", &a).await);
+    assert!(!is_member(&s, "main", "warming", &b).await);
+    assert!(s.partial_member_routes().await.unwrap().is_empty());
+}
+
+pub async fn dropping_one_route_keeps_the_others(stores: Stores<'_>) {
+    let s = stores();
+    let k = member(&s, "a@example.com").await;
+    for (ramp, route) in [
+        ("main", "warming"),
+        ("main", "other"),
+        ("partner", "warming"),
+    ] {
+        let r = taken(&s, &in_ramp(ramp, request(route, Some(10), 1))).await;
+        s.commit_recording(&r, &[], Some(&k)).await.unwrap();
+    }
+    let n = s
+        .drop_partial_members("main", "warming", Utc::now() + Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    assert!(!is_member(&s, "main", "warming", &k).await);
+    assert!(is_member(&s, "main", "other", &k).await);
+    assert!(is_member(&s, "partner", "warming", &k).await);
+}
+
+pub async fn racing_first_commits_for_one_recipient_make_one_member(stores: Stores<'_>) {
+    // Two pools, warmed, released together: every contender is the recipient's
+    // "first" commit. Insert-if-absent must leave exactly one row, and none of
+    // the commits may fail on the duplicate.
+    const N: usize = 12;
+    let (a, b) = (stores(), stores());
+    warm(&[Arc::clone(&a), Arc::clone(&b)], N).await;
+    let k = member(&a, "racer@example.com").await;
+    let mut reservations = Vec::new();
+    for _ in 0..N {
+        reservations.push(taken(&a, &request("warming", Some(N as i64), 1)).await);
+    }
+    let gate = Arc::new(tokio::sync::Barrier::new(N));
+    let mut handles = Vec::new();
+    for (i, r) in reservations.into_iter().enumerate() {
+        let st = if i % 2 == 0 {
+            Arc::clone(&a)
+        } else {
+            Arc::clone(&b)
+        };
+        let (gate, k) = (Arc::clone(&gate), k.clone());
+        handles.push(tokio::spawn(async move {
+            gate.wait().await;
+            st.commit_recording(&r, &[], Some(&k)).await
+        }));
+    }
+    for h in handles {
+        h.await.expect("task").expect("every commit succeeds");
+    }
+    let routes = a.partial_member_routes().await.unwrap();
+    assert_eq!(routes.len(), 1);
+    assert_eq!(routes[0].members, 1);
+    let u = a.usage("main", "warming", "catchall", 0).await.unwrap();
+    assert_eq!(u.committed, N as i64);
+}
+
+// ---------------------------------------------------------------------------
+// D-116 — ramp groups: one shared ceiling over several ramps' warming routes
+// ---------------------------------------------------------------------------
+
+/// `req`, also counted against `group`'s row for `day` at `allowance`.
+fn grouped(req: ReserveRequest, group: &str, day: i64, allowance: i64) -> ReserveRequest {
+    ReserveRequest {
+        group: Some(simmer::quota::GroupReserve {
+            name: group.into(),
+            day_index: day,
+            allowance,
+            step: day.max(0),
+        }),
+        ..req
+    }
+}
+
+async fn group_refused(store: &Arc<dyn QuotaStore>, req: &ReserveRequest) {
+    match store.reserve(req).await.expect("reserve") {
+        Reserved::NoGroupHeadroom { .. } => {}
+        other => panic!("expected no group headroom, got {other:?}"),
+    }
+}
+
+async fn group(store: &Arc<dyn QuotaStore>, name: &str, day: i64) -> simmer::quota::Usage {
+    store.group_usage(name, day).await.expect("group_usage")
+}
+
+pub async fn a_grouped_reservation_counts_on_both_rows(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(
+        &s,
+        &grouped(request("warming", Some(10), 1), "brands", 0, 5),
+    )
+    .await;
+    assert_eq!(
+        r.ramp_group,
+        Some(simmer::quota::GroupHold {
+            name: "brands".into(),
+            day_index: 0
+        })
+    );
+    let g = group(&s, "brands", 0).await;
+    assert_eq!((g.allowance, g.reserved, g.committed), (Some(5), 1, 0));
+
+    s.commit(&r, &[]).await.unwrap();
+    let g = group(&s, "brands", 0).await;
+    assert_eq!((g.reserved, g.committed), (0, 1));
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
+    assert_eq!((u.reserved, u.committed), (0, 1));
+}
+
+pub async fn a_grouped_release_gives_both_rows_back(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(
+        &s,
+        &grouped(request("warming", Some(10), 1), "brands", 0, 5),
+    )
+    .await;
+    s.release(&r).await.unwrap();
+    let g = group(&s, "brands", 0).await;
+    assert_eq!((g.reserved, g.committed), (0, 0));
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
+    assert_eq!((u.reserved, u.committed), (0, 0));
+}
+
+pub async fn the_group_cap_binds_across_ramps(stores: Stores<'_>) {
+    // Two ramps, each with plenty of its own room, share a ceiling of 3.
+    let s = stores();
+    let main = || grouped(request("warming", Some(10), 1), "brands", 0, 3);
+    let partner = || in_ramp("partner", main());
+    for req in [main(), partner(), main()] {
+        let r = taken(&s, &req).await;
+        s.commit(&r, &[]).await.unwrap();
+    }
+    group_refused(&s, &partner()).await;
+    group_refused(&s, &main()).await;
+
+    let g = group(&s, "brands", 0).await;
+    assert_eq!((g.committed, g.reserved), (3, 0));
+    assert_eq!(
+        s.usage("main", "warming", "catchall", 0)
+            .await
+            .unwrap()
+            .committed,
+        2
+    );
+    assert_eq!(
+        s.usage("partner", "warming", "catchall", 0)
+            .await
+            .unwrap()
+            .committed,
+        1
+    );
+}
+
+pub async fn the_route_cap_binds_when_the_group_has_room(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(
+        &s,
+        &grouped(request("warming", Some(1), 1), "brands", 0, 10),
+    )
+    .await;
+    s.commit(&r, &[]).await.unwrap();
+    refused(
+        &s,
+        &grouped(request("warming", Some(1), 1), "brands", 0, 10),
+    )
+    .await;
+}
+
+pub async fn a_day_both_are_full_is_reported_as_the_groups(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(&s, &grouped(request("warming", Some(1), 1), "brands", 0, 1)).await;
+    s.commit(&r, &[]).await.unwrap();
+    group_refused(&s, &grouped(request("warming", Some(1), 1), "brands", 0, 1)).await;
+}
+
+pub async fn a_refused_group_reservation_changes_nothing(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(
+        &s,
+        &grouped(request("warming", Some(10), 1), "brands", 0, 1),
+    )
+    .await;
+    s.commit(&r, &[]).await.unwrap();
+    group_refused(
+        &s,
+        &grouped(request("warming", Some(10), 1), "brands", 0, 1),
+    )
+    .await;
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
+    assert_eq!(
+        (u.committed, u.reserved),
+        (1, 0),
+        "the route row is untouched"
+    );
+    let g = group(&s, "brands", 0).await;
+    assert_eq!((g.committed, g.reserved), (1, 0));
+}
+
+pub async fn an_over_cap_grouped_reservation_counts_on_both_rows(stores: Stores<'_>) {
+    // D-090 on a group: a pinned reply skips both checks and counts on both.
+    let s = stores();
+    let req = || grouped(request("warming", Some(1), 1), "brands", 0, 1);
+    let r = taken(&s, &req()).await;
+    s.commit(&r, &[]).await.unwrap();
+    group_refused(&s, &req()).await;
+
+    let r = taken(&s, &over_cap(req())).await;
+    s.commit(&r, &[]).await.unwrap();
+    let g = group(&s, "brands", 0).await;
+    assert_eq!(
+        (g.committed, g.allowance),
+        (2, Some(1)),
+        "past the group's cap"
+    );
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
+    assert_eq!(u.committed, 2, "and the route's");
+    // Nothing else is let through.
+    group_refused(&s, &req()).await;
+}
+
+pub async fn the_first_group_allowance_written_is_authoritative(stores: Stores<'_>) {
+    let s = stores();
+    let first = taken(
+        &s,
+        &grouped(request("warming", Some(10), 1), "brands", 0, 2),
+    )
+    .await;
+    assert!(first.created_group_row);
+    let second = taken(
+        &s,
+        &grouped(request("warming", Some(10), 1), "brands", 0, 999),
+    )
+    .await;
+    assert!(!second.created_group_row);
+    assert_eq!(group(&s, "brands", 0).await.allowance, Some(2));
+    group_refused(
+        &s,
+        &grouped(request("warming", Some(10), 1), "brands", 0, 999),
+    )
+    .await;
+}
+
+pub async fn the_sweeper_releases_group_rows_too(stores: Stores<'_>) {
+    let s = stores();
+    taken(&s, &grouped(expired("warming", Some(5)), "brands", 0, 5)).await;
+    taken(&s, &grouped(expired("warming", Some(5)), "brands", 0, 5)).await;
+    taken(&s, &grouped(request("warming", Some(5), 1), "brands", 0, 5)).await;
+
+    let swept = s.sweep_expired().await.unwrap();
+    assert_eq!(swept.len(), 1, "{swept:?}");
+    assert_eq!(swept[0].count, 2);
+    assert_eq!(group(&s, "brands", 0).await.reserved, 1);
+    assert_eq!(
+        s.usage("main", "warming", "catchall", 0)
+            .await
+            .unwrap()
+            .reserved,
+        1
+    );
+    assert!(s.sweep_expired().await.unwrap().is_empty(), "idempotent");
+    assert_eq!(group(&s, "brands", 0).await.reserved, 1);
+}
+
+pub async fn committing_a_swept_grouped_reservation_still_counts_on_both(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(&s, &grouped(expired("warming", Some(5)), "brands", 0, 5)).await;
+    s.sweep_expired().await.unwrap();
+    s.commit(&r, &[]).await.unwrap();
+    let g = group(&s, "brands", 0).await;
+    assert_eq!((g.committed, g.reserved), (1, 0));
+    let u = s.usage("main", "warming", "catchall", 0).await.unwrap();
+    assert_eq!((u.committed, u.reserved), (1, 0));
+
+    // And a release after the sweeper gives nothing back twice.
+    let r = taken(&s, &grouped(expired("warming", Some(5)), "brands", 0, 5)).await;
+    taken(&s, &grouped(request("warming", Some(5), 1), "brands", 0, 5)).await;
+    s.sweep_expired().await.unwrap();
+    s.release(&r).await.unwrap();
+    assert_eq!(group(&s, "brands", 0).await.reserved, 1);
+}
+
+pub async fn group_advance_rows_split_today_from_the_latest_earlier_row(stores: Stores<'_>) {
+    let s = stores();
+    // Days 0 and 2 have rows; 1 and 3 do not.
+    for (day, n) in [(0, 2), (2, 1)] {
+        for _ in 0..n {
+            let r = taken(
+                &s,
+                &grouped(
+                    at("warming", "catchall", day, Some(10), 1),
+                    "brands",
+                    day,
+                    4,
+                ),
+            )
+            .await;
+            s.commit(&r, &[]).await.unwrap();
+        }
+    }
+    let rows = s.group_advance_rows("brands", 2).await.unwrap();
+    let today = rows.today.expect("day 2");
+    let prev = rows.previous.expect("day 0");
+    assert_eq!(
+        (
+            today.day_index,
+            today.step,
+            today.allowance,
+            today.committed
+        ),
+        (2, Some(2), Some(4), 1)
+    );
+    assert_eq!((prev.day_index, prev.committed), (0, 2));
+
+    let rows = s.group_advance_rows("brands", 3).await.unwrap();
+    assert!(rows.today.is_none());
+    assert_eq!(rows.previous.map(|r| r.day_index), Some(2));
+
+    assert_eq!(
+        s.group_advance_rows("other", 3).await.unwrap(),
+        Default::default()
+    );
+}
+
+pub async fn an_ungrouped_reservation_never_touches_a_group_row(stores: Stores<'_>) {
+    let s = stores();
+    let r = taken(&s, &request("warming", Some(10), 1)).await;
+    assert!(r.ramp_group.is_none() && !r.created_group_row);
+    s.commit(&r, &[]).await.unwrap();
+    assert_eq!(group(&s, "brands", 0).await, Default::default());
+    assert_eq!(
+        s.group_advance_rows("brands", 0).await.unwrap(),
+        Default::default()
+    );
+}
+
+pub async fn racing_ramps_never_overshoot_their_group(stores: Stores<'_>) {
+    // Two pools, two ramps, routes with room to spare: only the group binds.
+    const N: usize = 24;
+    const CAP: i64 = 7;
+    let (a, b) = (stores(), stores());
+    warm(&[Arc::clone(&a), Arc::clone(&b)], N).await;
+    let gate = Arc::new(tokio::sync::Barrier::new(N));
+    let mut handles = Vec::new();
+    for i in 0..N {
+        let st = if i % 2 == 0 {
+            Arc::clone(&a)
+        } else {
+            Arc::clone(&b)
+        };
+        let ramp = if i % 3 == 0 { "main" } else { "partner" };
+        let gate = Arc::clone(&gate);
+        handles.push(tokio::spawn(async move {
+            let req = grouped(
+                in_ramp(ramp, request("warming", Some(100), 1)),
+                "brands",
+                0,
+                CAP,
+            );
+            gate.wait().await;
+            match st.reserve(&req).await.expect("reserve") {
+                Reserved::Taken(r) => {
+                    st.commit(&r, &[]).await.expect("commit");
+                    1
+                }
+                Reserved::NoGroupHeadroom { .. } => 0,
+                other => panic!("only the group binds: {other:?}"),
+            }
+        }));
+    }
+    let mut won = 0;
+    for h in handles {
+        won += h.await.expect("task");
+    }
+    assert_eq!(won, CAP);
+    let g = group(&a, "brands", 0).await;
+    assert_eq!((g.committed, g.reserved), (CAP, 0));
+}
+
+pub async fn exactly_one_racing_reservation_creates_the_group_row(stores: Stores<'_>) {
+    const N: usize = 16;
+    let (a, b) = (stores(), stores());
+    warm(&[Arc::clone(&a), Arc::clone(&b)], N).await;
+    for day in 0..5 {
+        let gate = Arc::new(tokio::sync::Barrier::new(N));
+        let mut handles = Vec::new();
+        for i in 0..N {
+            let st = if i % 2 == 0 {
+                Arc::clone(&a)
+            } else {
+                Arc::clone(&b)
+            };
+            let gate = Arc::clone(&gate);
+            handles.push(tokio::spawn(async move {
+                // Different routes, so only the group row is contended for
+                // creation.
+                let req = grouped(
+                    at(&format!("r{i}"), "catchall", day, Some(10), 1),
+                    "brands",
+                    day,
+                    N as i64,
+                );
+                gate.wait().await;
+                match st.reserve(&req).await {
+                    Ok(Reserved::Taken(r)) => r.created_group_row,
+                    other => panic!("every contender reserves: {other:?}"),
+                }
+            }));
+        }
+        let mut created = 0;
+        for h in handles {
+            if h.await.expect("task") {
+                created += 1;
+            }
+        }
+        assert_eq!(created, 1, "day {day}");
+    }
+}
+
+pub async fn grouped_reserves_commits_and_releases_interleave_without_deadlock(stores: Stores<'_>) {
+    // Every transaction touching both rows takes the group's lock first. Mix
+    // reserves, commits, releases and sweeps over two routes sharing a group,
+    // from two pools: any order inversion shows up as a deadlock error here.
+    const N: usize = 16;
+    const ROUNDS: usize = 6;
+    let (a, b) = (stores(), stores());
+    warm(&[Arc::clone(&a), Arc::clone(&b)], N).await;
+    let gate = Arc::new(tokio::sync::Barrier::new(N));
+    let mut handles = Vec::new();
+    for i in 0..N {
+        let st = if i % 2 == 0 {
+            Arc::clone(&a)
+        } else {
+            Arc::clone(&b)
+        };
+        let gate = Arc::clone(&gate);
+        handles.push(tokio::spawn(async move {
+            gate.wait().await;
+            let mut committed = 0;
+            for round in 0..ROUNDS {
+                let route = if (i + round) % 2 == 0 { "w1" } else { "w2" };
+                let req = grouped(request(route, Some(1000), 1), "brands", 0, 1000);
+                let r = taken(&st, &req).await;
+                if (i + round) % 3 == 0 {
+                    st.release(&r).await.expect("release");
+                } else {
+                    st.commit(&r, &[]).await.expect("commit");
+                    committed += 1;
+                }
+                if round == ROUNDS / 2 {
+                    st.sweep_expired().await.expect("sweep");
+                }
+            }
+            committed
+        }));
+    }
+    let mut total = 0;
+    for h in handles {
+        total += h.await.expect("no task may fail");
+    }
+    let g = group(&a, "brands", 0).await;
+    assert_eq!((g.committed, g.reserved), (total, 0));
+    let w1 = a.usage("main", "w1", "catchall", 0).await.unwrap();
+    let w2 = a.usage("main", "w2", "catchall", 0).await.unwrap();
+    assert_eq!(w1.committed + w2.committed, total);
+    assert_eq!(w1.reserved + w2.reserved, 0);
 }

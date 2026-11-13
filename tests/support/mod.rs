@@ -896,6 +896,8 @@ pub struct GrantAllQuota {
     /// put a route over its threshold without a database and without waiting for
     /// a window to fill.
     counts: Arc<Mutex<HashMap<String, i64>>>,
+    /// D-118 — `(ramp, route, member key)` for every commit that carried one.
+    members: Arc<Mutex<Vec<(String, String, Key)>>>,
 }
 
 impl GrantAllQuota {
@@ -945,14 +947,25 @@ impl QuotaStore for GrantAllQuota {
             domain_group: req.domain_group.clone(),
             day_index: req.day_index,
             count: req.count,
+            created_row: false,
+            ramp_group: None,
+            created_group_row: false,
         }))
     }
 
-    async fn commit(
+    async fn commit_recording(
         &self,
         reservation: &Reservation,
         recipient_keys: &[Key],
+        member: Option<&Key>,
     ) -> Result<(), QuotaError> {
+        if let Some(m) = member {
+            self.members.lock().expect("not poisoned").push((
+                reservation.ramp.clone(),
+                reservation.route.clone(),
+                m.clone(),
+            ));
+        }
         self.committed
             .lock()
             .expect("not poisoned")
@@ -1029,6 +1042,7 @@ impl QuotaStore for GrantAllQuota {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // D-115 added the step beside the allowance
     async fn set_allowance_override(
         &self,
         _ramp: &str,
@@ -1037,6 +1051,7 @@ impl QuotaStore for GrantAllQuota {
         day: i64,
         allowance: Option<i64>,
         scheduled: Option<i64>,
+        _scheduled_step: Option<i64>,
     ) -> Result<(), QuotaError> {
         let mut rows = self.usage.lock().expect("not poisoned");
         let row = rows
@@ -1047,6 +1062,19 @@ impl QuotaStore for GrantAllQuota {
             });
         row.allowance_override = allowance;
         Ok(())
+    }
+
+    /// Grants everything, so no element is ever held: nothing is read, and a
+    /// threshold-mode route is on its first step. Tests that care about D-115
+    /// use a real store.
+    async fn advance_rows(
+        &self,
+        _ramp: &str,
+        _route: &str,
+        _group: &str,
+        _day: i64,
+    ) -> Result<simmer::quota::AdvanceRows, QuotaError> {
+        Ok(simmer::quota::AdvanceRows::default())
     }
 
     async fn reset_counters(
@@ -1123,6 +1151,47 @@ impl QuotaStore for GrantAllQuota {
         _cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, QuotaError> {
         Ok(0)
+    }
+
+    async fn is_partial_member(
+        &self,
+        ramp: &str,
+        route: &str,
+        member: &Key,
+    ) -> Result<bool, QuotaError> {
+        Ok(self
+            .members
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .any(|(a, r, k)| a == ramp && r == route && k == member))
+    }
+
+    async fn partial_member_routes(
+        &self,
+    ) -> Result<Vec<simmer::quota::store::MemberRoute>, QuotaError> {
+        Ok(Vec::new())
+    }
+
+    async fn drop_partial_members(
+        &self,
+        _ramp: &str,
+        _route: &str,
+        _idle_since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, QuotaError> {
+        Ok(0)
+    }
+
+    async fn group_usage(&self, _: &str, _: i64) -> Result<Usage, QuotaError> {
+        Ok(Usage::default())
+    }
+
+    async fn group_advance_rows(
+        &self,
+        _: &str,
+        _: i64,
+    ) -> Result<simmer::quota::AdvanceRows, QuotaError> {
+        Ok(simmer::quota::AdvanceRows::default())
     }
 
     async fn is_available(&self) -> bool {

@@ -308,6 +308,12 @@ pub async fn reserve_relay_commit(
         route = Empty,
         domain_group = Empty,
         day_index = Empty,
+        warmup.step = Empty,
+        warmup.held_days = Empty,
+        warmup.advance_mode = Empty,
+        partial_ramp.member = Empty,
+        ramp_group = Empty,
+        ramp_group.step = Empty,
         thread_pin = Empty,
         over_cap = Empty,
         result = Empty,
@@ -383,6 +389,12 @@ async fn reserve_relay_commit_inner(
         route = Empty,
         domain_group = Empty,
         day_index = Empty,
+        warmup.step = Empty,
+        warmup.held_days = Empty,
+        warmup.advance_mode = Empty,
+        partial_ramp.member = Empty,
+        ramp_group = Empty,
+        ramp_group.step = Empty,
         over_cap = Empty,
     );
     let walk = chain::walk_and_reserve(
@@ -409,7 +421,24 @@ async fn reserve_relay_commit_inner(
                 span.record("route", s.route.name.as_str());
                 span.record("domain_group", s.domain_group.as_str());
                 span.record("day_index", s.day_index);
+                // D-115: where the selected window stood on its schedule. An
+                // overflow route has none.
+                if let Some(w) = s.route.warmup.as_ref() {
+                    span.record("warmup.step", s.position.step);
+                    span.record("warmup.held_days", s.position.held_days());
+                    span.record("warmup.advance_mode", w.advance().mode());
+                }
                 span.record("over_cap", s.over_cap);
+                // D-118: only recorded where it decided something — an auto
+                // route whose share refused and whose membership did not.
+                if s.partial_member {
+                    span.record("partial_ramp.member", true);
+                }
+                // D-116: the shared ceiling this message counted against.
+                if let Some(g) = s.ramp_group.as_ref() {
+                    span.record("ramp_group", g.name.as_str());
+                    span.record("ramp_group.step", g.step);
+                }
             }
             s
         }
@@ -653,9 +682,14 @@ async fn reserve_relay_commit_inner(
             // §7.4 phase 3, both halves in one transaction: the count moves from
             // `reserved` to `committed` and this message's recipient-frequency
             // events are recorded. `recipient_keys` is empty unless the selected
-            // route declares a constraint.
+            // route declares a constraint. D-118's membership rides in the same
+            // transaction; `member_key` is `None` unless the share is auto.
             store
-                .commit(&selected.reservation, &selected.recipient_keys)
+                .commit_recording(
+                    &selected.reservation,
+                    &selected.recipient_keys,
+                    selected.member_key.as_ref(),
+                )
                 .await
         } else {
             store.release(&selected.reservation).await

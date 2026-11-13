@@ -1,0 +1,181 @@
+# simmer: two brands warming through ONE provider, under one shared ceiling.
+#
+# Each brand is its own ramp (docs/manual/06-routing.md#ramps), with its own
+# senders, routes and schedule, as in starter.yaml. Both warming routes send
+# through the same provider account, so `ramp_groups` caps what the two may
+# send between them each day; past that, each brand's mail goes to its own
+# overflow route. Mail reaches `partner` through a listener with
+# `ramp: partner`, or through the `X-Simmer-Ramp` header.
+#
+# Walkthrough: docs/manual/08-warmup.md#sharing-a-ceiling-between-ramps
+# Every key:   docs/manual/reference.md
+
+server:
+  listeners:
+    # 2525 so the process needs no privilege to bind it. Plaintext with AUTH
+    # required, which is acceptable only on a trusted internal network; see
+    # docs/manual/04-server.md to add TLS and ports 587/465.
+    - address: "0.0.0.0:2525"
+      auth: required
+  hostname: "${SIMMER_HOSTNAME}"
+  max_message_bytes: 26214400          # 25 MiB
+  max_recipients: 1                    # one recipient per transaction, always
+  max_concurrent_sessions: 64
+  allowed_cidrs: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"]
+  timeouts:
+    command: 30s
+    data: 300s
+    session: 600s
+  auth:
+    allow_insecure_auth: true          # AUTH over plaintext; see the listener note
+    users:
+      - username: "${SIMMER_SMTP_USER}"
+        password_hash: "${SIMMER_SMTP_PASSWORD_HASH}"   # from `server hash-password`
+        grants:
+          send_as: ["${SIMMER_CURRENT_DOMAIN}", "${SIMMER_NEW_DOMAIN}"]
+
+database:
+  url: "${DATABASE_URL}"
+  connect_timeout: 5s
+
+admin:
+  listen: "0.0.0.0:8080"
+  auth_token: "${SIMMER_ADMIN_TOKEN}"
+  metrics: true
+
+default_ramp: main
+ramps:
+  main:
+    domain_groups:
+      - name: google
+        domains: ["gmail.com", "googlemail.com"]
+        mx: ["google.com", "googlemail.com"]
+      - name: microsoft
+        domains: ["outlook.com", "hotmail.com", "live.com", "msn.com"]
+        mx: ["mail.protection.outlook.com", "olc.protection.outlook.com"]
+      - name: yahoo
+        domains: ["yahoo.com", "aol.com"]
+        mx: ["yahoodns.net"]
+      - name: other
+        domains: ["*"]
+
+    # Mail from either domain takes the warming route while it has allowance,
+    # and the overflow route after that.
+    senders:
+      - match: "${SIMMER_CURRENT_DOMAIN}"
+        match_on: from_header
+        chain: [warming, overflow]
+      - match: "${SIMMER_NEW_DOMAIN}"
+        match_on: from_header
+        chain: [warming, overflow]
+    default_chain: [overflow]
+    warmup_advance: { mode: threshold, threshold: 0.9 }   # D-115; the default
+
+    routes:
+      - name: warming
+        downstream:
+          host: "${SIMMER_WARM_SMTP_HOST}"
+          port: 587
+          tls: required_verify
+          auth:
+            username: "${SIMMER_WARM_SMTP_USER}"
+            password: "${SIMMER_WARM_SMTP_PASSWORD}"
+          pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@${SIMMER_NEW_DOMAIN}"
+          set_headers:
+            From: "{{original.from.display_name}} <{{original.from.local}}@${SIMMER_NEW_DOMAIN}>"
+            Message-ID: "<{{uuid}}@${SIMMER_NEW_DOMAIN}>"
+        warmup:
+          started: "${SIMMER_WARMUP_STARTED}"   # RFC 3339, e.g. 2026-11-02T09:00:00Z
+          schedule:
+            # Messages per day per domain group, from day 0. The last value repeats.
+            default: [50, 100, 200, 400, 800, 1500, 3000, 5000, 8000, 12000]
+
+      - name: overflow
+        overflow: true
+        downstream:
+          host: "${SIMMER_OVERFLOW_SMTP_HOST}"
+          port: 587
+          tls: required_verify
+          auth:
+            username: "${SIMMER_OVERFLOW_SMTP_USER}"
+            password: "${SIMMER_OVERFLOW_SMTP_PASSWORD}"
+          pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@${SIMMER_CURRENT_DOMAIN}"
+          set_headers:
+            From: "{{original.from.display_name}} <{{original.from.local}}@${SIMMER_CURRENT_DOMAIN}>"
+            Message-ID: "<{{uuid}}@${SIMMER_CURRENT_DOMAIN}>"
+
+  partner:
+    domain_groups:
+      - name: google
+        domains: ["gmail.com", "googlemail.com"]
+        mx: ["google.com", "googlemail.com"]
+      - name: microsoft
+        domains: ["outlook.com", "hotmail.com", "live.com", "msn.com"]
+        mx: ["mail.protection.outlook.com", "olc.protection.outlook.com"]
+      - name: yahoo
+        domains: ["yahoo.com", "aol.com"]
+        mx: ["yahoodns.net"]
+      - name: other
+        domains: ["*"]
+
+    # Mail from either domain takes the warming route while it has allowance,
+    # and the overflow route after that.
+    senders:
+      - match: "${SIMMER_PARTNER_CURRENT_DOMAIN}"
+        match_on: from_header
+        chain: [warming, overflow]
+      - match: "${SIMMER_PARTNER_NEW_DOMAIN}"
+        match_on: from_header
+        chain: [warming, overflow]
+    default_chain: [overflow]
+    warmup_advance: { mode: threshold, threshold: 0.9 }   # D-115; the default
+
+    routes:
+      - name: warming
+        downstream:
+          host: "${SIMMER_WARM_SMTP_HOST}"
+          port: 587
+          tls: required_verify
+          auth:
+            username: "${SIMMER_WARM_SMTP_USER}"
+            password: "${SIMMER_WARM_SMTP_PASSWORD}"
+          pool: { max_connections: 4, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@${SIMMER_PARTNER_NEW_DOMAIN}"
+          set_headers:
+            From: "{{original.from.display_name}} <{{original.from.local}}@${SIMMER_PARTNER_NEW_DOMAIN}>"
+            Message-ID: "<{{uuid}}@${SIMMER_PARTNER_NEW_DOMAIN}>"
+        warmup:
+          started: "${SIMMER_WARMUP_STARTED}"   # RFC 3339, e.g. 2026-11-02T09:00:00Z
+          schedule:
+            # Messages per day per domain group, from day 0. The last value repeats.
+            default: [50, 100, 200, 400, 800, 1500, 3000, 5000, 8000, 12000]
+
+      - name: overflow
+        overflow: true
+        downstream:
+          host: "${SIMMER_OVERFLOW_SMTP_HOST}"
+          port: 587
+          tls: required_verify
+          auth:
+            username: "${SIMMER_OVERFLOW_SMTP_USER}"
+            password: "${SIMMER_OVERFLOW_SMTP_PASSWORD}"
+          pool: { max_connections: 8, idle_ttl: 60s, max_messages_per_connection: 100 }
+        identity:
+          envelope_from: "bounce@${SIMMER_PARTNER_CURRENT_DOMAIN}"
+          set_headers:
+            From: "{{original.from.display_name}} <{{original.from.local}}@${SIMMER_PARTNER_CURRENT_DOMAIN}>"
+            Message-ID: "<{{uuid}}@${SIMMER_PARTNER_CURRENT_DOMAIN}>"
+
+# One ceiling over BOTH brands' warming routes. Overflow routes never count.
+ramp_groups:
+  shared-provider:
+    ramps: [main, partner]
+    started: "${SIMMER_WARMUP_STARTED}"   # the group's own day 0
+    # Messages per day across both brands, from day 0. The last value repeats.
+    schedule: [80, 160, 320, 640, 1200, 2400, 4800, 8000, 13000, 20000]
+    advance: { mode: threshold, threshold: 0.9 }   # the default, as for a route

@@ -11,13 +11,19 @@
 //! as long as the route is warming and not graduated.
 //!
 //! Which messages are offered is a **keyed hash**, not a dice roll: the §7.3
-//! salt over the normalised recipient, the ramp, the route and the day index.
-//! That is what
+//! salt over the normalised recipient, the ramp and the route. That is what
 //! lets two instances agree without sharing any state, and what lets §9.4's dry
 //! run report the real result rather than a probability. The route is in the
 //! hash so two partial routes in one chain decide independently; the ramp is in
-//! it so two ramps' same-named routes do too (D-099); the day index is in it so
-//! a recipient's route can change from one day to the next.
+//! it so two ramps' same-named routes do too (D-099).
+//!
+//! **The day index is not in it** (D-117). Each recipient has one fixed
+//! [`draw`] per `(ramp, route)` for the life of the ramp, and is offered while
+//! `draw < share`. The offered sets are therefore nested: a share list that
+//! never decreases (§4.2 refuses one that does) keeps every recipient it has
+//! ramped onto the route for the rest of the ramp, and only ever adds more. It
+//! was in the hash until D-117, which let a recipient's identity change from
+//! one day to the next — exactly the churn a warm-up is meant to avoid.
 //!
 //! Nothing about the recipient leaves this module — not in a log line, not in a
 //! metric. §7.3 hashes so that the container keeps no record of who was mailed.
@@ -35,11 +41,15 @@ use crate::quota::{self, Allowance};
 /// the ramp.
 ///
 /// `auto` is `None` here too. [`share_for_group`] is what resolves either kind.
-pub fn share_today(route: &Route, day_index: i64, state: RouteState) -> Option<f64> {
-    if state.graduated {
+///
+/// A list is indexed by D-115's **step**, like the caps it paces, so a held
+/// element keeps the share of the entry it is held on. `day_index` only says
+/// whether the ramp has begun.
+pub fn share_today(route: &Route, day_index: i64, step: i64, state: RouteState) -> Option<f64> {
+    if state.graduated || day_index < 0 {
         return None;
     }
-    route.warmup.as_ref()?.schedule.share_for(day_index)
+    route.warmup.as_ref()?.schedule.share_for(step)
 }
 
 /// Does deciding this route's share need the day's quota row read first?
@@ -64,9 +74,13 @@ pub fn needs_usage(route: &Route, state: RouteState) -> bool {
 /// `usage` is the day's row, or `None` where no row exists yet — nothing has
 /// been sent on this route and group today, so the cap is untouched. `scheduled`
 /// is what §7.2 says the allowance is, used only when the row does not carry one.
+///
+/// `step` is D-115's schedule position, which indexes a share list; `day_index`
+/// and `now` are the clock D-097's pacing and the start check use.
 pub fn share_for_group(
     route: &Route,
     day_index: i64,
+    step: i64,
     state: RouteState,
     now: DateTime<Utc>,
     scheduled: Allowance,
@@ -77,7 +91,7 @@ pub fn share_for_group(
     }
     let warmup = route.warmup.as_ref()?;
     let Some(auto) = warmup.schedule.share.auto() else {
-        return warmup.schedule.share_for(day_index);
+        return share_today(route, day_index, step, state);
     };
     if day_index < 0 {
         // §7.2: a `started` in the future makes the route ineligible anyway, and
@@ -156,27 +170,58 @@ pub fn auto_share(p: &AutoShare, allowance: i64, used: i64, elapsed: f64) -> f64
     (c / t).powf(p.gain).clamp(p.floor, p.ceiling)
 }
 
-/// Is this message offered to `route` today, at `share`?
+/// Is this message offered to `route` at `share`?
+///
+/// `draw < share`, with [`draw`] fixed per recipient for the whole ramp (D-117):
+/// whoever is offered at one share is offered at every share above it.
 pub fn offered(
     keyer: &Keyer,
     ramp: &str,
     route: &str,
     recipient: &str,
-    day_index: i64,
     share: f64,
     dot_insensitive: &[String],
 ) -> bool {
     if share >= 1.0 {
         return true;
     }
+    draw(keyer, ramp, route, recipient, dot_insensitive) < share
+}
+
+/// D-118 — does this route keep members? An auto share that is still ramping.
+/// A list does not need them: D-117's nested draw already keeps everyone it
+/// ramped, since a list may not decrease.
+pub fn keeps_members(route: &Route, state: RouteState) -> bool {
+    needs_usage(route, state)
+}
+
+/// D-118 — the recipient's member key: §7.3's keyed hash of the normalised
+/// address, over a domain-separated input so it never equals a
+/// `recipient_event` key. `(ramp, route)` are columns beside it, not inside it.
+///
+/// Never logged or exported: it is a function of the recipient.
+pub fn member_key(keyer: &Keyer, recipient: &str, dot_insensitive: &[String]) -> frequency::Key {
     let normalised = frequency::normalise(recipient, FrequencyMode::ToAddress, dot_insensitive);
-    let key = keyer.key(&format!("{normalised}\0{ramp}\0{route}\0{day_index}"));
+    keyer.key(&format!("{normalised}\0member"))
+}
+
+/// A recipient's place in a route's partial ramp: a uniform value in `[0, 1)`,
+/// the same on every day, every instance and in §9.4's dry run (D-117).
+///
+/// Never logged or exported: it is a function of the recipient.
+pub fn draw(
+    keyer: &Keyer,
+    ramp: &str,
+    route: &str,
+    recipient: &str,
+    dot_insensitive: &[String],
+) -> f64 {
+    let normalised = frequency::normalise(recipient, FrequencyMode::ToAddress, dot_insensitive);
+    let key = keyer.key(&format!("{normalised}\0{ramp}\0{route}"));
     let mut head = [0u8; 8];
     head.copy_from_slice(&key.as_bytes()[..8]);
-    // A uniform draw from [0, 1) with 53 bits of precision, which is all an f64
-    // share can distinguish anyway.
-    let draw = (u64::from_be_bytes(head) >> 11) as f64 / (1u64 << 53) as f64;
-    draw < share
+    // 53 bits of precision, which is all an f64 share can distinguish anyway.
+    (u64::from_be_bytes(head) >> 11) as f64 / (1u64 << 53) as f64
 }
 
 #[cfg(test)]
@@ -395,6 +440,7 @@ mod auto_tests {
                 below: 0.1,
                 ceiling: 1.0,
             },
+            member_retention_days: AutoShare::DEFAULT_MEMBER_RETENTION_DAYS,
         };
         let cases = [
             (0.00, 0, 0.50),
@@ -421,13 +467,51 @@ mod tests {
         Keyer::new(b"a fixed test salt".to_vec())
     }
 
+    // -- D-118: the member key ------------------------------------------------
+
+    #[test]
+    fn a_member_key_is_stable_and_normalised() {
+        let k = keyer();
+        let a = member_key(&k, "Reader@Example.COM", &[]);
+        assert_eq!(a, member_key(&k, "reader@example.com", &[]));
+        assert_eq!(a, member_key(&keyer(), "reader@example.com", &[]));
+        assert_ne!(a, member_key(&k, "other@example.com", &[]));
+        // gmail's dots, where the operator says they do not count (§7.3).
+        let dots = ["gmail.com".to_string()];
+        assert_eq!(
+            member_key(&k, "re.ader@gmail.com", &dots),
+            member_key(&k, "reader@gmail.com", &dots)
+        );
+    }
+
+    #[test]
+    fn a_member_key_never_equals_the_recipients_frequency_key() {
+        // Domain-separated, so the member table does not join against
+        // `recipient_event`: one leak cannot be widened with the other.
+        let k = keyer();
+        let normalised = frequency::normalise("reader@example.com", FrequencyMode::ToAddress, &[]);
+        assert_ne!(
+            member_key(&k, "reader@example.com", &[]),
+            k.key(&normalised)
+        );
+    }
+
+    #[test]
+    fn a_member_key_depends_on_the_salt() {
+        let other = Keyer::new(b"another instance's salt".to_vec());
+        assert_ne!(
+            member_key(&keyer(), "reader@example.com", &[]),
+            member_key(&other, "reader@example.com", &[])
+        );
+    }
+
     fn recipients(n: usize) -> impl Iterator<Item = String> {
         (0..n).map(|i| format!("user{i}@example.com"))
     }
 
-    fn offered_set(k: &Keyer, route: &str, day: i64, share: f64) -> Vec<bool> {
+    fn offered_set(k: &Keyer, route: &str, share: f64) -> Vec<bool> {
         recipients(2000)
-            .map(|r| offered(k, "main", route, &r, day, share, &[]))
+            .map(|r| offered(k, "main", route, &r, share, &[]))
             .collect()
     }
 
@@ -435,13 +519,13 @@ mod tests {
     fn the_same_message_gets_the_same_answer() {
         let k = keyer();
         assert_eq!(
-            offered_set(&k, "warming", 3, 0.3),
-            offered_set(&k, "warming", 3, 0.3)
+            offered_set(&k, "warming", 0.3),
+            offered_set(&k, "warming", 0.3)
         );
         // And across keyers holding the same salt, which is two instances.
         assert_eq!(
-            offered_set(&k, "warming", 3, 0.3),
-            offered_set(&keyer(), "warming", 3, 0.3)
+            offered_set(&k, "warming", 0.3),
+            offered_set(&keyer(), "warming", 0.3)
         );
     }
 
@@ -451,7 +535,7 @@ mod tests {
         for share in [0.05, 0.25, 0.5, 0.9] {
             let n = 10_000;
             let hit = recipients(n)
-                .filter(|r| offered(&k, "main", "warming", r, 0, share, &[]))
+                .filter(|r| offered(&k, "main", "warming", r, share, &[]))
                 .count();
             let got = hit as f64 / n as f64;
             assert!((got - share).abs() < 0.02, "share {share}: offered {got}");
@@ -461,15 +545,123 @@ mod tests {
     #[test]
     fn a_share_of_one_offers_everything() {
         let k = keyer();
-        assert!(offered_set(&k, "warming", 0, 1.0).iter().all(|o| *o));
+        assert!(offered_set(&k, "warming", 1.0).iter().all(|o| *o));
     }
 
     #[test]
-    fn the_day_and_the_route_each_change_the_decision() {
+    fn the_route_changes_the_decision() {
         let k = keyer();
-        let base = offered_set(&k, "warming", 0, 0.5);
-        assert_ne!(base, offered_set(&k, "warming", 1, 0.5), "day index");
-        assert_ne!(base, offered_set(&k, "warming-b", 0, 0.5), "route");
+        let base = offered_set(&k, "warming", 0.5);
+        assert_ne!(base, offered_set(&k, "warming-b", 0.5), "route");
+    }
+
+    // -- D-117: a recipient ramped onto a route stays ramped -----------------
+
+    #[test]
+    fn a_recipients_draw_is_the_same_whatever_the_day() {
+        // There is no day in the hash any more, so there is nothing a day could
+        // change. Asserted against two keyers, which is two instances.
+        let k = keyer();
+        for r in recipients(500) {
+            let d = draw(&k, "main", "warming", &r, &[]);
+            assert_eq!(d, draw(&keyer(), "main", "warming", &r, &[]));
+            assert!((0.0..1.0).contains(&d));
+        }
+    }
+
+    #[test]
+    fn the_offered_sets_are_nested() {
+        // Whoever is offered at one share is offered at every share above it.
+        let k = keyer();
+        let shares = [0.01, 0.05, 0.1, 0.25, 0.33, 0.5, 0.75, 0.9, 0.99, 1.0];
+        for pair in shares.windows(2) {
+            let (lo, hi) = (pair[0], pair[1]);
+            for r in recipients(3000) {
+                if offered(&k, "main", "warming", &r, lo, &[]) {
+                    assert!(
+                        offered(&k, "main", "warming", &r, hi, &[]),
+                        "offered at {lo} but not at {hi}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_decreasing_list_keeps_every_ramped_recipient_for_the_rest_of_the_ramp() {
+        // Walk a ramp's days: anyone offered on day d is offered on every later
+        // day, and each day only adds recipients.
+        let k = keyer();
+        let days = [0.1, 0.1, 0.25, 0.25, 0.5, 0.8, 1.0];
+        let mut ramped: std::collections::HashSet<String> = Default::default();
+        for (day, share) in days.iter().enumerate() {
+            let today: std::collections::HashSet<String> = recipients(4000)
+                .filter(|r| offered(&k, "main", "warming", r, *share, &[]))
+                .collect();
+            for r in &ramped {
+                assert!(
+                    today.contains(r),
+                    "{r} was ramped before day {day} and dropped"
+                );
+            }
+            assert!(today.len() >= ramped.len());
+            ramped.extend(today);
+        }
+        assert_eq!(ramped.len(), 4000, "a share of 1 has everyone");
+    }
+
+    #[test]
+    fn a_held_step_keeps_exactly_the_same_set() {
+        // D-115 holds the step, so the list entry and its share repeat: the
+        // set neither grows nor loses anyone.
+        let k = keyer();
+        assert_eq!(
+            offered_set(&k, "warming", 0.25),
+            offered_set(&k, "warming", 0.25)
+        );
+    }
+
+    #[test]
+    fn two_partial_routes_in_one_chain_still_decide_independently() {
+        // Nesting is per route: a recipient's draw on one route says nothing
+        // about its draw on the next.
+        let k = keyer();
+        let a: Vec<f64> = recipients(1000)
+            .map(|r| draw(&k, "main", "warming-a", &r, &[]))
+            .collect();
+        let b: Vec<f64> = recipients(1000)
+            .map(|r| draw(&k, "main", "warming-b", &r, &[]))
+            .collect();
+        let both_low = a
+            .iter()
+            .zip(&b)
+            .filter(|(x, y)| **x < 0.5 && **y < 0.5)
+            .count();
+        assert!((both_low as f64 / 1000.0 - 0.25).abs() < 0.05, "{both_low}");
+    }
+
+    #[test]
+    fn normalisation_keeps_a_ramped_inbox_ramped_under_another_spelling() {
+        let k = keyer();
+        let dots = vec!["gmail.com".to_string()];
+        for i in 0..200 {
+            assert_eq!(
+                draw(
+                    &k,
+                    "main",
+                    "warming",
+                    &format!("bobsmith{i}@gmail.com"),
+                    &dots
+                ),
+                draw(
+                    &k,
+                    "main",
+                    "warming",
+                    &format!("Bob.Smith{i}+x@Gmail.com"),
+                    &dots
+                ),
+            );
+        }
     }
 
     #[test]
@@ -479,7 +671,7 @@ mod tests {
         let k = keyer();
         let in_ramp = |ramp: &str| -> Vec<bool> {
             recipients(2000)
-                .map(|r| offered(&k, ramp, "warming", &r, 0, 0.5, &[]))
+                .map(|r| offered(&k, ramp, "warming", &r, 0.5, &[]))
                 .collect()
         };
         assert_ne!(in_ramp("main"), in_ramp("brand-b"));
@@ -493,8 +685,8 @@ mod tests {
             let plain = format!("bobsmith{i}@gmail.com");
             let dressed = format!("Bob.Smith{i}+news@GMAIL.com");
             assert_eq!(
-                offered(&k, "main", "warming", &plain, 2, 0.5, &dots),
-                offered(&k, "main", "warming", &dressed, 2, 0.5, &dots),
+                offered(&k, "main", "warming", &plain, 0.5, &dots),
+                offered(&k, "main", "warming", &dressed, 0.5, &dots),
             );
         }
     }

@@ -241,6 +241,21 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "ramp",
         include_str!("../../migrations-mssql/20260925000000_ramp.sql"),
     ),
+    (
+        20261113000000,
+        "quota step",
+        include_str!("../../migrations-mssql/20261113000000_quota_step.sql"),
+    ),
+    (
+        20261114000000,
+        "partial ramp member",
+        include_str!("../../migrations-mssql/20261114000000_partial_ramp_member.sql"),
+    ),
+    (
+        20261115000000,
+        "ramp group",
+        include_str!("../../migrations-mssql/20261115000000_ramp_group.sql"),
+    ),
 ];
 
 /// Apply migrations. Runs at startup, per §11.

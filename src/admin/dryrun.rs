@@ -203,6 +203,25 @@ pub struct StepView {
     /// for opposite responses and the difference is the whole answer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explanation: Option<&'static str>,
+    /// D-115 — the schedule step the route was measured at, for a warming route
+    /// that reached the headroom check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warmup_step: Option<i64>,
+    /// D-116 — the ramp group a warming route's traffic counts against, and
+    /// what it had left when the dry run read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ramp_group: Option<GroupView>,
+}
+
+/// D-116 — a ramp group on one dry-run step. Counts and a name; no recipient.
+#[derive(Debug, Serialize)]
+pub struct GroupView {
+    pub name: String,
+    pub day_index: i64,
+    pub step: i64,
+    pub allowance: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headroom: Option<i64>,
 }
 
 /// D-112 — the downstream a selected route would use for this recipient's group.
@@ -685,6 +704,20 @@ fn split_message(raw: &[u8]) -> (Vec<Header>, Vec<u8>) {
 }
 
 fn step_view(step: &chain::Step) -> StepView {
+    StepView {
+        warmup_step: step.warmup_step,
+        ramp_group: step.ramp_group.as_ref().map(|g| GroupView {
+            name: g.name.clone(),
+            day_index: g.day_index,
+            step: g.step,
+            allowance: g.allowance,
+            headroom: g.headroom,
+        }),
+        ..step_outcome(step)
+    }
+}
+
+fn step_outcome(step: &chain::Step) -> StepView {
     match step.outcome {
         Ok(()) if step.over_cap => StepView {
             route: step.route.clone(),
@@ -692,21 +725,28 @@ fn step_view(step: &chain::Step) -> StepView {
             reason: Some("over_cap"),
             explanation: Some(
                 "a thread-affinity reply on its pinned route, which has no headroom left for \
-                 this domain group today: it would be reserved and counted past the cap \
-                 (§3.2 step 2a, D-090)",
+                 this domain group today, or whose ramp group has none: it would be reserved \
+                 and counted past the cap, on the group's row too (§3.2 step 2a, D-090, \
+                 D-116)",
             ),
+            warmup_step: None,
+            ramp_group: None,
         },
         Ok(()) => StepView {
             route: step.route.clone(),
             outcome: "selected",
             reason: None,
             explanation: None,
+            warmup_step: None,
+            ramp_group: None,
         },
         Err(reason) => StepView {
             route: step.route.clone(),
             outcome: "skipped",
             reason: Some(reason.as_str()),
             explanation: Some(explain(reason)),
+            warmup_step: None,
+            ramp_group: None,
         },
     }
 }
@@ -733,6 +773,12 @@ fn explain(reason: SkipReason) -> &'static str {
              purpose. Under a share list that ends when the list does; under share: auto \
              the share moves with how full the day's cap is and how far through the day \
              it is, so /routes is where to read what it is now (D-097)"
+        }
+        SkipReason::GroupQuota => {
+            "the ramp group this ramp belongs to has no headroom left today (D-116): its \
+             ceiling is shared with other ramps' warming routes, and they have used it. This \
+             route may have room of its own; it returns at the group's next day boundary. \
+             /ramp-groups shows the group's row"
         }
         SkipReason::Unknown => {
             "the chain names a route that is not defined. §4.2 refuses to start on this, \
@@ -860,6 +906,8 @@ mod tests {
             route: "overflow".into(),
             outcome: Ok(()),
             over_cap: false,
+            warmup_step: None,
+            ramp_group: None,
         });
         assert_eq!(selected.outcome, "selected");
         assert_eq!(selected.reason, None);
@@ -868,6 +916,8 @@ mod tests {
             route: "warming".into(),
             outcome: Err(SkipReason::Quota),
             over_cap: false,
+            warmup_step: None,
+            ramp_group: None,
         });
         assert_eq!(skipped.outcome, "skipped");
         assert_eq!(skipped.reason, Some("quota"));
@@ -877,6 +927,8 @@ mod tests {
             route: "warming".into(),
             outcome: Ok(()),
             over_cap: true,
+            warmup_step: None,
+            ramp_group: None,
         });
         assert_eq!(over.outcome, "selected", "past the cap is still selected");
         assert_eq!(over.reason, Some("over_cap"));

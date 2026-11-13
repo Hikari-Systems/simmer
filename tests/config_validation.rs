@@ -6,7 +6,7 @@
 //! that takes minutes to build should not be discovered to be misconfigured one
 //! error at a time.
 
-use simmer::config::{self, AutoShare, LoadError, ShareSchedule, Tail};
+use simmer::config::{self, Advance, AdvanceSource, AutoShare, LoadError, ShareSchedule, Tail};
 
 /// A minimal configuration that passes every rule. Tests mutate one thing.
 const BASE: &str = r#"
@@ -1658,7 +1658,7 @@ fn accepts_a_share_list_followed_by_another_route() {
         "not §7.2's 'final value repeats'"
     );
 
-    let ones = load(&with_share("[1.0, 0.5]")).expect("a share of 1 is valid");
+    let ones = load(&with_share("[0.5, 1.0]")).expect("a share of 1 is valid");
     let schedule = &ones
         .default_ramp()
         .route("warming")
@@ -1667,8 +1667,8 @@ fn accepts_a_share_list_followed_by_another_route() {
         .as_ref()
         .unwrap()
         .schedule;
-    assert_eq!(schedule.share_for(0), None);
-    assert_eq!(schedule.share_for(1), Some(0.5));
+    assert_eq!(schedule.share_for(0), Some(0.5));
+    assert_eq!(schedule.share_for(1), None);
 
     // And absent, or empty, is no partial ramp at all.
     assert!(!load(BASE)
@@ -1838,6 +1838,45 @@ fn rejects_a_gain_that_is_not_above_zero_and_finite() {
         );
     }
     load(&with_auto_share(", gain: 12")).expect("a high gain is legal, if brutal");
+}
+
+#[test]
+fn member_retention_days_defaults_to_thirty_and_can_be_set() {
+    // D-118: a route's members go this many days after its last commit.
+    let auto = |yaml: &str| {
+        load(yaml)
+            .expect("valid")
+            .default_ramp()
+            .route("warming")
+            .unwrap()
+            .warmup
+            .as_ref()
+            .unwrap()
+            .schedule
+            .share
+            .auto()
+            .expect("auto")
+            .member_retention_days
+    };
+    assert_eq!(auto(&with_auto_share("")), 30);
+    assert_eq!(
+        auto(&with_auto_share("")),
+        AutoShare::DEFAULT_MEMBER_RETENTION_DAYS
+    );
+    assert_eq!(auto(&with_auto_share(", member_retention_days: 1")), 1);
+    assert_eq!(auto(&with_auto_share(", member_retention_days: 400")), 400);
+}
+
+#[test]
+fn rejects_a_member_retention_of_zero_or_less() {
+    rejected_for(
+        &with_auto_share(", member_retention_days: 0"),
+        "schedule.share.member_retention_days",
+    );
+    // Not a count of days at all: serde refuses before §4.2 runs.
+    for bad in ["-1", "1.5", "\"thirty\""] {
+        load(&with_auto_share(&format!(", member_retention_days: {bad}"))).expect_err(bad);
+    }
 }
 
 #[test]
@@ -2605,5 +2644,337 @@ fn smtputf8_is_advertised_only_if_every_override_carries_it_too() {
     assert!(
         !without.advertise_smtputf8(),
         "the group is not knowable at EHLO, so one override without SMTPUTF8 withholds it"
+    );
+}
+
+// -- §4.2 / D-117: a share list never decreases -----------------------------
+
+#[test]
+fn rejects_a_share_list_that_decreases() {
+    // A recipient ramped onto the route at 0.25 would fall back at 0.2.
+    rejected_for(&with_share("[0.1, 0.25, 0.2]"), "schedule.share[2]");
+    rejected_for(&with_share("[0.5, 0.1]"), "must never decrease");
+}
+
+#[test]
+fn accepts_a_share_list_that_repeats_or_rises() {
+    for ok in [
+        "[0.1, 0.1, 0.1]",
+        "[0.1, 0.25, 0.25, 0.5, 1.0]",
+        "[0.3]",
+        "[1.0]",
+    ] {
+        load(&with_share(ok)).unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+}
+
+#[test]
+fn every_decrease_in_a_share_list_is_reported() {
+    match load(&with_share("[0.5, 0.4, 0.6, 0.3]")) {
+        Err(LoadError::Invalid(v)) => {
+            assert!(v.mentions("schedule.share[1]"), "{v}");
+            assert!(v.mentions("schedule.share[3]"), "{v}");
+            assert!(!v.mentions("schedule.share[2]"), "{v}");
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+}
+
+// -- §4.2 / D-115: warmup.advance and warmup_advance ------------------------
+
+fn warming_advance(cfg: &config::Config) -> (Advance, AdvanceSource) {
+    let w = cfg
+        .default_ramp()
+        .route("warming")
+        .unwrap()
+        .warmup
+        .as_ref()
+        .unwrap()
+        .clone();
+    (w.advance(), w.advance_source)
+}
+
+/// `BASE` with `warmup.advance` on the warming route.
+fn with_route_advance(advance: &str) -> String {
+    BASE.replace(
+        "      started: \"2020-01-01T09:00:00Z\"\n",
+        &format!("      started: \"2020-01-01T09:00:00Z\"\n      advance: {advance}\n"),
+    )
+}
+
+/// `BASE` with `warmup_advance` on the ramp.
+fn with_ramp_advance(advance: &str) -> String {
+    BASE.replace(
+        "  strict_senders: false\n",
+        &format!("  strict_senders: false\n  warmup_advance: {advance}\n"),
+    )
+}
+
+#[test]
+fn the_default_is_the_threshold_rule_at_ninety_percent() {
+    let cfg = load(BASE).expect("valid");
+    assert_eq!(
+        warming_advance(&cfg),
+        (
+            Advance::Threshold { threshold: 0.9 },
+            AdvanceSource::Default
+        )
+    );
+}
+
+#[test]
+fn a_defaulted_rule_is_warned_about_and_an_explicit_one_is_not() {
+    let warned = |yaml: &str| {
+        config::validate::warnings(&load(yaml).expect("valid"))
+            .iter()
+            .any(|w| w.path.ends_with("warmup_advance"))
+    };
+    assert!(warned(BASE));
+    assert!(!warned(&with_ramp_advance("auto")));
+    assert!(!warned(&with_route_advance("threshold")));
+}
+
+#[test]
+fn every_spelling_of_the_rule_parses() {
+    let cases = [
+        ("auto", Advance::Auto),
+        ("threshold", Advance::Threshold { threshold: 0.9 }),
+        ("{ mode: auto }", Advance::Auto),
+        ("{ mode: threshold }", Advance::Threshold { threshold: 0.9 }),
+        (
+            "{ mode: threshold, threshold: 0.75 }",
+            Advance::Threshold { threshold: 0.75 },
+        ),
+        (
+            "{ mode: threshold, threshold: 1.0 }",
+            Advance::Threshold { threshold: 1.0 },
+        ),
+    ];
+    for (yaml, want) in cases {
+        let cfg = load(&with_route_advance(yaml)).unwrap_or_else(|e| panic!("{yaml}: {e}"));
+        assert_eq!(
+            warming_advance(&cfg),
+            (want, AdvanceSource::Route),
+            "{yaml}"
+        );
+    }
+}
+
+#[test]
+fn the_route_wins_over_the_ramp_which_wins_over_the_default() {
+    let ramp_only = load(&with_ramp_advance("auto")).expect("valid");
+    assert_eq!(
+        warming_advance(&ramp_only),
+        (Advance::Auto, AdvanceSource::Ramp)
+    );
+
+    let both = load(
+        &with_ramp_advance("auto").replace(
+            "      started: \"2020-01-01T09:00:00Z\"\n",
+            "      started: \"2020-01-01T09:00:00Z\"\n      advance: { mode: threshold, threshold: 0.5 }\n",
+        ),
+    )
+    .expect("valid");
+    assert_eq!(
+        warming_advance(&both),
+        (Advance::Threshold { threshold: 0.5 }, AdvanceSource::Route)
+    );
+}
+
+#[test]
+fn rejects_a_threshold_outside_zero_to_one() {
+    for bad in ["0", "0.0", "-0.1", "1.01", "2", ".nan", ".inf"] {
+        rejected_for(
+            &with_route_advance(&format!("{{ mode: threshold, threshold: {bad} }}")),
+            "warmup.advance.threshold",
+        );
+        rejected_for(
+            &with_ramp_advance(&format!("{{ mode: threshold, threshold: {bad} }}")),
+            "warmup_advance.threshold",
+        );
+    }
+}
+
+#[test]
+fn rejects_a_threshold_with_mode_auto_and_an_unknown_spelling() {
+    for bad in [
+        "{ mode: auto, threshold: 0.5 }",
+        "calendar",
+        "{ mode: volume }",
+        "{ mode: threshold, limit: 2 }",
+    ] {
+        assert!(load(&with_route_advance(bad)).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn an_advance_rule_on_an_overflow_route_is_refused() {
+    // An overflow route has no warmup block, so there is nowhere to put one.
+    let yaml = BASE.replace(
+        "  - name: overflow\n    overflow: true\n",
+        "  - name: overflow\n    overflow: true\n    advance: auto\n",
+    );
+    assert!(load(&yaml).is_err());
+}
+
+// -- §4.2: ramp groups (D-116) -------------------------------------------
+
+/// BASE with a second ramp, `partner`, identical to `main`, and `groups`
+/// appended as the top-level `ramp_groups` block.
+fn with_ramp_groups(groups: &str) -> String {
+    let ramp = &BASE[BASE.find(" main:\n").expect("the main ramp")..];
+    format!(
+        "{BASE}{}\nramp_groups:\n{groups}",
+        ramp.replacen(" main:", " partner:", 1)
+    )
+}
+
+const BRANDS: &str = r#"  brands:
+    ramps: [main, partner]
+    started: "2020-01-01T09:00:00Z"
+    schedule: [500, 1000, 2000]
+"#;
+
+#[test]
+fn a_ramp_group_is_attached_to_each_of_its_ramps() {
+    let cfg = load(&with_ramp_groups(BRANDS)).expect("valid");
+    for name in ["main", "partner"] {
+        let group = cfg.ramp(name).unwrap().ramp_group.as_ref().expect(name);
+        assert_eq!(group.name, "brands");
+        assert_eq!(group.schedule, vec![500, 1000, 2000]);
+        // D-115's default, as for a route.
+        assert_eq!(group.advance(), Advance::default());
+    }
+    // The final value repeats, as §7.2's does.
+    let g = cfg.ramp_groups.get("brands").unwrap();
+    assert_eq!(g.allowance_at(0), Some(500));
+    assert_eq!(g.allowance_at(2), Some(2000));
+    assert_eq!(g.allowance_at(99), Some(2000));
+}
+
+#[test]
+fn a_ramp_outside_every_group_has_none_and_no_block_means_no_groups() {
+    let cfg = load(&with_ramp_groups(
+        "  solo:\n    ramps: [partner]\n    started: \"2020-01-01T09:00:00Z\"\n    schedule: [10]\n",
+    ))
+    .expect("valid");
+    assert!(cfg.default_ramp().ramp_group.is_none());
+    assert!(cfg.ramp("partner").unwrap().ramp_group.is_some());
+
+    let plain = load(BASE).expect("valid");
+    assert!(plain.ramp_groups.is_empty());
+    assert!(plain.default_ramp().ramp_group.is_none());
+}
+
+#[test]
+fn a_ramp_group_advance_takes_every_form_a_route_does() {
+    let advance = |line: &str| {
+        load(&with_ramp_groups(&format!("{BRANDS}    advance: {line}\n")))
+            .expect(line)
+            .ramp_groups
+            .get("brands")
+            .unwrap()
+            .advance()
+    };
+    assert_eq!(advance("auto"), Advance::Auto);
+    assert_eq!(advance("threshold"), Advance::default());
+    assert_eq!(
+        advance("{ mode: threshold, threshold: 0.75 }"),
+        Advance::Threshold { threshold: 0.75 }
+    );
+}
+
+#[test]
+fn rejects_a_ramp_group_naming_an_unknown_ramp() {
+    rejected_for(
+        &with_ramp_groups(&BRANDS.replace("[main, partner]", "[main, nonesuch]")),
+        "nonesuch",
+    );
+}
+
+#[test]
+fn rejects_a_ramp_in_two_groups() {
+    let second =
+        "  other:\n    ramps: [partner]\n    started: \"2020-01-01T09:00:00Z\"\n    schedule: [10]\n";
+    rejected_for(
+        &with_ramp_groups(&format!("{BRANDS}{second}")),
+        "at most one group",
+    );
+}
+
+#[test]
+fn rejects_a_ramp_group_with_no_ramps_or_an_empty_or_negative_schedule() {
+    rejected_for(
+        &with_ramp_groups(&BRANDS.replace("[main, partner]", "[]")),
+        "must list at least one ramp",
+    );
+    rejected_for(
+        &with_ramp_groups(&BRANDS.replace("[500, 1000, 2000]", "[]")),
+        "ramp_groups.brands.schedule",
+    );
+    rejected_for(
+        &with_ramp_groups(&BRANDS.replace("[500, 1000, 2000]", "[500, -1]")),
+        "ramp_groups.brands.schedule[1]",
+    );
+}
+
+#[test]
+fn rejects_a_ramp_group_threshold_outside_zero_to_one() {
+    for bad in ["0", "1.5", "-0.1"] {
+        rejected_for(
+            &with_ramp_groups(&format!(
+                "{BRANDS}    advance: {{ mode: threshold, threshold: {bad} }}\n"
+            )),
+            "ramp_groups.brands.advance.threshold",
+        );
+    }
+}
+
+#[test]
+fn rejects_an_unknown_key_in_a_ramp_group() {
+    load(&with_ramp_groups(&format!("{BRANDS}    cap: 5\n"))).expect_err("deny_unknown_fields");
+}
+
+#[test]
+fn every_ramp_group_violation_is_reported_at_once() {
+    let yaml = with_ramp_groups(
+        &BRANDS
+            .replace("[main, partner]", "[main, nonesuch]")
+            .replace("[500, 1000, 2000]", "[-5]"),
+    );
+    match load(&yaml) {
+        Err(LoadError::Invalid(v)) => {
+            assert!(v.mentions("nonesuch"), "{v}");
+            assert!(v.mentions("schedule[0]"), "{v}");
+        }
+        other => panic!("expected both violations, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_ramp_group_whose_ramps_have_no_warming_route_is_warned_about() {
+    let quiet = load(&with_ramp_groups(BRANDS)).expect("valid");
+    assert!(!config::validate::warnings(&quiet)
+        .iter()
+        .any(|w| w.path.starts_with("ramp_groups")));
+
+    // `partner` with its warming route removed from every chain and the list.
+    let yaml = with_ramp_groups(
+        "  idle:\n    ramps: [partner]\n    started: \"2020-01-01T09:00:00Z\"\n    schedule: [10]\n",
+    );
+    let mut cfg = load(&yaml).expect("valid");
+    let partner = cfg
+        .ramps
+        .0
+        .iter_mut()
+        .find(|r| r.name == "partner")
+        .unwrap();
+    partner.routes.retain(|r| r.warmup.is_none());
+    let warnings = config::validate::warnings(&cfg);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.path == "ramp_groups.idle" && w.message.contains("never binds")),
+        "{warnings:?}"
     );
 }

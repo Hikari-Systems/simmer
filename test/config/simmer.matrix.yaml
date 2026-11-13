@@ -85,6 +85,9 @@ ramps:
       - { match: "flows.matrix.test", match_on: envelope, chain: [warming-flows, mailpit-direct] }
 
     default_chain: [mailpit-direct]
+    # D-115: this tier measures days on the calendar (D-042), so the schedule
+    # advances on elapsed days rather than on volume.
+    warmup_advance: auto
     strict_senders: false
 
     routes:

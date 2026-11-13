@@ -5474,6 +5474,297 @@ enough that a refusal would be wrong.
 records, `telemetry.level`'s independence from `RUST_LOG`, and §1.1: still no
 trace context in relayed mail.
 
+## Volume-gated advancement and sticky partial ramps (2026-11-13)
+
+### D-115 — A schedule entry is earned, not elapsed (§7.2)
+
+> **Requested 2026-11-13 by the spec's author, directly; the spec is amended in
+> the same change (§3.2, §4.1, §4.2, §7.2, §9.1, §9.2, §9.4, §9.6).**
+
+**The problem.** §7.2 indexed every schedule by `day_index`, so a route moved to
+its next entry every 24h whatever it sent. A route whose traffic fell short —
+40 of a planned 50 — was handed 100 the next day anyway, and a route that sent
+nothing over a weekend came back two entries further on. Neither has warmed
+anything to justify the larger number.
+
+**What it does.** Each `(ramp, route, domain_group)` — the §7.1 key, so Gmail can
+be held while Microsoft advances on one route — has a **step** beside its day
+index. The schedule is indexed by the step. Under `advance: threshold` (the
+default, at 0.9) the step moves on by one only after a day that committed at
+least `ceil(threshold × planned allowance)`:
+
+```
+P        = the element's latest row before today
+step     = min(today, P.step + (P.committed >= ceil(threshold × P.allowance) ? 1 : 0))
+           0 when there is no P
+```
+
+`advance: auto` is `step = day_index`, which is §7.2 before this entry exactly. A
+route's `warmup.advance` overrides its ramp's `warmup_advance`, which overrides the
+default; `Warmup::advance` is the one place that is resolved, at load.
+
+The author's example, which `tests/advance.rs` drives through the real walk:
+A/B/C on [50, 100, 200, 400] and D on [100, 200, 400, 800] send 45/40/45/98 on
+day 0 against bars of 45/45/45/90, so day 1 is **100/50/100/200**. Day 1 sends
+100/50/80/200 against bars of 90/45/90/180, so day 2 is 200/100/100/400.
+
+**The basis is the plan, never the override.** The row's `allowance` column is the
+schedule's value as written when the row was created. §9.3's override is ignored:
+a day an operator throttled to 10 and that sent 10 has not met a plan of 50, and
+a day an operator raised has not raised the bar.
+
+**Where the step lives.** In the row, beside `allowance`, written when the row is
+created and authoritative thereafter (the D-026 pattern). `quota::position` is
+the ONE entry point — the walk in every `Mode`, the dry run, the early check,
+`/routes`, the allowance mutation and the gauges all call it — and it reads at
+most two rows (`QuotaStore::advance_rows`: today's and the latest before it), and
+only for a threshold-mode warming route. Every instance computes the same step
+from the same earlier row, and the insert-if-absent decides which instance's
+row stands.
+
+**One edge, accepted.** A reservation taken in the last seconds of day `d-1` that
+commits after day `d`'s row exists is not counted toward `d`'s decision. It is
+bounded by the reservations in flight at the boundary, and the alternative —
+re-deciding a day already being spent — would move a ceiling mid-day, which is
+what D-026 exists to prevent.
+
+**The upgrade.** The migration adds `quota_usage.step` and backfills `step =
+day_index` on every warming row, so a route part-way through its ramp continues
+from the day it is on, and the threshold rule takes over from the next boundary.
+A configuration that names no rule is now volume-gated; `config::validate::warnings`
+says so once per ramp at startup, because it loads cleanly and has changed meaning.
+Every tier config whose suite measures days on the calendar (D-042) now says
+`warmup_advance: auto`.
+
+**Counted once.** `lock_usage` reports whether it created the row (`xmax = 0` on
+Postgres, the `IF @@ROWCOUNT = 0` arm on SQL Server, both under the row lock), so
+exactly one reservation per row carries `created_row`. That reservation increments
+`simmer_warmup_advance_total{outcome}` and emits the `simmer.warmup.advance` event,
+whichever instance took it. `tests/store_conformance` races sixteen contenders on
+two pools for it on both backends.
+
+**What is observable.** `simmer_warmup_step`, `simmer_warmup_held_days`,
+`simmer_warmup_advance_threshold` and `simmer_warmup_previous_attainment`, recomputed
+at scrape (D-056) from `quota::position`; the counter; the event; `warmup.step`,
+`warmup.held_days` and `warmup.advance_mode` on `simmer.relay` and `simmer.route`;
+`step`, `held_days`, `next_allowance_if_met` and `previous` per window in `/routes`;
+`warmup_step` per step in the dry run. None carries a recipient.
+
+**Not changed.** `day_index` itself, the day boundary, D-097's `elapsed`, graduation
+(still the final value; the step keeps being tracked underneath), §7.4's protocol,
+and an overflow route, which has no step.
+
+### D-116 — Ramp groups: one shared daily ceiling across several ramps (§3.4)
+
+> **Requested 2026-11-13 by the spec's author, directly; the spec is amended in
+> the same change (§3.2 step 3c, §3.4, §4.1, §4.2, §7.1, §7.4, §9.1, §9.2, §9.4,
+> §11).** Settled with the author before building: only **warming** routes count;
+> a full group makes the route **ineligible**, so the message steers to the next
+> link; the ceiling is **a schedule of its own** advancing by D-115's rule on the
+> group's own total; a ramp is in **at most one** group; and a pinned reply
+> follows D-090 here too.
+
+**The problem.** §3.4 made ramps share nothing, which is right for two unrelated
+identities but wrong for two brands warming on one IP pool or one provider
+account: each ramp's schedule is safe alone and the sum is not. Nothing could say
+"between them, no more than N today".
+
+**What it does.** Top-level `ramp_groups` maps a name to `{ramps, started,
+schedule, advance}`. `config::from_str` copies each group onto its member ramps
+(`Ramp::ramp_group`), so the walk never searches. Per message the walk computes
+the group's position once (`quota::group_position` — the ONE entry point, as
+`quota::position` is for a route: `day::index(started, now)`, then
+`advance::decide` over the group's own two latest rows, unchanged from D-115).
+For a **warming** route only, the reservation carries `GroupReserve`, and the
+store, in the one transaction:
+
+1. locks the group's row for its day (insert-if-absent, writing `allowance` and
+   `step` once, D-026),
+2. locks the route's row,
+3. refuses with `Reserved::NoGroupHeadroom` if the group lacks room, else with
+   `NoHeadroom` if the route does, else reserves on both.
+
+The walk reports the first as `SkipReason::GroupQuota` (`group_quota`) and moves
+on; overflow never touches the group, so a full group spills to overflow and only
+a no-overflow ramp (D-113) ends at its usual policy. Commit, release and the
+sweeper resolve both rows from the reservation, which records `ramp_group` and
+`group_day_index`.
+
+**Lock order is the invariant.** Every transaction touching both rows takes the
+**group row first**: reserve, commit, release, the sweeper and `release_by_ids`.
+That is why the Postgres sweeper is no longer one CTE — a single `UPDATE` over
+both tables locks them in whatever order the plan picks. It is now `DELETE …
+RETURNING`, then group rows in key order, then route rows in key order, in one
+transaction. `tests/store_conformance` has an interleaving test (reserves,
+commits, releases and sweeps over two routes in one group, from two warmed pools,
+behind a barrier). Moving the group update after the route update in commit made
+it fail with `deadlock detected` on every run.
+
+**Choices made without asking, each worth a look:**
+
+- **Group before route.** On a day both are full the skip is `group_quota`.
+  Simulation 3 (route full, group not) is still `quota`. Checking the group
+  first also makes `simmer_ramp_group_over_cap_total` exact: a pinned reply's
+  first refusal names the group exactly when the group was full.
+- **Before `started` the group caps nothing** and writes no row: a ceiling that
+  starts at T says nothing about before T. The other reading — warming routes
+  ineligible until then — would stop every member ramp the moment a group with
+  a future start was added. Its routes are still bound by their own caps.
+- **A graduated route still counts.** It still has a `warmup` block and is still
+  building the shared reputation. A route only stops counting when it becomes an
+  overflow route.
+- **§9.3's route mutations do not touch the group row.** A reset zeroes the
+  route's `committed` and leaves the group's alone; an allowance override raises
+  the route's ceiling, never the group's. There are **no group mutations**, no
+  pause and no override, in this change: they are a follow-up.
+- **D-097's `auto` share paces against the route's row, not the group's.** A
+  route throttled by its group may see a share computed as if it had room. The
+  share only decides who is *offered*; the group still refuses at the
+  reservation, so nothing overshoots. A group-aware controller is a follow-up if
+  the author wants one.
+- **A zero in a group schedule is allowed**, as in a route's: it stops every
+  member ramp's warming traffic for that step and spills it to overflow.
+- **A group whose ramps have no warming route** loads, with a startup `WARN`
+  that its ceiling never binds.
+
+**Edges.** The D-115 boundary edge applies to the group row as to a route row: a
+reservation taken just before a day boundary commits to the day it reserved
+from. The dry run and §5.4's early check read the group row unlocked, which errs
+the way their reads of a route row already do.
+
+**Observable.** `simmer_ramp_group_{allowance,committed,reserved,day,step,
+held_days}{ramp_group}` (recomputed at scrape time, D-056; the allowance, step and
+held days are absent before `started`), `simmer_ramp_group_advance_total
+{ramp_group,outcome}` (counted by the reservation that creates the group's row),
+`simmer_ramp_group_over_cap_total{ramp_group}`, and
+`simmer_route_skipped_total{reason="group_quota"}`. A `simmer.ramp_group.advance`
+event is emitted when the row is created. `ramp_group` and `ramp_group.step` are
+recorded on `simmer.relay` and `simmer.route`. `GET /ramp-groups` and
+`GET /ramp-groups/{name}` return the group's numbers, `GET /ramps/{ramp}` names
+the ramp's group, and §9.4's steps carry the group with its headroom. None of
+them carries a recipient: the no-`@` test covers the new endpoints.
+
+**Tested.**
+
+- 15 conformance tests, run on both backends: both rows counted, released and
+  swept; the group binding across ramps; route-versus-group refusal; over-cap;
+  the first allowance kept; advance rows; ungrouped requests untouched; a
+  two-pool race for the group's last slots; exactly one creator per group row;
+  the deadlock interleaving.
+- `tests/ramp_groups.rs`, through the real walk, covering simulations 1–8 and
+  four more:
+  - a group not yet started caps nothing;
+  - a no-overflow ramp gets its usual policy and the early check sees the full
+    group;
+  - the dry run agrees with the walk;
+  - an edited schedule does not move a day already written.
+- Admin, metrics and telemetry tests.
+
+### D-117 — A recipient ramped onto a route stays ramped (§3.2 step 3c′)
+
+> **Requested 2026-11-13 by the spec's author, directly**: every recipient ramped
+> onto the warming route on an earlier day must stay ramped for the rest of the
+> ramp. The author chose the mechanism: drop the day from the hash rather than
+> store a membership.
+
+**The problem.** D-091's partial-ramp hash covered the day index, so each day drew
+a fresh share of recipients. A recipient mailed from the new identity on Monday
+had the same chance as anyone of being sent back to the old one on Tuesday — the
+identity churn per recipient that a warm-up exists to avoid.
+
+**What it does.** The hash is now `(normalised recipient, ramp, route)` under the
+§7.3 salt: each recipient has one fixed `partial::draw` in `[0, 1)` per route for
+the life of the ramp, offered while `draw < share`. The offered sets are nested,
+so a share that never falls keeps everyone it has ever offered and only adds.
+§4.2 now refuses a `share` list that decreases. With D-115, the list is indexed by
+the step, so a held element offers exactly the same recipients again.
+
+**What it covers, and what it does not.** It covers the partial ramp entirely,
+for a listed share, with no storage and nothing new about any recipient kept
+anywhere. It does not keep a ramped recipient on the route when the route's cap is
+full or §7.3's threshold applies: the author accepted overflow there for now. The
+hash can say who *would* have been offered on an earlier day, not who was mailed,
+so letting the would-have-been set past the cap would let far more past it than
+were ever ramped; that needs a stored membership, if it is ever wanted.
+
+**`share: {mode: auto}`** was left open as **O-21**, since settled by **D-118**.
+The controller's share rises and falls within a day, so `draw < share(t)` alone
+admits and later refuses some of the same recipients.
+
+**The cost of the change.** Every recipient's draw changed once, at upgrade: a
+ramp part-way through re-drew its offered set on that day. Nothing else moved.
+
+### D-118 — An auto partial ramp keeps the recipients it mailed (§3.2 step 3c′; O-21)
+
+> **Settled 2026-11-13 by the spec's author**, choosing O-21's option (b): a
+> stored, hashed membership. Asked whether the per-recipient record is acceptable
+> against §7.3's reasoning: **yes**. Asked how it is bounded: **a route's rows are
+> dropped N days after its last commit.**
+
+**The problem.** D-117 keeps a *listed* share sticky without storing anything,
+because a non-decreasing list offers nested sets. D-097's controller is not a
+list: its share falls as the cap fills ahead of pace, within a day as well as
+across days. A recipient offered at 09:00 at a share of 0.8 could be steered
+back to the old identity at 14:00 at 0.1. The draw can say who *would* be
+offered; only a record can say who *was mailed*.
+
+**What it does.** A recipient a message is **committed** to on a route whose
+share is `mode: auto` becomes a **member** of `(ramp, route)`. In
+`Check::PartialRamp`, when the share refuses, membership is consulted, and a
+member is offered the route regardless. Same day or any later day; a pinned
+reply (D-090) makes a member too, since it was mailed on the route. Membership
+answers the share and nothing else: the cap, §7.3's threshold, pause, strict
+preflight and a future start still apply to a member, as D-117 accepted.
+
+- **Storage.** `partial_ramp_member (ramp, route, recipient_hash,
+  first_committed_at, last_committed_at)`, primary key `(ramp, route,
+  recipient_hash)`, on both backends. The key is §7.3's keyed hash under the
+  instance salt, 16 bytes, over a domain-separated input
+  (`"{normalised}\0member"`) so it never equals a `recipient_event` key and the
+  two tables do not join.
+- **Written in §7.4 phase 3's transaction**, as the frequency events are:
+  `QuotaStore::commit_recording(reservation, keys, member)`. A delivered message
+  is never missing its row; an undelivered one never has one. Insert-if-absent,
+  then `last_committed_at` moves forward (`ON CONFLICT DO UPDATE … GREATEST` on
+  Postgres; the `UPDLOCK, SERIALIZABLE` update then `IF @@ROWCOUNT = 0 INSERT` on
+  SQL Server). `QuotaStore::commit` is now a provided method that records no
+  member.
+- **Written only for auto routes** that are not graduated. A list does not need
+  it (D-117), and a row nothing will consult is the opposite of §7.3's reason
+  for hashing.
+- **Read only when the share refuses**, so a recipient the share offers costs no
+  lookup. Unlocked: two first commits racing both read "no" and are each judged
+  on the share, which is what would have happened without the table. The dry run
+  reads it too, so §9.4 still gives the walk's answer per recipient. The §5.4
+  early check does not run this check, as before.
+
+**Pacing still converges.** A member uses the cap like anyone else, and the
+controller reads `committed + reserved`, so a day heavy with members lowers the
+share for new recipients rather than overrunning. The cap is never lifted.
+
+**Retention.** Per **route**, not per row: `partial_members::sweep_once` (hourly)
+drops every row of `(ramp, route)` once the route's newest `last_committed_at` is
+older than `schedule.share.member_retention_days` (default **30**, at least 1).
+Per row would evict exactly the recipients mailed least often, breaking the
+promise for them; a route idle that long has finished or been abandoned. A route
+no longer configured as auto writes no more rows, and its old ones age out under
+the default. The guard is inside the `DELETE`, so a commit between the sweeper's
+read and its drop keeps its route. The sweeper always runs: a route that *was*
+auto still has rows to bound.
+
+**What it costs, recorded because the author accepted it knowingly.** For the
+life of an auto ramp plus its retention, the database holds a keyed hash of every
+address mailed on the route — §7.3 avoids exactly that by letting events age out
+within a window. The salt sits in the same database, so anyone with read access
+to both can test a candidate address. No read endpoint, metric or span carries a
+key; `simmer_partial_ramp_members` is a count.
+
+**Observable.** `simmer_partial_ramp_member_offered_total{ramp,route}` (the share
+refused and membership kept them), `simmer_partial_ramp_members{ramp,route}` (set
+by the sweeper, so up to an hour stale), `simmer_partial_ramp_members_evicted_total
+{ramp,route}`, and `partial_ramp.member = true` on `simmer.relay` and
+`simmer.route` when membership is what decided.
+
 ## Still open — to settle at the start of the phase that needs them
 
 Raised during planning, defaulted as described, and worth an explicit call before
@@ -5500,6 +5791,7 @@ the phase that depends on each.
 | O-14 | Should §11 ("no alternative backend is implemented in v1") and §12/§13's Postgres assumptions be amended for the SQL Server build (**D-084**), or does it stay a recorded divergence? | A divergence, recorded in D-084. The spec is unchanged | Before the next spec amendment. *Deferred again, explicitly, by the 2026-09-24 amendment — see **D-099**.* |
 | ~~O-18~~ | *Settled 2026-09-23 by the spec's author: `554`, not configurable, and amend the spec. §5.5 (the end-of-data marker is `CRLF . CRLF` and nothing else, and the whole payload is refused), §9.1 (`simmer_ambiguous_terminator_total`) and §10.3 (the one permanent reply that is a statement about the message, and why §14.1's worked example does not reach it) now carry it — see **D-095**.* | | |
 | O-19 | What should `database.fail_closed: false` do? §7.5 defines only `true` (`451 4.3.0`, send nothing). The implementation answers a store failure under `false` as an exhausted chain — the ramp's `exhausted_chain_reply`, so `451 4.7.1` by default and **`550 5.7.1` if the ramp sets `"550"`**, which §14.1 would forbid for a transient failure. The old log line claimed the message was sent unenforced; it never was. Options: (a) true fail-open, relaying without a reservation; (b) keep refusing, but always `451` (4.3.0 or 4.7.1); (c) remove the key. | Behaviour unchanged; log and docs made truthful — see **D-107** | Before any phase that touches §7.5 or the reservation path |
+| ~~O-21~~ | *Settled 2026-11-13 by the spec's author: option (b), a stored, hashed membership, dropped `member_retention_days` after the route's last commit — see **D-118**.* | | |
 | O-20 | Should §6.7's preflight be evaluated per `(route, group)` when a route has `downstream_overrides` (**D-112**)? Today it is per route, so one `spf_include` must cover every MTA the route can use, and a strict failure eliminates the route for every group. Per-group verdicts would make strict preflight steer per group inside the walk. | Per route; the operator's `spf_include` covers every override — see **D-112** | Before preflight or the walk next changes |
 
 

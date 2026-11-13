@@ -18,6 +18,7 @@ must be present; the rest show their default. Durations are written `30s`, `5m`,
 | `dot_insensitive_domains` | list of domains | `[gmail.com, googlemail.com]` | [07](07-routes.md#recipient-frequency) |
 | `default_ramp` | string | required | [06](06-routing.md#ramps) |
 | `ramps` | map of name to ramp | required, at least one | [06](06-routing.md#ramps) |
+| `ramp_groups` | map of name to group | none | [08](08-warmup.md#sharing-a-ceiling-between-ramps) |
 
 ## `server`
 
@@ -122,6 +123,15 @@ must be present; the rest show their default. Durations are written `30s`, `5m`,
 | `queue_depth` | integer | `1024` | |
 | `max_queue_bytes` | integer | `67108864` | At least twice `server.max_message_bytes` |
 
+## `ramp_groups.<name>`
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `ramps` | list of ramp names | required, at least one | The ramps whose warming routes share this ceiling. A ramp may be in only one group |
+| `started` | RFC 3339 instant | required | Day 0 of the group's schedule. Before it the group caps nothing |
+| `schedule` | list of integers | required, not empty, none negative | The ceiling at each step; the last repeats |
+| `advance` | `auto`, `threshold` or `{mode, threshold}` | `{mode: threshold, threshold: 0.9}` | How the group moves to its next step, as a route's `warmup.advance` |
+
 ## `ramps.<name>`
 
 | Key | Type | Default | Notes |
@@ -140,6 +150,7 @@ must be present; the rest show their default. Durations are written `30s`, `5m`,
 | `thread_affinity` | bool | `false` | |
 | `allow_no_overflow_route` | bool | `false` | |
 | `black_hole_allowed` | bool | `false` | Needs `allow_no_overflow_route` and `strict_senders: false` |
+| `warmup_advance` | `auto` \| `threshold` \| `{mode, threshold}` | `{mode: threshold, threshold: 0.9}` | How the ramp's warming routes move along their schedules; threshold above 0, at most 1 |
 | `routes` | list | required | |
 
 ## `ramps.<name>.routes[]`
@@ -164,13 +175,15 @@ must be present; the rest show their default. Durations are written `30s`, `5m`,
 | `warmup.started` | RFC 3339 instant | required | Required on a warming route; not allowed on an overflow route |
 | `warmup.schedule.default` | list of integers | required, not empty | Each at least 0 |
 | `warmup.schedule.overrides` | map of group name to list | none | |
-| `warmup.schedule.share` | list of fractions, or `{mode: auto, …}` | none | Not on the last route of a chain |
+| `warmup.advance` | `auto` \| `threshold` \| `{mode, threshold}` | the ramp's `warmup_advance` | |
+| `warmup.schedule.share` | list of fractions, or `{mode: auto, …}` | none | Not on the last route of a chain. A list may not decrease |
 | `warmup.schedule.share.floor` | fraction | `0.05` | Auto only |
 | `warmup.schedule.share.ceiling` | fraction | `1.0` | Auto only |
 | `warmup.schedule.share.gain` | number | `4.0` | Auto only; above 0 |
 | `warmup.schedule.share.fill_by` | fraction | `0.6` | Auto only |
 | `warmup.schedule.share.tail.below` | number | `0.1` | Auto only; 0 to below 1 |
 | `warmup.schedule.share.tail.ceiling` | fraction | `1.0` | Auto only |
+| `warmup.schedule.share.member_retention_days` | integer | `30` | Auto only; at least 1. A route's members are dropped this long after its last commit |
 | `recipient_frequency.mode` | `to_address` \| `to_domain` | required | |
 | `recipient_frequency.window.unit` | `hourly` \| `daily` \| `weekly` | required | |
 | `recipient_frequency.window.count` | integer | required | At least 1 |

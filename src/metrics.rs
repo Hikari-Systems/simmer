@@ -238,6 +238,90 @@ fn describe() {
          Negative means the route has not started, and its allowance reads 0"
     );
     describe_gauge!(
+        "simmer_warmup_step",
+        "The schedule entry in force today for a route and domain group (D-115). Equal to \
+         simmer_warmup_day under advance: auto; under the threshold rule it moves on only \
+         after a day that committed its threshold of the planned allowance"
+    );
+    describe_gauge!(
+        "simmer_warmup_held_days",
+        "How many days this route and domain group is behind its calendar: \
+         simmer_warmup_day minus simmer_warmup_step (D-115). 0 under advance: auto. A \
+         rising value is a ramp held back by low volume"
+    );
+    describe_gauge!(
+        "simmer_warmup_advance_threshold",
+        "The fraction of a day's planned allowance a route must commit to advance (D-115). \
+         Absent for a route under advance: auto"
+    );
+    describe_gauge!(
+        "simmer_warmup_previous_attainment",
+        "Committed over planned allowance on the last day this route and domain group sent, \
+         which is what today's step was decided from (D-115). Absent before the first such \
+         day and under advance: auto"
+    );
+    describe_counter!(
+        "simmer_warmup_advance_total",
+        "Each day's schedule decision for a route and domain group, counted once across all \
+         instances when the day's quota row is created (D-115). outcome: advanced, held, \
+         first (no earlier day), auto (advance: auto)"
+    );
+    describe_counter!(
+        "simmer_partial_ramp_member_offered_total",
+        "Messages an auto partial ramp's share would have steered past this route, offered \
+         it anyway because an earlier commit made the recipient a member (D-118)"
+    );
+    describe_gauge!(
+        "simmer_partial_ramp_members",
+        "Recipients that are members of this auto partial ramp (D-118). Set by the hourly \
+         member sweeper, so up to an hour stale; a count, never a key"
+    );
+    describe_counter!(
+        "simmer_partial_ramp_members_evicted_total",
+        "Member rows dropped because their route committed nothing for \
+         member_retention_days (D-118)"
+    );
+    describe_gauge!(
+        "simmer_ramp_group_allowance",
+        "Today's shared ceiling for a ramp group (D-116): the warming routes of every member \
+         ramp together may commit no more. Absent before the group's started"
+    );
+    describe_gauge!(
+        "simmer_ramp_group_committed",
+        "Messages committed today against a ramp group's ceiling (D-116), across all its \
+         member ramps' warming routes"
+    );
+    describe_gauge!(
+        "simmer_ramp_group_reserved",
+        "Reservations in flight against a ramp group's ceiling (D-116)"
+    );
+    describe_gauge!(
+        "simmer_ramp_group_day",
+        "Elapsed-duration day index since the ramp group's started (§7.2, D-116). Negative \
+         means the group is not yet in force and caps nothing"
+    );
+    describe_gauge!(
+        "simmer_ramp_group_step",
+        "The ramp group schedule entry in force today (D-116), decided by D-115's rule on \
+         the group's own committed total"
+    );
+    describe_gauge!(
+        "simmer_ramp_group_held_days",
+        "How many days a ramp group is behind its calendar: simmer_ramp_group_day minus \
+         simmer_ramp_group_step (D-116). 0 under advance: auto"
+    );
+    describe_counter!(
+        "simmer_ramp_group_advance_total",
+        "Each day's schedule decision for a ramp group, counted once across all instances \
+         when the group's day row is created (D-116). outcome as \
+         simmer_warmup_advance_total"
+    );
+    describe_counter!(
+        "simmer_ramp_group_over_cap_total",
+        "Thread-affinity replies reserved past a full ramp group's ceiling on their pinned \
+         route (D-090, D-116). Counted on the group; nothing else passes it"
+    );
+    describe_gauge!(
         "simmer_route_paused",
         "1 when an operator has paused this route through §9.3, 0 otherwise"
     );
@@ -245,7 +329,8 @@ fn describe() {
         "simmer_route_skipped_total",
         "Routes passed over during a chain walk, by reason (§3.2 step 3). \
          reason=\"partial_ramp\" is a route given less traffic on purpose (D-091), not a \
-         shortage"
+         shortage. reason=\"group_quota\" is a warming route whose ramp group's shared \
+         ceiling is full (D-116)"
     );
     describe_counter!(
         "simmer_reservation_expired_total",
@@ -888,6 +973,47 @@ pub fn warmup_day(ramp: &str, route: &str, day_index: i64) {
         .set(day_index as f64);
 }
 
+/// D-115's gauges for one `(route, domain_group)`: the step, how far it is held
+/// behind the calendar, the threshold, and what the step was decided from.
+///
+/// Called from the walk on every reservation and recomputed at every scrape
+/// from `quota::position` (D-056), so a dashboard cannot show a step the walk
+/// was not using.
+pub fn warmup_step(ramp: &str, route: &str, domain_group: &str, p: &crate::quota::Position) {
+    if p.day_index < 0 {
+        return;
+    }
+    let labels = [
+        ("ramp", ramp.to_string()),
+        ("route", route.to_string()),
+        ("domain_group", domain_group.to_string()),
+    ];
+    metrics::gauge!("simmer_warmup_step", &labels).set(p.step as f64);
+    metrics::gauge!("simmer_warmup_held_days", &labels).set(p.held_days() as f64);
+    if let Some(attainment) = p.decision.basis.and_then(|b| b.attainment()) {
+        metrics::gauge!("simmer_warmup_previous_attainment", &labels).set(attainment);
+    }
+}
+
+/// D-115 `simmer_warmup_advance_threshold{ramp,route}`. Absent under `auto`.
+pub fn warmup_advance_threshold(ramp: &str, route: &str, threshold: f64) {
+    metrics::gauge!(
+        "simmer_warmup_advance_threshold",
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
+    )
+    .set(threshold);
+}
+
+/// D-115 `simmer_warmup_advance_total{ramp,route,domain_group,outcome}`.
+pub fn warmup_advance(ramp: &str, route: &str, domain_group: &str, outcome: &str) {
+    counter!(
+        "simmer_warmup_advance_total",
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
+        "domain_group" => domain_group.to_string(), "outcome" => outcome.to_string(),
+    )
+    .increment(1);
+}
+
 /// §9.3's pause, as a gauge. Not in §9.1's list — see D-056.
 ///
 /// `simmer_route_skipped_total{reason="paused"}` only moves when a message is
@@ -933,6 +1059,65 @@ pub fn reservation_expired(ramp: &str, route: &str, count: i64) {
 /// that the sweeper is running and that the table is not growing without bound.
 pub fn recipient_events_evicted(count: u64) {
     counter!("simmer_recipient_events_evicted_total").increment(count);
+}
+
+/// D-118 `simmer_partial_ramp_member_offered_total{ramp,route}` — the share
+/// refused and membership kept the recipient on the route.
+pub fn partial_ramp_member_offered(ramp: &str, route: &str) {
+    counter!(
+        "simmer_partial_ramp_member_offered_total",
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
+    )
+    .increment(1);
+}
+
+/// D-116 — every `simmer_ramp_group_*` gauge for one group, from
+/// [`crate::quota::group_position`] and the group's row. Set at scrape time
+/// and by the walk; the allowance gauge is absent before the group starts.
+pub fn ramp_group(name: &str, p: &crate::quota::GroupPosition, usage: &crate::quota::Usage) {
+    let g = |metric: &'static str, v: f64| {
+        metrics::gauge!(metric, "ramp_group" => name.to_string()).set(v);
+    };
+    g("simmer_ramp_group_day", p.day_index as f64);
+    if let Some(a) = p.allowance {
+        g("simmer_ramp_group_allowance", a as f64);
+        g("simmer_ramp_group_step", p.step as f64);
+        g("simmer_ramp_group_held_days", p.held_days() as f64);
+    }
+    g("simmer_ramp_group_committed", usage.committed as f64);
+    g("simmer_ramp_group_reserved", usage.reserved as f64);
+}
+
+/// D-116 `simmer_ramp_group_advance_total{ramp_group,outcome}`.
+pub fn ramp_group_advance(name: &str, outcome: &str) {
+    counter!(
+        "simmer_ramp_group_advance_total",
+        "ramp_group" => name.to_string(), "outcome" => outcome.to_string(),
+    )
+    .increment(1);
+}
+
+/// D-116 `simmer_ramp_group_over_cap_total{ramp_group}`.
+pub fn ramp_group_over_cap(name: &str) {
+    counter!("simmer_ramp_group_over_cap_total", "ramp_group" => name.to_string()).increment(1);
+}
+
+/// D-118 `simmer_partial_ramp_members{ramp,route}`, from the sweeper's read.
+pub fn partial_ramp_members(ramp: &str, route: &str, members: i64) {
+    metrics::gauge!(
+        "simmer_partial_ramp_members",
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
+    )
+    .set(members as f64);
+}
+
+/// D-118 `simmer_partial_ramp_members_evicted_total{ramp,route}`.
+pub fn partial_ramp_members_evicted(ramp: &str, route: &str, count: u64) {
+    counter!(
+        "simmer_partial_ramp_members_evicted_total",
+        "ramp" => ramp.to_string(), "route" => route.to_string(),
+    )
+    .increment(count);
 }
 
 /// §7.5 — a message answered `451` because the quota store was unreachable.

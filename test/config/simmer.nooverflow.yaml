@@ -72,6 +72,9 @@ ramps:
         match_on: envelope
         chain: [warming-newbrand]
     default_chain: [warming-newbrand]
+    # D-115: this tier measures days on the calendar (D-042), so the schedule
+    # advances on elapsed days rather than on volume.
+    warmup_advance: auto
     strict_senders: false
     allow_no_overflow_route: true
     routes:
@@ -101,6 +104,9 @@ ramps:
         match_on: envelope
         chain: [warming-newbrand]
     default_chain: [warming-newbrand]
+    # D-115: this tier measures days on the calendar (D-042), so the schedule
+    # advances on elapsed days rather than on volume.
+    warmup_advance: auto
     strict_senders: false
     allow_no_overflow_route: true
     black_hole_allowed: true

@@ -1,6 +1,7 @@
 //! §7 — the quota model: day-index arithmetic, allowance resolution, and the
 //! §7.4 reserve/send/commit protocol.
 
+pub mod advance;
 pub mod day;
 #[cfg(feature = "mssql")]
 pub mod mssql;
@@ -21,7 +22,8 @@ pub use mssql::MssqlQuotaStore;
 pub use postgres::PgQuotaStore;
 pub use registry::ReservationRegistry;
 pub use store::{
-    Adoption, QuotaError, QuotaStore, Reservation, ReserveRequest, Reserved, Reset, Usage, UsageKey,
+    Adoption, AdvanceRows, GroupHold, GroupReserve, QuotaError, QuotaStore, Reservation,
+    ReserveRequest, Reserved, Reset, Usage, UsageKey,
 };
 
 /// §7.4: "Reservations carry an expiry (default: downstream timeout budget +
@@ -58,10 +60,15 @@ impl Allowance {
 /// routes never do this on their own: "Routes do not auto-graduate to uncapped;
 /// a warm route is made uncapped by editing the configuration and restarting, or
 /// by removing Simmer entirely."
+///
+/// `step` is D-115's schedule position — [`position`]'s answer, which is the day
+/// index itself under `advance: auto`. `day_index` still decides whether the
+/// route has started.
 pub fn allowance_for(
     route: &Route,
     domain_group: &str,
     day_index: i64,
+    step: i64,
     state: RouteState,
 ) -> Allowance {
     let Some(warmup) = route.warmup.as_ref() else {
@@ -80,7 +87,7 @@ pub fn allowance_for(
     let effective_day = if state.graduated {
         u64::MAX
     } else {
-        day_index as u64
+        step.clamp(0, day_index) as u64
     };
 
     warmup
@@ -91,6 +98,243 @@ pub fn allowance_for(
         // treating it as a zero ceiling rather than unlimited keeps the failure
         // safe if that ever stops being true.
         .unwrap_or(Allowance::Limited(0))
+}
+
+/// D-115 — where one `(ramp, route, domain_group)` element is today: its
+/// schedule step, the allowance that step plans, and what the step was decided
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Position {
+    pub day_index: i64,
+    pub step: i64,
+    pub allowance: Allowance,
+    pub decision: advance::Decision,
+    pub rule: crate::config::Advance,
+}
+
+impl Position {
+    pub fn held_days(&self) -> i64 {
+        self.decision.held_days(self.day_index)
+    }
+
+    /// The step to write into a row this position creates. `None` for an
+    /// overflow route or before the start, whose rows record no step.
+    pub fn step_column(&self) -> Option<i64> {
+        matches!(self.allowance, Allowance::Limited(_)).then_some(self.step)
+    }
+}
+
+/// D-115's position from rows already read — the pure half of [`position`],
+/// for callers that read many elements in one query.
+pub fn position_from(
+    route: &Route,
+    domain_group: &str,
+    day_index: i64,
+    state: RouteState,
+    rows: AdvanceRows,
+) -> Position {
+    let rule = route
+        .warmup
+        .as_ref()
+        .map_or(crate::config::Advance::Auto, |w| w.advance());
+    let decision = if route.warmup.is_none() {
+        // An overflow route has no schedule to walk; its "step" is the day.
+        advance::decide(crate::config::Advance::Auto, day_index, None, None)
+    } else {
+        advance::decide(rule, day_index, rows.today, rows.previous)
+    };
+    Position {
+        day_index,
+        step: decision.step,
+        allowance: allowance_for(route, domain_group, day_index, decision.step, state),
+        decision,
+        rule,
+    }
+}
+
+/// Does [`position`] need to read anything for this route? Only a warming,
+/// started route under a threshold rule: under `auto` the step is the day
+/// index, and an overflow route has no schedule.
+pub fn position_reads_rows(route: &Route, day_index: i64) -> bool {
+    day_index >= 0
+        && route
+            .warmup
+            .as_ref()
+            .is_some_and(|w| matches!(w.advance(), crate::config::Advance::Threshold { .. }))
+}
+
+/// D-115 — the ONE entry point for "where is this element today". The walk
+/// (every `Mode`), the dry run, the §5.4 early check, `/routes`, the allowance
+/// mutation and the gauges all call this, so none of them can disagree about
+/// which schedule entry is in force.
+///
+/// One unlocked read, and only for a threshold-mode warming route. The answer
+/// is advisory until a reservation writes it: the row's `step` and `allowance`
+/// are authoritative once the row exists (D-026), and every instance computes
+/// the same value from the same earlier row.
+pub async fn position(
+    store: &dyn QuotaStore,
+    route: &Route,
+    domain_group: &str,
+    day_index: i64,
+    state: RouteState,
+) -> Result<Position, QuotaError> {
+    let rows = if position_reads_rows(route, day_index) {
+        store
+            .advance_rows(&route.ramp, &route.name, domain_group, day_index)
+            .await?
+    } else {
+        AdvanceRows::default()
+    };
+    Ok(position_from(route, domain_group, day_index, state, rows))
+}
+
+/// D-115 — a reservation just created the day's row for this element, and with
+/// it fixed the element's step for the day. Count it, and say why, once: the
+/// row lock means exactly one reservation per row ever reports `created_row`,
+/// whichever instance took it.
+///
+/// No recipient anywhere in it: it is about a schedule, not a message.
+pub fn report_row_created(route: &Route, domain_group: &str, p: &Position) {
+    let outcome = match p.decision.outcome {
+        // A row created now cannot have existed when `position` read; if one
+        // did, a racing instance created and its own report covers it. Count
+        // what the step amounts to.
+        advance::Outcome::Existing | advance::Outcome::NotStarted => return,
+        o => o,
+    };
+    if route.warmup.is_none() {
+        return;
+    }
+    crate::metrics::warmup_advance(&route.ramp, &route.name, domain_group, outcome.as_str());
+
+    let basis = p.decision.basis;
+    tracing::info!(
+        event = "simmer.warmup.advance",
+        ramp = %route.ramp,
+        route = %route.name,
+        domain_group,
+        day_index = p.day_index,
+        step = p.step,
+        held_days = p.held_days(),
+        advance_mode = p.rule.mode(),
+        threshold = p.rule.threshold(),
+        outcome = outcome.as_str(),
+        allowance = p.allowance.as_column(),
+        previous_day_index = basis.map(|b| b.previous.day_index),
+        previous_step = basis.map(|b| b.previous.step_or_day()),
+        previous_committed = basis.map(|b| b.previous.committed),
+        previous_allowance = basis.and_then(|b| b.previous.allowance),
+        required = basis.map(|b| b.required),
+        "warm-up schedule step decided for the day (D-115)"
+    );
+}
+
+/// D-116 — where a ramp group is today: its own day index (from the group's
+/// `started`, by §7.2's arithmetic), its step under D-115's rule applied to its
+/// own rows, and the ceiling that step plans.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroupPosition {
+    pub day_index: i64,
+    pub step: i64,
+    /// `None` before the group's `started`: the group is not yet in force and
+    /// caps nothing, and no group row is written (D-116).
+    pub allowance: Option<i64>,
+    pub decision: advance::Decision,
+    pub rule: crate::config::Advance,
+}
+
+impl GroupPosition {
+    pub fn held_days(&self) -> i64 {
+        self.decision.held_days(self.day_index)
+    }
+
+    /// What a reservation passes to have the group row created and counted.
+    /// `None` when the group is not in force.
+    pub fn reserve(&self, group: &crate::config::RampGroup) -> Option<GroupReserve> {
+        self.allowance.map(|allowance| GroupReserve {
+            name: group.name.clone(),
+            day_index: self.day_index,
+            allowance,
+            step: self.step,
+        })
+    }
+}
+
+/// The pure half of [`group_position`], from rows already read.
+pub fn group_position_from(
+    group: &crate::config::RampGroup,
+    day_index: i64,
+    rows: AdvanceRows,
+) -> GroupPosition {
+    let rule = group.advance();
+    let decision = advance::decide(rule, day_index, rows.today, rows.previous);
+    // Today's row is authoritative once it exists (D-026), so an edited
+    // schedule does not move a day already being spent.
+    let allowance = if day_index < 0 {
+        None
+    } else {
+        rows.today
+            .and_then(|t| t.allowance)
+            .or_else(|| group.allowance_at(decision.step))
+    };
+    GroupPosition {
+        day_index,
+        step: decision.step,
+        allowance,
+        decision,
+        rule,
+    }
+}
+
+/// D-116 — the ONE entry point for "where is this ramp group today". The walk
+/// (once per message, not per route), the dry run, the early check, the read
+/// API and the gauges all call it.
+///
+/// One unlocked read, of the group's two most recent rows: under `auto` the
+/// step needs none, but the allowance of a row that already exists wins over
+/// the schedule's, and the read API wants the row anyway.
+pub async fn group_position(
+    store: &dyn QuotaStore,
+    group: &crate::config::RampGroup,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<GroupPosition, QuotaError> {
+    let day_index = day::index(group.started, now);
+    let rows = if day_index >= 0 {
+        store.group_advance_rows(&group.name, day_index).await?
+    } else {
+        AdvanceRows::default()
+    };
+    Ok(group_position_from(group, day_index, rows))
+}
+
+/// D-116 — a reservation created the group's row for the day, fixing its step.
+/// [`report_row_created`] for the group: counted once across every instance.
+pub fn report_group_row_created(group: &crate::config::RampGroup, p: &GroupPosition) {
+    let outcome = match p.decision.outcome {
+        advance::Outcome::Existing | advance::Outcome::NotStarted => return,
+        o => o,
+    };
+    crate::metrics::ramp_group_advance(&group.name, outcome.as_str());
+
+    let basis = p.decision.basis;
+    tracing::info!(
+        event = "simmer.ramp_group.advance",
+        ramp_group = %group.name,
+        day_index = p.day_index,
+        step = p.step,
+        held_days = p.held_days(),
+        advance_mode = p.rule.mode(),
+        threshold = p.rule.threshold(),
+        outcome = outcome.as_str(),
+        allowance = p.allowance,
+        previous_day_index = basis.map(|b| b.previous.day_index),
+        previous_step = basis.map(|b| b.previous.step_or_day()),
+        previous_committed = basis.map(|b| b.previous.committed),
+        previous_allowance = basis.and_then(|b| b.previous.allowance),
+        required = basis.map(|b| b.required),
+        "ramp group schedule step decided for the day (D-116)"
+    );
 }
 
 /// §7.4's reservation expiry: the whole timeout budget of the downstream the
@@ -175,15 +419,15 @@ ramps:
         let cfg = config();
         let r = cfg.default_ramp().route("warming").unwrap();
         assert_eq!(
-            allowance_for(r, "catchall", 0, plain()),
+            allowance_for(r, "catchall", 0, 0, plain()),
             Allowance::Limited(50)
         );
         assert_eq!(
-            allowance_for(r, "catchall", 1, plain()),
+            allowance_for(r, "catchall", 1, 1, plain()),
             Allowance::Limited(100)
         );
         assert_eq!(
-            allowance_for(r, "catchall", 2, plain()),
+            allowance_for(r, "catchall", 2, 2, plain()),
             Allowance::Limited(200)
         );
     }
@@ -193,11 +437,11 @@ ramps:
         let cfg = config();
         let r = cfg.default_ramp().route("warming").unwrap();
         assert_eq!(
-            allowance_for(r, "google", 0, plain()),
+            allowance_for(r, "google", 0, 0, plain()),
             Allowance::Limited(20)
         );
         assert_eq!(
-            allowance_for(r, "google", 1, plain()),
+            allowance_for(r, "google", 1, 1, plain()),
             Allowance::Limited(40)
         );
     }
@@ -209,21 +453,21 @@ ramps:
         let cfg = config();
         let r = cfg.default_ramp().route("warming").unwrap();
         assert_eq!(
-            allowance_for(r, "catchall", 3, plain()),
+            allowance_for(r, "catchall", 3, 3, plain()),
             Allowance::Limited(200)
         );
         assert_eq!(
-            allowance_for(r, "catchall", 500, plain()),
+            allowance_for(r, "catchall", 500, 500, plain()),
             Allowance::Limited(200)
         );
         assert_eq!(
-            allowance_for(r, "catchall", i64::MAX, plain()),
+            allowance_for(r, "catchall", i64::MAX, i64::MAX, plain()),
             Allowance::Limited(200)
         );
         // ...and the override series repeats its own final value, not the
         // default's.
         assert_eq!(
-            allowance_for(r, "google", 99, plain()),
+            allowance_for(r, "google", 99, 99, plain()),
             Allowance::Limited(40)
         );
     }
@@ -235,11 +479,11 @@ ramps:
         let cfg = config();
         let r = cfg.default_ramp().route("warming").unwrap();
         assert_eq!(
-            allowance_for(r, "catchall", -1, plain()),
+            allowance_for(r, "catchall", -1, -1, plain()),
             Allowance::NotStarted
         );
         assert_eq!(
-            allowance_for(r, "catchall", -9, plain()),
+            allowance_for(r, "catchall", -9, -9, plain()),
             Allowance::NotStarted
         );
     }
@@ -250,7 +494,7 @@ ramps:
         let r = cfg.default_ramp().route("overflow").unwrap();
         for day in [-5, 0, 1, 10_000] {
             assert_eq!(
-                allowance_for(r, "catchall", day, plain()),
+                allowance_for(r, "catchall", day, day, plain()),
                 Allowance::Unlimited
             );
         }
@@ -265,11 +509,11 @@ ramps:
             graduated: true,
         };
         assert_eq!(
-            allowance_for(r, "catchall", 0, graduated),
+            allowance_for(r, "catchall", 0, 0, graduated),
             Allowance::Limited(200)
         );
         assert_eq!(
-            allowance_for(r, "google", 0, graduated),
+            allowance_for(r, "google", 0, 0, graduated),
             Allowance::Limited(40)
         );
     }
@@ -285,7 +529,7 @@ ramps:
             graduated: true,
         };
         assert_eq!(
-            allowance_for(r, "catchall", -1, graduated),
+            allowance_for(r, "catchall", -1, -1, graduated),
             Allowance::NotStarted
         );
     }

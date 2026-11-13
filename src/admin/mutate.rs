@@ -313,7 +313,17 @@ pub async fn allowance(
     let day_index = quota::day::for_route(route, now);
     let states = state.store().route_states(&ramp.name).await?;
     let route_state = states.get(&name).copied().unwrap_or_default();
-    let scheduled = quota::allowance_for(route, &body.domain_group, day_index, route_state);
+    // D-115: the override may create today's row, and a row records the step
+    // its allowance came from — decided here exactly as a reservation would.
+    let position = quota::position(
+        state.store().as_ref(),
+        route,
+        &body.domain_group,
+        day_index,
+        route_state,
+    )
+    .await?;
+    let scheduled = position.allowance;
 
     let previous = state
         .store()
@@ -330,6 +340,7 @@ pub async fn allowance(
             day_index,
             body.allowance.0,
             scheduled.as_column(),
+            position.step_column(),
         )
         .await
         .inspect_err(|_| metrics::admin_mutation("allowance", "failed"))?;
@@ -503,6 +514,7 @@ pub async fn exhaustion_warnings(
         .store()
         .usage_many(&ramp.name, &super::keys_for(ramp, now))
         .await?;
+    let advance = super::advance_rows_for(state.store().as_ref(), ramp, None, now).await?;
 
     let mut out = Vec::new();
 
@@ -510,15 +522,15 @@ pub async fn exhaustion_warnings(
         for group in &ramp.domain_groups {
             let any_eligible = chain.routes.iter().any(|name| {
                 ramp.route(name).is_some_and(|route| {
+                    let route_state = states.get(name).copied().unwrap_or_default();
                     eligible(
-                        route,
-                        &group.name,
-                        states.get(name).copied().unwrap_or_default(),
+                        super::view::position_for(route, &group.name, route_state, &advance, now)
+                            .allowance,
+                        route_state,
                         usage
                             .get(&(name.clone(), group.name.clone()))
                             .copied()
                             .unwrap_or_default(),
-                        now,
                     )
                 })
             });
@@ -554,19 +566,14 @@ fn known_ramp<'a>(
 
 /// The same three questions `chain::walk_and_reserve` asks, minus §7.3's, which
 /// needs a recipient.
-fn eligible(
-    route: &crate::config::Route,
-    group: &str,
-    state: RouteState,
-    usage: crate::quota::Usage,
-    now: chrono::DateTime<Utc>,
-) -> bool {
+///
+/// `allowance` is D-115's position for the window — `view::position_for`, the
+/// function `/routes` and the walk use.
+fn eligible(allowance: Allowance, state: RouteState, usage: crate::quota::Usage) -> bool {
     if state.paused {
         return false;
     }
 
-    let day_index = quota::day::for_route(route, now);
-    let allowance = quota::allowance_for(route, group, day_index, state);
     if allowance == Allowance::NotStarted {
         return false;
     }

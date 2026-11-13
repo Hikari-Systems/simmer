@@ -100,13 +100,14 @@ fn request(route: &str, allowance: Option<i64>, count: i64) -> ReserveRequest {
         correlation_id: Uuid::new_v4().to_string(),
         expires_at: Utc::now() + Duration::minutes(10),
         over_cap: false,
+        ..Default::default()
     }
 }
 
 async fn taken(store: &Arc<dyn QuotaStore>, req: &ReserveRequest) -> quota::Reservation {
     match store.reserve(req).await.expect("reserve") {
         Reserved::Taken(r) => r,
-        Reserved::NoHeadroom { usage } => panic!("expected headroom, got {usage:?}"),
+        other => panic!("expected headroom, got {other:?}"),
     }
 }
 
@@ -408,6 +409,7 @@ async fn an_allowance_override_raises_todays_ceiling_for_one_group(pool: PgPool)
         0,
         Some(10),
         Some(3),
+        None,
     )
     .await
     .expect("override");
@@ -440,6 +442,7 @@ async fn an_override_expires_with_the_day_it_was_set_for(pool: PgPool) {
         0,
         Some(99),
         Some(3),
+        None,
     )
     .await
     .unwrap();
@@ -472,6 +475,7 @@ async fn an_override_can_lower_a_ceiling_below_what_is_already_committed(pool: P
         0,
         Some(1),
         Some(3),
+        None,
     )
     .await
     .unwrap();
@@ -615,6 +619,7 @@ async fn n_concurrent_reservations_against_n_minus_one_slots_never_overshoot(poo
                     true
                 }
                 Ok(Reserved::NoHeadroom { .. }) => false,
+                Ok(other) => panic!("ungrouped: {other:?}"),
                 Err(e) => panic!("reserve failed: {e}"),
             }
         }));

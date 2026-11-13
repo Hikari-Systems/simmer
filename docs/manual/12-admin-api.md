@@ -38,6 +38,7 @@ on loopback (`-p 127.0.0.1:8080:8080`), or keep it on an internal network.
 | `GET /metrics` | no | Prometheus metrics, when `admin.metrics` is on; `404` otherwise |
 | `GET /ramps`, `GET /ramps/{ramp}` | yes | Each ramp: its name, whether it is the default, the listeners routing to it, its routes |
 | `GET /ramps/{ramp}/routes`, `GET /ramps/{ramp}/routes/{name}` | yes | Each route's configuration and live state |
+| `GET /ramp-groups`, `GET /ramp-groups/{name}` | yes | Each [ramp group](08-warmup.md#sharing-a-ceiling-between-ramps): its ramps and schedule, today's step, ceiling, delivered, in flight and headroom, and the day the step was decided from. `GET /ramps/{ramp}` names the ramp's group |
 | `GET /quota?ramp=&route=&group=` | yes | Today's counters, filtered. `ramp` is required when there is more than one ramp |
 | `POST /ramps/{ramp}/routes/{name}/pause`, `…/resume` | yes | Take a route out of use, or put it back |
 | `POST /ramps/{ramp}/routes/{name}/graduate` | yes | Give the route the last value of its schedule from now on |
@@ -63,6 +64,7 @@ The main fields:
 | `status` | `active`, `paused` (by an operator), or `not_started` (`warmup.started` is in the future) |
 | `day_index`, `day_started_at`, `day_ends_at` | Which day of the schedule the route is on, and when it started and ends |
 | `graduated` | Whether the route has been graduated |
+| `advance` | How the route moves along its schedule: `mode` (`threshold` or `auto`), `threshold`, and `source` (`route`, `ramp` or `default`) |
 | `groups[]` | One entry per domain group, below |
 | `preflight` | The last DNS preflight result, check by check. `null` means nothing has been checked, which is not the same as passing |
 | `pool` | Connections: `max_connections`, the current `idle` and `active`, and lifetime `opened`, `reused`, `retired` and `discarded` |
@@ -81,6 +83,10 @@ For each domain group:
 | `drift` | `true` when `allowance` and `scheduled` differ. Normal for the rest of the day after a schedule change, and the first thing to check when the route is not doing what the configuration says |
 | `partial_ramp_share` | The share currently offered, or `null` for all |
 | `row_exists` | `false` means nothing has been sent on this route and group today, so the numbers are what the first message will start from |
+| `step` | The schedule entry `scheduled` comes from. Equal to `day_index` under `advance: auto` |
+| `held_days` | How many days this group is behind the calendar because a day fell short |
+| `next_allowance_if_met` | Tomorrow's allowance if today delivers enough |
+| `previous` | The day today's step was decided from: its `committed`, planned `allowance`, the `required` count, `attainment` and whether it was `met`. `null` under `auto` and on a group's first day |
 
 Reading the pool: `reused` far below `opened` means connections are not lasting
 between messages, and a growing `discarded` means the provider is closing them
