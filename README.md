@@ -3,7 +3,7 @@
 An SMTP relay that warms up a new sending domain for you.
 
 <!-- current-version: source of truth for the release number. Keep in sync with the git tag, DOCKERHUB.md, and Cargo.toml; enforced by .githooks/pre-push and the release CI. -->
-**Current version: `v0.13.2`** ([all releases](https://github.com/Hikari-Systems/simmer/releases))
+**Current version: `v0.14.0`** ([all releases](https://github.com/Hikari-Systems/simmer/releases))
 
 Your application sends mail to Simmer instead of straight to its SMTP provider.
 For each message, Simmer checks whether the new domain still has allowance today
