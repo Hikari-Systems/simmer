@@ -27,15 +27,14 @@ jobs:
   # reason holds for crates.io too — `cargo deny check` is only a gate on the
   # graph that actually resolves.
   #
-  # amd64 jobs run on the org's self-hosted public runners: two runners on one
-  # persistent host. Two things follow from that, throughout this file. No job
-  # binds a fixed host port — two jobs on that host at once would collide — so
-  # each service publishes to a random port and the job reads it back from
-  # `job.services`. And nothing a job creates outlives it: containers are
-  # named per run and removed, and registry logins go to an auth file under
-  # $RUNNER_TEMP, which the runner deletes, not to the runner user's home.
+  # Jobs run on Blacksmith runners (blacksmith-2vcpu-ubuntu-2404, and -arm for
+  # the arm64 legs). The file stays safe on shared, persistent runners too: no
+  # job binds a fixed host port — each service publishes to a random port and
+  # the job reads it back from `job.services` — and nothing a job creates
+  # outlives it: containers are named per run and removed, and registry logins
+  # go to an auth file under $RUNNER_TEMP, not to the runner user's home.
   check:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 25
 
     services:
@@ -154,9 +153,9 @@ jobs:
         platform: [amd64, arm64]
         include:
           - platform: amd64
-            runner: self-hosted-public-amd64
+            runner: blacksmith-2vcpu-ubuntu-2404
           - platform: arm64
-            runner: self-hosted-public-arm64
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
     services:
       registry:
         image: registry:3.0
@@ -216,7 +215,7 @@ jobs:
             -t registry:5000/${{ env.REPO_NAME }}:${{ github.sha }}-${{ matrix.platform }} .
 
   merge-manifest:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     needs: build
     services:
@@ -310,10 +309,10 @@ jobs:
         platform: [amd64, arm64]
         include:
           - platform: amd64
-            runner: self-hosted-public-amd64
+            runner: blacksmith-2vcpu-ubuntu-2404
             db_image: mcr.microsoft.com/mssql/server:2022-latest
           - platform: arm64
-            runner: self-hosted-public-arm64
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
             db_image: mcr.microsoft.com/azure-sql-edge:latest
 
     env:
@@ -424,9 +423,9 @@ jobs:
         platform: [amd64, arm64]
         include:
           - platform: amd64
-            runner: self-hosted-public-amd64
+            runner: blacksmith-2vcpu-ubuntu-2404
           - platform: arm64
-            runner: self-hosted-public-arm64
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
     services:
       registry:
         image: registry:3.0
@@ -471,7 +470,7 @@ jobs:
   # fail independently: a broken SQL Server build must not stop the Postgres
   # image publishing, which is what almost every deployment runs.
   merge-manifest-mssql:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     needs: build-mssql
     services:

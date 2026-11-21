@@ -34,7 +34,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: self-hosted-public-amd64
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     # Most of this is the wait for build.yml below, when the tag was pushed
     # together with the commit it names.
     timeout-minutes: 75
