@@ -53,8 +53,13 @@ yanked = "deny"
 # Moving to a maintained parser (saphyr / serde-saphyr) is a change to how every
 # config key deserialises, so it is a decision of its own. Revisit then, or on a
 # real advisory against the crate.
+# RUSTSEC-2026-0543: `chrono` is unmaintained (all versions; no known vulnerability).
+# simmer uses it directly for its timestamps and through sqlx's `chrono` feature, so
+# moving to `jiff` or `time` is a change to every timestamp type and to the sqlx
+# feature set: a decision of its own. Revisit then, or on a real advisory against it.
 ignore = [
     { id = "RUSTSEC-2024-0449", reason = "unmaintained, not vulnerable; the config parser only reads the operator's own file at startup (D-004)" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, not vulnerable; replacing it (jiff/time) touches every timestamp and sqlx's chrono feature" },
 ]
 
 [sources]
